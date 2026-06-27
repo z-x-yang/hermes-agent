@@ -52,6 +52,11 @@ def _list_worktrees() -> list[dict]:
             cur["head"] = line[len("HEAD "):]
         elif line.startswith("branch "):
             cur["branch"] = line[len("branch "):].replace("refs/heads/", "")
+        elif line.startswith("prunable "):
+            # `git worktree list --porcelain` can report metadata for a worktree
+            # whose .git file is already gone. It is not a valid checkout, so the
+            # doctor must not run `git status` inside it.
+            cur["prunable"] = line[len("prunable "):]
         elif line == "detached":
             cur["branch"] = None
     if cur:
@@ -107,6 +112,10 @@ def _classify(wt: dict, stale_days: int) -> Verdict:
     path, branch = wt["path"], wt.get("branch")
     if wt.get("is_main") or branch in (None, MAIN):
         # 主 worktree(gateway 生产)/ detached / main 本身:绝不回收
+        return Verdict(path, branch, 0, 0, 0.0, False, "SKIP")
+    if wt.get("prunable") or not (Path(path) / ".git").exists():
+        # Broken admin records are Git's prune domain, not live worktrees. Skip
+        # them so one stale metadata entry cannot abort the whole cron run.
         return Verdict(path, branch, 0, 0, 0.0, False, "SKIP")
     ahead, behind = _ahead_behind(branch)
     dirty = _dirty(path)
