@@ -567,6 +567,12 @@ def _compute_tool_definitions(
 def _resolve_active_context_length() -> int:
     """Look up the active model's context length for the tool-search gate.
 
+    The gate must honor the same explicit config override used by the context
+    compressor.  Otherwise a provider-specific cap such as ``model.context_length:
+    272000`` can be ignored and broad catalog fallbacks (for example direct-API
+    GPT-5.5 at 1.05M) make the tool-search threshold so large that MCP schemas
+    stay fully visible.
+
     Returns 0 when the model can't be resolved — ``should_activate`` falls
     back to a fixed token cutoff in that case.
     """
@@ -579,8 +585,28 @@ def _resolve_active_context_length() -> int:
         model_id = (model_cfg.get("model") or model_cfg.get("default") or "").strip()
         if not model_id:
             return 0
+
+        config_context_length = None
+        raw_context_length = model_cfg.get("context_length")
+        if raw_context_length is not None:
+            try:
+                parsed_context_length = int(raw_context_length)
+                if parsed_context_length > 0:
+                    config_context_length = parsed_context_length
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid model.context_length for tool-search gate: %r — "
+                    "falling back to auto-detection",
+                    raw_context_length,
+                )
+
         from agent.model_metadata import get_model_context_length
-        return int(get_model_context_length(model_id) or 0)
+        return int(get_model_context_length(
+            model_id,
+            base_url=str(model_cfg.get("base_url") or ""),
+            config_context_length=config_context_length,
+            provider=str(model_cfg.get("provider") or ""),
+        ) or 0)
     except Exception as e:
         logger.debug("Could not resolve active context length: %s", e)
         return 0

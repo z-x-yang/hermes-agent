@@ -178,6 +178,47 @@ class TestThresholdGate:
         big_t = estimate_tokens_from_schemas(big)
         assert big_t > small_t * 10
 
+    def test_active_context_length_honors_model_config_override(self, monkeypatch):
+        """Regression: tool-search auto gate must not ignore model.context_length.
+
+        If this falls back to the hardcoded GPT-5.5 direct-API context (1.05M),
+        the default 10% threshold is too high and large MCP schemas remain fully
+        visible despite a smaller configured usable context window.
+        """
+        import agent.model_metadata as model_metadata
+        import hermes_cli.config as hermes_config
+        from model_tools import _resolve_active_context_length
+
+        monkeypatch.setattr(
+            hermes_config,
+            "load_config",
+            lambda: {
+                "model": {
+                    "default": "gpt-5.5",
+                    "provider": "gptcodex",
+                    "context_length": 272_000,
+                }
+            },
+        )
+
+        seen = {}
+
+        def fake_get_model_context_length(model, **kwargs):
+            seen["model"] = model
+            seen.update(kwargs)
+            return kwargs.get("config_context_length") or 1_050_000
+
+        monkeypatch.setattr(
+            model_metadata,
+            "get_model_context_length",
+            fake_get_model_context_length,
+        )
+
+        assert _resolve_active_context_length() == 272_000
+        assert seen["model"] == "gpt-5.5"
+        assert seen["config_context_length"] == 272_000
+        assert seen["provider"] == "gptcodex"
+
 
 # ---------------------------------------------------------------------------
 # Retrieval (BM25 + substring fallback)
