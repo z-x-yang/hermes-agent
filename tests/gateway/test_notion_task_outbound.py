@@ -23,6 +23,15 @@ async def test_detect_task_links_only_returns_task_pages():
 
 
 @pytest.mark.asyncio
+async def test_detect_task_links_accepts_app_notion_p_urls():
+    notion = SimpleNamespace(get_page=AsyncMock(return_value=TASK_PAGE))
+    text = f"Notion: https://app.notion.com/p/Reply-to-Alice-{PID}"
+    tasks = await outbound.detect_task_links(text, notion=notion)
+    assert tasks == [(PID, "Reply to Alice")]
+    notion.get_page.assert_awaited_once_with(PID)
+
+
+@pytest.mark.asyncio
 async def test_detect_task_links_skips_get_page_failure():
     notion = SimpleNamespace(get_page=AsyncMock(side_effect=RuntimeError("boom")))
     tasks = await outbound.detect_task_links(f"[x](https://notion.so/{PID})", notion=notion)
@@ -52,6 +61,25 @@ async def test_standalone_components_builds_done_button(monkeypatch):
     assert len(rows) == 1
     btn = rows[0]["components"][0]
     assert btn["custom_id"] == f"ntask:done:{PID}" and btn["style"] == 3
+
+
+@pytest.mark.asyncio
+async def test_standalone_components_builds_done_button_for_app_notion(monkeypatch):
+    from plugins.platforms.discord.notion_tasks import notion_client as nc
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def get_page(self, pid):
+            return TASK_PAGE
+
+    monkeypatch.setattr(nc, "NotionClient", _FakeClient)
+    rows = await outbound.standalone_task_components(
+        f"Notion: https://app.notion.com/p/Reply-to-Alice-{PID}"
+    )
+    assert len(rows) == 1
+    assert rows[0]["components"][0]["custom_id"] == f"ntask:done:{PID}"
 
 
 @pytest.mark.asyncio

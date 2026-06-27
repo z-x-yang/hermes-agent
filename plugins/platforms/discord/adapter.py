@@ -1981,7 +1981,8 @@ class DiscordAdapter(BasePlatformAdapter):
             # before the controller does any network fetch. No tracker write
             # here — the click handler captures location + content authoritatively.
             # Done before the forum branch so forum starters get the button too.
-            if view is None and content and "notion.so" in content.lower():
+            from plugins.platforms.discord.notion_tasks import detection as notion_detection
+            if view is None and notion_detection.has_notion_link(content):
                 try:
                     view = await self._notion_controller.render_view_for_text(content)
                 except Exception as e:
@@ -7476,7 +7477,7 @@ async def _standalone_send(
         # Notion task one-click button for the standalone HTTP path. This is the
         # path `hermes send` uses (the email-reminder cron pushes via it), so the
         # button MUST be attached here — adapter.send() is not reached from a CLI
-        # process. Short-circuits cheaply when the message has no notion.so link;
+        # process. Short-circuits cheaply when the message has no supported Notion link;
         # never raises into delivery.
         from plugins.platforms.discord.notion_tasks.outbound import standalone_task_components
         task_components = await standalone_task_components(message)

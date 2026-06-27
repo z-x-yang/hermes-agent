@@ -45,6 +45,23 @@ async def test_send_attaches_task_view_when_link_present():
 
 
 @pytest.mark.asyncio
+async def test_send_attaches_task_view_for_app_notion_links():
+    adapter = _make_adapter()
+    channel = MagicMock()
+    sent = MagicMock()
+    sent.id = 123
+    channel.send = AsyncMock(return_value=sent)
+    adapter._client.get_channel = MagicMock(return_value=channel)
+    fake_view = MagicMock()
+    adapter._notion_controller.render_view_for_text = AsyncMock(return_value=fake_view)
+
+    res = await adapter.send("9001", f"Notion: https://app.notion.com/p/Reply-to-Alice-{PID}")
+    assert res.success is True
+    adapter._notion_controller.render_view_for_text.assert_awaited_once()
+    assert channel.send.call_args.kwargs.get("view") is fake_view
+
+
+@pytest.mark.asyncio
 async def test_send_skips_render_without_notion_substring():
     adapter = _make_adapter()
     channel = MagicMock()

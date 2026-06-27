@@ -19,12 +19,20 @@ DEFAULT_TASKS_IDS = {"1f17a58d229e816f839bef72f6f2ec72",
 # Only these hosts are real Notion links. A crafted URL like
 # https://evil.example/notion.so/<id> must NOT match — host is the authority,
 # verified via urlparse in _id_from_url, not the substring in these regexes.
-_NOTION_HOSTS = {"notion.so", "www.notion.so"}
+_NOTION_HOSTS = {"notion.so", "www.notion.so", "app.notion.com"}
 
 _HEXISH = r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}"
 _MD = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
 _URL = re.compile(r"https?://[^\s)]+")
 _ID_IN = re.compile(_HEXISH)
+
+
+def has_notion_link(text: str | None) -> bool:
+    """Cheap pre-filter for messages that may contain a supported Notion URL."""
+    if not text:
+        return False
+    lower = text.lower()
+    return "notion.so" in lower or "app.notion.com" in lower
 
 
 def normalize_id(raw: str | None) -> str | None:
@@ -53,7 +61,7 @@ def _id_from_url(url: str) -> str | None:
 
 
 def extract_notion_links(text: str) -> list[NotionLink]:
-    if not text:
+    if not has_notion_link(text):
         return []
     seen: dict[str, str | None] = {}
     for anchor, url in _MD.findall(text):

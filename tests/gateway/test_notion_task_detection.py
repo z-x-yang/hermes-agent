@@ -28,6 +28,14 @@ def test_extract_bare_url_and_hyphenated_id():
     assert links[0].anchor is None
 
 
+def test_extract_app_notion_p_url():
+    text = "Notion: https://app.notion.com/p/Task-title-1f17a58d229e816f839bef72f6f2ec72"
+    links = d.extract_notion_links(text)
+    assert len(links) == 1
+    assert links[0].page_id == "1f17a58d229e816f839bef72f6f2ec72"
+    assert links[0].anchor is None
+
+
 def test_non_notion_link_ignored():
     assert d.extract_notion_links("[x](https://example.com/abc)") == []
 
@@ -37,6 +45,7 @@ def test_rejects_spoofed_host():
     pid = "1f17a58d229e816f839bef72f6f2ec72"
     assert d.extract_notion_links(f"[x](https://evil.example/notion.so/{pid})") == []
     assert d.extract_notion_links(f"https://evil.example/notion.so/{pid}") == []
+    assert d.extract_notion_links(f"https://evil.example/app.notion.com/p/{pid}") == []
 
 
 def test_id_only_in_query_string_ignored():

@@ -29,7 +29,7 @@ async def detect_task_links(message: str, *, notion, tasks_ids=None) -> list[tup
     failure is logged and the link dropped (no button) — intentional graceful
     degradation, never a silent success.
     """
-    if not message or "notion.so" not in message.lower():
+    if not detection.has_notion_link(message):
         return []
     ids = tasks_ids or detection.DEFAULT_TASKS_IDS
     out: list[tuple[str, str]] = []
@@ -58,7 +58,7 @@ async def standalone_task_components(message: str) -> list[dict]:
     the message still goes out (the buttons can't appear, but delivery must not
     break).
     """
-    if not message or "notion.so" not in message.lower():
+    if not detection.has_notion_link(message):
         return []
     try:
         from .notion_client import NotionClient
