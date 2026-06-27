@@ -261,6 +261,20 @@ def test_run_job_no_agent_script_failure_delivers_error(hermes_env):
     assert "Cron watchdog" in final_response  # alert header
 
 
+def test_script_timeout_summary_does_not_claim_provider_fallback():
+    """Script watchdog timeouts are local script failures, not provider fallback exhaustion."""
+    from cron.scheduler import _summarize_cron_failure_for_delivery
+
+    message = _summarize_cron_failure_for_delivery(
+        {"name": "Relay gptcodex health monitor", "no_agent": True},
+        "Script timed out after 120s: /Users/zongxin/.hermes/scripts/relay_healthcheck.py",
+    )
+
+    assert "script timed out after 120s" in message.lower()
+    assert "provider timeout" not in message.lower()
+    assert "Fallback chain" not in message
+
+
 def test_run_job_no_agent_never_invokes_aiagent(hermes_env):
     """no_agent jobs must NOT import/construct the AIAgent."""
     from cron.jobs import create_job

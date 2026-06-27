@@ -71,6 +71,16 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             "Full details saved in cron output."
         )
 
+    # Local cron script timeouts are watchdog/runtime failures, not model
+    # provider fallback exhaustion. Match this before the generic provider
+    # timeout bucket, because _run_job_script returns this exact prefix.
+    script_timeout = re.search(r"\bScript timed out after\s+([^:]+)", text, re.IGNORECASE)
+    if script_timeout:
+        return (
+            f"⚠️ Cron '{job_name}' failed: script timed out after {script_timeout.group(1).strip()}. "
+            "Full details saved in cron output."
+        )
+
     if "readtimeout" in lower or "timed out" in lower or "timeout" in lower:
         return (
             f"⚠️ Cron '{job_name}' failed: provider timeout. "
