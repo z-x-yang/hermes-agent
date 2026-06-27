@@ -170,6 +170,87 @@ def test_build_models_payload_returns_expected_shape():
     assert payload["providers"][1:] == rows
 
 
+def test_build_models_payload_applies_model_picker_allowlist():
+    rows = [
+        {
+            "slug": "openrouter",
+            "name": "OpenRouter",
+            "models": ["m1", "m2", "m3"],
+            "total_models": 3,
+            "is_current": True,
+            "is_user_defined": False,
+            "source": "built-in",
+        },
+        {
+            "slug": "anthropic",
+            "name": "Anthropic",
+            "models": ["claude"],
+            "total_models": 1,
+            "is_current": False,
+            "is_user_defined": False,
+            "source": "built-in",
+        },
+    ]
+    cfg = {
+        "model_picker": {
+            "allowed_providers": ["openrouter"],
+            "allowed_models": {"openrouter": ["m2", "m1"]},
+        }
+    }
+    with _list_auth_returning(rows), patch("hermes_cli.config.load_config", return_value=cfg):
+        payload = build_models_payload(_empty_ctx(provider="openrouter", model="m1"))
+
+    assert [row["slug"] for row in payload["providers"]] == ["openrouter"]
+    assert payload["providers"][0]["models"] == ["m2", "m1"]
+    assert payload["providers"][0]["total_models"] == 2
+
+
+def test_build_models_payload_allowlist_accepts_custom_provider_aliases():
+    rows = [
+        {
+            "slug": "custom:gptcodex",
+            "name": "GPTCodex",
+            "models": ["gpt-5.5", "gpt-5.4-mini"],
+            "total_models": 2,
+            "is_current": True,
+            "is_user_defined": True,
+            "source": "config",
+        },
+        {
+            "slug": "openai",
+            "name": "OpenAI",
+            "models": ["gpt-5.5"],
+            "total_models": 1,
+            "is_current": False,
+            "is_user_defined": False,
+            "source": "built-in",
+        },
+    ]
+    cfg = {"model_picker": {"allowed_providers": ["gptcodex"], "allowed_models": {"GPTCodex": ["gpt-5.4-mini"]}}}
+    with _list_auth_returning(rows), patch("hermes_cli.config.load_config", return_value=cfg):
+        payload = build_models_payload(_empty_ctx(provider="custom:gptcodex", model="gpt-5.4-mini"))
+
+    assert [row["slug"] for row in payload["providers"]] == ["custom:gptcodex"]
+    assert payload["providers"][0]["models"] == ["gpt-5.4-mini"]
+
+
+def test_list_picker_providers_applies_model_picker_allowlist():
+    from hermes_cli.model_switch import list_picker_providers
+
+    rows = [
+        {"slug": "openrouter", "name": "OpenRouter", "models": ["or-1"], "total_models": 1, "is_user_defined": False},
+        {"slug": "anthropic", "name": "Anthropic", "models": ["claude"], "total_models": 1, "is_user_defined": False},
+    ]
+    cfg = {"model_picker": {"allowed_providers": ["anthropic"]}}
+    with (
+        patch("hermes_cli.model_switch.list_authenticated_providers", return_value=rows),
+        patch("hermes_cli.config.load_config", return_value=cfg),
+    ):
+        payload = list_picker_providers()
+
+    assert [row["slug"] for row in payload] == ["anthropic"]
+
+
 def test_build_models_payload_does_not_call_provider_model_ids():
     """``build_models_payload`` is a thin shape adapter — it delegates the
     actual curation to ``list_authenticated_providers`` (which DOES call

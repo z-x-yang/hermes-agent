@@ -2364,6 +2364,7 @@ def list_picker_providers(
     picker payload is narrowed.
     """
     from hermes_cli.models import fetch_openrouter_models
+    from hermes_cli.inventory import _apply_model_picker_allowlist
 
     providers = list_authenticated_providers(
         current_provider=current_provider,
@@ -2395,4 +2396,4 @@ def list_picker_providers(
             continue
         filtered.append(p)
 
-    return filtered
+    return _apply_model_picker_allowlist(filtered)

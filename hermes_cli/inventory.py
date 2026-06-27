@@ -214,6 +214,7 @@ def build_models_payload(
 
     if include_unconfigured:
         rows = list(rows) + [r for r in _append_unconfigured_rows(rows, ctx) if str(r.get("slug", "")).lower() != "moa"]
+    rows = _apply_model_picker_allowlist(rows)
     if picker_hints:
         _apply_picker_hints(rows)
     if canonical_order:
@@ -228,6 +229,103 @@ def build_models_payload(
         "model": ctx.current_model,
         "provider": ctx.current_provider,
     }
+
+
+def _as_string_list(value) -> list[str]:
+    """Return a cleaned string list from config scalar/list values."""
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        return []
+    out: list[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def _provider_allowlist_keys(slug: str, name: str = "") -> set[str]:
+    """Aliases accepted by ``model_picker.allowed_providers``."""
+    raw_slug = str(slug or "").strip().lower()
+    raw_name = str(name or "").strip().lower()
+    keys = {k for k in (raw_slug, raw_name) if k}
+    if raw_slug.startswith("custom:"):
+        keys.add(raw_slug.split(":", 1)[1])
+    if raw_name:
+        keys.add(f"custom:{raw_name}")
+    return keys
+
+
+def _apply_model_picker_allowlist(rows: list[dict]) -> list[dict]:
+    """Apply optional provider/model allowlists to picker payloads.
+
+    Empty / absent settings preserve upstream behavior. This is a display-level
+    filter for picker payloads; direct typed ``/model --provider ...`` remains
+    available for expert use.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        return rows
+
+    section = cfg.get("model_picker") if isinstance(cfg, dict) else None
+    if not isinstance(section, dict):
+        return rows
+
+    allowed_providers = {
+        item.lower()
+        for item in _as_string_list(
+            section.get("allowed_providers")
+            or section.get("provider_allowlist")
+            or section.get("providers")
+        )
+    }
+
+    raw_allowed_models = section.get("allowed_models") or section.get("model_allowlist")
+    allowed_models_by_provider: dict[str, list[str]] = {}
+    if isinstance(raw_allowed_models, dict):
+        for provider, models in raw_allowed_models.items():
+            pkey = str(provider or "").strip().lower()
+            cleaned = _as_string_list(models)
+            if pkey and cleaned:
+                allowed_models_by_provider[pkey] = cleaned
+
+    if not allowed_providers and not allowed_models_by_provider:
+        return rows
+
+    filtered_rows: list[dict] = []
+    for row in rows:
+        slug = str(row.get("slug", "") or "")
+        name = str(row.get("name", "") or "")
+        keys = _provider_allowlist_keys(slug, name)
+        if allowed_providers and not (keys & allowed_providers):
+            continue
+
+        model_allowlist: list[str] = []
+        for key in keys:
+            if key in allowed_models_by_provider:
+                model_allowlist = allowed_models_by_provider[key]
+                break
+        if model_allowlist:
+            original_models = list(row.get("models") or [])
+            models_by_lower = {str(m).lower(): m for m in original_models}
+            filtered_models = [
+                models_by_lower.get(model.lower(), model)
+                for model in model_allowlist
+                if not original_models or model.lower() in models_by_lower
+            ]
+            row = dict(row)
+            row["models"] = filtered_models
+            row["total_models"] = len(filtered_models)
+
+        filtered_rows.append(row)
+
+    return filtered_rows
 
 
 def _apply_capabilities(rows: list[dict]) -> None:
