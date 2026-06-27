@@ -7,6 +7,8 @@ hold regardless of which strong LLM produced the summary.
 
 from __future__ import annotations
 
+import re
+
 from collections.abc import Sequence
 
 
@@ -44,18 +46,79 @@ def _content_text(content: object) -> str:
     return str(content)
 
 
+def _line_heading_positions(summary: str, heading: str) -> list[int]:
+    return [
+        match.start()
+        for match in re.finditer(rf"(?m)^{re.escape(heading)}$", summary)
+        if not _is_inside_fenced_code_block(summary, match.start())
+    ]
+
+
 def _section(summary: str, heading: str) -> str:
-    try:
-        start = summary.index(heading) + len(heading)
-    except ValueError:
+    positions = _line_heading_positions(summary, heading)
+    if not positions:
         return ""
+    start = positions[0] + len(heading)
     next_starts = [
-        summary.index(next_heading, start)
+        pos
         for next_heading in NINE_SECTION_HEADINGS
-        if next_heading != heading and next_heading in summary[start:]
+        if next_heading != heading
+        for pos in _line_heading_positions(summary, next_heading)
+        if pos > start
     ]
     end = min(next_starts) if next_starts else len(summary)
     return summary[start:end].strip()
+
+
+def _is_inside_fenced_code_block(text: str, position: int) -> bool:
+    fence_char: str | None = None
+    fence_len = 0
+    for line in text[:position].splitlines():
+        match = re.match(r"^[ \t]*(`{3,}|~{3,})", line)
+        if not match:
+            continue
+        fence = match.group(1)
+        char = fence[0]
+        length = len(fence)
+        if fence_char is None:
+            fence_char = char
+            fence_len = length
+        elif char == fence_char and length >= fence_len:
+            fence_char = None
+            fence_len = 0
+    return fence_char is not None
+
+
+def _looks_like_summary_tail_boundary_remainder(text: str) -> bool:
+    remainder = (text or "").lstrip()
+    return (
+        not remainder
+        or remainder.startswith(ASSISTANT_TAIL_MARKER)
+        or remainder.startswith(USER_TAIL_MARKER_PREFIX)
+    )
+
+
+def _find_summary_end_marker(text: str) -> int:
+    outside_fence: list[int] = []
+    boundary_fallbacks: list[int] = []
+    start = 0
+    while True:
+        pos = text.find(SUMMARY_END_MARKER, start)
+        if pos < 0:
+            break
+        if pos == 0 or text[pos - 1] == "\n":
+            if not _is_inside_fenced_code_block(text, pos):
+                outside_fence.append(pos)
+            elif _looks_like_summary_tail_boundary_remainder(
+                text[pos + len(SUMMARY_END_MARKER):]
+            ) or text[pos + len(SUMMARY_END_MARKER):].lstrip():
+                boundary_fallbacks.append(pos)
+        start = pos + len(SUMMARY_END_MARKER)
+    if outside_fence:
+        return min(outside_fence)
+    if boundary_fallbacks:
+        return max(boundary_fallbacks)
+    return -1
 
 
 def evaluate_nine_section_summary(
@@ -74,11 +137,12 @@ def evaluate_nine_section_summary(
 
     positions: list[int] = []
     for heading in NINE_SECTION_HEADINGS:
-        count = summary.count(heading)
+        heading_positions = _line_heading_positions(summary, heading)
+        count = len(heading_positions)
         if count != 1:
             failures.append(f"heading {heading!r} appears {count} time(s), expected exactly once")
             continue
-        positions.append(summary.index(heading))
+        positions.append(heading_positions[0])
     if len(positions) == len(NINE_SECTION_HEADINGS) and positions != sorted(positions):
         failures.append("nine-section headings are not in canonical order")
 
@@ -105,9 +169,10 @@ def evaluate_compacted_messages(messages: Sequence[dict]) -> list[str]:
     failures: list[str] = []
     for index, msg in enumerate(messages):
         content = _content_text(msg.get("content"))
-        if SUMMARY_END_MARKER not in content:
+        marker_pos = _find_summary_end_marker(content)
+        if marker_pos < 0:
             continue
-        remainder = content.split(SUMMARY_END_MARKER, 1)[1].strip()
+        remainder = content[marker_pos + len(SUMMARY_END_MARKER):].strip()
         if not remainder:
             continue
         role = msg.get("role")

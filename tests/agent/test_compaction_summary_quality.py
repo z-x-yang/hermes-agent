@@ -124,3 +124,69 @@ def test_quality_eval_rejects_nested_summary_inside_labelled_tail():
     failures = evaluate_compacted_messages(messages)
 
     assert any("nested compacted summary" in failure for failure in failures)
+
+
+def test_quality_eval_ignores_protocol_literals_inside_summary_body():
+    summary = GOOD_SUMMARY.replace(
+        "Context compaction is a lossy checkpoint with source attribution boundaries.",
+        """Context compaction is a lossy checkpoint with source attribution boundaries.
+The summary may document the canonical headings as an example:
+```md
+## Primary Request and Intent
+## Key Technical Concepts
+## Files and Code Sections
+## Errors and Fixes
+## Problem Solving
+## All User Messages
+## Pending Tasks
+## Current Work
+## Optional Next Step
+--- END OF COMPACTED CONTEXT ---
+```""",
+    )
+
+    failures = evaluate_nine_section_summary(
+        summary,
+        user_messages=["Keep the nine-section structure.", "Build the minimal evaluator."],
+    )
+
+    assert failures == []
+
+
+def test_transcript_eval_ignores_quoted_end_marker_before_real_boundary():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "[CONTEXT COMPACTION] summary can quote:\n```text\n--- END OF COMPACTED CONTEXT ---\n```\nreal summary body\n\n--- END OF COMPACTED CONTEXT ---\n\n[RETAINED ASSISTANT CONTINUATION — not user-provided text]\nassistant self note",
+        }
+    ]
+
+    failures = evaluate_compacted_messages(messages)
+
+    assert failures == []
+
+
+def test_transcript_eval_handles_unclosed_fence_before_real_boundary():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "[CONTEXT COMPACTION] summary starts malformed fence:\n```text\nexample\n\n--- END OF COMPACTED CONTEXT ---\n\n[RETAINED ASSISTANT CONTINUATION — not user-provided text]\nassistant self note",
+        }
+    ]
+
+    failures = evaluate_compacted_messages(messages)
+
+    assert failures == []
+
+
+def test_transcript_eval_handles_four_backtick_fence_quoting_triple_marker():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "[CONTEXT COMPACTION] summary can quote nested fences:\n````md\n```text\n--- END OF COMPACTED CONTEXT ---\n```\n````\nreal summary body\n\n--- END OF COMPACTED CONTEXT ---\n\n[RETAINED ASSISTANT CONTINUATION — not user-provided text]\nassistant self note",
+        }
+    ]
+
+    failures = evaluate_compacted_messages(messages)
+
+    assert failures == []
