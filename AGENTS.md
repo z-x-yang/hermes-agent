@@ -221,6 +221,29 @@ source .venv/bin/activate   # or: source venv/bin/activate
 `$HOME/.hermes/hermes-agent/venv` (for worktrees that share a venv with the
 main checkout).
 
+## Local development: use worktrees
+
+The main checkout `~/.hermes/hermes-agent` runs a live gateway against its
+working tree — edits there go live on restart. So develop in a worktree, never
+the main checkout.
+
+- **One task, one worktree off `main`**:
+  `git worktree add ~/.hermes/worktrees/<task> -b feat/<topic> main`. Work,
+  test, and commit there — physically isolated, so even `git add -A` can't grab
+  another agent's files.
+- **Squash back when green**: `git merge --squash feat/<topic> && git commit`
+  (one clean commit per feature), then `git worktree remove` + delete the
+  branch. Don't pile unrelated work onto a long-lived branch.
+- **Only `git add` the files you changed — never `-A`/`.`** in a shared checkout.
+- **Share heavy assets; never rebuild them per worktree.** Symlink
+  `venv`/`.venv`/`node_modules`/datasets/model weights — anything large and
+  identical across worktrees (`scripts/run_tests.sh` already falls back to the
+  main `venv`). Treat them read-only: a task that must *change* a dependency or
+  dataset needs its own copy, else the change leaks into the live gateway. Keep
+  worktrees under `~/.hermes/worktrees/`, not `/tmp`.
+- `scripts/worktree_doctor.py` reaps merged worktrees and flags stale ones
+  (wired to cron) — but remove your own when done rather than relying on it.
+
 ## Project Structure
 
 File counts shift constantly — don't treat the tree below as exhaustive.
