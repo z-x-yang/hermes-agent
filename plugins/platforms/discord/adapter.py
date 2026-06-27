@@ -793,9 +793,6 @@ class DiscordAdapter(BasePlatformAdapter):
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
         self._threads = ThreadParticipationTracker("discord")
-        # Fire-and-forget tasks naming freshly-created user threads. Tracked so
-        # they aren't garbage-collected mid-flight (see _maybe_name_new_thread).
-        self._thread_name_tasks: set = set()
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
@@ -5172,54 +5169,6 @@ class DiscordAdapter(BasePlatformAdapter):
             return content[:77] + "..."
         return content
 
-    async def _maybe_name_new_thread(
-        self,
-        thread_id: Optional[str],
-        content: str,
-        *,
-        is_thread: bool,
-        auto_created: bool,
-        is_forum: bool = False,
-        is_command: bool = False,
-    ) -> None:
-        """Best-effort: name a freshly-engaged, user-created thread.
-
-        When a user manually creates a thread off a Hermes message and posts in
-        it, Discord defaults the thread name to the *starter* (Hermes) message,
-        and Hermes never names it itself — unlike the auto-thread path, which
-        names threads at creation. The only later rename hook is session-title
-        propagation, which never fires when a turn produces no final text reply
-        (long tool-only investigations) or when title generation fails. Naming
-        the thread from the user's first message here makes the title align with
-        the conversation immediately and independently of those failure modes.
-
-        The caller is responsible for the "first message only" gate: it must
-        mark participation (``self._threads.mark``) *before* awaiting this, so a
-        second concurrent first-message can't also rename (Discord caps thread
-        renames at 2 / 10 min). Skips:
-          - non-threads and auto-created threads (already named at creation);
-          - forum posts (their title is authored by the user who opened the
-            post — renaming it would clobber a deliberate title);
-          - slash-command first messages (``/status`` is a useless thread name).
-        """
-        if not thread_id or not is_thread or auto_created or is_forum or is_command:
-            return
-        name = self._derive_thread_name(content)
-        if not name:
-            return
-        try:
-            result = await self.rename_thread(thread_id, name)
-            if result is not None and getattr(result, "success", True) is False:
-                logger.warning(
-                    "[%s] Could not name new thread %s: %s",
-                    self.name, thread_id, getattr(result, "error", None),
-                )
-        except Exception as e:
-            logger.warning(
-                "[%s] Failed to name new thread %s: %s",
-                self.name, thread_id, e, exc_info=True,
-            )
-
     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
         """Create a thread from a user message for auto-threading.
 
@@ -6300,30 +6249,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Track thread participation so the bot won't require @mention for
         # follow-up messages in threads it has already engaged in.
         if thread_id:
-            was_fresh = thread_id not in self._threads
-            # Claim participation synchronously NOW — before scheduling the
-            # rename — so a second concurrent first-message can't also pass the
-            # freshness gate and rename again (Discord caps renames at 2/10 min).
             self._threads.mark(thread_id)
-            if was_fresh:
-                is_forum_thread = is_thread and self._is_forum_parent(
-                    self._resolve_thread_parent(message.channel)
-                )
-                # Fire-and-forget: awaiting here would yield before the text
-                # batching below, letting a later split-chunk enqueue ahead of
-                # this one and reorder the user's message (#chunk-ordering).
-                name_task = asyncio.create_task(
-                    self._maybe_name_new_thread(
-                        thread_id,
-                        normalized_content,
-                        is_thread=is_thread,
-                        auto_created=auto_threaded_channel is not None,
-                        is_forum=is_forum_thread,
-                        is_command=msg_type == MessageType.COMMAND,
-                    )
-                )
-                self._thread_name_tasks.add(name_task)
-                name_task.add_done_callback(self._thread_name_tasks.discard)
 
         # Only batch plain text messages — commands, media, etc. dispatch
         # immediately since they won't be split by the Discord client.
