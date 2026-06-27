@@ -128,6 +128,19 @@ def _resolve_credentials() -> Tuple[Optional[str], Optional[str], str]:
     return (api_key or None, base_url or None, key_env)
 
 
+def _resolve_route_credentials(route: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], str]:
+    """Return credentials for one explicit fallback route."""
+    raw_sub = route.get("openai")
+    sub: Dict[str, Any] = raw_sub if isinstance(raw_sub, dict) else {}
+    key_env = str(sub.get("api_key_env") or "OPENAI_API_KEY").strip() or "OPENAI_API_KEY"
+    api_key = os.environ.get(key_env, "").strip()
+    if "base_url" in sub:
+        base_url = str(sub.get("base_url") or "").strip()
+    else:
+        base_url = str(os.environ.get("OPENAI_BASE_URL", "")).strip()
+    return (api_key or None, base_url or None, key_env)
+
+
 def _resolve_model() -> Tuple[str, Dict[str, Any]]:
     """Decide which tier to use and return ``(model_id, meta)``."""
     env_override = os.environ.get("OPENAI_IMAGE_MODEL")
@@ -150,6 +163,83 @@ def _resolve_model() -> Tuple[str, Dict[str, Any]]:
         return candidate, _MODELS[candidate]
 
     return DEFAULT_MODEL, _MODELS[DEFAULT_MODEL]
+
+
+def _resolve_route_model(route: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """Resolve the model tier for a configured route."""
+    env_override = os.environ.get("OPENAI_IMAGE_MODEL")
+    if env_override and env_override in _MODELS:
+        return env_override, _MODELS[env_override]
+
+    openai_cfg = route.get("openai") if isinstance(route.get("openai"), dict) else {}
+    if isinstance(openai_cfg, dict):
+        value = openai_cfg.get("model")
+        if isinstance(value, str) and value in _MODELS:
+            return value, _MODELS[value]
+    value = route.get("model")
+    if isinstance(value, str) and value in _MODELS:
+        return value, _MODELS[value]
+
+    cfg = _load_openai_config()
+    global_openai_cfg = cfg.get("openai") if isinstance(cfg.get("openai"), dict) else {}
+    if isinstance(global_openai_cfg, dict):
+        value = global_openai_cfg.get("model")
+        if isinstance(value, str) and value in _MODELS:
+            return value, _MODELS[value]
+    value = cfg.get("model") if isinstance(cfg, dict) else None
+    if isinstance(value, str) and value in _MODELS:
+        return value, _MODELS[value]
+    return DEFAULT_MODEL, _MODELS[DEFAULT_MODEL]
+
+
+def _configured_routes() -> List[Dict[str, Any]]:
+    """Return explicit OpenAI fallback routes from ``image_gen.fallbacks``."""
+    cfg = _load_openai_config()
+    raw = cfg.get("fallbacks") if isinstance(cfg, dict) else None
+    if not isinstance(raw, list):
+        return []
+
+    routes: List[Dict[str, Any]] = []
+    for index, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("provider") or "openai").strip().lower()
+        if provider != "openai":
+            logger.warning(
+                "Ignoring non-OpenAI image generation fallback route at position %s: %s",
+                index,
+                provider,
+            )
+            continue
+        routes.append(item)
+    return routes
+
+
+def _route_name(route: Dict[str, Any], index: int) -> str:
+    name = route.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return f"openai-route-{index}"
+
+
+def _use_responses_api_for_route(route: Dict[str, Any], base_url: Optional[str]) -> bool:
+    sub = route.get("openai") if isinstance(route.get("openai"), dict) else {}
+    if isinstance(sub, dict):
+        configured = sub.get("use_responses_api")
+    else:
+        configured = None
+    if isinstance(configured, bool):
+        return configured
+    if isinstance(configured, str):
+        value = configured.strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
+            return False
+    return "gptcodex.top" in (base_url or "").lower()
+
+
+_FALLBACK_ERROR_TYPES = {"api_error", "empty_response", "auth_required", "missing_dependency"}
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +374,9 @@ class OpenAIImageGenProvider(ImageGenProvider):
         return "OpenAI"
 
     def is_available(self) -> bool:
+        routes = _configured_routes()
+        if routes:
+            return any(bool(_resolve_route_credentials(route)[0]) for route in routes)
         api_key, _, _ = _resolve_credentials()
         return bool(api_key)
 
@@ -342,7 +435,123 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        api_key, base_url, api_key_label = _resolve_credentials()
+        routes = _configured_routes()
+        if not routes:
+            return self._generate_once(
+                prompt,
+                aspect,
+                image_url=image_url,
+                reference_image_urls=reference_image_urls,
+                **kwargs,
+            )
+
+        attempted_routes: List[str] = []
+        route_failures: List[Dict[str, str]] = []
+        last_result: Optional[Dict[str, Any]] = None
+
+        for index, route in enumerate(routes, start=1):
+            name = _route_name(route, index)
+            attempted_routes.append(name)
+            result = self._generate_once(
+                prompt,
+                aspect,
+                image_url=image_url,
+                reference_image_urls=reference_image_urls,
+                route=route,
+                **kwargs,
+            )
+            result["provider_route"] = name
+            result["fallback_used"] = bool(route_failures)
+            result["attempted_routes"] = list(attempted_routes)
+            if route_failures:
+                result["route_failures"] = list(route_failures)
+
+            if result.get("success"):
+                if route_failures:
+                    result["route_failures"] = list(route_failures)
+                    logger.warning(
+                        "OpenAI image generation succeeded on fallback route %s after failures: %s",
+                        name,
+                        route_failures,
+                    )
+                return result
+
+            error_type = str(result.get("error_type") or "provider_error")
+            if error_type not in _FALLBACK_ERROR_TYPES:
+                return result
+
+            failure = {
+                "route": name,
+                "error_type": error_type,
+                "error": str(result.get("error") or ""),
+            }
+            route_failures.append(failure)
+            result["route_failures"] = list(route_failures)
+            last_result = result
+
+            if index < len(routes):
+                next_name = _route_name(routes[index], index + 1)
+                logger.warning(
+                    "OpenAI image generation route %s failed (%s): %s; falling back to route %s",
+                    name,
+                    error_type,
+                    failure["error"],
+                    next_name,
+                )
+            else:
+                logger.warning(
+                    "OpenAI image generation route %s failed (%s): %s; no fallback routes remain",
+                    name,
+                    error_type,
+                    failure["error"],
+                )
+
+        final = last_result or error_response(
+            error="All OpenAI image generation routes failed",
+            error_type="provider_error",
+            provider="openai",
+            prompt=prompt,
+            aspect_ratio=aspect,
+        )
+        if route_failures:
+            failure_summary = "; ".join(
+                f"{failure['route']} ({failure['error_type']}): {failure['error']}"
+                for failure in route_failures
+            )
+            final["error"] = f"All OpenAI image generation routes failed. Route failures: {failure_summary}"
+        else:
+            final["error"] = f"All OpenAI image generation routes failed. Last error: {final.get('error', '')}"
+        final["provider_route"] = attempted_routes[-1] if attempted_routes else ""
+        final["fallback_used"] = len(attempted_routes) > 1
+        final["attempted_routes"] = list(attempted_routes)
+        final["route_failures"] = list(route_failures)
+        return final
+
+    def _generate_once(
+        self,
+        prompt: str,
+        aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+        *,
+        image_url: Optional[str] = None,
+        reference_image_urls: Optional[List[str]] = None,
+        route: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        prompt = (prompt or "").strip()
+        aspect = resolve_aspect_ratio(aspect_ratio)
+
+        if not prompt:
+            return error_response(
+                error="Prompt is required and must be a non-empty string",
+                error_type="invalid_argument",
+                provider="openai",
+                aspect_ratio=aspect,
+            )
+
+        if route is None:
+            api_key, base_url, api_key_label = _resolve_credentials()
+        else:
+            api_key, base_url, api_key_label = _resolve_route_credentials(route)
         if not api_key:
             return error_response(
                 error=(
@@ -355,7 +564,10 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        tier_id, meta = _resolve_model()
+        if route is None:
+            tier_id, meta = _resolve_model()
+        else:
+            tier_id, meta = _resolve_route_model(route)
         size = _SIZES.get(aspect, _SIZES["square"])
 
         # Collect source images (primary + references) for image-to-image.
@@ -368,7 +580,12 @@ class OpenAIImageGenProvider(ImageGenProvider):
         is_edit = bool(sources)
         modality = "image" if is_edit else "text"
 
-        if _use_responses_api(base_url):
+        use_responses = (
+            _use_responses_api(base_url)
+            if route is None
+            else _use_responses_api_for_route(route, base_url)
+        )
+        if use_responses:
             try:
                 payload = _build_responses_payload(
                     prompt=prompt,
