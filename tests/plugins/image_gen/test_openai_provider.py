@@ -221,7 +221,7 @@ class TestGenerate:
         # All tiers hit the single underlying API model.
         assert call_kwargs["model"] == "gpt-image-2"
         assert call_kwargs["quality"] == "medium"
-        assert call_kwargs["size"] == "1536x1024"
+        assert call_kwargs["size"] == "1536x864"
         # gpt-image-2 rejects response_format — we must NOT send it.
         assert "response_format" not in call_kwargs
 
@@ -245,7 +245,7 @@ class TestGenerate:
         assert fake_client.images.generate.call_args.kwargs["model"] == "gpt-image-2"
 
     @pytest.mark.parametrize("aspect,expected_size", [
-        ("landscape", "1536x1024"),
+        ("landscape", "1536x864"),
         ("square", "1024x1024"),
         ("portrait", "1024x1536"),
     ])

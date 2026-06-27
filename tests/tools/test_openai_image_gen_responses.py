@@ -77,9 +77,9 @@ def test_openai_provider_uses_responses_payload_for_high_quality(monkeypatch, tm
                 "type": "image_generation_call",
                 "result": _ONE_BY_ONE_PNG,
                 "quality": "high",
-                "size": "1536x1024",
+                "size": "1536x864",
                 "width": 1536,
-                "height": 1024,
+                "height": 864,
             }]
         })
 
@@ -95,7 +95,7 @@ def test_openai_provider_uses_responses_payload_for_high_quality(monkeypatch, tm
     assert captured["timeout"] == 420
     assert captured["payload"]["model"] == "gpt-image-2"
     assert captured["payload"]["quality"] == "high"
-    assert captured["payload"]["size"] == "1536x1024"
+    assert captured["payload"]["size"] == "1536x864"
     assert captured["payload"]["input"][0]["content"] == [
         {"type": "input_text", "text": "draw a cat"}
     ]

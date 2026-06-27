@@ -82,7 +82,9 @@ _MODELS: Dict[str, Dict[str, Any]] = {
 DEFAULT_MODEL = "gpt-image-2-medium"
 
 _SIZES = {
-    "landscape": "1536x1024",
+    # True 16:9 landscape. The public tool description promises landscape
+    # output is wide; OpenAI's Images API accepts 1536x864 for gpt-image-2.
+    "landscape": "1536x864",
     "square": "1024x1024",
     "portrait": "1024x1536",
 }
