@@ -2250,6 +2250,28 @@ def _strip_media_directives(text: str) -> str:
     return _strip_media_tag_directives(text)
 
 
+FINAL_MESSAGE_SPLIT_MARKER = "<!-- HERMES_SPLIT_MESSAGE -->"
+_FINAL_MESSAGE_SPLIT_RE = re.compile(
+    r"(?:^|\n)[ \t]*<!--[ \t]*HERMES_SPLIT_MESSAGE[ \t]*-->[ \t]*(?:\n|$)"
+)
+
+
+def split_final_response_segments(response: Optional[str]) -> list[str]:
+    """Split an assistant reply into explicit platform-message segments.
+
+    ``<!-- HERMES_SPLIT_MESSAGE -->`` is an opt-in delivery marker for
+    platforms where one logical assistant response should appear as several
+    ordered chat messages (for example: a pure image message followed by its
+    caption on Discord).  The marker must be on its own line; ordinary replies
+    without the marker keep the historical single-message path.
+    """
+    if not response:
+        return []
+    if not _FINAL_MESSAGE_SPLIT_RE.search(response):
+        return [response]
+    return [segment.strip() for segment in _FINAL_MESSAGE_SPLIT_RE.split(response) if segment.strip()]
+
+
 class BasePlatformAdapter(ABC):
     """
     Base class for platform adapters.
@@ -4889,7 +4911,7 @@ class BasePlatformAdapter(ABC):
                 response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
-            if response:
+            for response in split_final_response_segments(response):
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files
                 # through send_document instead of send_multiple_images. Used
