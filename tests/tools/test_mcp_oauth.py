@@ -264,6 +264,7 @@ class TestRedirectHandlerSshHint:
         monkeypatch.setattr(mco, "_oauth_port", 49200)
         monkeypatch.setenv("SSH_CLIENT", "1.2.3.4 1234 22")
         monkeypatch.delenv("SSH_TTY", raising=False)
+        _set_interactive_stdin(monkeypatch)
         monkeypatch.setattr(mco, "_can_open_browser", lambda: False)
 
         self._run(_redirect_handler("https://example.com/auth?foo=bar"))
@@ -278,6 +279,7 @@ class TestRedirectHandlerSshHint:
         monkeypatch.setattr(mco, "_oauth_port", 49201)
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.setenv("SSH_TTY", "/dev/pts/1")
+        _set_interactive_stdin(monkeypatch)
         monkeypatch.setattr(mco, "_can_open_browser", lambda: False)
 
         self._run(_redirect_handler("https://example.com/auth"))
@@ -291,6 +293,7 @@ class TestRedirectHandlerSshHint:
         monkeypatch.setattr(mco, "_oauth_port", 49202)
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
+        _set_interactive_stdin(monkeypatch)
         monkeypatch.setattr(mco, "_can_open_browser", lambda: True)
         monkeypatch.setattr("webbrowser.open", lambda url, **kw: True)
 
@@ -299,10 +302,29 @@ class TestRedirectHandlerSshHint:
         err = capsys.readouterr().err
         assert "ssh -N -L" not in err
 
+    def test_noninteractive_local_session_does_not_open_browser(self, monkeypatch):
+        """Daemon/gateway OAuth failures must not pop a browser window."""
+        import tools.mcp_oauth as mco
+        monkeypatch.setattr(mco, "_oauth_port", 49203)
+        monkeypatch.delenv("SSH_CLIENT", raising=False)
+        monkeypatch.delenv("SSH_TTY", raising=False)
+        _set_interactive_stdin(monkeypatch, is_tty=False)
+        monkeypatch.setattr(mco, "_can_open_browser", lambda: True)
+        monkeypatch.setattr(
+            "webbrowser.open",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                AssertionError("non-interactive OAuth must not open a browser")
+            ),
+        )
+
+        with pytest.raises(OAuthNonInteractiveError, match="non-interactive"):
+            self._run(_redirect_handler("https://example.com/auth"))
+
     def test_no_ssh_hint_when_port_not_set(self, monkeypatch, capsys):
         import tools.mcp_oauth as mco
         monkeypatch.setattr(mco, "_oauth_port", None)
         monkeypatch.setenv("SSH_CLIENT", "1.2.3.4 1234 22")
+        _set_interactive_stdin(monkeypatch)
         monkeypatch.setattr(mco, "_can_open_browser", lambda: False)
 
         self._run(_redirect_handler("https://example.com/auth"))

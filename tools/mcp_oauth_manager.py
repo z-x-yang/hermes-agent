@@ -35,6 +35,7 @@ Design reference:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import threading
@@ -385,12 +386,87 @@ def _make_hermes_provider_class() -> Optional[type]:
                     self._hermes_server_name, exc,
                 )
 
+        async def _reload_external_tokens_after_refresh_failure(
+            self,
+            status_code: int,
+        ) -> bool:
+            """Reload tokens when another process won a refresh-token race."""
+            try:
+                manager = getattr(self, "_hermes_oauth_manager", None) or get_manager()
+                disk_changed = await manager.invalidate_if_disk_changed(
+                    self._hermes_server_name
+                )
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.debug(
+                    "MCP OAuth '%s': post-refresh-failure disk-watch failed "
+                    "after HTTP %s (non-fatal): %s",
+                    self._hermes_server_name, status_code, exc,
+                )
+                return False
+            if not disk_changed:
+                return False
+
+            try:
+                await self._initialize()
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.debug(
+                    "MCP OAuth '%s': failed to reload externally refreshed "
+                    "tokens after HTTP %s: %s",
+                    self._hermes_server_name, status_code, exc,
+                )
+                return False
+
+            if self.context.is_token_valid():
+                logger.info(
+                    "MCP OAuth '%s': refresh failed with HTTP %s, but tokens "
+                    "changed on disk; reloaded external refresh instead of "
+                    "starting browser reauth",
+                    self._hermes_server_name, status_code,
+                )
+                return True
+            return False
+
+        async def _discard_stale_tokens_on_invalid_grant(self, response) -> None:
+            """Remove the cached token file after an unrecoverable refresh."""
+            error = None
+            try:
+                content = await response.aread()
+                if content:
+                    error = json.loads(content.decode("utf-8")).get("error")
+            except Exception:
+                error = None
+            if error != "invalid_grant":
+                return
+
+            storage = self.context.storage
+            from tools.mcp_oauth import HermesTokenStorage
+            if isinstance(storage, HermesTokenStorage):
+                storage.remove_tokens()
+                logger.warning(
+                    "MCP OAuth '%s': refresh token rejected as invalid_grant; "
+                    "removed stale token cache so future non-interactive "
+                    "loads fail fast until `hermes mcp login %s` is run",
+                    self._hermes_server_name,
+                    self._hermes_server_name,
+                )
+            self.context.clear_tokens()
+
+        async def _handle_refresh_response(self, response):  # type: ignore[override]
+            if response.status_code != 200:
+                if await self._reload_external_tokens_after_refresh_failure(
+                    response.status_code
+                ):
+                    return True
+                await self._discard_stale_tokens_on_invalid_grant(response)
+            return await super()._handle_refresh_response(response)
+
         async def async_auth_flow(self, request):  # type: ignore[override]
             # Pre-flow hook: ask the manager to refresh from disk if needed.
             # Any failure here is non-fatal — we just log and proceed with
             # whatever state the SDK already has.
             try:
-                await get_manager().invalidate_if_disk_changed(
+                manager = getattr(self, "_hermes_oauth_manager", None) or get_manager()
+                await manager.invalidate_if_disk_changed(
                     self._hermes_server_name
                 )
             except Exception as exc:  # pragma: no cover — defensive
@@ -545,7 +621,7 @@ class MCPOAuthManager:
         client_metadata = _build_client_metadata(cfg)
         _maybe_preregister_client(storage, cfg, client_metadata)
 
-        return _HERMES_PROVIDER_CLS(
+        provider = _HERMES_PROVIDER_CLS(
             server_name=server_name,
             preregistered=bool(cfg.get("client_id")),
             server_url=entry.server_url,
@@ -555,6 +631,8 @@ class MCPOAuthManager:
             callback_handler=_wait_for_callback,
             timeout=float(cfg.get("timeout", 300)),
         )
+        provider._hermes_oauth_manager = self  # noqa: SLF001[attr-defined]
+        return provider
 
     def remove(self, server_name: str) -> None:
         """Evict the provider from cache AND delete tokens from disk.

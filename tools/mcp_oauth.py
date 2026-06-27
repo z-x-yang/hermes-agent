@@ -394,6 +394,10 @@ class HermesTokenStorage:
 
     # -- cleanup -----------------------------------------------------------
 
+    def remove_tokens(self) -> None:
+        """Delete only the cached OAuth token file for this server."""
+        self._tokens_path().unlink(missing_ok=True)
+
     def remove(self) -> None:
         """Delete all stored OAuth state for this server."""
         for p in (self._tokens_path(), self._client_info_path(), self._meta_path()):
@@ -559,6 +563,17 @@ async def _redirect_handler(authorization_url: str) -> None:
             f"\n"
             f"  See: https://hermes-agent.nousresearch.com/docs/guides/oauth-over-ssh\n",
             file=sys.stderr,
+        )
+
+    if not _is_interactive():
+        print(
+            "  (Non-interactive environment detected — not opening a browser. "
+            "Run `hermes mcp login <server>` from a terminal to re-authorize.)\n",
+            file=sys.stderr,
+        )
+        raise OAuthNonInteractiveError(
+            "MCP OAuth authorization required in a non-interactive environment. "
+            "Run `hermes mcp login <server>` interactively to complete authorization."
         )
 
     if _can_open_browser():

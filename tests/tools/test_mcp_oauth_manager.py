@@ -254,6 +254,107 @@ def test_manager_builds_hermes_provider_subclass(tmp_path, monkeypatch):
     assert provider._hermes_server_name == "srv"
 
 
+@pytest.mark.asyncio
+async def test_refresh_failure_reloads_tokens_if_another_process_refreshed(
+    tmp_path, monkeypatch
+):
+    """A rotated refresh-token race must not fall through to browser reauth."""
+    import httpx
+    from mcp.shared.auth import OAuthToken
+
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+
+    storage = HermesTokenStorage("srv")
+    await storage.set_tokens(
+        OAuthToken(
+            access_token="OLD_ACCESS",
+            token_type="Bearer",
+            expires_in=0,
+            refresh_token="OLD_REFRESH",
+        )
+    )
+
+    mgr = MCPOAuthManager()
+    provider = mgr.get_or_build_provider("srv", "https://example.com/mcp", None)
+    assert provider is not None
+
+    assert await mgr.invalidate_if_disk_changed("srv") is True
+    await provider._initialize()
+    assert provider.context.current_tokens.access_token == "OLD_ACCESS"
+
+    await storage.set_tokens(
+        OAuthToken(
+            access_token="NEW_ACCESS",
+            token_type="Bearer",
+            expires_in=3600,
+            refresh_token="NEW_REFRESH",
+        )
+    )
+    tokens_path = tmp_path / "mcp-tokens" / "srv.json"
+    future_mtime = time.time() + 10
+    os.utime(tokens_path, (future_mtime, future_mtime))
+
+    response = httpx.Response(
+        400,
+        request=httpx.Request("POST", "https://example.com/token"),
+    )
+
+    assert await provider._handle_refresh_response(response) is True
+    assert provider.context.current_tokens.access_token == "NEW_ACCESS"
+    assert provider.context.is_token_valid() is True
+
+
+@pytest.mark.asyncio
+async def test_invalid_grant_refresh_failure_removes_stale_token_file(
+    tmp_path, monkeypatch
+):
+    """Unrecoverable refresh tokens should fail fast on the next load."""
+    import httpx
+    from mcp.shared.auth import OAuthToken
+
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+
+    storage = HermesTokenStorage("srv")
+    await storage.set_tokens(
+        OAuthToken(
+            access_token="OLD_ACCESS",
+            token_type="Bearer",
+            expires_in=0,
+            refresh_token="INVALID_REFRESH",
+        )
+    )
+    token_path = tmp_path / "mcp-tokens" / "srv.json"
+    client_path = tmp_path / "mcp-tokens" / "srv.client.json"
+    client_path.write_text('{"client_id":"cid"}')
+
+    mgr = MCPOAuthManager()
+    provider = mgr.get_or_build_provider("srv", "https://example.com/mcp", None)
+    assert provider is not None
+    assert await mgr.invalidate_if_disk_changed("srv") is True
+    await provider._initialize()
+
+    response = httpx.Response(
+        400,
+        json={"error": "invalid_grant", "error_description": "Invalid refresh token"},
+        request=httpx.Request("POST", "https://example.com/token"),
+    )
+
+    assert await provider._handle_refresh_response(response) is False
+    assert not token_path.exists()
+    assert client_path.exists()
+    assert provider.context.current_tokens is None
+
+
 def test_manager_fails_fast_noninteractive_without_cached_tokens(tmp_path, monkeypatch):
     """A daemon without cached MCP OAuth tokens must not enter browser auth."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
