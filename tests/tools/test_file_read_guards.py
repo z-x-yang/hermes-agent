@@ -722,7 +722,7 @@ class TestConfigOverride(unittest.TestCase):
     @patch("hermes_cli.config.load_config", return_value={"file_read_max_chars": 500_000})
     def test_custom_config_raises_limit(self, _mock_cfg, mock_ops):
         """A config value of 500K should allow reads up to 500K chars."""
-        # 200K chars would be rejected at the default 100K but passes at 500K
+        # 200K chars would be rejected at the default 80K but passes at 500K
         mock_ops.return_value = _make_fake_ops(
             content="y" * 200_000, file_size=200_000,
         )

@@ -50,13 +50,14 @@ def _expand_tilde(path: str) -> str:
 # ---------------------------------------------------------------------------
 # Read-size guard: cap the character count returned to the model.
 # We're model-agnostic so we can't count tokens; characters are a safe proxy.
-# 100K chars ≈ 25–35K tokens across typical tokenisers.  Files larger than
-# this in a single read are a context-window hazard — the model should use
-# offset+limit to read the relevant section.
+# 80K chars keeps the default close to Claude Code's 25K-token Read cap for
+# code/English while being a little safer for CJK-heavy files. Files larger
+# than this in a single read are a context-window hazard — the model should
+# use offset+limit to read the relevant section.
 #
 # Configurable via config.yaml:  file_read_max_chars: 200000
 # ---------------------------------------------------------------------------
-_DEFAULT_MAX_READ_CHARS = 100_000
+_DEFAULT_MAX_READ_CHARS = 80_000
 _max_read_chars_cached: int | None = None
 
 
@@ -1935,7 +1936,7 @@ def _check_file_reqs():
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are rejected; use offset and limit to read specific sections of large files. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~80K characters are rejected; use offset and limit to read specific sections of large files. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {
