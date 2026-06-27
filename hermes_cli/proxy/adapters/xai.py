@@ -87,15 +87,22 @@ class XAIGrokAdapter(UpstreamAdapter):
             if pool is None:
                 return None
 
+            failed_api_key = str(failed_credential.bearer or "").strip()
             if status_code == 429:
                 # Mark the rate-limited key with its 1-hour cooldown and rotate
                 # to the next available credential. Returns None when the pool
                 # has no other key to offer — the 429 will flow back to the client.
-                refreshed = pool.mark_exhausted_and_rotate(status_code=status_code)
+                refreshed = pool.mark_exhausted_and_rotate(
+                    status_code=status_code,
+                    api_key_hint=failed_api_key,
+                )
             else:
-                refreshed = pool.try_refresh_current()
+                refreshed = pool.try_refresh_current(api_key_hint=failed_api_key)
                 if refreshed is None:
-                    refreshed = pool.mark_exhausted_and_rotate(status_code=status_code)
+                    refreshed = pool.mark_exhausted_and_rotate(
+                        status_code=status_code,
+                        api_key_hint=failed_api_key,
+                    )
             if refreshed is None:
                 return None
 

@@ -1521,6 +1521,58 @@ class CredentialPool:
         available = self._available_entries()
         return available[0] if available else None
 
+    def _entry_for_api_key_hint_unlocked(self, api_key_hint: Optional[str]) -> Optional[PooledCredential]:
+        hint = str(api_key_hint or "").strip()
+        if not hint:
+            return None
+        def _matches(entry: PooledCredential) -> bool:
+            candidates = (
+                getattr(entry, "runtime_api_key", ""),
+                getattr(entry, "access_token", ""),
+                getattr(entry, "agent_key", ""),
+            )
+            return any(str(candidate or "").strip() == hint for candidate in candidates)
+        return next((entry for entry in self._entries if _matches(entry)), None)
+
+    def _rotated_singleton_entry_for_hint_unlocked(
+        self,
+        api_key_hint: Optional[str],
+    ) -> Optional[PooledCredential]:
+        """Return a singleton OAuth entry when a hint missed due token rotation.
+
+        OAuth access tokens can rotate in another Hermes process after this
+        process built its client.  The failed request then carries the *old*
+        token, while the pool/auth-store entry has already adopted the new one.
+        Treat that as the same credential lineage instead of falling back to an
+        unrelated current() pointer.
+        """
+        hint = str(api_key_hint or "").strip()
+        if not hint:
+            return None
+        singleton_sources = {
+            "openai-codex": {"device_code"},
+            "xai-oauth": {"loopback_pkce"},
+            "nous": {"device_code"},
+        }.get(self.provider, set())
+        if not singleton_sources:
+            return None
+        if any(entry.source not in singleton_sources for entry in self._entries):
+            return None
+        candidates = [
+            entry for entry in self._entries
+            if entry.runtime_api_key != hint
+        ]
+        if len(candidates) != 1:
+            return None
+        entry = candidates[0]
+        if self.provider == "openai-codex":
+            entry = self._sync_codex_entry_from_auth_store(entry)
+        elif self.provider == "xai-oauth":
+            entry = self._sync_xai_oauth_entry_from_auth_store(entry)
+        elif self.provider == "nous":
+            entry = self._sync_nous_entry_from_auth_store(entry)
+        return entry if entry.runtime_api_key and entry.runtime_api_key != hint else None
+
     def mark_exhausted_and_rotate(
         self,
         *,
@@ -1529,19 +1581,29 @@ class CredentialPool:
         api_key_hint: Optional[str] = None,
     ) -> Optional[PooledCredential]:
         with self._lock:
-            entry = None
-            if api_key_hint:
-                # Prefer the specific entry whose API key matches the one that
-                # actually failed.  When this pool was freshly loaded from disk
-                # (another process already rotated), current() is None and
-                # _select_unlocked() would return the NEXT key — the wrong one.
-                entry = next(
-                    (e for e in self._entries if e.runtime_api_key == api_key_hint),
-                    None,
-                )
+            hint_supplied = bool(str(api_key_hint or "").strip())
+            entry = self._entry_for_api_key_hint_unlocked(api_key_hint)
+            if entry is None and hint_supplied:
+                rotated_entry = self._rotated_singleton_entry_for_hint_unlocked(api_key_hint)
+                if rotated_entry is not None:
+                    entry = rotated_entry
+                else:
+                    logger.warning(
+                        "credential pool: failed API key did not match any %s pool entry; "
+                        "skipping exhaustion mark to avoid poisoning another credential",
+                        self.provider,
+                    )
+                    return None
             if entry is None:
                 entry = self.current() or self._select_unlocked()
             if entry is None:
+                return None
+            if entry.last_status == STATUS_DEAD:
+                logger.warning(
+                    "credential pool: refusing to mutate dead %s pool entry %s",
+                    self.provider,
+                    entry.id,
+                )
                 return None
             _label = entry.label or entry.id[:8]
             self._mark_exhausted(entry, status_code, error_context)
@@ -1607,13 +1669,38 @@ class CredentialPool:
             else:
                 self._active_leases[credential_id] = count - 1
 
-    def try_refresh_current(self) -> Optional[PooledCredential]:
+    def try_refresh_current(self, api_key_hint: Optional[str] = None) -> Optional[PooledCredential]:
         with self._lock:
-            return self._try_refresh_current_unlocked()
+            hint_supplied = bool(str(api_key_hint or "").strip())
+            entry = self._entry_for_api_key_hint_unlocked(api_key_hint)
+            if entry is None and hint_supplied:
+                rotated_entry = self._rotated_singleton_entry_for_hint_unlocked(api_key_hint)
+                if rotated_entry is not None:
+                    logger.info(
+                        "credential pool: failed API key for %s no longer matches; "
+                        "using rotated singleton entry %s",
+                        self.provider,
+                        rotated_entry.id,
+                    )
+                    return self._try_refresh_current_unlocked(entry=rotated_entry)
+                logger.warning(
+                    "credential pool: failed API key did not match any %s pool entry; "
+                    "skipping refresh to avoid poisoning another credential",
+                    self.provider,
+                )
+                return None
+            return self._try_refresh_current_unlocked(entry=entry)
 
-    def _try_refresh_current_unlocked(self) -> Optional[PooledCredential]:
-        entry = self.current()
+    def _try_refresh_current_unlocked(self, entry: Optional[PooledCredential] = None) -> Optional[PooledCredential]:
+        entry = entry or self.current()
         if entry is None:
+            return None
+        if entry.last_status == STATUS_DEAD:
+            logger.warning(
+                "credential pool: refusing to refresh dead %s pool entry %s",
+                self.provider,
+                entry.id,
+            )
             return None
         refreshed = self._refresh_entry(entry, force=True)
         if refreshed is not None:

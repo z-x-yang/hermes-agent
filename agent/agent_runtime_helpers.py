@@ -663,6 +663,55 @@ def strip_think_blocks(agent, content: str) -> str:
 
 
 
+def _failed_request_api_key_hint(agent: Any) -> Optional[str]:
+    """Return the API key the just-failed request used, if available.
+
+    Credential-pool recovery must mark/rotate the entry that actually failed,
+    not the pool's shared ``current()`` pointer. Concurrent subagents update
+    that pointer while leasing credentials, so it can identify a different key
+    by the time recovery handles this request's error.
+    """
+    client = getattr(agent, "client", None)
+    if getattr(agent, "api_mode", None) == "anthropic_messages":
+        candidates = (
+            getattr(agent, "_anthropic_api_key", None),
+            getattr(agent, "api_key", None),
+            getattr(client, "api_key", None),
+        )
+    else:
+        candidates = (
+            getattr(client, "api_key", None),
+            getattr(agent, "api_key", None),
+            getattr(agent, "_anthropic_api_key", None),
+        )
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            stripped = candidate.strip()
+            if stripped:
+                return stripped
+    return None
+
+
+def _entry_for_api_key_hint(pool: Any, api_key_hint: Optional[str]) -> Optional[Any]:
+    hint = str(api_key_hint or "").strip()
+    if not hint:
+        return None
+    try:
+        entries = pool.entries()
+    except Exception:
+        return None
+    for entry in entries:
+        candidates = (
+            getattr(entry, "runtime_api_key", ""),
+            getattr(entry, "access_token", ""),
+            getattr(entry, "agent_key", ""),
+        )
+        if any(str(candidate or "").strip() == hint for candidate in candidates):
+            return entry
+    return None
+
+
+
 def recover_with_credential_pool(
     agent,
     *,
@@ -688,6 +737,7 @@ def recover_with_credential_pool(
     pool = agent._credential_pool
     if pool is None:
         return False, has_retried_429
+    failed_api_key_hint = _failed_request_api_key_hint(agent)
 
     # Defensive guard: if a fallback provider is active and its provider name
     # doesn't match the pool's provider, the pool belongs to the PRIMARY
@@ -758,7 +808,11 @@ def recover_with_credential_pool(
 
     if effective_reason == FailoverReason.billing:
         rotate_status = status_code if status_code is not None else 402
-        next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+        next_entry = pool.mark_exhausted_and_rotate(
+            status_code=rotate_status,
+            error_context=error_context,
+            api_key_hint=failed_api_key_hint,
+        )
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (billing) — rotated to pool entry %s",
@@ -774,7 +828,8 @@ def recover_with_credential_pool(
         # rotate immediately. This prevents the "cancel-between-429s" trap
         # where has_retried_429 (a local var) gets reset on each new prompt,
         # causing the pool to retry the same exhausted credential forever.
-        current_entry = pool.current()
+        hinted_entry = _entry_for_api_key_hint(pool, failed_api_key_hint)
+        current_entry = hinted_entry if failed_api_key_hint else pool.current()
         current_last_status = getattr(current_entry, "last_status", None) if current_entry else None
         if current_last_status == STATUS_EXHAUSTED:
             _ra().logger.info(
@@ -782,7 +837,11 @@ def recover_with_credential_pool(
                 current_last_status,
             )
             rotate_status = status_code if status_code is not None else 429
-            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+            next_entry = pool.mark_exhausted_and_rotate(
+                status_code=rotate_status,
+                error_context=error_context,
+                api_key_hint=failed_api_key_hint,
+            )
             if next_entry is not None:
                 _ra().logger.info(
                     "Credential %s (rate limit, pre-exhausted) — rotated to pool entry %s",
@@ -806,7 +865,11 @@ def recover_with_credential_pool(
         if not has_retried_429 and not usage_limit_reached:
             return False, True
         rotate_status = status_code if status_code is not None else 429
-        next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+        next_entry = pool.mark_exhausted_and_rotate(
+            status_code=rotate_status,
+            error_context=error_context,
+            api_key_hint=failed_api_key_hint,
+        )
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (rate limit) — rotated to pool entry %s",
@@ -874,7 +937,7 @@ def recover_with_credential_pool(
                 agent.provider or "provider",
             )
             return False, has_retried_429
-        refreshed = pool.try_refresh_current()
+        refreshed = pool.try_refresh_current(api_key_hint=failed_api_key_hint)
         if refreshed is not None:
             # ``try_refresh_current()`` re-mints a fresh OAuth token and reports
             # success even when the upstream keeps rejecting it — a single-entry
@@ -906,7 +969,11 @@ def recover_with_credential_pool(
         # Refresh failed — rotate to next credential instead of giving up.
         # The failed entry is already marked exhausted by try_refresh_current().
         rotate_status = status_code if status_code is not None else 401
-        next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+        next_entry = pool.mark_exhausted_and_rotate(
+            status_code=rotate_status,
+            error_context=error_context,
+            api_key_hint=failed_api_key_hint,
+        )
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (auth refresh failed) — rotated to pool entry %s",

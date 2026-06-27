@@ -516,6 +516,72 @@ def test_xai_adapter_retry_rotates_pool_entry_on_429(tmp_path, monkeypatch):
     )
 
 
+def test_xai_adapter_retry_passes_failed_bearer_hint_to_pool_mutation():
+    adapter = XAIGrokAdapter()
+    retry_entry = MagicMock()
+    retry_entry.runtime_api_key = "retry-access-token"
+    retry_entry.access_token = "retry-access-token"
+    retry_entry.runtime_base_url = "https://api.x.ai/v1"
+    retry_entry.base_url = "https://api.x.ai/v1"
+    retry_entry.expires_at = None
+
+    pool = MagicMock()
+    pool.mark_exhausted_and_rotate.return_value = retry_entry
+    adapter._pool = pool
+
+    failed = UpstreamCredential(
+        bearer="failed-access-token",
+        base_url="https://api.x.ai/v1",
+    )
+
+    retry = adapter.get_retry_credential(
+        failed_credential=failed,
+        status_code=429,
+    )
+
+    assert retry is not None
+    assert retry.bearer == "retry-access-token"
+    pool.mark_exhausted_and_rotate.assert_called_once_with(
+        status_code=429,
+        api_key_hint="failed-access-token",
+    )
+
+
+def test_xai_adapter_retry_passes_failed_bearer_hint_after_refresh_miss():
+    adapter = XAIGrokAdapter()
+    retry_entry = MagicMock()
+    retry_entry.runtime_api_key = "retry-access-token"
+    retry_entry.access_token = "retry-access-token"
+    retry_entry.runtime_base_url = "https://api.x.ai/v1"
+    retry_entry.base_url = "https://api.x.ai/v1"
+    retry_entry.expires_at = None
+
+    pool = MagicMock()
+    pool.try_refresh_current.return_value = None
+    pool.mark_exhausted_and_rotate.return_value = retry_entry
+    adapter._pool = pool
+
+    failed = UpstreamCredential(
+        bearer="failed-access-token",
+        base_url="https://api.x.ai/v1",
+    )
+
+    retry = adapter.get_retry_credential(
+        failed_credential=failed,
+        status_code=401,
+    )
+
+    assert retry is not None
+    assert retry.bearer == "retry-access-token"
+    pool.try_refresh_current.assert_called_once_with(
+        api_key_hint="failed-access-token",
+    )
+    pool.mark_exhausted_and_rotate.assert_called_once_with(
+        status_code=401,
+        api_key_hint="failed-access-token",
+    )
+
+
 def test_xai_adapter_retry_returns_none_on_429_when_pool_exhausted(tmp_path, monkeypatch):
     """Single-entry pool: 429 has nowhere to rotate to → return None
     so the 429 flows back to the client unchanged (existing behavior

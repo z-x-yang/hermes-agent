@@ -497,6 +497,118 @@ class TestResolveXaiOAuthForAux:
             "https://example.x.ai/v1",
         )
 
+    def test_refresh_provider_credentials_uses_failed_xai_key_hint(self, tmp_path, monkeypatch):
+        from agent.auxiliary_client import _refresh_provider_credentials
+        from agent.credential_pool import load_pool
+        from hermes_cli.auth import DEFAULT_XAI_OAUTH_BASE_URL
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "auth.json").write_text(json.dumps({
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "xai-oauth": [
+                    {
+                        "id": "innocent",
+                        "label": "innocent",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:xai_pkce",
+                        "access_token": "innocent-token",
+                        "refresh_token": "innocent-refresh",
+                        "base_url": DEFAULT_XAI_OAUTH_BASE_URL,
+                    },
+                    {
+                        "id": "failed",
+                        "label": "failed",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:xai_pkce",
+                        "access_token": "failed-token",
+                        "refresh_token": "failed-refresh",
+                        "base_url": DEFAULT_XAI_OAUTH_BASE_URL,
+                    },
+                ]
+            },
+        }))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        def fake_refresh(access_token, refresh_token, **kwargs):
+            assert access_token == "failed-token"
+            assert refresh_token == "failed-refresh"
+            return {
+                "access_token": "new-failed-token",
+                "refresh_token": "new-failed-refresh",
+                "last_refresh": "2026-06-24T00:00:00Z",
+            }
+
+        monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", fake_refresh)
+
+        assert _refresh_provider_credentials(
+            "xai-oauth",
+            failed_api_key="failed-token",
+        ) is True
+
+        by_id = {entry.id: entry for entry in load_pool("xai-oauth").entries()}
+        assert by_id["innocent"].access_token == "innocent-token"
+        assert by_id["failed"].access_token == "new-failed-token"
+
+    def test_refresh_provider_credentials_hint_miss_does_not_fallback_to_singleton(self, tmp_path, monkeypatch):
+        from agent.auxiliary_client import _refresh_provider_credentials
+        from agent.credential_pool import load_pool
+        from hermes_cli.auth import DEFAULT_XAI_OAUTH_BASE_URL
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "auth.json").write_text(json.dumps({
+            "version": 1,
+            "providers": {
+                "xai-oauth": {
+                    "tokens": {
+                        "access_token": "singleton-token",
+                        "refresh_token": "singleton-refresh",
+                    }
+                }
+            },
+            "credential_pool": {
+                "xai-oauth": [
+                    {
+                        "id": "innocent",
+                        "label": "innocent",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:xai_pkce",
+                        "access_token": "innocent-token",
+                        "refresh_token": "innocent-refresh",
+                        "base_url": DEFAULT_XAI_OAUTH_BASE_URL,
+                    },
+                ]
+            },
+        }))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        singleton_calls = []
+
+        def singleton_refresh_must_not_run(*args, **kwargs):
+            singleton_calls.append((args, kwargs))
+            return {"api_key": "singleton-new-token"}
+
+        monkeypatch.setattr(
+            "hermes_cli.auth.resolve_xai_oauth_runtime_credentials",
+            singleton_refresh_must_not_run,
+        )
+
+        assert _refresh_provider_credentials(
+            "xai-oauth",
+            failed_api_key="not-in-pool-token",
+        ) is False
+        assert singleton_calls == []
+
+        by_id = {entry.id: entry for entry in load_pool("xai-oauth").entries()}
+        assert by_id["innocent"].access_token == "innocent-token"
+        assert by_id["innocent"].last_status is None
+
 
 class TestAnthropicOAuthFlag:
     """Test that OAuth tokens get is_oauth=True in auxiliary Anthropic client."""
@@ -3401,7 +3513,7 @@ class TestAuxiliaryPoolRotationRetry:
             def has_credentials(self):
                 return True
 
-            def try_refresh_current(self):
+            def try_refresh_current(self, api_key_hint=None):
                 return None
 
             def mark_exhausted_and_rotate(self, **kwargs):
@@ -3451,7 +3563,7 @@ class TestAuxiliaryPoolRotationRetry:
             def has_credentials(self):
                 return True
 
-            def try_refresh_current(self):
+            def try_refresh_current(self, api_key_hint=None):
                 return None
 
             def mark_exhausted_and_rotate(self, **kwargs):
@@ -3480,6 +3592,95 @@ class TestAuxiliaryPoolRotationRetry:
         assert len(pool.rotate_calls) == 1
         assert pool.rotate_calls[0]["status_code"] == 429
         mock_fallback.assert_not_called()
+
+    def test_second_rotated_sync_failure_reports_rotated_key_hint(self):
+        class _RateLimit(Exception):
+            status_code = 429
+
+        first_err = _RateLimit("first rate limit")
+        second_err = _RateLimit("rotated rate limit")
+
+        stale_client = MagicMock()
+        stale_client.api_key = "sk-stale"
+        stale_client.base_url = "https://chatgpt.com/backend-api/codex"
+        stale_client.chat.completions.create.side_effect = [first_err, first_err]
+
+        rotated_client = MagicMock()
+        rotated_client.api_key = "sk-rotated"
+        rotated_client.base_url = "https://chatgpt.com/backend-api/codex"
+        rotated_client.chat.completions.create.side_effect = second_err
+
+        recover_calls = []
+
+        def _recover(provider, exc, *, failed_api_key=""):
+            recover_calls.append((provider, exc, failed_api_key))
+            return len(recover_calls) == 1
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openai-codex", "gpt-5.4", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "gpt-5.4"), (rotated_client, "gpt-5.4")]),
+            patch("agent.auxiliary_client._refresh_provider_credentials", return_value=False),
+            patch("agent.auxiliary_client._recover_provider_pool", side_effect=_recover),
+            patch("agent.auxiliary_client._try_payment_fallback", return_value=(None, None, "")),
+        ):
+            with pytest.raises(Exception) as exc_info:
+                call_llm(
+                    task="compression",
+                    provider="openai-codex",
+                    model="gpt-5.4",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+
+        assert len(recover_calls) == 2
+        assert recover_calls == [
+            ("openai-codex", first_err, "sk-stale"),
+            ("openai-codex", second_err, "sk-rotated"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_second_rotated_async_failure_reports_rotated_key_hint(self):
+        class _RateLimit(Exception):
+            status_code = 429
+
+        first_err = _RateLimit("first rate limit")
+        second_err = _RateLimit("rotated rate limit")
+
+        stale_client = MagicMock()
+        stale_client.api_key = "sk-stale"
+        stale_client.base_url = "https://chatgpt.com/backend-api/codex"
+        stale_client.chat.completions.create = AsyncMock(side_effect=[first_err, first_err])
+
+        rotated_client = MagicMock()
+        rotated_client.api_key = "sk-rotated"
+        rotated_client.base_url = "https://chatgpt.com/backend-api/codex"
+        rotated_client.chat.completions.create = AsyncMock(side_effect=second_err)
+
+        recover_calls = []
+
+        def _recover(provider, exc, *, failed_api_key=""):
+            recover_calls.append((provider, exc, failed_api_key))
+            return len(recover_calls) == 1
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openai-codex", "gpt-5.4", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "gpt-5.4"), (rotated_client, "gpt-5.4")]),
+            patch("agent.auxiliary_client._refresh_provider_credentials", return_value=False),
+            patch("agent.auxiliary_client._recover_provider_pool", side_effect=_recover),
+            patch("agent.auxiliary_client._try_payment_fallback", return_value=(None, None, "")),
+        ):
+            with pytest.raises(Exception) as exc_info:
+                await async_call_llm(
+                    task="compression",
+                    provider="openai-codex",
+                    model="gpt-5.4",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+
+        assert len(recover_calls) == 2
+        assert recover_calls == [
+            ("openai-codex", first_err, "sk-stale"),
+            ("openai-codex", second_err, "sk-rotated"),
+        ]
 
 
 class TestCodexAdapterReasoningTranslation:

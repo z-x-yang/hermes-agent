@@ -741,6 +741,20 @@ def _pool_runtime_api_key(entry: Any) -> str:
     return str(key or "").strip()
 
 
+def _client_api_key_hint(client: Any) -> str:
+    key = getattr(client, "api_key", "")
+    return key.strip() if isinstance(key, str) else ""
+
+
+def _attach_failed_api_key_hint(exc: Exception, api_key_hint: str) -> None:
+    if not api_key_hint:
+        return
+    try:
+        setattr(exc, "_hermes_failed_api_key", api_key_hint)
+    except Exception:
+        logger.debug("Auxiliary client: could not attach failed api-key hint", exc_info=True)
+
+
 def _pool_runtime_base_url(entry: Any, fallback: str = "") -> str:
     if entry is None:
         return str(fallback or "").strip().rstrip("/")
@@ -3125,7 +3139,7 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
     hint = failed_api_key or None
 
     if _is_auth_error(exc):
-        refreshed = pool.try_refresh_current()
+        refreshed = pool.try_refresh_current(api_key_hint=hint)
         if refreshed is not None:
             _evict_cached_clients(normalized)
             return True
@@ -3191,6 +3205,7 @@ def _retry_same_provider_sync(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
         )
 
+    retry_api_key_hint = _client_api_key_hint(retry_client)
     retry_base = str(getattr(retry_client, "base_url", "") or "")
     retry_kwargs = _build_call_kwargs(
         resolved_provider,
@@ -3205,9 +3220,13 @@ def _retry_same_provider_sync(
     )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
-    return _validate_llm_response(
-        retry_client.chat.completions.create(**retry_kwargs), task,
-    )
+    try:
+        return _validate_llm_response(
+            retry_client.chat.completions.create(**retry_kwargs), task,
+        )
+    except Exception as exc:
+        _attach_failed_api_key_hint(exc, retry_api_key_hint)
+        raise
 
 
 async def _retry_same_provider_async(
@@ -3248,6 +3267,7 @@ async def _retry_same_provider_async(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
         )
 
+    retry_api_key_hint = _client_api_key_hint(retry_client)
     retry_base = str(getattr(retry_client, "base_url", "") or "")
     retry_kwargs = _build_call_kwargs(
         resolved_provider,
@@ -3262,12 +3282,16 @@ async def _retry_same_provider_async(
     )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
-    return _validate_llm_response(
-        await retry_client.chat.completions.create(**retry_kwargs), task,
-    )
+    try:
+        return _validate_llm_response(
+            await retry_client.chat.completions.create(**retry_kwargs), task,
+        )
+    except Exception as exc:
+        _attach_failed_api_key_hint(exc, retry_api_key_hint)
+        raise
 
 
-def _refresh_provider_credentials(provider: str) -> bool:
+def _refresh_provider_credentials(provider: str, *, failed_api_key: str = "") -> bool:
     """Refresh short-lived credentials for OAuth-backed auxiliary providers."""
     normalized = _normalize_aux_provider(provider)
     try:
@@ -3303,15 +3327,23 @@ def _refresh_provider_credentials(provider: str) -> bool:
             return True
         if normalized == "xai-oauth":
             # Preference: pool-level refresh (uses refresh_token from pool entry),
-            # then fall back to singleton auth-store resolver.
+            # then fall back to singleton auth-store resolver. When the caller
+            # knows the key that failed, pass it through so concurrent pool
+            # leases cannot refresh/quarantine an unrelated current() entry.
             pool = load_pool(normalized)
             if pool and pool.has_credentials():
-                # Ensure a current entry is selected before trying to refresh.
-                pool.select()
-                refreshed = pool.try_refresh_current()
+                hint = str(failed_api_key or "").strip()
+                if hint:
+                    refreshed = pool.try_refresh_current(api_key_hint=hint)
+                else:
+                    # Legacy/no-hint path: choose a current entry before refreshing.
+                    pool.select()
+                    refreshed = pool.try_refresh_current()
                 if refreshed is not None and str(getattr(refreshed, "runtime_api_key", "") or "").strip():
                     _evict_cached_clients(normalized)
                     return True
+                if hint:
+                    return False
             from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
 
             creds = resolve_xai_oauth_runtime_credentials(force_refresh=True)
@@ -6282,11 +6314,23 @@ def call_llm(
                 return _validate_llm_response(
                     refreshed_client.chat.completions.create(**kwargs), task)
 
+        # Capture the exact API key used so recovery/refresh paths can find the
+        # correct pool entry even when another process rotated the pool between
+        # this call and error handling.
+        _client_api_key = _client_api_key_hint(client)
+
         # ── Auth refresh retry ───────────────────────────────────────
         if (_is_auth_error(first_err)
                 and resolved_provider not in {"auto", "", None}
                 and not client_is_nous):
-            if _refresh_provider_credentials(resolved_provider):
+            if _normalize_aux_provider(resolved_provider) == "xai-oauth" and _client_api_key:
+                credentials_refreshed = _refresh_provider_credentials(
+                    resolved_provider,
+                    failed_api_key=_client_api_key,
+                )
+            else:
+                credentials_refreshed = _refresh_provider_credentials(resolved_provider)
+            if credentials_refreshed:
                 logger.info(
                     "Auxiliary %s: refreshed %s credentials after auth error, retrying",
                     task or "call", resolved_provider,
@@ -6310,11 +6354,6 @@ def call_llm(
 
         # ── Same-provider credential-pool recovery ─────────────────────
         pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
-        # Capture the exact API key used so mark_exhausted_and_rotate can find
-        # the correct pool entry even when another process rotated the pool
-        # between this call and recovery (which leaves current()=None and makes
-        # _select_unlocked() return the NEXT key by mistake).
-        _client_api_key = str(getattr(client, "api_key", "") or "")
         if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
             recovery_err = first_err
             # Skip the extra retry for clear payment/quota errors — the endpoint
@@ -6357,7 +6396,12 @@ def call_llm(
                     # alternative providers can still serve the request.
                     if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
                             or _is_rate_limit_error(retry2_err)):
-                        _recover_provider_pool(pool_provider, retry2_err)
+                        retry2_api_key = str(getattr(retry2_err, "_hermes_failed_api_key", "") or "")
+                        _recover_provider_pool(
+                            pool_provider,
+                            retry2_err,
+                            failed_api_key=retry2_api_key,
+                        )
                         first_err = retry2_err
                     else:
                         raise
@@ -6810,11 +6854,23 @@ async def async_call_llm(
                 return _validate_llm_response(
                     await refreshed_client.chat.completions.create(**kwargs), task)
 
+        # Capture the exact API key used so recovery/refresh paths can find the
+        # correct pool entry even when another process rotated the pool between
+        # this call and error handling.
+        _client_api_key = _client_api_key_hint(client)
+
         # ── Auth refresh retry (mirrors sync call_llm) ───────────────
         if (_is_auth_error(first_err)
                 and resolved_provider not in {"auto", "", None}
                 and not client_is_nous):
-            if _refresh_provider_credentials(resolved_provider):
+            if _normalize_aux_provider(resolved_provider) == "xai-oauth" and _client_api_key:
+                credentials_refreshed = _refresh_provider_credentials(
+                    resolved_provider,
+                    failed_api_key=_client_api_key,
+                )
+            else:
+                credentials_refreshed = _refresh_provider_credentials(resolved_provider)
+            if credentials_refreshed:
                 logger.info(
                     "Auxiliary %s (async): refreshed %s credentials after auth error, retrying",
                     task or "call", resolved_provider,
@@ -6837,7 +6893,6 @@ async def async_call_llm(
 
         # ── Same-provider credential-pool recovery (mirrors sync) ─────
         pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
-        _client_api_key = str(getattr(client, "api_key", "") or "")
         if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
             recovery_err = first_err
             # Skip the extra retry for clear payment/quota errors — the endpoint
@@ -6874,7 +6929,12 @@ async def async_call_llm(
                 except Exception as retry2_err:
                     if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
                             or _is_rate_limit_error(retry2_err)):
-                        _recover_provider_pool(pool_provider, retry2_err)
+                        retry2_api_key = str(getattr(retry2_err, "_hermes_failed_api_key", "") or "")
+                        _recover_provider_pool(
+                            pool_provider,
+                            retry2_err,
+                            failed_api_key=retry2_api_key,
+                        )
                         first_err = retry2_err
                     else:
                         raise
