@@ -2088,7 +2088,20 @@ class Migrator:
                 self.record("sensitive-skip", candidate, None, "skipped", "Contains secrets, binary state, or product-specific runtime data")
 
     def archive_path(self, source: Path, reason: str) -> None:
-        destination = self.archive_dir / relative_label(source, self.source_root) if self.archive_dir else None
+        destination = None
+        if self.archive_dir is not None:
+            label = Path(relative_label(source, self.source_root))
+            # relative_label() returns an ABSOLUTE path when `source` lives
+            # outside source_root — e.g. a custom OpenClaw workspace such as
+            # ~/clawd/ declared via agents.defaults.workspace.  `archive_dir /
+            # Path("/abs/…")` then DISCARDS archive_dir (pathlib joins onto the
+            # absolute right-hand side), collapsing the destination onto
+            # `source` itself, so shutil.copy2 below raises SameFileError and
+            # aborts the whole migration.  Strip the anchor so the archived copy
+            # always lands under archive_dir, mirroring backup_existing().
+            if label.is_absolute() and len(label.parts) > 1:
+                label = Path(*label.parts[1:])
+            destination = self.archive_dir / label
         if self.execute and destination is not None:
             ensure_parent(destination)
             if source.is_dir():
