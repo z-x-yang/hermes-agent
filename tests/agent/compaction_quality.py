@@ -22,6 +22,7 @@ NINE_SECTION_HEADINGS = [
     "## Optional Next Step",
 ]
 
+SUMMARY_PREFIX = "[CONTEXT COMPACTION]"
 SUMMARY_END_MARKER = "--- END OF COMPACTED CONTEXT ---"
 ASSISTANT_TAIL_MARKER = "[RETAINED ASSISTANT CONTINUATION — not user-provided text]"
 USER_TAIL_MARKER_PREFIX = "[RETAINED USER CONTINUATION"
@@ -118,4 +119,14 @@ def evaluate_compacted_messages(messages: Sequence[dict]) -> list[str]:
             failures.append(
                 f"message {index} has retained user continuation without role marker"
             )
+
+        if role == "assistant" and remainder.startswith(ASSISTANT_TAIL_MARKER):
+            tail_text = remainder[len(ASSISTANT_TAIL_MARKER):].lstrip()
+        elif role == "user" and remainder.startswith(USER_TAIL_MARKER_PREFIX):
+            marker_end = remainder.find("]")
+            tail_text = remainder[marker_end + 1:].lstrip() if marker_end >= 0 else remainder
+        else:
+            tail_text = remainder
+        if tail_text.startswith(SUMMARY_PREFIX):
+            failures.append(f"message {index} has nested compacted summary inside retained tail")
     return failures

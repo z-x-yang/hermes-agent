@@ -111,3 +111,16 @@ def test_quality_eval_accepts_labelled_merged_assistant_tail():
     failures = evaluate_compacted_messages(messages)
 
     assert failures == []
+
+
+def test_quality_eval_rejects_nested_summary_inside_labelled_tail():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "[CONTEXT COMPACTION] new summary\n\n--- END OF COMPACTED CONTEXT ---\n\n[RETAINED ASSISTANT CONTINUATION — not user-provided text]\n[CONTEXT COMPACTION] old summary\n\n--- END OF COMPACTED CONTEXT ---",
+        }
+    ]
+
+    failures = evaluate_compacted_messages(messages)
+
+    assert any("nested compacted summary" in failure for failure in failures)
