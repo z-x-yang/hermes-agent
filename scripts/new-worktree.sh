@@ -23,7 +23,9 @@ wt="$HOME/.hermes/worktrees/$task"
 cd "$MAIN"
 git worktree add "$wt" -b "feat/$topic" main
 
-for asset in "${RO_SHARED[@]}"; do
+# 防护展开:bash 3.2 + set -u 下,空数组的 "${arr[@]}" 会被当作 unbound variable 报错。
+# "${arr[@]+...}" 形式在数组为空时整体不展开(不触发 unbound),非空时正常带引号展开。
+for asset in "${RO_SHARED[@]+"${RO_SHARED[@]}"}"; do
   if [ -e "$MAIN/$asset" ] && [ ! -e "$wt/$asset" ]; then
     ln -s "$MAIN/$asset" "$wt/$asset"
     echo "  shared (read-only): $asset"
