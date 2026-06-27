@@ -9,9 +9,10 @@ three virtual model IDs so the ``hermes tools`` model picker and the
     gpt-image-2-medium  ~40s   default — balanced
     gpt-image-2-high    ~2min  slowest, highest fidelity
 
-All three hit the same underlying API model (``gpt-image-2``) through the
-Responses API with a different ``quality`` parameter. Output is read from the
-``image_generation_call.result`` base64 field → saved under
+All three use the same underlying API model (``gpt-image-2``) with a
+different ``quality`` parameter. Stock OpenAI uses the Images API. GPTCodex
+compatibility mode uses the observed-working Responses API shape and reads
+``image_generation_call.result`` base64 output. Images are saved under
 ``$HERMES_HOME/cache/images/``.
 
 Selection precedence (first hit wins):
@@ -40,6 +41,7 @@ from agent.image_gen_provider import (
     normalize_reference_images,
     resolve_aspect_ratio,
     save_b64_image,
+    save_url_image,
     success_response,
 )
 
@@ -119,8 +121,7 @@ def _resolve_credentials() -> Tuple[Optional[str], Optional[str], str]:
     """
     sub = _openai_subconfig()
     key_env = str(sub.get("api_key_env") or "OPENAI_API_KEY").strip() or "OPENAI_API_KEY"
-    inline_key = str(sub.get("api_key") or "").strip()
-    api_key = inline_key or os.environ.get(key_env, "").strip()
+    api_key = os.environ.get(key_env, "").strip()
     base_url = str(sub.get("base_url") or os.environ.get("OPENAI_BASE_URL", "")).strip()
     return (api_key or None, base_url or None, key_env)
 
@@ -198,6 +199,21 @@ def _responses_endpoint(base_url: Optional[str]) -> str:
     return f"{base}/responses"
 
 
+def _use_responses_api(base_url: Optional[str]) -> bool:
+    """Return true for gateways that need the observed GPTCodex Responses shape."""
+    sub = _openai_subconfig()
+    configured = sub.get("use_responses_api")
+    if isinstance(configured, bool):
+        return configured
+    if isinstance(configured, str):
+        value = configured.strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
+            return False
+    return "gptcodex.top" in (base_url or "").lower()
+
+
 def _build_responses_payload(
     *,
     prompt: str,
@@ -255,7 +271,7 @@ def _extract_responses_image(value: Any) -> Optional[Tuple[str, Dict[str, Any]]]
 
 
 class OpenAIImageGenProvider(ImageGenProvider):
-    """OpenAI-compatible ``/responses`` image-generation backend — gpt-image-2."""
+    """OpenAI GPT Image backend with GPTCodex Responses compatibility."""
 
     @property
     def name(self) -> str:
@@ -299,8 +315,9 @@ class OpenAIImageGenProvider(ImageGenProvider):
         }
 
     def capabilities(self) -> Dict[str, Any]:
-        # gpt-image-2 supports image-conditioned generation via Responses API
-        # input_image items. Keep the public surface as image-to-image/editing.
+        # gpt-image-2 supports image-to-image/editing via the stock Images API;
+        # GPTCodex compatibility mode maps the same public surface to Responses
+        # input_image items.
         return {"modalities": ["text", "image"], "max_reference_images": 16}
 
     def generate(
@@ -329,8 +346,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 error=(
                     f"{api_key_label} not set. Run `hermes tools` → Image "
                     "Generation → OpenAI to configure, or set "
-                    "image_gen.openai.api_key_env / image_gen.openai.api_key "
-                    "in config.yaml."
+                    "image_gen.openai.api_key_env in config.yaml."
                 ),
                 error_type="auth_required",
                 provider="openai",
@@ -350,87 +366,227 @@ class OpenAIImageGenProvider(ImageGenProvider):
         is_edit = bool(sources)
         modality = "image" if is_edit else "text"
 
-        try:
-            payload = _build_responses_payload(
-                prompt=prompt,
-                size=size,
-                quality=meta["quality"],
-                sources=sources,
-            )
-        except Exception as exc:
-            return error_response(
-                error=f"Could not load source image for image generation: {exc}",
-                error_type="io_error",
-                provider="openai",
-                model=tier_id,
-                prompt=prompt,
-                aspect_ratio=aspect,
+        if _use_responses_api(base_url):
+            try:
+                payload = _build_responses_payload(
+                    prompt=prompt,
+                    size=size,
+                    quality=meta["quality"],
+                    sources=sources,
+                )
+            except Exception as exc:
+                return error_response(
+                    error=f"Could not load source image for image generation: {exc}",
+                    error_type="io_error",
+                    provider="openai",
+                    model=tier_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
+
+            request = urllib.request.Request(
+                _responses_endpoint(base_url),
+                data=json.dumps(payload).encode("utf-8"),
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
             )
 
-        request = urllib.request.Request(
-            _responses_endpoint(base_url),
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-        )
+            try:
+                with urllib.request.urlopen(request, timeout=420) as response:
+                    response_payload = json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                body = exc.read(1000).decode("utf-8", errors="replace")
+                logger.debug("OpenAI Responses image generation failed", exc_info=True)
+                return error_response(
+                    error=f"OpenAI Responses image generation failed: HTTP {exc.code}: {body}",
+                    error_type="api_error",
+                    provider="openai",
+                    model=tier_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
+            except Exception as exc:
+                logger.debug("OpenAI Responses image generation failed", exc_info=True)
+                return error_response(
+                    error=f"OpenAI Responses image generation failed: {exc}",
+                    error_type="api_error",
+                    provider="openai",
+                    model=tier_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
 
-        try:
-            with urllib.request.urlopen(request, timeout=420) as response:
-                response_payload = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read(1000).decode("utf-8", errors="replace")
-            logger.debug("OpenAI Responses image generation failed", exc_info=True)
-            return error_response(
-                error=f"OpenAI Responses image generation failed: HTTP {exc.code}: {body}",
-                error_type="api_error",
-                provider="openai",
-                model=tier_id,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
-        except Exception as exc:
-            logger.debug("OpenAI Responses image generation failed", exc_info=True)
-            return error_response(
-                error=f"OpenAI Responses image generation failed: {exc}",
-                error_type="api_error",
-                provider="openai",
-                model=tier_id,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
+            extracted = _extract_responses_image(response_payload)
+            if not extracted:
+                return error_response(
+                    error="OpenAI Responses payload contained no image_generation_call result",
+                    error_type="empty_response",
+                    provider="openai",
+                    model=tier_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
 
-        extracted = _extract_responses_image(response_payload)
-        if not extracted:
-            return error_response(
-                error="OpenAI Responses payload contained no image_generation_call result",
-                error_type="empty_response",
-                provider="openai",
-                model=tier_id,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
+            b64, response_meta = extracted
+            try:
+                saved_path = save_b64_image(b64, prefix=f"openai_{tier_id}")
+            except Exception as exc:
+                return error_response(
+                    error=f"Could not save image to cache: {exc}",
+                    error_type="io_error",
+                    provider="openai",
+                    model=tier_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
+            image_ref = str(saved_path)
 
-        b64, response_meta = extracted
-        try:
-            saved_path = save_b64_image(b64, prefix=f"openai_{tier_id}")
-        except Exception as exc:
-            return error_response(
-                error=f"Could not save image to cache: {exc}",
-                error_type="io_error",
-                provider="openai",
-                model=tier_id,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
-        image_ref = str(saved_path)
+            extra: Dict[str, Any] = {"size": size, "quality": meta["quality"]}
+            for key, value in response_meta.items():
+                if value is not None:
+                    extra[key] = value
+        else:
+            try:
+                import openai
+            except ImportError:
+                return error_response(
+                    error="openai Python package not installed (pip install openai)",
+                    error_type="missing_dependency",
+                    provider="openai",
+                    aspect_ratio=aspect,
+                )
 
-        extra: Dict[str, Any] = {"size": size, "quality": meta["quality"]}
-        for key, value in response_meta.items():
-            if value is not None:
-                extra[key] = value
+            client_kwargs: Dict[str, Any] = {"api_key": api_key}
+            if base_url:
+                client_kwargs["base_url"] = base_url
+            client = openai.OpenAI(**client_kwargs)
+
+            if is_edit:
+                # images.edit() expects file-like objects. Download/read each
+                # source into a named BytesIO so the SDK sends correct multipart.
+                import io
+
+                try:
+                    files = []
+                    for ref in sources:
+                        data, fname = _load_image_bytes(ref)
+                        bio = io.BytesIO(data)
+                        bio.name = fname
+                        files.append(bio)
+                except Exception as exc:
+                    return error_response(
+                        error=f"Could not load source image for editing: {exc}",
+                        error_type="io_error",
+                        provider="openai",
+                        model=tier_id,
+                        prompt=prompt,
+                        aspect_ratio=aspect,
+                    )
+
+                try:
+                    response = client.images.edit(
+                        model=API_MODEL,
+                        image=files if len(files) > 1 else files[0],
+                        prompt=prompt,
+                        size=size,  # type: ignore[arg-type]  # _SIZES values are valid gpt-image sizes
+                        quality=meta["quality"],
+                        n=1,
+                    )
+                except Exception as exc:
+                    logger.debug("OpenAI image edit failed", exc_info=True)
+                    return error_response(
+                        error=f"OpenAI image editing failed: {exc}",
+                        error_type="api_error",
+                        provider="openai",
+                        model=tier_id,
+                        prompt=prompt,
+                        aspect_ratio=aspect,
+                    )
+            else:
+                # gpt-image-2 returns b64_json unconditionally and REJECTS
+                # ``response_format`` as an unknown parameter. Don't send it.
+                payload: Dict[str, Any] = {
+                    "model": API_MODEL,
+                    "prompt": prompt,
+                    "size": size,
+                    "n": 1,
+                    "quality": meta["quality"],
+                }
+
+                try:
+                    response = client.images.generate(**payload)
+                except Exception as exc:
+                    logger.debug("OpenAI image generation failed", exc_info=True)
+                    return error_response(
+                        error=f"OpenAI image generation failed: {exc}",
+                        error_type="api_error",
+                        provider="openai",
+                        model=tier_id,
+                        prompt=prompt,
+                        aspect_ratio=aspect,
+                    )
+
+            data = getattr(response, "data", None) or []
+            if not data:
+                return error_response(
+                    error="OpenAI returned no image data",
+                    error_type="empty_response",
+                    provider="openai",
+                    model=tier_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
+
+            first = data[0]
+            b64 = getattr(first, "b64_json", None)
+            url = getattr(first, "url", None)
+            revised_prompt = getattr(first, "revised_prompt", None)
+
+            if b64:
+                try:
+                    saved_path = save_b64_image(b64, prefix=f"openai_{tier_id}")
+                except Exception as exc:
+                    return error_response(
+                        error=f"Could not save image to cache: {exc}",
+                        error_type="io_error",
+                        provider="openai",
+                        model=tier_id,
+                        prompt=prompt,
+                        aspect_ratio=aspect,
+                    )
+                image_ref = str(saved_path)
+            elif url:
+                # Defensive — gpt-image-2 returns b64 today, but OpenAI's API
+                # has previously returned URLs. Cache the bytes locally so the
+                # gateway never tries to fetch an ephemeral / signed URL after
+                # it expires — same rationale as the xAI provider (#26942).
+                try:
+                    saved_path = save_url_image(url, prefix=f"openai_{tier_id}")
+                except Exception as exc:
+                    logger.warning(
+                        "OpenAI image URL %s could not be cached (%s); falling back to bare URL.",
+                        url,
+                        exc,
+                    )
+                    image_ref = url
+                else:
+                    image_ref = str(saved_path)
+            else:
+                return error_response(
+                    error="OpenAI response contained neither b64_json nor URL",
+                    error_type="empty_response",
+                    provider="openai",
+                    model=tier_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
+
+            extra = {"size": size, "quality": meta["quality"]}
+            if revised_prompt:
+                extra["revised_prompt"] = revised_prompt
 
         return success_response(
             image=image_ref,

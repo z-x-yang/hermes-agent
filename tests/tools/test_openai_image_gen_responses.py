@@ -28,6 +28,27 @@ class _FakeHTTPResponse:
         return self._payload
 
 
+def test_responses_api_false_string_overrides_gptcodex_heuristic(monkeypatch):
+    import plugins.image_gen.openai as openai_image
+
+    monkeypatch.setattr(
+        openai_image,
+        "_openai_subconfig",
+        lambda: {"use_responses_api": "false"},
+    )
+
+    assert openai_image._use_responses_api("https://gptcodex.top/v1") is False
+
+
+def test_responses_api_defaults_to_gptcodex_heuristic(monkeypatch):
+    import plugins.image_gen.openai as openai_image
+
+    monkeypatch.setattr(openai_image, "_openai_subconfig", lambda: {})
+
+    assert openai_image._use_responses_api("https://gptcodex.top/v1") is True
+    assert openai_image._use_responses_api("https://api.openai.com/v1") is False
+
+
 def test_openai_provider_uses_responses_payload_for_high_quality(monkeypatch, tmp_path):
     from plugins.image_gen.openai import OpenAIImageGenProvider
     import plugins.image_gen.openai as openai_image
@@ -43,6 +64,7 @@ def test_openai_provider_uses_responses_payload_for_high_quality(monkeypatch, tm
         "_resolve_model",
         lambda: ("gpt-image-2-high", {"quality": "high"}),
     )
+    monkeypatch.setattr(openai_image, "_use_responses_api", lambda base_url: True)
 
     captured = {}
 
@@ -95,6 +117,7 @@ def test_openai_provider_embeds_source_images_as_responses_input_images(monkeypa
         "_resolve_model",
         lambda: ("gpt-image-2-medium", {"quality": "medium"}),
     )
+    monkeypatch.setattr(openai_image, "_use_responses_api", lambda base_url: True)
     monkeypatch.setattr(
         openai_image,
         "_load_image_bytes",
@@ -141,6 +164,7 @@ def test_openai_provider_surfaces_responses_http_errors(monkeypatch, tmp_path):
         "_resolve_credentials",
         lambda: ("sk-test", "https://example.test/v1", "OPENAI_API_KEY"),
     )
+    monkeypatch.setattr(openai_image, "_use_responses_api", lambda base_url: True)
 
     def fake_urlopen(request, timeout):
         raise urllib.error.HTTPError(
@@ -171,6 +195,7 @@ def test_openai_provider_reports_empty_responses_payload(monkeypatch, tmp_path):
         "_resolve_credentials",
         lambda: ("sk-test", "https://example.test/v1", "OPENAI_API_KEY"),
     )
+    monkeypatch.setattr(openai_image, "_use_responses_api", lambda base_url: True)
     monkeypatch.setattr(
         openai_image.urllib.request,
         "urlopen",
