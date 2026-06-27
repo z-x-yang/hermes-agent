@@ -2852,9 +2852,13 @@ def _compress_session_history(
         usage = _get_usage(agent)
         return 0, usage
     if approx_tokens is None:
+        from agent.manual_compression_feedback import (
+            materialize_manual_compression_system_prompt,
+        )
+
         # Include system prompt + tool schemas so the figure reflects real
         # request pressure, not a transcript-only underestimate (#6217).
-        _sys_prompt = getattr(agent, "_cached_system_prompt", "") or ""
+        _sys_prompt = materialize_manual_compression_system_prompt(agent, None)
         _tools = getattr(agent, "tools", None) or None
         approx_tokens = estimate_request_tokens_rough(
             history, system_prompt=_sys_prompt, tools=_tools
@@ -7610,7 +7614,10 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     focus_topic = str(params.get("focus_topic", "") or "").strip()
     try:
-        from agent.manual_compression_feedback import summarize_manual_compression
+        from agent.manual_compression_feedback import (
+            materialize_manual_compression_system_prompt,
+            summarize_manual_compression,
+        )
         from agent.model_metadata import estimate_request_tokens_rough
 
         with session["history_lock"]:
@@ -7618,7 +7625,7 @@ def _(rid, params: dict) -> dict:
             history_version = int(session.get("history_version", 0))
         before_count = len(before_messages)
         _agent = session["agent"]
-        _sys_prompt = getattr(_agent, "_cached_system_prompt", "") or ""
+        _sys_prompt = materialize_manual_compression_system_prompt(_agent, None)
         _tools = getattr(_agent, "tools", None) or None
         before_tokens = (
             estimate_request_tokens_rough(
@@ -12500,13 +12507,16 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             # compressed + emitted session.info and returned "", so the TUI
             # showed no "compressed N → M messages / ~X → ~Y tokens" stats
             # while CLI and gateway both did.
-            from agent.manual_compression_feedback import summarize_manual_compression
+            from agent.manual_compression_feedback import (
+                materialize_manual_compression_system_prompt,
+                summarize_manual_compression,
+            )
             from agent.model_metadata import estimate_request_tokens_rough
 
             with session["history_lock"]:
                 _before_messages = list(session.get("history", []))
             _before_count = len(_before_messages)
-            _sys_prompt = getattr(agent, "_cached_system_prompt", "") or ""
+            _sys_prompt = materialize_manual_compression_system_prompt(agent, None)
             _tools = getattr(agent, "tools", None) or None
             _before_tokens = (
                 estimate_request_tokens_rough(

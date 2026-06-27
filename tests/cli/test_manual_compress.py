@@ -70,6 +70,50 @@ def test_manual_compress_explains_when_token_estimate_rises(capsys):
     assert "denser summaries" in output
 
 
+def test_manual_compress_builds_prompt_before_estimating_tokens(capsys):
+    """CLI /compress should not estimate the pre-compression request with an
+    empty cached prompt and the post-compression request with a rebuilt prompt.
+    """
+    shell = _make_cli()
+    history = _make_history()
+    compressed = [
+        history[0],
+        {"role": "assistant", "content": "compressed summary"},
+        history[-1],
+    ]
+    shell.conversation_history = history
+    shell.agent = MagicMock()
+    shell.agent.compression_enabled = True
+    shell.agent._cached_system_prompt = ""
+    shell.agent._build_system_prompt.return_value = "BUILT SYSTEM PROMPT"
+    shell.agent.tools = [{"type": "function", "function": {"name": "demo"}}]
+    shell.agent.session_id = shell.session_id
+
+    def _compress(*_args, **_kwargs):
+        shell.agent._cached_system_prompt = "POST-COMPRESSION SYSTEM PROMPT"
+        return (compressed, "POST-COMPRESSION SYSTEM PROMPT")
+
+    shell.agent._compress_context.side_effect = _compress
+    estimate_calls = []
+
+    def _estimate(messages, **kwargs):
+        estimate_calls.append((messages, kwargs))
+        if messages == history:
+            return 100
+        if messages == compressed:
+            return 60
+        raise AssertionError(f"unexpected transcript: {messages!r}")
+
+    with patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=_estimate):
+        shell._manual_compress()
+
+    capsys.readouterr()
+    assert estimate_calls[0][1]["system_prompt"] == "BUILT SYSTEM PROMPT"
+    assert estimate_calls[1][1]["system_prompt"] == "POST-COMPRESSION SYSTEM PROMPT"
+    assert estimate_calls[0][1]["tools"] is shell.agent.tools
+    assert estimate_calls[1][1]["tools"] is shell.agent.tools
+
+
 def test_manual_compress_syncs_session_id_after_split():
     """Regression for cli.session_id desync after /compress.
 

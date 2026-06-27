@@ -3111,7 +3111,10 @@ class GatewaySlashCommandsMixin:
 
         try:
             from run_agent import AIAgent
-            from agent.manual_compression_feedback import summarize_manual_compression
+            from agent.manual_compression_feedback import (
+                materialize_manual_compression_system_prompt,
+                summarize_manual_compression,
+            )
             from agent.model_metadata import estimate_request_tokens_rough
 
             session_key = self._session_key_for_source(source)
@@ -3188,7 +3191,9 @@ class GatewaySlashCommandsMixin:
                 # figure reflects real request pressure, not a transcript-only
                 # underestimate (#6217). Must be computed after tmp_agent is
                 # built so _cached_system_prompt/tools are populated.
-                _sys_prompt = getattr(tmp_agent, "_cached_system_prompt", "") or ""
+                _sys_prompt = materialize_manual_compression_system_prompt(
+                    tmp_agent, None
+                )
                 _tools = getattr(tmp_agent, "tools", None) or None
                 approx_tokens = estimate_request_tokens_rough(
                     msgs, system_prompt=_sys_prompt, tools=_tools
@@ -3199,7 +3204,7 @@ class GatewaySlashCommandsMixin:
                     return t("gateway.compress.nothing_to_do")
 
                 loop = asyncio.get_running_loop()
-                compressed, _ = await loop.run_in_executor(
+                compressed, _new_system_prompt = await loop.run_in_executor(
                     None,
                     lambda: tmp_agent._compress_context(head, "", approx_tokens=approx_tokens, focus_topic=focus_topic, force=True)
                 )
@@ -3267,8 +3272,13 @@ class GatewaySlashCommandsMixin:
                 self.session_store.update_session(
                     session_entry.session_key, last_prompt_tokens=0
                 )
+                _sys_prompt_after = (
+                    getattr(tmp_agent, "_cached_system_prompt", "")
+                    or _new_system_prompt
+                    or _sys_prompt
+                )
                 new_tokens = estimate_request_tokens_rough(
-                    compressed, system_prompt=_sys_prompt, tools=_tools
+                    compressed, system_prompt=_sys_prompt_after, tools=_tools
                 )
                 summary = summarize_manual_compression(
                     msgs,

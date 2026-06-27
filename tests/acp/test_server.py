@@ -1563,7 +1563,7 @@ class TestSlashCommands:
         def _compress_context(messages, system_prompt, *, approx_tokens, task_id):
             assert state.agent._session_db is None
             assert messages == state.history
-            assert system_prompt == "system"
+            assert system_prompt is None
             assert approx_tokens == 40
             assert task_id == state.session_id
             return [{"role": "user", "content": "summary"}], "new-system"
@@ -1590,11 +1590,59 @@ class TestSlashCommands:
                 {"role": "user", "content": "three"},
                 {"role": "assistant", "content": "four"},
             ],
-            "system",
+            None,
             approx_tokens=40,
             task_id=state.session_id,
         )
         mock_save.assert_called_once_with(state.session_id)
+
+    def test_compact_materializes_prompt_without_passing_it_as_system_message(
+        self, agent, mock_manager
+    ):
+        state = self._make_state(mock_manager)
+        state.history = [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+            {"role": "user", "content": "three"},
+            {"role": "assistant", "content": "four"},
+        ]
+        state.agent.compression_enabled = True
+        state.agent._cached_system_prompt = ""
+        state.agent._build_system_prompt.return_value = "BUILT SYSTEM PROMPT"
+        state.agent.tools = None
+        state.agent._session_db = object()
+
+        def _compress_context(messages, system_prompt, *, approx_tokens, task_id):
+            assert messages == state.history
+            assert system_prompt is None
+            assert approx_tokens == 40
+            assert task_id == state.session_id
+            state.agent._cached_system_prompt = "POST-COMPRESSION SYSTEM PROMPT"
+            return [
+                {"role": "user", "content": "summary"}
+            ], "POST-COMPRESSION SYSTEM PROMPT"
+
+        state.agent._compress_context = MagicMock(side_effect=_compress_context)
+        estimate_calls = []
+
+        def _estimate(messages, **kwargs):
+            estimate_calls.append((messages, kwargs))
+            if messages == state.history:
+                return 40
+            return 12
+
+        with (
+            patch.object(agent.session_manager, "save_session"),
+            patch(
+                "agent.model_metadata.estimate_request_tokens_rough",
+                side_effect=_estimate,
+            ),
+        ):
+            result = agent._handle_slash_command("/compact", state)
+
+        assert "Context compressed: 4 -> 1 messages" in result
+        assert estimate_calls[0][1]["system_prompt"] == "BUILT SYSTEM PROMPT"
+        assert estimate_calls[1][1]["system_prompt"] == "POST-COMPRESSION SYSTEM PROMPT"
 
     def test_unknown_command_returns_none(self, agent, mock_manager):
         state = self._make_state(mock_manager)

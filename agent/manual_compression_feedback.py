@@ -5,6 +5,35 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 
+def materialize_manual_compression_system_prompt(
+    agent: Any,
+    system_message: str | None = None,
+) -> str:
+    """Return the system prompt used for manual-compression token estimates.
+
+    Manual compression paths create or reuse agents before making a real model
+    request.  At that point ``_cached_system_prompt`` may still be empty even
+    though the subsequent compression call rebuilds it.  Token feedback must not
+    compare a pre-compression request estimated with an empty prompt against a
+    post-compression request estimated with the rebuilt prompt.
+    """
+    prompt = getattr(agent, "_cached_system_prompt", "") or ""
+    if prompt:
+        return prompt
+
+    build_prompt = getattr(agent, "_build_system_prompt", None)
+    if not callable(build_prompt):
+        return ""
+
+    prompt = build_prompt(system_message) or ""
+    if prompt:
+        try:
+            agent._cached_system_prompt = prompt
+        except Exception:
+            pass
+    return prompt
+
+
 def summarize_manual_compression(
     before_messages: Sequence[dict[str, Any]],
     after_messages: Sequence[dict[str, Any]],

@@ -131,6 +131,64 @@ async def test_compress_command_explains_when_token_estimate_rises():
 
 
 @pytest.mark.asyncio
+async def test_compress_command_builds_prompt_before_estimating_tokens():
+    """Manual /compress feedback must compare before/after estimates with
+    the same request-shape basis.  A fresh temporary agent can have an empty
+    cached prompt; estimating the pre-compress request with that empty prompt
+    but the post-compress request with a rebuilt prompt makes compression look
+    like it increased tokens for the wrong reason.
+    """
+    history = _make_history()
+    compressed = [
+        history[0],
+        {"role": "assistant", "content": "compressed summary"},
+        history[-1],
+    ]
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance._build_system_prompt.return_value = "BUILT SYSTEM PROMPT"
+    agent_instance.tools = [{"type": "function", "function": {"name": "demo"}}]
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.context_compressor._last_compress_aborted = False
+    agent_instance.context_compressor._last_aux_model_failure_model = None
+    agent_instance.session_id = "sess-1"
+    agent_instance._last_compaction_in_place = True
+
+    def _compress(messages, system_message, **_kwargs):
+        assert system_message == ""
+        agent_instance._cached_system_prompt = "POST-COMPRESSION SYSTEM PROMPT"
+        return compressed, "POST-COMPRESSION SYSTEM PROMPT"
+
+    agent_instance._compress_context.side_effect = _compress
+    estimate_calls = []
+
+    def _estimate(messages, **kwargs):
+        estimate_calls.append((messages, kwargs))
+        if messages == history:
+            return 100
+        if messages == compressed:
+            return 60
+        raise AssertionError(f"unexpected transcript: {messages!r}")
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=_estimate),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "Compressed:" in result
+    assert estimate_calls[0][1]["system_prompt"] == "BUILT SYSTEM PROMPT"
+    assert estimate_calls[1][1]["system_prompt"] == "POST-COMPRESSION SYSTEM PROMPT"
+    assert estimate_calls[0][1]["tools"] is agent_instance.tools
+    assert estimate_calls[1][1]["tools"] is agent_instance.tools
+
+
+@pytest.mark.asyncio
 async def test_compress_command_appends_warning_when_compression_aborts():
     """When the auxiliary summariser fails and the compressor ABORTS (returns
     messages unchanged), /compress must append a visible ⚠️ warning to its

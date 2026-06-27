@@ -9372,7 +9372,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         with self._busy_command("Compressing context..."):
             try:
                 from agent.model_metadata import estimate_request_tokens_rough
-                from agent.manual_compression_feedback import summarize_manual_compression
+                from agent.manual_compression_feedback import (
+                    materialize_manual_compression_system_prompt,
+                    summarize_manual_compression,
+                )
                 original_history = list(self.conversation_history)
 
                 # Boundary-aware split: only the head is summarized; the
@@ -9394,7 +9397,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 # a transcript-only number understates real request pressure
                 # and can even appear to grow after compression because a
                 # dense handoff summary replaces many short turns (#6217).
-                _sys_prompt = getattr(self.agent, "_cached_system_prompt", "") or ""
+                _sys_prompt = materialize_manual_compression_system_prompt(
+                    self.agent, None
+                )
                 _tools = getattr(self.agent, "tools", None) or None
                 approx_tokens = estimate_request_tokens_rough(
                     original_history,
@@ -9417,7 +9422,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 # _build_system_prompt appends system_message to prompt_parts
                 # which already contain the agent identity — resulting in the
                 # identity block appearing twice (issue #15281).
-                compressed, _ = self.agent._compress_context(
+                compressed, _new_system_prompt = self.agent._compress_context(
                     head,
                     None,
                     approx_tokens=approx_tokens,
@@ -9450,9 +9455,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     # compressed handoff for the child session. Persist it from
                     # offset 0 so resume can recover the continuation after exit.
                     self.agent._flush_messages_to_session_db(self.conversation_history, None)
+                _sys_prompt_after = (
+                    getattr(self.agent, "_cached_system_prompt", "")
+                    or _new_system_prompt
+                    or _sys_prompt
+                )
                 new_tokens = estimate_request_tokens_rough(
                     self.conversation_history,
-                    system_prompt=_sys_prompt,
+                    system_prompt=_sys_prompt_after,
                     tools=_tools,
                 )
                 summary = summarize_manual_compression(
