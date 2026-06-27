@@ -833,6 +833,35 @@ class DiscordAdapter(BasePlatformAdapter):
         # Persistent set of bot-authored lifecycle/status message IDs that
         # should not act as conversational history boundaries after restart.
         self._nonconversational_messages = _DiscordNonConversationalMessageTracker()
+        # Notion task one-click completion: attach complete/undo buttons to
+        # Notion task links in outgoing messages and handle the clicks. The
+        # allowlist is read live (getter) because _allowed_user_ids is empty
+        # until on_ready resolves usernames.
+        from plugins.platforms.discord.notion_tasks.notion_client import NotionClient
+        from plugins.platforms.discord.notion_tasks.tracker import NotionTaskTracker
+        from plugins.platforms.discord.notion_tasks.controller import NotionTaskController
+        from plugins.platforms.discord.notion_tasks.registry import set_active_controller
+        self._notion_controller = NotionTaskController(
+            notion=NotionClient(),
+            tracker=NotionTaskTracker(),
+            allowed_ids_getter=lambda: (self._allowed_user_ids, self._allowed_role_ids),
+            fetch_channel=self._fetch_channel_async,
+        )
+        set_active_controller(self._notion_controller)
+
+    async def _fetch_channel_async(self, channel_id):
+        """Resolve a channel/thread id to a channel object (cache then fetch)."""
+        ch = self._client.get_channel(int(channel_id))
+        if ch is None:
+            ch = await self._client.fetch_channel(int(channel_id))
+        return ch
+
+    async def _handle_thread_create(self, thread):
+        """Offer a complete button when a thread is opened on a task message."""
+        try:
+            await self._notion_controller.on_thread_opened(thread)
+        except Exception as exc:
+            logger.warning("[%s] notion task on_thread_create failed: %s", self.name, exc)
 
     def _handle_bot_task_done(self, task: asyncio.Task) -> None:
         """Surface post-startup discord.py task exits to the gateway supervisor.
@@ -1021,6 +1050,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 await adapter_self._resolve_allowed_usernames()
                 adapter_self._ready_event.set()
 
+                # Register the persistent notion-task button so clicks on
+                # historical task messages still route after a restart.
+                try:
+                    from plugins.platforms.discord.notion_tasks.buttons import TaskActionButton
+                    adapter_self._client.add_dynamic_items(TaskActionButton)
+                except Exception as exc:
+                    logger.warning("[%s] failed to register notion task dynamic items: %s",
+                                   adapter_self.name, exc)
+
                 if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
                     adapter_self._post_connect_task.cancel()
                 adapter_self._post_connect_task = asyncio.create_task(
@@ -1135,6 +1173,12 @@ class DiscordAdapter(BasePlatformAdapter):
                             return
 
                 await self._handle_message(message, role_authorized=_role_authorized)
+
+            @self._client.event
+            async def on_thread_create(thread):
+                # User opened a thread (often on a task push message) — offer a
+                # complete button inside it. Delegated to a method for testing.
+                await adapter_self._handle_thread_create(thread)
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
@@ -1896,7 +1940,8 @@ class DiscordAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        view: Optional[Any] = None,
     ) -> SendResult:
         """Send a message to a Discord channel or thread.
 
@@ -1931,9 +1976,21 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
 
+            # Notion task one-click: if the message carries Notion task links,
+            # attach a complete button per task. Cheap substring pre-filter
+            # before the controller does any network fetch. No tracker write
+            # here — the click handler captures location + content authoritatively.
+            # Done before the forum branch so forum starters get the button too.
+            if view is None and content and "notion.so" in content.lower():
+                try:
+                    view = await self._notion_controller.render_view_for_text(content)
+                except Exception as e:
+                    logger.warning("[%s] notion task render failed: %s", self.name, e)
+                    view = None
+
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
-                return await self._send_to_forum(channel, content)
+                return await self._send_to_forum(channel, content, view=view)
 
             # Format and split message if needed
             formatted = self.format_message(content)
@@ -1953,15 +2010,17 @@ class DiscordAdapter(BasePlatformAdapter):
                     logger.debug("Could not fetch reply-to message: %s", e)
 
             for i, chunk in enumerate(chunks):
+                # Notion task buttons ride on the first chunk only.
+                chunk_view = view if (i == 0 and view is not None) else None
                 if self._reply_to_mode == "all":
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
+                send_kwargs: Dict[str, Any] = {"content": chunk, "reference": chunk_reference}
+                if chunk_view is not None:
+                    send_kwargs["view"] = chunk_view
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -1980,10 +2039,10 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        retry_kwargs: Dict[str, Any] = {"content": chunk, "reference": None}
+                        if chunk_view is not None:
+                            retry_kwargs["view"] = chunk_view
+                        msg = await channel.send(**retry_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
@@ -1997,6 +2056,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 elif not _looks_like_nonconversational_history_message(content):
                     self._last_self_message_id[_target_id] = message_ids[-1]
 
+
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
@@ -2007,7 +2067,7 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
-    async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
+    async def _send_to_forum(self, forum_channel: Any, content: str, *, view: Any = None) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 
         Forum channels (type 15) don't support direct messages.  Instead we
@@ -2027,10 +2087,10 @@ class DiscordAdapter(BasePlatformAdapter):
         starter_content = chunks[0] if chunks else thread_name
 
         try:
-            thread = await forum_channel.create_thread(
-                name=thread_name,
-                content=starter_content,
-            )
+            _thread_kwargs: Dict[str, Any] = {"name": thread_name, "content": starter_content}
+            if view is not None:
+                _thread_kwargs["view"] = view  # task button rides on the forum starter
+            thread = await forum_channel.create_thread(**_thread_kwargs)
         except Exception as e:
             logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
             return SendResult(success=False, error=f"Forum thread creation failed: {e}")
@@ -7413,6 +7473,14 @@ async def _standalone_send(
         last_data = None
         warnings = []
 
+        # Notion task one-click button for the standalone HTTP path. This is the
+        # path `hermes send` uses (the email-reminder cron pushes via it), so the
+        # button MUST be attached here — adapter.send() is not reached from a CLI
+        # process. Short-circuits cheaply when the message has no notion.so link;
+        # never raises into delivery.
+        from plugins.platforms.discord.notion_tasks.outbound import standalone_task_components
+        task_components = await standalone_task_components(message)
+
         # Thread endpoint: Discord threads are channels; send directly to the thread ID.
         if thread_id:
             url = f"https://discord.com/api/v10/channels/{thread_id}/messages"
@@ -7474,6 +7542,8 @@ async def _standalone_send(
                             for idx, path in enumerate(valid_media)
                         ]
                         starter_message = {"content": message, "attachments": attachments_meta}
+                        if task_components:
+                            starter_message["components"] = task_components
                         payload_json = json.dumps({"name": thread_name, "message": starter_message})
 
                         form = aiohttp.FormData()
@@ -7497,12 +7567,15 @@ async def _standalone_send(
                     else:
                         # No media — simple JSON POST creates the thread with
                         # just the text starter.
+                        _forum_message: Dict[str, Any] = {"content": message}
+                        if task_components:
+                            _forum_message["components"] = task_components
                         async with session.post(
                             thread_url,
                             headers=json_headers,
                             json={
                                 "name": thread_name,
-                                "message": {"content": message},
+                                "message": _forum_message,
                             },
                             **_req_kw,
                         ) as resp:
@@ -7529,7 +7602,10 @@ async def _standalone_send(
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             # Send text message (skip if empty and media is present)
             if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
+                _text_payload: Dict[str, Any] = {"content": message}
+                if task_components:
+                    _text_payload["components"] = task_components
+                async with session.post(url, headers=json_headers, json=_text_payload, **_req_kw) as resp:
                     if resp.status not in {200, 201}:
                         body = await resp.text()
                         return {"error": f"Discord API error ({resp.status}): {body}"}

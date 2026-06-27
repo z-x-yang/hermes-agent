@@ -1,0 +1,99 @@
+"""Persistent map: notion_page_id -> Discord message locations + status meta.
+
+JSON file via atomic_json_write, mirrors gateway/platforms/helpers.py
+ThreadParticipationTracker.
+
+Each record holds the page's title/status meta plus a ``locations`` map keyed
+by Discord message_id, so the same task shown in a channel AND in a thread can
+be kept in sync. The tracker is written by the live gateway at CLICK time (it
+captures the pre-edit message content as ``orig_content`` for a clean undo);
+the send paths do not need to write it, which keeps cross-process delivery
+(``hermes send`` standalone HTTP) free of tracker races.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+_UNSET = object()
+
+
+class NotionTaskTracker:
+    def __init__(self, max_tracked: int = 1000):
+        self._max = max_tracked
+        self._tasks: dict[str, dict[str, Any]] = self._load()
+
+    def _state_path(self) -> Path:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "discord_notion_tasks.json"
+
+    def _load(self) -> dict:
+        path = self._state_path()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            # Corruption must be visible (fail-fast), not silently swallowed.
+            # Don't crash the gateway: back the bad file up and start fresh —
+            # buttons still work because handle_action re-fetches at click time.
+            logger.error("notion task tracker: corrupt state at %s (%s); backing up and resetting",
+                         path, exc)
+            try:
+                path.rename(path.with_suffix(".corrupt"))
+            except Exception:
+                logger.warning("notion task tracker: could not back up corrupt state", exc_info=True)
+            return {}
+        if isinstance(data, dict):
+            return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+        logger.error("notion task tracker: state at %s is not a dict; resetting", path)
+        return {}
+
+    def _save(self) -> None:
+        from utils import atomic_json_write
+        if len(self._tasks) > self._max:
+            items = sorted(self._tasks.items(), key=lambda kv: kv[1].get("updated_at", 0))
+            self._tasks = dict(items[-self._max:])
+        atomic_json_write(self._state_path(), self._tasks, indent=2)
+
+    def get(self, page_id) -> dict | None:
+        return self._tasks.get(str(page_id))
+
+    def locations(self, page_id) -> list[dict]:
+        rec = self._tasks.get(str(page_id)) or {}
+        return list((rec.get("locations") or {}).values())
+
+    def upsert_meta(self, page_id, *, title=None, status_kind=None,
+                    original_status=_UNSET, done=_UNSET) -> None:
+        rec = self._tasks.setdefault(str(page_id), {})
+        if title is not None:
+            rec["title"] = title
+        if status_kind is not None:
+            rec["status_kind"] = status_kind
+        if original_status is not _UNSET:
+            rec["original_status"] = original_status
+        if done is not _UNSET:
+            rec["done"] = bool(done)
+        rec["updated_at"] = time.time()
+        self._save()
+
+    def add_location(self, page_id, *, message_id, channel_id, orig_content=None) -> None:
+        """Record a Discord message showing this task.
+
+        ``orig_content`` is the message's pre-edit text, captured once for undo;
+        a later call with ``None`` never clobbers an already-stored original.
+        """
+        rec = self._tasks.setdefault(str(page_id), {})
+        locs = rec.setdefault("locations", {})
+        mid = str(message_id)
+        loc = locs.setdefault(mid, {"message_id": mid})
+        loc["channel_id"] = str(channel_id)
+        if orig_content is not None and loc.get("orig_content") is None:
+            loc["orig_content"] = orig_content
+        rec["updated_at"] = time.time()
+        self._save()

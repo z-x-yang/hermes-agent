@@ -178,10 +178,35 @@ def _ensure_discord_mock() -> None:
             self.description = description
     discord_mod.SelectOption = _FakeSelectOption
 
+    class _FakeDynamicItem:
+        """Mock of discord.ui.DynamicItem (discord.py >= 2.4).
+
+        Supports ``class X(DynamicItem[Button], template=...)`` subclassing
+        and ``X(item)`` construction so the notion-task button module can be
+        imported and unit-tested without the real library.
+        """
+        def __init_subclass__(cls, *, template=None, **kw):
+            cls.__discord_ui_template__ = template
+            super().__init_subclass__(**kw)
+
+        def __class_getitem__(cls, _item):
+            return cls
+
+        def __init__(self, item, **_):
+            self.item = item
+
+        @classmethod
+        async def from_custom_id(cls, interaction, item, match):  # pragma: no cover
+            return cls(item)
+
+        async def callback(self, interaction):  # pragma: no cover
+            pass
+
     discord_mod.ui = SimpleNamespace(
         View=_FakeView,
         Select=_FakeSelect,
         Button=_FakeButton,
+        DynamicItem=_FakeDynamicItem,
         button=lambda *a, **k: (lambda fn: fn),
     )
     discord_mod.ButtonStyle = SimpleNamespace(
