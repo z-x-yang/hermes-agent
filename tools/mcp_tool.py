@@ -3448,6 +3448,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             structured = getattr(result, "structuredContent", None)
             if structured is not None:
                 if text_result:
+                    try:
+                        parsed_text = json.loads(text_result)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed_text = None
+                    if parsed_text == structured:
+                        return json.dumps({"result": structured}, ensure_ascii=False)
                     return json.dumps({
                         "result": text_result,
                         "structuredContent": structured,

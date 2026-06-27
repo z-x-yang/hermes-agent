@@ -141,3 +141,22 @@ class TestStructuredContentPreservation:
         raw = handler({})
         data = json.loads(raw)
         assert data["result"] == payload
+
+    def test_json_text_duplicate_of_structured_content_is_not_returned_twice(self, _patch_mcp_server):
+        """When text content is just structuredContent serialized as JSON, keep one copy."""
+        session = _patch_mcp_server
+        payload = {
+            "ok": True,
+            "response": "FOUND",
+            "links": [{"kind": "notion_page", "notion_id": "abc"}],
+        }
+        session.call_tool = AsyncMock(
+            return_value=_FakeCallToolResult(
+                content=[_FakeContentBlock(json.dumps(payload, ensure_ascii=False))],
+                structuredContent=payload,
+            )
+        )
+        handler = mcp_tool._make_tool_handler("test-server", "my-tool", 30.0)
+        raw = handler({})
+        data = json.loads(raw)
+        assert data == {"result": payload}
