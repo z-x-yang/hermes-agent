@@ -235,12 +235,16 @@ the main checkout.
   (one clean commit per feature), then `git worktree remove` + delete the
   branch. Don't pile unrelated work onto a long-lived branch.
 - **Only `git add` the files you changed — never `-A`/`.`** in a shared checkout.
-- **Share heavy assets; never rebuild them per worktree.** Symlink
-  `venv`/`.venv`/`node_modules`/datasets/model weights — anything large and
-  identical across worktrees (`scripts/run_tests.sh` already falls back to the
-  main `venv`). Treat them read-only: a task that must *change* a dependency or
-  dataset needs its own copy, else the change leaks into the live gateway. Keep
-  worktrees under `~/.hermes/worktrees/`, not `/tmp`.
+- **Reuse cross-worktree assets from the main checkout; don't rebuild them
+  per worktree** — the test is whether they're *identical across every
+  worktree*, not whether they're large:
+  - *Read-only* (datasets, model weights): symlink the main checkout's copy.
+  - *Writable* (`venv`/`.venv`/`node_modules`): never symlink — a
+    `pip`/`npm install` would write through the link into the live gateway's
+    deps. Tests reuse the main `venv` read-only via `scripts/run_tests.sh`'s
+    fallback; only a task that must *change* a dependency builds its own.
+
+  Keep worktrees under `~/.hermes/worktrees/`, not `/tmp`.
 - `scripts/worktree_doctor.py` reaps merged worktrees and flags stale ones
   (wired to cron) — but remove your own when done rather than relying on it.
 
