@@ -74,6 +74,36 @@ logger = logging.getLogger(__name__)
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
+def _should_self_heal_persistent_overload(
+    *,
+    reason,
+    consecutive_overload_errors,
+    threshold,
+    compression_enabled,
+    compression_attempts,
+    max_compression_attempts,
+):
+    """Decide whether a persistent origin-overload streak should trigger a
+    compression-based self-heal.
+
+    Origin-level intermittent overload (Cloudflare ``origin_bad_gateway`` 502,
+    or 503/529 ``overloaded``) lasts minutes — longer than the same-origin
+    retry budget can outlast, and heavy structured sessions get rejected while
+    light requests pass. Once we've seen ``threshold`` consecutive overload
+    errors on one request, compress the history into a lighter request (far
+    higher pass rate in a bad window, as manual ``/compress`` recovery proved)
+    and retry. Bounded by ``max_compression_attempts`` so a truly-bad window
+    (where even the light compression call 502s) fails honestly instead of
+    looping. A single transient blip never reaches ``threshold``.
+    """
+    return (
+        reason in (FailoverReason.server_error, FailoverReason.overloaded)
+        and consecutive_overload_errors >= threshold
+        and compression_enabled
+        and compression_attempts < max_compression_attempts
+    )
+
+
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
     parts = []
