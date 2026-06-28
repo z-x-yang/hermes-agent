@@ -81,8 +81,8 @@ class _FakeAgent:
     def _ensure_db_session(self):
         self._ensure_db_prompt_at_call = self._cached_system_prompt
 
-    def _restore_primary_runtime(self):
-        pass
+    def _restore_primary_runtime(self) -> bool:
+        return False
 
     def _cleanup_dead_connections(self):
         return False
@@ -243,6 +243,58 @@ def test_ensure_db_session_runs_after_system_prompt_restore():
     # The prompt was populated before the DB row was created.
     assert agent._ensure_db_prompt_at_call == "REBUILT-SYSTEM"
     assert agent._cached_system_prompt == "REBUILT-SYSTEM"
+
+
+def test_runtime_main_sync_happens_after_primary_restore():
+    """Auxiliary routing must not capture a stale fallback runtime.
+
+    Gateway reuses an ``AIAgent`` across messages. If a prior turn activated
+    fallback, the next turn's prologue restores the primary runtime before any
+    compression/title-generation auxiliary calls should resolve "main".  The
+    process-local ``set_runtime_main`` hook feeds those aux calls, so it must
+    observe the post-restore primary values, not the stale fallback values.
+    """
+    agent = _FakeAgent()
+    agent.provider = "openrouter"
+    agent.model = "anthropic/claude-sonnet-4"
+    agent.base_url = "https://openrouter.ai/api/v1"
+    agent.api_key = "fallback-key"
+    agent.api_mode = "chat_completions"
+
+    def _restore_primary_runtime():
+        agent.provider = "openai-codex"
+        agent.model = "gpt-5.5"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent.api_key = "primary-token"
+        agent.api_mode = "codex_responses"
+        return True
+
+    agent._restore_primary_runtime = _restore_primary_runtime
+    observed = []
+
+    def _record_runtime(provider, model, **kwargs):
+        observed.append(
+            {
+                "provider": provider,
+                "model": model,
+                "base_url": kwargs.get("base_url"),
+                "api_key": kwargs.get("api_key"),
+                "api_mode": kwargs.get("api_mode"),
+            }
+        )
+
+    with patch("agent.auxiliary_client.set_runtime_main", side_effect=_record_runtime):
+        _build(agent)
+
+    assert observed == [
+        {
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "primary-token",
+            "api_mode": "codex_responses",
+        }
+    ]
 
 
 # ── Between-turns MCP refresh (cache-safe late-binding) ──────────────────────
