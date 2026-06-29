@@ -969,6 +969,7 @@ Foreground (default): Commands return INSTANTLY when done, even if the timeout i
 Background: Set background=true to get a session_id. Almost always pair with notify_on_complete=true — bg without notify runs SILENTLY and you have no way to learn it finished short of calling process(action='poll') yourself. Two legitimate uses:
   (1) Long-lived processes that never exit (servers, watchers, daemons) — silent is correct, there's no exit to notify on.
   (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — MUST set notify_on_complete=true. Without it you'll either forget to poll or sit blocked waiting for the user to surface the result.
+For rare mid-process signals, watch_patterns can wake the agent when matching output appears, but do not rely on them to survive a gateway restart: local background output is pipe-backed, so after restart Hermes can recover PID/liveness but not continue scanning the old stdout stream.
 For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Hermes can track lifecycle and output.
 After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
 Use process(action="poll") for progress checks, process(action="wait") to block until done.
@@ -2368,6 +2369,7 @@ def terminal_tool(
                     "exit_code": 0,
                     "error": None,
                 }
+                checkpoint_after_notification_setup = False
                 if approval_note:
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
@@ -2523,6 +2525,7 @@ def terminal_tool(
                             proc_session.watcher_user_name = _gw_user_name
                             proc_session.watcher_thread_id = _gw_thread_id
                             proc_session.watcher_message_id = _gw_message_id
+                            checkpoint_after_notification_setup = True
 
                 # Mutual exclusion: if both notify_on_complete and watch_patterns
                 # are set, drop watch_patterns. The combination produces duplicate
@@ -2543,6 +2546,7 @@ def terminal_tool(
                 # Mark for agent notification on completion
                 if notify_on_complete and background:
                     proc_session.notify_on_complete = True
+                    checkpoint_after_notification_setup = True
                     result_data["notify_on_complete"] = True
 
                     # In gateway mode, auto-register a fast watcher so the
@@ -2550,6 +2554,7 @@ def terminal_tool(
                     # turn.  CLI mode uses the completion_queue directly.
                     if proc_session.watcher_platform:
                         proc_session.watcher_interval = 5
+                        checkpoint_after_notification_setup = True
                         process_registry.pending_watchers.append({
                             "session_id": proc_session.id,
                             "check_interval": 5,
@@ -2566,7 +2571,25 @@ def terminal_tool(
                 # Set watch patterns for output monitoring
                 if watch_patterns and background:
                     proc_session.watch_patterns = list(watch_patterns)
+                    checkpoint_after_notification_setup = True
                     result_data["watch_patterns"] = proc_session.watch_patterns
+
+                if checkpoint_after_notification_setup:
+                    try:
+                        process_registry._write_checkpoint()
+                    except Exception as _checkpoint_err:
+                        result_data["checkpoint_warning"] = (
+                            "Background process started, but Hermes could not refresh "
+                            "the restart-recovery checkpoint after notification metadata "
+                            f"setup: {_checkpoint_err}"
+                        )
+                        logger.warning(
+                            "background proc %s: failed to refresh checkpoint "
+                            "after notification metadata setup: %s",
+                            proc_session.id,
+                            _checkpoint_err,
+                            exc_info=True,
+                        )
 
                 return json.dumps(result_data, ensure_ascii=False)
             except Exception as e:

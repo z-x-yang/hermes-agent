@@ -1,4 +1,6 @@
-"""Regression tests for sudo detection and sudo password handling."""
+"""Regression tests for sudo detection and terminal background handling."""
+
+import time
 
 import tools.terminal_tool as terminal_tool
 
@@ -9,6 +11,89 @@ def setup_function():
 
 def teardown_function():
     terminal_tool._reset_cached_sudo_passwords()
+
+
+def test_background_notify_metadata_is_checkpointed_after_session_setup(monkeypatch, tmp_path):
+    """Gateway restart recovery needs watcher metadata persisted after spawn."""
+    import tools.process_registry as pr_module
+    from tools.process_registry import ProcessSession
+
+    class FakeEnv:
+        cwd = str(tmp_path)
+        timeout = 10
+        env = {}
+
+    proc_session = ProcessSession(
+        id="proc_checkpoint",
+        command="sleep 60",
+        task_id="default",
+        session_key="discord-session",
+        pid=12345,
+        started_at=time.time(),
+    )
+    checkpoint_snapshots = []
+
+    def fake_checkpoint():
+        checkpoint_snapshots.append({
+            "watcher_platform": proc_session.watcher_platform,
+            "watcher_chat_id": proc_session.watcher_chat_id,
+            "watcher_thread_id": proc_session.watcher_thread_id,
+            "watcher_user_id": proc_session.watcher_user_id,
+            "watcher_user_name": proc_session.watcher_user_name,
+            "watcher_message_id": proc_session.watcher_message_id,
+            "watcher_interval": proc_session.watcher_interval,
+            "notify_on_complete": proc_session.notify_on_complete,
+            "watch_patterns": list(proc_session.watch_patterns),
+        })
+
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setattr(terminal_tool, "_create_environment", lambda **_kw: FakeEnv())
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda *_a, **_kw: {"approved": True},
+    )
+    monkeypatch.setattr(
+        pr_module.process_registry,
+        "spawn_local",
+        lambda **_kw: proc_session,
+    )
+    monkeypatch.setattr(pr_module.process_registry, "_write_checkpoint", fake_checkpoint)
+    pr_module.process_registry.pending_watchers = []
+    terminal_tool._active_environments.clear()
+    terminal_tool._last_activity.clear()
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-2")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-3")
+    monkeypatch.setenv("HERMES_SESSION_USER_NAME", "Zongxin")
+    monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "message-4")
+
+    try:
+        result_json = terminal_tool.terminal_tool(
+            command="sleep 60",
+            background=True,
+            task_id="discord-session",
+            notify_on_complete=True,
+        )
+    finally:
+        terminal_tool._active_environments.clear()
+        terminal_tool._last_activity.clear()
+        pr_module.process_registry.pending_watchers = []
+
+    assert '"exit_code": 0' in result_json
+    assert checkpoint_snapshots == [{
+        "watcher_platform": "discord",
+        "watcher_chat_id": "channel-1",
+        "watcher_thread_id": "thread-2",
+        "watcher_user_id": "user-3",
+        "watcher_user_name": "Zongxin",
+        "watcher_message_id": "message-4",
+        "watcher_interval": 5,
+        "notify_on_complete": True,
+        "watch_patterns": [],
+    }]
 
 
 def test_searching_for_sudo_does_not_trigger_rewrite(monkeypatch):
@@ -28,6 +113,8 @@ def test_terminal_schema_advertises_persistent_env_state():
     assert "exported environment variables persist between calls" in description
     assert "activate a virtualenv" in description
     assert "do not re-source the same environment before every command" in description
+    assert "watch_patterns" in description
+    assert "do not rely on them to survive a gateway restart" in description
 
 
 def test_printf_literal_sudo_does_not_trigger_rewrite(monkeypatch):
