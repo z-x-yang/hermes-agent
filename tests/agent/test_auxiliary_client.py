@@ -5,7 +5,7 @@ import json
 import logging
 import time
 from types import SimpleNamespace
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock, AsyncMock, call
 
 import pytest
 
@@ -1688,6 +1688,13 @@ class TestIsPaymentError:
         setattr(exc, "status_code", 429)
         assert _is_payment_error(exc) is True
 
+    def test_error_code_429_usage_limit_reached_is_payment_without_status_attr(self):
+        exc = Exception(
+            "Error code: 429 - {'error': {'type': 'usage_limit_reached', "
+            "'message': 'The usage limit has been reached'}}"
+        )
+        assert _is_payment_error(exc) is True
+
     def test_404_generic_not_found_is_not_payment(self):
         exc = Exception("Not Found")
         exc.status_code = 404
@@ -2412,6 +2419,267 @@ class TestAuxiliaryFallbackLayering:
         assert fallback_client.chat.completions.create.called
         # Main agent fallback should NOT be needed when chain succeeds
         mock_main.assert_not_called()
+
+    def test_explicit_provider_uses_top_level_fallback_before_main_agent(self, monkeypatch):
+        """Explicit aux providers should still honor fallback_providers on capacity errors."""
+        primary_client = MagicMock()
+        usage_err = Exception(
+            "Error code: 429 - {'error': {'type': 'usage_limit_reached', "
+            "'message': 'The usage limit has been reached'}}"
+        )
+        primary_client.chat.completions.create.side_effect = usage_err
+
+        main_chain_client = MagicMock()
+        main_chain_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from top-level fallback"))
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("openai-codex", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")) as mock_task_chain, \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   return_value=(main_chain_client, "gpt-5.5", "gptcodex")) as mock_main_chain, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main_agent:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from top-level fallback"
+        mock_task_chain.assert_called_once_with(
+            "compression", "openai-codex", reason="payment error")
+        mock_main_chain.assert_called_once_with(
+            "compression", "openai-codex", reason="payment error")
+        mock_main_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_explicit_provider_uses_top_level_fallback_before_main_agent(self, monkeypatch):
+        """Async explicit aux calls use the same top-level fallback layer."""
+        primary_client = MagicMock()
+        usage_err = Exception(
+            "Error code: 429 - {'error': {'type': 'usage_limit_reached', "
+            "'message': 'The usage limit has been reached'}}"
+        )
+        primary_client.chat.completions.create = AsyncMock(side_effect=usage_err)
+
+        sync_main_chain_client = MagicMock()
+        async_main_chain_client = MagicMock()
+        async_main_chain_client.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from async top-level fallback"))
+        ]))
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("openai-codex", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")) as mock_task_chain, \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   return_value=(sync_main_chain_client, "gpt-5.5", "gptcodex")) as mock_main_chain, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main_agent, \
+             patch("agent.auxiliary_client._to_async_client",
+                   return_value=(async_main_chain_client, "gpt-5.5")):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from async top-level fallback"
+        mock_task_chain.assert_called_once_with(
+            "compression", "openai-codex", reason="payment error")
+        mock_main_chain.assert_called_once_with(
+            "compression", "openai-codex", reason="payment error")
+        mock_main_agent.assert_not_called()
+
+    def test_explicit_provider_continues_to_main_agent_when_top_level_fallback_fails(self, monkeypatch):
+        """A depleted fallback_providers entry must not block the final safety net."""
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_payment_err()
+
+        main_chain_client = MagicMock()
+        main_chain_client.chat.completions.create.side_effect = self._make_payment_err()
+
+        main_agent_client = MagicMock()
+        main_agent_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from main agent safety net"))
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("openai-codex", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   return_value=(main_chain_client, "gpt-5.5", "gptcodex")) as mock_main_chain, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                   return_value=(main_agent_client, "gpt-5.5", "main-agent(openai-codex)")) as mock_main_agent:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from main agent safety net"
+        assert main_chain_client.chat.completions.create.called
+        assert main_agent_client.chat.completions.create.called
+        assert mock_main_chain.call_args_list == [
+            call("compression", "openai-codex", reason="payment error"),
+            call(
+                "compression", "openai-codex",
+                reason="payment error", skip_providers={"gptcodex"},
+            ),
+        ]
+        mock_main_agent.assert_called_once_with(
+            "openai-codex", "compression",
+            reason="payment error", skip_providers={"gptcodex"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_explicit_provider_continues_to_main_agent_when_top_level_fallback_fails(self, monkeypatch):
+        """Async explicit aux calls preserve the final safety net after fallback failure."""
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(side_effect=self._make_payment_err())
+
+        sync_main_chain_client = MagicMock()
+        async_main_chain_client = MagicMock()
+        async_main_chain_client.chat.completions.create = AsyncMock(side_effect=self._make_payment_err())
+
+        sync_main_agent_client = MagicMock()
+        async_main_agent_client = MagicMock()
+        async_main_agent_client.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from async main agent safety net"))
+        ]))
+
+        async_clients = [
+            (async_main_chain_client, "gpt-5.5"),
+            (async_main_agent_client, "gpt-5.5"),
+        ]
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("openai-codex", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   return_value=(sync_main_chain_client, "gpt-5.5", "gptcodex")) as mock_main_chain, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                   return_value=(sync_main_agent_client, "gpt-5.5", "main-agent(openai-codex)")) as mock_main_agent, \
+             patch("agent.auxiliary_client._to_async_client",
+                   side_effect=async_clients):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from async main agent safety net"
+        assert async_main_chain_client.chat.completions.create.await_count == 1
+        assert async_main_agent_client.chat.completions.create.await_count == 1
+        assert mock_main_chain.call_args_list == [
+            call("compression", "openai-codex", reason="payment error"),
+            call(
+                "compression", "openai-codex",
+                reason="payment error", skip_providers={"gptcodex"},
+            ),
+        ]
+        mock_main_agent.assert_called_once_with(
+            "openai-codex", "compression",
+            reason="payment error", skip_providers={"gptcodex"},
+        )
+
+    def test_explicit_provider_exhausts_top_level_chain_entries_before_main_agent(self, monkeypatch):
+        """If one fallback_providers entry is depleted, keep walking that chain."""
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_payment_err()
+
+        depleted_fallback_client = MagicMock()
+        depleted_fallback_client.chat.completions.create.side_effect = self._make_payment_err()
+
+        healthy_fallback_client = MagicMock()
+        healthy_fallback_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from second top-level fallback"))
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("openai-codex", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   side_effect=[
+                       (depleted_fallback_client, "gpt-5.4", "openrouter"),
+                       (healthy_fallback_client, "gpt-5.5", "gptcodex"),
+                   ]) as mock_main_chain, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main_agent:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from second top-level fallback"
+        assert depleted_fallback_client.chat.completions.create.called
+        assert healthy_fallback_client.chat.completions.create.called
+        assert mock_main_chain.call_args_list == [
+            call("compression", "openai-codex", reason="payment error"),
+            call(
+                "compression", "openai-codex",
+                reason="payment error", skip_providers={"openrouter"},
+            ),
+        ]
+        mock_main_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_explicit_provider_exhausts_top_level_chain_entries_before_main_agent(self, monkeypatch):
+        """Async fallback keeps walking top-level entries before the safety net."""
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(side_effect=self._make_payment_err())
+
+        sync_depleted_client = MagicMock()
+        sync_healthy_client = MagicMock()
+        async_depleted_client = MagicMock()
+        async_depleted_client.chat.completions.create = AsyncMock(side_effect=self._make_payment_err())
+        async_healthy_client = MagicMock()
+        async_healthy_client.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from async second top-level fallback"))
+        ]))
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("openai-codex", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   side_effect=[
+                       (sync_depleted_client, "gpt-5.4", "openrouter"),
+                       (sync_healthy_client, "gpt-5.5", "gptcodex"),
+                   ]) as mock_main_chain, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main_agent, \
+             patch("agent.auxiliary_client._to_async_client",
+                   side_effect=[
+                       (async_depleted_client, "gpt-5.4"),
+                       (async_healthy_client, "gpt-5.5"),
+                   ]):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from async second top-level fallback"
+        assert async_depleted_client.chat.completions.create.await_count == 1
+        assert async_healthy_client.chat.completions.create.await_count == 1
+        assert mock_main_chain.call_args_list == [
+            call("compression", "openai-codex", reason="payment error"),
+            call(
+                "compression", "openai-codex",
+                reason="payment error", skip_providers={"openrouter"},
+            ),
+        ]
+        mock_main_agent.assert_not_called()
 
 
     def test_warning_emitted_when_all_fallbacks_exhausted(self, monkeypatch, caplog):

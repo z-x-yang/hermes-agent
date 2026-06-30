@@ -2649,6 +2649,7 @@ def _is_payment_error(exc: Exception) -> bool:
             "not available on the free tier",
             "requires a subscription", "upgrade for access",
             "upgrade for higher limits", "reached your session usage limit",
+            "usage_limit_reached", "usage limit has been reached",
             # Daily / monthly / weekly quota exhaustion keywords
             "quota exceeded", "quota_exceeded",
             "too many tokens per day", "daily limit",
@@ -2987,6 +2988,37 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
         and "llm returned invalid response" in msg
         and "choices[0].message" in msg
     )
+
+
+def _is_auxiliary_fallback_error(exc: Exception) -> bool:
+    """Return True for auxiliary failures that should advance fallback layers."""
+    return (
+        _is_payment_error(exc)
+        or _is_connection_error(exc)
+        or _is_rate_limit_error(exc)
+        or _is_model_incompatible_error(exc)
+        or _is_invalid_aux_response_error(exc)
+    )
+
+
+def _fallback_failed_provider_label(
+    provider_label: str,
+    client: Any = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Best-effort provider name for skipping a failed fallback candidate."""
+    recovered = ""
+    if client is not None:
+        try:
+            recovered = _recoverable_pool_provider(
+                provider_label, client, main_runtime=main_runtime
+            ) or ""
+        except Exception:
+            recovered = ""
+    label = str(recovered or provider_label or "").strip()
+    if label.endswith(")") and "(" in label:
+        label = label.rsplit("(", 1)[1][:-1]
+    return label.strip()
 
 
 def _evict_cached_clients(provider: str) -> None:
@@ -3361,6 +3393,7 @@ def _try_payment_fallback(
     failed_provider: str,
     task: str = None,
     reason: str = "payment error",
+    skip_providers: Optional[set[str]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try alternative providers after a payment/credit or connection error.
 
@@ -3376,6 +3409,10 @@ def _try_payment_fallback(
     # (e.g. main_provider="openrouter" → skip "openrouter" in chain)
     main_provider = _read_main_provider()
     skip_labels = {skip}
+    for provider in skip_providers or set():
+        provider = str(provider or "").strip().lower()
+        if provider:
+            skip_labels.add(provider)
     if main_provider and main_provider.lower() in skip:
         skip_labels.add(main_provider.lower())
     # Map common resolved_provider values back to chain labels.
@@ -3412,6 +3449,7 @@ def _try_main_agent_model_fallback(
     failed_provider: str,
     task: str = None,
     reason: str = "error",
+    skip_providers: Optional[set[str]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Last-resort fallback to the user's main agent provider + model.
 
@@ -3432,7 +3470,12 @@ def _try_main_agent_model_fallback(
         return None, None, ""
 
     skip = (failed_provider or "").lower().strip()
-    if main_provider.lower() == skip:
+    extra_skip = {
+        str(provider or "").strip().lower()
+        for provider in (skip_providers or set())
+        if str(provider or "").strip()
+    }
+    if main_provider.lower() == skip or main_provider.lower() in extra_skip:
         # The thing that failed IS the main model — nothing to fall back to.
         return None, None, ""
     if _is_provider_unhealthy(main_provider):
@@ -3543,6 +3586,7 @@ def _try_configured_fallback_chain(
     task: str,
     failed_provider: str,
     reason: str = "error",
+    skip_providers: Optional[set[str]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -3561,7 +3605,12 @@ def _try_configured_fallback_chain(
     if not chain or not isinstance(chain, list):
         return None, None, ""
 
-    skip = failed_provider.lower().strip()
+    skip = {failed_provider.lower().strip()}
+    skip.update(
+        str(provider or "").strip().lower()
+        for provider in (skip_providers or set())
+        if str(provider or "").strip()
+    )
     tried = []
     min_ctx = _task_minimum_context_length(task)
 
@@ -3569,7 +3618,7 @@ def _try_configured_fallback_chain(
         if not isinstance(entry, dict):
             continue
         fb_provider = str(entry.get("provider", "")).strip()
-        if not fb_provider or fb_provider.lower() == skip:
+        if not fb_provider or fb_provider.lower() in skip:
             continue
         fb_model = str(entry.get("model", "")).strip() or None
 
@@ -3665,6 +3714,7 @@ def _try_main_fallback_chain(
     task: Optional[str],
     failed_provider: str = "",
     reason: str = "error",
+    skip_providers: Optional[set[str]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try the top-level main-agent fallback chain for an auxiliary call.
 
@@ -3689,6 +3739,11 @@ def _try_main_fallback_chain(
     failed_norm = (failed_provider or "").strip().lower()
     main_norm = (_read_main_provider() or "").strip().lower()
     skip = {p for p in (failed_norm, main_norm, "auto") if p}
+    skip.update(
+        str(provider or "").strip().lower()
+        for provider in (skip_providers or set())
+        if str(provider or "").strip()
+    )
     tried: List[str] = []
     min_ctx = _task_minimum_context_length(task)
 
@@ -6057,6 +6112,12 @@ def call_llm(
                     client, final_model = fb_client, fb_model
                     resolved_provider = fb_label or resolved_provider
                 else:
+                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
+                        task, _explicit, reason="provider unavailable")
+                    if fb_client is not None:
+                        client, final_model = fb_client, fb_model
+                        resolved_provider = fb_label or resolved_provider
+                if client is None:
                     raise RuntimeError(
                         f"Provider '{_explicit}' is set in config.yaml but no API key "
                         f"was found. Set the {_explicit.upper()}_API_KEY environment "
@@ -6487,41 +6548,84 @@ def call_llm(
 
             # Fallback order (#26882, #26803):
             #   1. User-configured fallback_chain (per-task) if set
-            #   2. For auto: top-level main fallback_providers/fallback_model
+            #   2. Top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
-            fb_client, fb_model, fb_label = (None, None, "")
-            if is_auto:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_payment_fallback(
-                        resolved_provider, task, reason=reason)
-            else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason)
+            failed_fallback_providers: set[str] = set()
 
-            if fb_client is not None:
-                fb_kwargs = _build_call_kwargs(
-                    fb_label, fb_model, messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, timeout=effective_timeout,
-                    extra_body=effective_extra_body,
-                    base_url=str(getattr(fb_client, "base_url", "") or ""))
-                return _validate_llm_response(
-                    fb_client.chat.completions.create(**fb_kwargs), task)
+            def _configured_layer():
+                kwargs = {"skip_providers": failed_fallback_providers} if failed_fallback_providers else {}
+                return _try_configured_fallback_chain(
+                    task, resolved_provider or "auto", reason=reason, **kwargs)
+
+            def _main_chain_layer():
+                kwargs = {"skip_providers": failed_fallback_providers} if failed_fallback_providers else {}
+                return _try_main_fallback_chain(
+                    task, resolved_provider or "auto", reason=reason, **kwargs)
+
+            fallback_layers = [_configured_layer, _main_chain_layer]
+            if is_auto:
+                def _builtin_layer():
+                    kwargs = {"skip_providers": failed_fallback_providers} if failed_fallback_providers else {}
+                    return _try_payment_fallback(
+                        resolved_provider, task, reason=reason, **kwargs)
+                fallback_layers.append(_builtin_layer)
+            else:
+                def _main_agent_layer():
+                    kwargs = {"skip_providers": failed_fallback_providers} if failed_fallback_providers else {}
+                    return _try_main_agent_model_fallback(
+                        resolved_provider, task, reason=reason, **kwargs)
+                fallback_layers.append(_main_agent_layer)
+
+            for fallback_layer in fallback_layers:
+                while True:
+                    fb_client, fb_model, fb_label = fallback_layer()
+                    if fb_client is None:
+                        break
+                    fb_failed_provider = _fallback_failed_provider_label(
+                        fb_label, fb_client, main_runtime=main_runtime)
+                    fb_failed_norm = fb_failed_provider.lower()
+                    if fb_failed_norm and fb_failed_norm in failed_fallback_providers:
+                        logger.debug(
+                            "Auxiliary %s: fallback layer returned already-failed provider %s; moving on",
+                            task or "call", fb_failed_provider,
+                        )
+                        break
+                    fb_kwargs = _build_call_kwargs(
+                        fb_label, fb_model or "", messages,
+                        temperature=temperature, max_tokens=max_tokens,
+                        tools=tools, timeout=effective_timeout,
+                        extra_body=effective_extra_body,
+                        base_url=str(getattr(fb_client, "base_url", "") or ""))
+                    try:
+                        return _validate_llm_response(
+                            fb_client.chat.completions.create(**fb_kwargs), task)
+                    except Exception as fallback_err:
+                        if not _is_auxiliary_fallback_error(fallback_err):
+                            raise
+                        if fb_failed_norm:
+                            failed_fallback_providers.add(fb_failed_norm)
+                        if _is_payment_error(fallback_err):
+                            _mark_provider_unhealthy(fb_failed_provider or fb_label)
+                        if _is_connection_error(fallback_err):
+                            try:
+                                _evict_cached_client_instance(fb_client)
+                            except Exception:
+                                logger.debug(
+                                    "Auxiliary: cache eviction after fallback connection error failed",
+                                    exc_info=True,
+                                )
+                        logger.info(
+                            "Auxiliary %s: fallback %s failed with %s; trying next fallback",
+                            task or "call", fb_label or "unknown", fallback_err,
+                        )
+                        continue
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
             # (#26882) The error itself is re-raised below.
             logger.warning(
                 "Auxiliary %s: %s on %s and all fallbacks exhausted "
-                "(fallback_chain + main agent model). Raising original error.",
+                "(fallback_chain + fallback_providers + main agent model). Raising original error.",
                 task or "call", reason, resolved_provider,
             )
         # Connection/timeout errors leave the cached client poisoned (closed
@@ -6663,6 +6767,14 @@ async def async_call_llm(
                     )
                     resolved_provider = fb_label or resolved_provider
                 else:
+                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
+                        task, _explicit, reason="provider unavailable")
+                    if fb_client is not None:
+                        client, final_model = _to_async_client(
+                            fb_client, fb_model or "", is_vision=(task == "vision")
+                        )
+                        resolved_provider = fb_label or resolved_provider
+                if client is None:
                     raise RuntimeError(
                         f"Provider '{_explicit}' is set in config.yaml but no API key "
                         f"was found. Set the {_explicit.upper()}_API_KEY environment "
@@ -6988,45 +7100,88 @@ async def async_call_llm(
 
             # Fallback order (#26882, #26803):
             #   1. User-configured fallback_chain (per-task) if set
-            #   2. For auto: top-level main fallback_providers/fallback_model
+            #   2. Top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
-            fb_client, fb_model, fb_label = (None, None, "")
-            if is_auto:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_payment_fallback(
-                        resolved_provider, task, reason=reason)
-            else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason)
+            failed_fallback_providers: set[str] = set()
 
-            if fb_client is not None:
-                fb_kwargs = _build_call_kwargs(
-                    fb_label, fb_model, messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, timeout=effective_timeout,
-                    extra_body=effective_extra_body,
-                    base_url=str(getattr(fb_client, "base_url", "") or ""))
-                # Convert sync fallback client to async
-                async_fb, async_fb_model = _to_async_client(
-                    fb_client, fb_model or "", is_vision=(task == "vision")
-                )
-                if async_fb_model and async_fb_model != fb_kwargs.get("model"):
-                    fb_kwargs["model"] = async_fb_model
-                return _validate_llm_response(
-                    await async_fb.chat.completions.create(**fb_kwargs), task)
+            def _configured_layer():
+                kwargs = {"skip_providers": failed_fallback_providers} if failed_fallback_providers else {}
+                return _try_configured_fallback_chain(
+                    task, resolved_provider or "auto", reason=reason, **kwargs)
+
+            def _main_chain_layer():
+                kwargs = {"skip_providers": failed_fallback_providers} if failed_fallback_providers else {}
+                return _try_main_fallback_chain(
+                    task, resolved_provider or "auto", reason=reason, **kwargs)
+
+            fallback_layers = [_configured_layer, _main_chain_layer]
+            if is_auto:
+                def _builtin_layer():
+                    kwargs = {"skip_providers": failed_fallback_providers} if failed_fallback_providers else {}
+                    return _try_payment_fallback(
+                        resolved_provider, task, reason=reason, **kwargs)
+                fallback_layers.append(_builtin_layer)
+            else:
+                def _main_agent_layer():
+                    kwargs = {"skip_providers": failed_fallback_providers} if failed_fallback_providers else {}
+                    return _try_main_agent_model_fallback(
+                        resolved_provider, task, reason=reason, **kwargs)
+                fallback_layers.append(_main_agent_layer)
+
+            for fallback_layer in fallback_layers:
+                while True:
+                    fb_client, fb_model, fb_label = fallback_layer()
+                    if fb_client is None:
+                        break
+                    fb_failed_provider = _fallback_failed_provider_label(fb_label, fb_client)
+                    fb_failed_norm = fb_failed_provider.lower()
+                    if fb_failed_norm and fb_failed_norm in failed_fallback_providers:
+                        logger.debug(
+                            "Auxiliary %s (async): fallback layer returned already-failed provider %s; moving on",
+                            task or "call", fb_failed_provider,
+                        )
+                        break
+                    fb_kwargs = _build_call_kwargs(
+                        fb_label, fb_model or "", messages,
+                        temperature=temperature, max_tokens=max_tokens,
+                        tools=tools, timeout=effective_timeout,
+                        extra_body=effective_extra_body,
+                        base_url=str(getattr(fb_client, "base_url", "") or ""))
+                    # Convert sync fallback client to async
+                    async_fb, async_fb_model = _to_async_client(
+                        fb_client, fb_model or "", is_vision=(task == "vision")
+                    )
+                    if async_fb_model and async_fb_model != fb_kwargs.get("model"):
+                        fb_kwargs["model"] = async_fb_model
+                    try:
+                        return _validate_llm_response(
+                            await async_fb.chat.completions.create(**fb_kwargs), task)
+                    except Exception as fallback_err:
+                        if not _is_auxiliary_fallback_error(fallback_err):
+                            raise
+                        if fb_failed_norm:
+                            failed_fallback_providers.add(fb_failed_norm)
+                        if _is_payment_error(fallback_err):
+                            _mark_provider_unhealthy(fb_failed_provider or fb_label)
+                        if _is_connection_error(fallback_err):
+                            try:
+                                _evict_cached_client_instance(async_fb)
+                                _evict_cached_client_instance(fb_client)
+                            except Exception:
+                                logger.debug(
+                                    "Auxiliary (async): cache eviction after fallback connection error failed",
+                                    exc_info=True,
+                                )
+                        logger.info(
+                            "Auxiliary %s (async): fallback %s failed with %s; trying next fallback",
+                            task or "call", fb_label or "unknown", fallback_err,
+                        )
+                        continue
             # All fallback layers exhausted — warn before re-raising. (#26882)
             logger.warning(
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "
-                "(fallback_chain + main agent model). Raising original error.",
+                "(fallback_chain + fallback_providers + main agent model). Raising original error.",
                 task or "call", reason, resolved_provider,
             )
         # Mirror the sync path: drop poisoned clients on connection/timeout

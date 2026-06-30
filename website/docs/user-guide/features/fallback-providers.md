@@ -167,7 +167,7 @@ fallback_providers:
 | Messaging gateway (Telegram, Discord, etc.) | ✔ |
 | Subagent delegation | ✔ (subagents inherit the parent fallback chain) |
 | Cron jobs | ✔ (cron agents inherit configured fallback providers) |
-| Auxiliary tasks on `provider: auto` | ✔ (try per-task fallback, then the main fallback chain before built-in aux discovery) |
+| Auxiliary tasks | ✔ (`provider: auto` tries per-task fallback, then the main fallback chain before built-in aux discovery; explicit aux providers also use the main fallback chain on capacity errors) |
 
 :::tip
 There are no environment variables for the primary fallback chain — configure it exclusively through `config.yaml` or `hermes fallback`. This is intentional: fallback configuration is a deliberate choice, not something a stale shell export should override.
@@ -201,7 +201,7 @@ Main provider + main model → auxiliary.<task>.fallback_chain →
 fallback_providers / fallback_model → built-in auxiliary discovery chain
 ```
 
-The task-specific chain is most precise and wins when present. The top-level `fallback_providers` chain is the same policy the main agent uses, so free-only or same-provider fallback rules apply to auxiliary tasks on `auto` as well.
+The task-specific chain is most precise and wins when present. The top-level `fallback_providers` chain is the same policy the main agent uses, so free-only or same-provider fallback rules apply to auxiliary tasks on `auto` and to explicit auxiliary providers when they hit capacity errors.
 
 **Built-in text discovery chain (compression, web extract, title generation, etc.):**
 
@@ -251,7 +251,7 @@ auxiliary:
     model: ""
 ```
 
-Every task above follows the same **provider / model / base_url** pattern. Each task can also declare its own `fallback_chain`; if omitted, `provider: auto` uses the top-level `fallback_providers` chain before Hermes' built-in auxiliary discovery chain.
+Every task above follows the same **provider / model / base_url** pattern. Each task can also declare its own `fallback_chain`; if omitted, capacity errors use the top-level `fallback_providers` chain. For `provider: auto`, Hermes then continues to the built-in auxiliary discovery chain; for explicit providers, Hermes uses the main agent model as the final safety net.
 
 Context compression is configured under `auxiliary.compression`:
 
@@ -305,20 +305,21 @@ auxiliary:
 
 ## Auxiliary Capacity-Error Fallback
 
-When you set an explicit auxiliary provider (e.g. `auxiliary.vision.provider: glm`), Hermes treats that as your preferred choice — but if the provider literally cannot serve the request because of a **capacity error** (HTTP 402 payment required, HTTP 429 daily-quota exhaustion, connection failure), Hermes falls back through a layered chain instead of failing silently:
+When you set an explicit auxiliary provider (e.g. `auxiliary.vision.provider: glm`), Hermes treats that as your preferred choice — but if the provider literally cannot serve the request because of a **capacity error** (HTTP 402 payment required, HTTP 429 rate/usage/quota exhaustion, connection failure), Hermes falls back through a layered chain instead of failing silently:
 
 1. **Primary aux provider** — the one you configured (tried first, always)
 2. **`auxiliary.<task>.fallback_chain`** — your per-task override list, if you wrote one
-3. **Main agent provider + model** — last-resort safety net (always tried, even if you didn't write a chain)
-4. **Warn + re-raise** — if every layer fails, Hermes logs `Auxiliary <task>: ... all fallbacks exhausted` at WARNING level and re-raises the original error
+3. **Top-level `fallback_providers` / `fallback_model`** — the same fallback policy the main agent uses
+4. **Main agent provider + model** — last-resort safety net (always tried, even if you didn't write a chain)
+5. **Warn + re-raise** — if every layer fails, Hermes logs `Auxiliary <task>: ... all fallbacks exhausted` at WARNING level and re-raises the original error
 
-Transient HTTP 429 rate limits (`Retry-After: ...`) are treated as request constraints, not capacity problems — they respect your explicit provider choice and do **not** trigger the fallback ladder. Only daily/monthly quota exhaustion, payment errors, and connection failures bypass the explicit-provider gate.
+HTTP 429s that survive the local same-provider recovery path are treated as capacity problems, including provider-specific `usage_limit_reached` errors where the SDK exposes only an error string. They bypass the explicit-provider gate so compression, web extraction, and other side tasks can keep running through your fallback policy.
 
-For users on `provider: auto` (no explicit aux provider), the existing auto-detection chain runs in place of steps 2–3. Its first step is already the main agent model, so `auto` users get the same outcome with zero config.
+For users on `provider: auto` (no explicit aux provider), the existing auto-detection chain runs in place of the final main-agent safety net. Its first step is already the main agent model, so `auto` users get the same outcome with zero config.
 
 ### Optional: per-task fallback chain
 
-If you want a different fallback ordering than "main agent model first", configure `fallback_chain` explicitly. Each entry needs at least `provider`; `model`, `base_url`, and `api_key` are optional.
+If you want a different fallback ordering before the top-level fallback chain, configure `fallback_chain` explicitly. Each entry needs at least `provider`; `model`, `base_url`, and `api_key` are optional.
 
 ```yaml
 auxiliary:
