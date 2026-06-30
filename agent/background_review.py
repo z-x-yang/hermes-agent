@@ -63,6 +63,7 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
         "base_url": parent_runtime.get("base_url") or None,
         "api_mode": parent_api_mode,
         "routed": False,
+        "reasoning_config": None,
     }
     try:
         from hermes_cli.config import load_config
@@ -75,6 +76,8 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
     task_model = (str(task.get("model", "")).strip() or None)
     task_base_url = (str(task.get("base_url", "")).strip() or None)
     task_api_key = (str(task.get("api_key", "")).strip() or None)
+    from hermes_constants import parse_auxiliary_reasoning_config
+    parent["reasoning_config"] = parse_auxiliary_reasoning_config(task)
     if not (task_provider and task_provider != "auto" and task_model):
         return parent
     if task_provider == (agent.provider or "") and task_model == (agent.model or ""):
@@ -94,6 +97,7 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
             "base_url": rp.get("base_url"),
             "api_mode": rp.get("api_mode"),
             "routed": True,
+            "reasoning_config": parent.get("reasoning_config"),
         }
     except Exception as e:
         logger.debug("background-review aux routing failed (%s); using main model", e)
@@ -658,6 +662,7 @@ def _run_review_in_thread(
                 parent_session_id=agent.session_id,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                reasoning_config=_rt.get("reasoning_config"),
                 skip_memory=True,
             )
             review_agent._memory_write_origin = "background_review"

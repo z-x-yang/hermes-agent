@@ -76,6 +76,19 @@ def test_routing_same_model_as_parent_is_not_routed():
     assert rt["routed"] is False  # same model/provider → keep full-replay path
 
 
+def test_aux_reasoning_config_applies_without_routing():
+    agent = _FakeAgent(provider="openai-codex", model="gpt-5.5")
+    cfg = {"auxiliary": {"background_review": {
+        "provider": "auto",
+        "model": "",
+        "extra_body": {"reasoning": {"enabled": True, "effort": "high"}},
+    }}}
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        rt = br._resolve_review_runtime(agent)
+    assert rt["routed"] is False
+    assert rt["reasoning_config"] == {"enabled": True, "effort": "high"}
+
+
 def test_routing_resolution_failure_falls_back_to_parent():
     agent = _FakeAgent()
     cfg = {"auxiliary": {"background_review": {

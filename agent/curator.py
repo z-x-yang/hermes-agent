@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, parse_auxiliary_reasoning_config
 from tools import skill_usage
 from utils import atomic_json_write
 
@@ -51,6 +51,7 @@ class _ReviewRuntimeBinding(NamedTuple):
     model: str
     explicit_api_key: Optional[str]
     explicit_base_url: Optional[str]
+    reasoning_config: Optional[Dict[str, Any]]
 
 
 DEFAULT_INTERVAL_HOURS = 24 * 7  # 7 days
@@ -1758,12 +1759,14 @@ def _resolve_review_runtime(cfg: Dict[str, Any]) -> _ReviewRuntimeBinding:
     _cur_task = _aux.get("curator", {}) if isinstance(_aux.get("curator"), dict) else {}
     _task_provider = (_cur_task.get("provider") or "").strip() or None
     _task_model = (_cur_task.get("model") or "").strip() or None
+    _task_reasoning = parse_auxiliary_reasoning_config(_cur_task)
     if _task_provider and _task_provider != "auto" and _task_model:
         return _ReviewRuntimeBinding(
             _task_provider,
             _task_model,
             _strip_aux_credential(_cur_task.get("api_key")),
             _strip_aux_credential(_cur_task.get("base_url")),
+            _task_reasoning,
         )
 
     # 2. Legacy curator.auxiliary.{provider,model} (deprecated, pre-unification)
@@ -1771,6 +1774,7 @@ def _resolve_review_runtime(cfg: Dict[str, Any]) -> _ReviewRuntimeBinding:
     _legacy = _cur.get("auxiliary", {}) if isinstance(_cur.get("auxiliary"), dict) else {}
     _legacy_provider = _legacy.get("provider") or None
     _legacy_model = _legacy.get("model") or None
+    _legacy_reasoning = parse_auxiliary_reasoning_config(_legacy)
     if _legacy_provider and _legacy_model:
         logger.info(
             "curator: using deprecated curator.auxiliary.{provider,model} "
@@ -1781,10 +1785,11 @@ def _resolve_review_runtime(cfg: Dict[str, Any]) -> _ReviewRuntimeBinding:
             str(_legacy_model),
             _strip_aux_credential(_legacy.get("api_key")),
             _strip_aux_credential(_legacy.get("base_url")),
+            _legacy_reasoning,
         )
 
     # 3. Fall through to the main chat model
-    return _ReviewRuntimeBinding(_main_provider, _main_model, None, None)
+    return _ReviewRuntimeBinding(_main_provider, _main_model, None, None, _task_reasoning)
 
 
 def _resolve_review_model(cfg: Dict[str, Any]) -> tuple[str, str]:
@@ -1849,6 +1854,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
     _api_key = None
     _base_url = None
     _api_mode = None
+    _reasoning_config = None
     _resolved_provider = None
     _model_name = ""
     try:
@@ -1857,6 +1863,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         _cfg = load_config()
         _binding = _resolve_review_runtime(_cfg)
         _provider, _model_name = _binding.provider, _binding.model
+        _reasoning_config = _binding.reasoning_config
         _rp = resolve_runtime_provider(
             requested=_provider,
             target_model=_model_name,
@@ -1881,6 +1888,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             api_key=_api_key,
             base_url=_base_url,
             api_mode=_api_mode,
+            reasoning_config=_reasoning_config,
             # Umbrella-building over a large skill collection is worth a
             # high iteration ceiling — the pass typically takes 50-100
             # API calls against hundreds of candidate skills. The

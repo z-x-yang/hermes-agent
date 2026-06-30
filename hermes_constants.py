@@ -820,6 +820,40 @@ def parse_reasoning_effort(effort) -> dict | None:
     return None
 
 
+def parse_auxiliary_reasoning_config(task_config: object) -> dict | None:
+    """Extract AIAgent reasoning_config from auxiliary.<task>.extra_body.reasoning.
+
+    Normal auxiliary calls send ``extra_body.reasoning`` directly. Forked
+    AIAgent-based auxiliary tasks need the same dial converted to the main
+    agent's ``reasoning_config`` shape before constructing the fork.
+    """
+    if not isinstance(task_config, dict):
+        return None
+    extra_body = task_config.get("extra_body")
+    if not isinstance(extra_body, dict):
+        return None
+    reasoning = extra_body.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return None
+
+    if reasoning.get("enabled") is False:
+        return {"enabled": False}
+
+    raw_effort = reasoning.get("effort")
+    effort = str(raw_effort).strip().lower() if raw_effort is not None else ""
+    if effort:
+        parsed = parse_reasoning_effort(effort)
+        if parsed is not None:
+            return parsed
+        # Preserve unknown non-empty efforts so the backend/transport fails
+        # explicitly instead of silently downgrading to a default effort.
+        return {"enabled": True, "effort": effort}
+
+    if reasoning.get("enabled") is True:
+        return {"enabled": True}
+    return None
+
+
 def is_termux() -> bool:
     """Return True when running inside a Termux (Android) environment.
 

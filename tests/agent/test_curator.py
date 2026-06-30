@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from unittest.mock import patch
 
 
 @pytest.fixture
@@ -62,6 +63,71 @@ def _write_skill(skills_dir: Path, name: str):
         f"---\nname: {name}\ndescription: x\n---\n", encoding="utf-8",
     )
     return d
+
+
+# ---------------------------------------------------------------------------
+# Auxiliary model runtime
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_review_runtime_includes_aux_reasoning_config():
+    import agent.curator as curator
+
+    cfg = {
+        "model": {"provider": "openai-codex", "default": "gpt-5.5"},
+        "auxiliary": {"curator": {
+            "provider": "auto",
+            "model": "",
+            "extra_body": {"reasoning": {"enabled": True, "effort": "high"}},
+        }},
+    }
+
+    binding = curator._resolve_review_runtime(cfg)
+
+    assert binding.provider == "openai-codex"
+    assert binding.model == "gpt-5.5"
+    assert binding.reasoning_config == {"enabled": True, "effort": "high"}
+
+
+def test_run_llm_review_passes_aux_reasoning_config_to_fork(monkeypatch):
+    import run_agent
+    import agent.curator as curator
+
+    captured = {}
+
+    class _Recorder:
+        def __init__(self, *args, **kwargs):
+            captured["kwargs"] = kwargs
+            self._session_messages = []
+            self._memory_nudge_interval = None
+            self._skill_nudge_interval = None
+            self._memory_write_origin = None
+
+        def run_conversation(self, *args, **kwargs):
+            return {"final_response": "review complete"}
+
+    cfg = {
+        "model": {"provider": "openai-codex", "default": "gpt-5.5"},
+        "auxiliary": {"curator": {
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "extra_body": {"reasoning": {"enabled": True, "effort": "high"}},
+        }},
+    }
+    fake_runtime = {
+        "provider": "openai-codex",
+        "api_key": "test-key",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_mode": "codex_responses",
+    }
+
+    with patch("hermes_cli.config.load_config", return_value=cfg), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=fake_runtime), \
+         patch.object(run_agent, "AIAgent", _Recorder):
+        result = curator._run_llm_review("review prompt")
+
+    assert result["summary"] == "review complete"
+    assert captured["kwargs"]["reasoning_config"] == {"enabled": True, "effort": "high"}
 
 
 # ---------------------------------------------------------------------------
