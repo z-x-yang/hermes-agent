@@ -2262,6 +2262,50 @@ class TestAuxiliaryFallbackLayering:
         )
         mock_main.assert_not_called()
 
+    def test_empty_content_response_triggers_fallback(self, monkeypatch):
+        """HTTP-200 with well-formed ``choices`` but EMPTY message *content*
+        must also advance to the fallback chain — not only empty ``choices``.
+
+        This is the live codex ``gpt-5.5`` failure mode ("Context compression
+        LLM returned empty content"): the backend returned a valid
+        ChatCompletion whose content was blank, which passed validation and so
+        the explicit-provider compression call aborted with no fallback tried.
+        With the fix, an explicit-provider (non-auto) compression call routes
+        empty content through the same capacity-error gate to gptcodex."""
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="", tool_calls=None),
+                finish_reason="stop",
+            )],
+            model="gpt-5.5",
+        )
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from fallback chain"))
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("openai-codex", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fallback_client, "gpt-5.5", "fallback_chain[0](gptcodex)")) as mock_chain, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result.choices[0].message.content == "from fallback chain"
+        mock_chain.assert_called_once_with(
+            "compression",
+            "openai-codex",
+            reason="invalid provider response",
+        )
+        mock_main.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_async_invalid_empty_choices_response_triggers_fallback(self, monkeypatch):
         """Async aux calls use the same malformed-response fallback path."""
@@ -5548,3 +5592,85 @@ class TestCompressionFallbackContextFilter:
         # Empty / unknown tasks have no minimum
         assert _task_minimum_context_length("") is None
         assert _task_minimum_context_length(None) is None
+
+
+class TestValidateLLMResponseEmptyContent:
+    """A provider that returns HTTP 200 with an empty/whitespace body must be
+    treated as an *invalid auxiliary response* so ``call_llm`` advances to the
+    next fallback provider — instead of the empty body reaching the compressor
+    and aborting compaction with no fallback attempted.
+
+    Root cause of the live "Context compression LLM returned empty content
+    (provider=openai-codex model=gpt-5.5)" abort: the codex backend returned a
+    well-formed ChatCompletion whose ``message.content`` was empty. That passed
+    ``_validate_llm_response`` (a ``message`` exists), so call_llm saw success
+    and never tried the configured ``fallback_providers`` (gptcodex). The fix
+    makes empty content (without tool_calls, unrecoverable) raise the same
+    invalid-aux-response error that already bypasses the explicit-provider gate.
+    """
+
+    @staticmethod
+    def _resp(content, tool_calls=None, **extra):
+        msg = SimpleNamespace(content=content)
+        if tool_calls is not None:
+            msg.tool_calls = tool_calls
+        choice = SimpleNamespace(message=msg, finish_reason="stop")
+        return SimpleNamespace(choices=[choice], **extra)
+
+    def test_empty_string_content_raises_invalid_aux_response(self):
+        from agent.auxiliary_client import (
+            _validate_llm_response, _is_invalid_aux_response_error,
+        )
+        with pytest.raises(RuntimeError) as ei:
+            _validate_llm_response(self._resp(""), "compression")
+        assert _is_invalid_aux_response_error(ei.value), (
+            "empty-content 200 must route through the invalid-aux-response "
+            "fallback path, not pass validation"
+        )
+
+    def test_whitespace_only_content_raises_invalid_aux_response(self):
+        from agent.auxiliary_client import (
+            _validate_llm_response, _is_invalid_aux_response_error,
+        )
+        with pytest.raises(RuntimeError) as ei:
+            _validate_llm_response(self._resp("   \n\t  "), "compression")
+        assert _is_invalid_aux_response_error(ei.value)
+
+    def test_none_content_without_tool_calls_raises_invalid_aux_response(self):
+        from agent.auxiliary_client import (
+            _validate_llm_response, _is_invalid_aux_response_error,
+        )
+        with pytest.raises(RuntimeError) as ei:
+            _validate_llm_response(self._resp(None), "compression")
+        assert _is_invalid_aux_response_error(ei.value)
+
+    def test_empty_content_with_tool_calls_is_ok(self):
+        # Tool-only assistant turns legitimately carry empty content.
+        from agent.auxiliary_client import _validate_llm_response
+        resp = self._resp("", tool_calls=[SimpleNamespace(id="c1")])
+        assert _validate_llm_response(resp, "toolcall") is resp
+
+    def test_none_content_with_tool_calls_is_ok(self):
+        from agent.auxiliary_client import _validate_llm_response
+        resp = self._resp(None, tool_calls=[SimpleNamespace(id="c1")])
+        assert _validate_llm_response(resp, "toolcall") is resp
+
+    def test_normal_content_passes_through(self):
+        from agent.auxiliary_client import _validate_llm_response
+        resp = self._resp("real summary body")
+        assert _validate_llm_response(resp, "compression") is resp
+
+    def test_recovers_output_text_when_choices_content_empty(self):
+        # If the wire carries Responses-style text even though
+        # choices[0].message.content is blank, salvage it rather than failing.
+        from agent.auxiliary_client import _validate_llm_response
+        out = _validate_llm_response(
+            self._resp("", output_text="salvaged body"), "compression")
+        assert out.choices[0].message.content == "salvaged body"
+
+    def test_non_string_content_is_left_alone(self):
+        # Multimodal / structured content (list/dict) is not "empty" — this
+        # validator must not judge it.
+        from agent.auxiliary_client import _validate_llm_response
+        resp = self._resp([{"type": "text", "text": "hi"}])
+        assert _validate_llm_response(resp, "vision") is resp

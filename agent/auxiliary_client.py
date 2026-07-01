@@ -5945,6 +5945,35 @@ def _validate_llm_response(response: Any, task: str = None) -> Any:
             f"Expected object with .choices[0].message — check provider "
             f"adapter or custom endpoint compatibility."
         ) from exc
+
+    # A well-formed 200 whose assistant message carries no text is still a
+    # provider/model capability failure for auxiliary tasks — downstream
+    # callers need real content.  Some routes return HTTP 200 with empty
+    # ``content`` instead of an error: a degraded codex/ChatGPT backend (the
+    # live "compression LLM returned empty content" abort), or one-api/cmkey
+    # proxies.  Route it through the SAME invalid-aux-response fallback path as
+    # a missing ``choices[0].message`` so ``call_llm`` advances to the next
+    # configured fallback provider (e.g. gptcodex) instead of handing an empty
+    # body upstream, where the compressor would abort with no fallback tried.
+    # Tool-only turns legitimately carry empty content, so they are exempt; and
+    # non-string (multimodal/structured) content is not "empty".
+    message = choices[0].message
+    tool_calls = getattr(message, "tool_calls", None)
+    content = getattr(message, "content", None)
+    content_is_blank = content is None or (
+        isinstance(content, str) and not content.strip()
+    )
+    if content_is_blank and not tool_calls:
+        recovered = _recover_aux_response_message(response)
+        if recovered is not None:
+            return recovered
+        response_type = type(response).__name__
+        raise RuntimeError(
+            f"Auxiliary {task or 'call'}: LLM returned invalid response "
+            f"(type={response_type}): empty message content. "
+            f"Expected non-empty .choices[0].message content — provider "
+            f"returned HTTP 200 with no text (check provider/model health)."
+        )
     return response
 
 
