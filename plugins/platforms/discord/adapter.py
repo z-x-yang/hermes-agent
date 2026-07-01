@@ -5533,9 +5533,19 @@ class DiscordAdapter(BasePlatformAdapter):
             clean_choices = clean_choices[:24]
 
             if clean_choices:
+                # Full option text goes in the embed body -- Discord
+                # button labels cap at 80 chars and truncate far shorter
+                # on mobile, so buttons carry only the choice number and
+                # the readable text lives here (auto-wraps, never cut).
+                for _i, _chunk in enumerate(_chunk_numbered_choices(clean_choices)):
+                    embed.add_field(
+                        name="Choices" if _i == 0 else "\u200b",
+                        value=_chunk,
+                        inline=False,
+                    )
                 embed.add_field(
-                    name="Choices",
-                    value="Pick one below, or click ✏️ Other to type a custom answer.",
+                    name="\u200b",
+                    value="👇 Tap the matching number below, or ✏️ Other to type your own answer.",
                     inline=False,
                 )
                 view = ClarifyChoiceView(
@@ -6406,6 +6416,38 @@ class DiscordAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 
+def _chunk_numbered_choices(choices, *, limit=1024):
+    """Render choices as a numbered list ("1. a", "2. b", ...) packed into
+    chunks that each fit Discord's 1024-char embed-field value limit.
+
+    Full option text lives in the embed body rather than on button labels
+    (Discord caps labels at 80 chars; mobile truncates far shorter). Long
+    lists span multiple fields; a single option longer than one whole field
+    is hard-truncated with an ellipsis (extreme -- MAX_CHOICES caps real
+    lists at 4) so the message can still be sent.
+    """
+    lines = []
+    for i, choice in enumerate(choices):
+        line = f"{i + 1}. {choice}"
+        if len(line) > limit:
+            line = line[: limit - 1] + "\u2026"
+        lines.append(line)
+
+    chunks = []
+    current = ""
+    for line in lines:
+        if not current:
+            current = line
+        elif len(current) + 1 + len(line) <= limit:
+            current = f"{current}\n{line}"
+        else:
+            chunks.append(current)
+            current = line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def _component_check_auth(
     interaction,
     allowed_user_ids: Optional[set],
@@ -7174,47 +7216,13 @@ def _define_discord_view_classes() -> None:
             self.resolved = False
 
             for index, choice in enumerate(self.choices):
-                # Discord button labels are capped at 80 chars. On mobile the
-                # visible width is much narrower (often <40 chars before it
-                # wraps to 2 lines and the second line gets cut off), so we
-                # cap aggressively and cut at a word boundary when possible
-                # to keep the trailing text readable.
-                #
-                # Cut strategy (most-preferred to least-preferred):
-                #   1. Last space in the trailing half of the budget
-                #      (cleanest word boundary)
-                #   2. Last soft boundary in the trailing half of the
-                #      budget (hyphen, comma, period, paren)
-                #   3. Hard cut at the budget limit (last resort)
-                prefix = f"{index + 1}. "
-                budget = 80 - len(prefix)
-                if len(choice) <= budget:
-                    label_body = choice
-                else:
-                    truncated = choice[: budget - 1].rstrip()
-                    cut_at = -1
-                    # 1. Last space in the trailing half of the budget.
-                    space = truncated.rfind(" ")
-                    if space >= budget // 2:
-                        cut_at = space
-                    # 2. Soft boundary — only if no word boundary found.
-                    # Find the latest soft boundary in the trailing half
-                    # of the budget; that maximizes preserved text length.
-                    # Cut AT the soft boundary (inclusive) so the label
-                    # ends on the soft char (e.g. "-" or ",") rather than
-                    # on the alpha char that followed it.
-                    if cut_at < 0:
-                        latest_soft = max(
-                            (truncated.rfind(s) for s in ("-", ",", ".", ")")),
-                            default=-1,
-                        )
-                        if latest_soft >= budget // 2:
-                            cut_at = latest_soft + 1
-                    if cut_at > 0:
-                        truncated = truncated[:cut_at]
-                    label_body = truncated.rstrip() + "…"
+                # The button carries ONLY the choice number -- full
+                # option text lives in the embed body (send_clarify).
+                # Discord caps button labels at 80 chars and mobile
+                # truncates far shorter, which would hide long options;
+                # a bare number never truncates.
                 button = discord.ui.Button(
-                    label=f"{prefix}{label_body}",
+                    label=f"{index + 1}.",
                     style=discord.ButtonStyle.primary,
                     custom_id=f"clarify:{clarify_id}:{index}",
                 )
