@@ -57,6 +57,12 @@ logger = logging.getLogger(__name__)
 # ``quality`` is the knob that changes generation time and output fidelity.
 
 API_MODEL = "gpt-image-2"
+RESPONSES_TEXT_MODEL = "gpt-5.5"
+RESPONSES_IMAGE_INSTRUCTIONS = (
+    "You are a tool runner. Pass the user prompt to image_generation VERBATIM. "
+    "DO NOT rewrite, expand, polish, or revise it in any way. "
+    "Use the exact text the user gave."
+)
 
 _MODELS: Dict[str, Dict[str, Any]] = {
     "gpt-image-2-low": {
@@ -306,29 +312,64 @@ def _use_responses_api(base_url: Optional[str]) -> bool:
     return "gptcodex.top" in (base_url or "").lower()
 
 
+def _resolve_responses_text_model(route: Optional[Dict[str, Any]] = None) -> str:
+    """Resolve the text model that should call the Responses image tool."""
+    candidates: List[Any] = []
+    if route is not None:
+        sub = route.get("openai") if isinstance(route.get("openai"), dict) else {}
+        if isinstance(sub, dict):
+            candidates.extend([sub.get("responses_text_model"), sub.get("text_model")])
+    cfg = _load_openai_config()
+    openai_cfg = cfg.get("openai") if isinstance(cfg.get("openai"), dict) else {}
+    if isinstance(openai_cfg, dict):
+        candidates.extend([openai_cfg.get("responses_text_model"), openai_cfg.get("text_model")])
+    candidates.append(cfg.get("responses_text_model") if isinstance(cfg, dict) else None)
+    candidates.append(os.environ.get("OPENAI_IMAGE_RESPONSES_TEXT_MODEL"))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return RESPONSES_TEXT_MODEL
+
+
 def _build_responses_payload(
     *,
     prompt: str,
     size: str,
     quality: str,
     sources: List[str],
+    text_model: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build the OpenAI-compatible Responses request body.
+    """Build the Responses image-generation-tool request body.
 
-    The gptcodex image route that works in practice accepts the image model as
-    the top-level Responses model and returns an ``image_generation_call`` item.
-    Keep the payload intentionally small: the older ``/images`` endpoints and
-    the explicit ``tools=[image_generation]`` shape have both been observed to
-    fail or downgrade quality on that gateway.
+    GPTCodex-compatible image routes require a text model to invoke the
+    ``image_generation`` tool over streaming Responses. Sending ``gpt-image-2``
+    as the top-level Responses model can complete with only text output and no
+    image result on that relay.
     """
     content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
     for ref in sources:
         content.append({"type": "input_image", "image_url": _image_ref_to_data_url(ref)})
-    return {
+    action = "edit" if sources else "generate"
+    tool: Dict[str, Any] = {
+        "type": "image_generation",
         "model": API_MODEL,
-        "input": [{"role": "user", "content": content}],
+        "action": action,
         "size": size,
         "quality": quality,
+        "output_format": "png",
+        "partial_images": 0,
+        "background": "auto",
+        "moderation": "low",
+    }
+    return {
+        "model": (text_model or RESPONSES_TEXT_MODEL).strip() or RESPONSES_TEXT_MODEL,
+        "input": [{"role": "user", "content": content}],
+        "tools": [tool],
+        "tool_choice": {"type": "image_generation"},
+        "reasoning": {"effort": "low"},
+        "store": False,
+        "stream": True,
+        "instructions": RESPONSES_IMAGE_INSTRUCTIONS,
     }
 
 
@@ -354,6 +395,30 @@ def _extract_responses_image(value: Any) -> Optional[Tuple[str, Dict[str, Any]]]
             found = _extract_responses_image(child)
             if found:
                 return found
+    return None
+
+
+def _extract_responses_image_from_text(raw: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Extract a Responses image result from JSON or SSE text."""
+    try:
+        return _extract_responses_image(json.loads(raw))
+    except Exception:
+        pass
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            event = json.loads(payload)
+        except Exception:
+            continue
+        found = _extract_responses_image(event)
+        if found:
+            return found
     return None
 
 
@@ -592,6 +657,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
                     size=size,
                     quality=meta["quality"],
                     sources=sources,
+                    text_model=_resolve_responses_text_model(route),
                 )
             except Exception as exc:
                 return error_response(
@@ -610,12 +676,13 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
                 },
             )
 
             try:
                 with urllib.request.urlopen(request, timeout=420) as response:
-                    response_payload = json.loads(response.read().decode("utf-8"))
+                    response_text = response.read().decode("utf-8", errors="replace")
             except urllib.error.HTTPError as exc:
                 body = exc.read(1000).decode("utf-8", errors="replace")
                 logger.debug("OpenAI Responses image generation failed", exc_info=True)
@@ -638,7 +705,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
                     aspect_ratio=aspect,
                 )
 
-            extracted = _extract_responses_image(response_payload)
+            extracted = _extract_responses_image_from_text(response_text)
             if not extracted:
                 return error_response(
                     error="OpenAI Responses payload contained no image_generation_call result",

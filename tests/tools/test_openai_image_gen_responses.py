@@ -17,8 +17,13 @@ _ONE_BY_ONE_PNG = (
 
 
 class _FakeHTTPResponse:
-    def __init__(self, payload: dict):
-        self._payload = json.dumps(payload).encode("utf-8")
+    def __init__(self, payload: dict | str | bytes):
+        if isinstance(payload, bytes):
+            self._payload = payload
+        elif isinstance(payload, str):
+            self._payload = payload.encode("utf-8")
+        else:
+            self._payload = json.dumps(payload).encode("utf-8")
 
     def __enter__(self):
         return self
@@ -95,11 +100,26 @@ def test_openai_provider_uses_responses_payload_for_high_quality(monkeypatch, tm
     assert result["actual_quality"] == "high"
     assert captured["url"] == "https://example.test/v1/responses"
     assert captured["timeout"] == 420
-    assert captured["payload"]["model"] == "gpt-image-2"
-    assert captured["payload"]["quality"] == "high"
-    assert captured["payload"]["size"] == "1536x864"
+    assert captured["payload"]["model"] == "gpt-5.5"
     assert captured["payload"]["input"][0]["content"] == [
         {"type": "input_text", "text": "draw a cat"}
+    ]
+    assert captured["payload"]["tool_choice"] == {"type": "image_generation"}
+    assert captured["payload"]["stream"] is True
+    assert captured["payload"]["store"] is False
+    assert captured["payload"]["instructions"].startswith("You are a tool runner")
+    assert captured["payload"]["tools"] == [
+        {
+            "type": "image_generation",
+            "model": "gpt-image-2",
+            "action": "generate",
+            "size": "1536x864",
+            "quality": "high",
+            "output_format": "png",
+            "partial_images": 0,
+            "background": "auto",
+            "moderation": "low",
+        }
     ]
     assert Path(result["image"]).exists()
 
@@ -154,6 +174,51 @@ def test_openai_provider_embeds_source_images_as_responses_input_images(monkeypa
     expected = "data:image/png;base64," + base64.b64encode(b"fake-image-bytes").decode("ascii")
     assert content[1]["image_url"] == expected
     assert content[2]["image_url"] == expected
+    assert captured["payload"]["tools"][0]["action"] == "edit"
+
+
+def test_openai_provider_extracts_responses_sse_image_generation_result(monkeypatch, tmp_path):
+    from plugins.image_gen.openai import OpenAIImageGenProvider
+    import plugins.image_gen.openai as openai_image
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        openai_image,
+        "_resolve_credentials",
+        lambda: ("sk-test", "https://example.test/v1", "OPENAI_API_KEY"),
+    )
+    monkeypatch.setattr(
+        openai_image,
+        "_resolve_model",
+        lambda: ("gpt-image-2-low", {"quality": "low"}),
+    )
+    monkeypatch.setattr(openai_image, "_use_responses_api", lambda base_url: True)
+
+    sse = "\n".join(
+        [
+            'data: {"type":"response.created"}',
+            'data: {"type":"response.image_generation_call.in_progress"}',
+            'data: {"type":"response.output_item.done","item":{"type":"image_generation_call","result":"'
+            + _ONE_BY_ONE_PNG
+            + '","quality":"medium","size":"1024x1024","width":1024,"height":1024}}',
+            'data: {"type":"response.completed"}',
+            'data: [DONE]',
+        ]
+    )
+    monkeypatch.setattr(
+        openai_image.urllib.request,
+        "urlopen",
+        lambda request, timeout: _FakeHTTPResponse(sse),
+    )
+
+    result = OpenAIImageGenProvider().generate("draw a cat")
+
+    assert result["success"] is True
+    assert result["actual_quality"] == "medium"
+    assert result["actual_size"] == "1024x1024"
+    assert result["width"] == 1024
+    assert result["height"] == 1024
+    assert Path(result["image"]).exists()
 
 
 def test_openai_provider_surfaces_responses_http_errors(monkeypatch, tmp_path):
