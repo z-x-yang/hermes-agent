@@ -577,6 +577,7 @@ def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
+    efficiency_ctx: Optional[Dict] = None,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -830,6 +831,19 @@ def _run_review_in_thread(
             notification_mode=getattr(agent, "memory_notifications", "on"),
         )
 
+        # Efficiency bookkeeping: surface recurred-after-encode escalations to
+        # the user (deterministic — does not rely on the review model saying
+        # anything) and stamp `encoded` ledger markers when the review actually
+        # wrote a skill rule for an encode_now pattern.
+        if efficiency_ctx:
+            try:
+                from agent.efficiency_review import apply_efficiency_outcome
+                apply_efficiency_outcome(
+                    efficiency_ctx, review_messages, messages_snapshot, actions
+                )
+            except Exception as e:
+                logger.warning("efficiency outcome bookkeeping failed: %s", e)
+
         if actions:
             summary = " · ".join(dict.fromkeys(actions))
             agent._safe_print(
@@ -896,8 +910,32 @@ def spawn_background_review_thread(
     else:
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
 
+    # Skill reviews additionally get the deterministic efficiency digest +
+    # recurrence-ledger block (agent/efficiency_review.py). Clean sessions
+    # gate to None and the prompt is unchanged. A digest failure must not
+    # cost the whole skill review, but it is never silent — it logs loudly.
+    efficiency_ctx: Optional[Dict] = None
+    if review_skills:
+        try:
+            from agent.efficiency_review import build_efficiency_block, run_family
+            block, efficiency_ctx = build_efficiency_block(
+                messages_snapshot,
+                session_id=getattr(agent, "session_id", None),
+                run_family=run_family(
+                    getattr(agent, "session_id", None),
+                    getattr(agent, "platform", None),
+                ),
+            )
+            if block:
+                prompt = prompt + block
+        except Exception as e:
+            efficiency_ctx = None
+            logger.warning(
+                "efficiency review block failed; skill review proceeds without it: %s", e
+            )
+
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        _run_review_in_thread(agent, messages_snapshot, prompt, efficiency_ctx)
 
     return _target, prompt
 
