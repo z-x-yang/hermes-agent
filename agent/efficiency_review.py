@@ -336,10 +336,18 @@ _HARD_CONSTRAINTS = (
     "(e.g. \"don't re-read X to learn its CLI flags — the parameter table "
     "is references/pipeline.md, read that one file\"). A ban without an "
     "exit hardens into a refusal.\n"
-    "  • Prefer adding to `references/` (loaded on demand) over the "
-    "SKILL.md body (always loaded — every added line is paid on every "
-    "future run). If you must touch an always-loaded SKILL.md, REPLACE or "
-    "MERGE existing text; do not grow it.\n"
+    "  • Keep the skill CLEAN, not small: if an existing rule already "
+    "covers the pattern, sharpen it in place instead of appending a "
+    "near-duplicate; if the new lesson contradicts existing text, "
+    "REPLACE the old text — never let both stand. Growth from genuinely "
+    "new rules is acceptable.\n"
+    "  • Place by usage frequency: content needed on almost every run "
+    "belongs in the SKILL.md body; low-frequency detail belongs in "
+    "references/ behind a pointer that names its trigger condition "
+    "(e.g. 'on X error, read references/y.md').\n"
+    "  • If the rule's natural home is a pinned skill, writes will be "
+    "refused — encode it in an unpinned companion skill or surface it "
+    "in your reply for the user.\n"
     "  • Judge in hindsight, by what was actually USED downstream: if a "
     "file was read in 5 segments and only one flag was extracted, the "
     "waste is real; if the content genuinely drove decisions, it is not.\n"
@@ -384,33 +392,41 @@ def build_efficiency_block(
     return block, ctx
 
 
-def _made_skill_write(review_messages: List[Dict], prior_snapshot: List[Dict]) -> bool:
-    """True when the review itself completed a successful skill_manage write
-    (create/edit/patch/write_file), ignoring results inherited from the prior
-    conversation snapshot."""
+def _successful_skill_writes(
+    review_messages: List[Dict], prior_snapshot: List[Dict]
+) -> List[Dict]:
+    """Args of skill_manage write calls (create/edit/patch/write_file) the
+    review itself completed successfully, ignoring results inherited from the
+    prior conversation snapshot."""
     prior_ids = {
         m.get("tool_call_id")
         for m in prior_snapshot or []
         if isinstance(m, dict) and m.get("role") == "tool" and m.get("tool_call_id")
     }
-    write_call_ids = set()
+    write_calls: Dict[str, Dict] = {}
     for _seq, tcid, name, args in _iter_tool_calls(review_messages):
         if name == "skill_manage" and args.get("action") in {"create", "edit", "patch", "write_file"}:
             if tcid:
-                write_call_ids.add(tcid)
+                write_calls[tcid] = args
+    out: List[Dict] = []
     for msg in review_messages or []:
         if not isinstance(msg, dict) or msg.get("role") != "tool":
             continue
         tcid = msg.get("tool_call_id")
-        if not tcid or tcid in prior_ids or tcid not in write_call_ids:
+        if not tcid or tcid in prior_ids or tcid not in write_calls:
             continue
         try:
             data = json.loads(msg.get("content") or "{}")
         except (json.JSONDecodeError, TypeError):
             continue
         if isinstance(data, dict) and data.get("success"):
-            return True
-    return False
+            out.append(write_calls[tcid])
+    return out
+
+
+def _made_skill_write(review_messages: List[Dict], prior_snapshot: List[Dict]) -> bool:
+    """True when the review itself completed a successful skill_manage write."""
+    return bool(_successful_skill_writes(review_messages, prior_snapshot))
 
 
 def apply_efficiency_outcome(
@@ -433,6 +449,140 @@ def apply_efficiency_outcome(
         mark_encoded(encode_keys)
 
 
+# ---------------------------------------------------------------------------
+# Compaction: deterministic nomination + outcome
+# ---------------------------------------------------------------------------
+
+# A skill accumulating this many patches since its last compaction baseline
+# gets nominated for a compaction pass. Override per-config via the agent
+# attribute ``skill_compaction_threshold``.
+COMPACTION_THRESHOLD = 15
+
+# A compaction that shrinks the SKILL.md body by more than this many percent
+# gets a warning in the user-visible action line — legitimate compaction
+# (dedup, decontradiction) produces slightly-smaller-or-equal output.
+SHRINK_WARN_PCT = 30
+
+
+def nominate_compaction(threshold: Optional[int] = None) -> Optional[Dict]:
+    """Deterministically nominate at most ONE skill for a compaction pass.
+
+    Eligible: local curation-eligible skills, present on disk, active, not
+    pinned, with ``patch_count - compacted_patch_count >= threshold``. The
+    most overdue one wins; one nomination per review bounds the cost.
+    """
+    from tools import skill_usage
+
+    thr = COMPACTION_THRESHOLD if threshold is None else int(threshold)
+    best: Optional[Dict] = None
+    for name, rec in (skill_usage.load_usage() or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("pinned") or (rec.get("state") or "active") != "active":
+            continue
+        overdue = int(rec.get("patch_count") or 0) - int(rec.get("compacted_patch_count") or 0)
+        if overdue < thr:
+            continue
+        if not skill_usage.is_curation_eligible(name):
+            continue
+        if skill_usage._find_skill_dir(name) is None:
+            continue
+        if best is None or overdue > best["overdue"]:
+            best = {"name": name, "overdue": overdue}
+    return best
+
+
+def build_compaction_block(nomination: Dict) -> str:
+    """Prompt block instructing the review to run a compaction pass."""
+    name = nomination["name"]
+    overdue = nomination["overdue"]
+    return (
+        "\n\n--- SKILL COMPACTION (deterministic nomination) ---\n"
+        f"Skill '{name}' has accumulated {overdue} patches since its last "
+        "compaction. Before any other skill work, run a compaction pass "
+        "on it:\n"
+        "  1. Read the FULL current SKILL.md with skill_view.\n"
+        "  2. Rewrite it in one piece via skill_manage action=edit (not "
+        "patch — anchor-style patching is the wrong tool for "
+        "consolidation).\n"
+        "Compaction removes ONLY three things: duplicate rules (merge "
+        "into one sharpened line), contradictions (keep the newer lesson, "
+        "delete the older), and content confirmed stale (e.g. it "
+        "references files or steps that no longer exist). It is NOT "
+        "shortening: length is not a metric, and every distinct valid "
+        "rule must survive the rewrite (rewording is fine, dropping "
+        "meaning is not). When in doubt, KEEP. Big is acceptable; dirty "
+        "is not.\n"
+        "While rewriting, tier by frequency: content needed on almost "
+        "every activation stays in the body; low-frequency detail moves "
+        "to references/ behind a pointer that names its trigger "
+        "condition.\n"
+        "In your reply, account for what changed: how many duplicates "
+        "merged, which contradictions resolved, what was dropped and "
+        "why.\n"
+    )
+
+
+def _compaction_shrink_pct(name: str) -> Optional[int]:
+    """Percent shrink of SKILL.md vs its newest .history/ backup, or None
+    when no backup exists (nothing to compare against)."""
+    try:
+        from tools.skill_manager_tool import _find_skill
+        existing = _find_skill(name)
+        if not existing:
+            return None
+        skill_dir = existing["path"]
+        backups = sorted((skill_dir / ".history").glob("SKILL-*.md"))
+        if not backups:
+            return None
+        old = backups[-1].stat().st_size
+        new = (skill_dir / "SKILL.md").stat().st_size
+        if old <= 0:
+            return None
+        return max(0, round((old - new) * 100 / old))
+    except Exception as e:
+        logger.warning("compaction shrink check failed for %s: %s", name, e)
+        return None
+
+
+def apply_compaction_outcome(
+    nomination: Optional[Dict],
+    review_messages: List[Dict],
+    prior_snapshot: List[Dict],
+    actions: List[str],
+) -> None:
+    """Post-review bookkeeping for a compaction nomination.
+
+    Only a successful full rewrite (skill_manage action=edit of the
+    nominated skill, performed by the review itself) resets the baseline —
+    otherwise the next review re-nominates. The accounting line is
+    deterministic; a >SHRINK_WARN_PCT size drop is flagged because
+    legitimate compaction dedupes, it does not shorten.
+    """
+    if not nomination:
+        return
+    name = nomination.get("name")
+    rewrote = any(
+        args.get("action") == "edit" and args.get("name") == name
+        for args in _successful_skill_writes(review_messages, prior_snapshot)
+    )
+    if not rewrote:
+        return
+    from tools import skill_usage
+    skill_usage.set_compaction_baseline(name)
+    line = (
+        f"🧹 Compacted skill '{name}' — folded "
+        f"{nomination.get('overdue')} accumulated patches"
+    )
+    shrink = _compaction_shrink_pct(name)
+    if shrink is not None and shrink > SHRINK_WARN_PCT:
+        line += (
+            f" · ⚠️ body shrank {shrink}% — compaction should dedupe, not "
+            "shorten; diff .history/ if unexpected"
+        )
+    actions.append(line)
+
+
 __all__ = [
     "build_tool_call_digest",
     "build_efficiency_block",
@@ -441,4 +591,7 @@ __all__ = [
     "mark_encoded",
     "ledger_path",
     "run_family",
+    "nominate_compaction",
+    "build_compaction_block",
+    "apply_compaction_outcome",
 ]

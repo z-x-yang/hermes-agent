@@ -841,6 +841,31 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     return result
 
 
+_HISTORY_KEEP = 5
+
+
+def _backup_skill_history(skill_dir: Path, original_content: str) -> None:
+    """Preserve the pre-rewrite SKILL.md under <skill>/.history/.
+
+    Skills live outside git, so an autonomous full rewrite is the one
+    destructive skill operation with no recovery path behind it — keep the
+    last few pre-images (pruned to _HISTORY_KEEP). Raises on failure; the
+    caller refuses the rewrite rather than proceed without the safety net.
+    """
+    from datetime import datetime
+    hist = skill_dir / ".history"
+    hist.mkdir(exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    target = hist / f"SKILL-{stamp}.md"
+    n = 0
+    while target.exists():
+        n += 1
+        target = hist / f"SKILL-{stamp}-{n:03d}.md"
+    target.write_text(original_content, encoding="utf-8")
+    for stale in sorted(hist.glob("SKILL-*.md"))[:-_HISTORY_KEEP]:
+        stale.unlink()
+
+
 def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     """Replace the SKILL.md of any existing skill (full rewrite)."""
     err = _validate_frontmatter(content)
@@ -867,6 +892,28 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
 
     # Back up original content for rollback
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
+
+    # Autonomous full rewrites (background review / compaction) must not
+    # proceed without their .history/ safety net — refuse instead of
+    # silently rewriting with no recovery path.
+    try:
+        from tools.skill_provenance import is_background_review
+        _autonomous = is_background_review()
+    except Exception:
+        _autonomous = False
+    if _autonomous and original_content is not None:
+        try:
+            _backup_skill_history(existing["path"], original_content)
+        except Exception as e:
+            return {
+                "success": False,
+                "error": (
+                    f"Refusing autonomous rewrite of '{name}': .history "
+                    f"backup of the previous SKILL.md failed ({e}). The "
+                    "pre-rewrite content must be preserved first."
+                ),
+            }
+
     _atomic_write_text(skill_md, content)
 
     # Security scan — roll back on block

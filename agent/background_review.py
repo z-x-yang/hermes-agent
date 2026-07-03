@@ -172,6 +172,30 @@ _MEMORY_REVIEW_PROMPT = (
     "If nothing is worth saving, just say 'Nothing to save.' and stop."
 )
 
+_EDIT_DISCIPLINE = (
+    "Edit discipline (applies to EVERY skill update):\n"
+    "  • READ BEFORE WRITE. Unless the skill's full current SKILL.md is "
+    "already visible in this conversation, run skill_view before "
+    "editing. A patch anchor only proves the anchor exists — not that "
+    "the same lesson isn't already written 30 lines away.\n"
+    "  • DUPLICATE → MERGE. If an existing line already covers the "
+    "lesson, sharpen that line in place (patch old_string→new_string); "
+    "never append a near-duplicate rule next to it.\n"
+    "  • CONTRADICTION → OVERWRITE. If the new lesson contradicts "
+    "existing text, REPLACE the old text with the new conclusion. Old "
+    "and new must never coexist — a future reader cannot tell which to "
+    "trust.\n"
+    "  • GENUINELY NEW → ADD. Growth is fine: a skill accumulating more "
+    "distinct knowledge is an investment, not bloat. Dirty is the "
+    "problem; big is not.\n"
+    "  • PLACE BY FREQUENCY. Content needed on almost every activation "
+    "belongs in the SKILL.md body. Low-frequency content "
+    "(troubleshooting, edge cases, situation-specific recipes) belongs "
+    "in references/ behind a pointer that names its trigger condition "
+    "(e.g. 'on X error, read references/y.md') — a bare 'see also' "
+    "pointer is dead weight.\n\n"
+)
+
 _SKILL_REVIEW_PROMPT = (
     "Review the conversation above and update the skill library. Be "
     "ACTIVE — most sessions produce at least one skill update, even if "
@@ -226,13 +250,15 @@ _SKILL_REVIEW_PROMPT = (
     "     Add support files via skill_manage action=write_file with "
     "file_path starting 'references/', 'templates/', or 'scripts/'. "
     "The umbrella's SKILL.md should gain a one-line pointer to any "
-    "new support file so future agents know it exists.\n"
+    "new support file, phrased as its trigger condition (when to read "
+    "it), so future agents know it exists and when it pays to load.\n"
     "  4. CREATE A NEW CLASS-LEVEL UMBRELLA SKILL when no existing "
     "skill covers the class. The name MUST be at the class level. "
     "The name MUST NOT be a specific PR number, error string, feature "
     "codename, library-alone name, or 'fix-X / debug-Y / audit-Z-today' "
     "session artifact. If the proposed name only makes sense for "
     "today's task, it's wrong — fall back to (1), (2), or (3).\n\n"
+    + _EDIT_DISCIPLINE +
     "User-preference embedding (important): when the user expressed a "
     "style/format/workflow preference, the update belongs in the "
     "SKILL.md body, not just in memory. Memory captures 'who the user "
@@ -245,10 +271,11 @@ _SKILL_REVIEW_PROMPT = (
     "Protected skills (DO NOT edit these):\n"
     "  • Bundled skills (shipped with Hermes, e.g. 'hermes-agent').\n"
     "  • Hub-installed skills (installed via 'hermes skills install').\n"
-    "Pinned skills (marked via 'hermes curator pin') CAN be improved — "
-    "pin only blocks deletion/archive/consolidation by the curator, not "
-    "content updates. Patch them when a pitfall or missing step turns up, "
-    "same as any other agent-created skill.\n"
+    "  • Pinned skills (marked via 'hermes curator pin') — read-only "
+    "for this autonomous review; writes to them are refused by a guard. "
+    "If the lesson belongs in a pinned skill, encode it in an unpinned "
+    "companion skill or state it in your reply so the user can apply "
+    "it manually.\n"
     "If the only skills that need updating are protected, say\n"
     "'Nothing to save.' and stop.\n\n"
     "Do NOT capture (these become persistent self-imposed constraints "
@@ -314,12 +341,14 @@ _COMBINED_REVIEW_PROMPT = (
     "for starter files meant to be copied and modified; "
     "`scripts/<name>.<ext>` for statically re-runnable actions "
     "(verification, fixture generators, probes). Add a one-line "
-    "pointer in SKILL.md so future agents find them.\n"
+    "pointer in SKILL.md, phrased as its trigger condition, so future "
+    "agents find them.\n"
     "  4. CREATE A NEW CLASS-LEVEL UMBRELLA when nothing exists. "
     "Name at the class level — NOT a PR number, error string, "
     "codename, library-alone name, or 'fix-X / debug-Y' session "
     "artifact. If the name only fits today's task, fall back to (1), "
     "(2), or (3).\n\n"
+    + _EDIT_DISCIPLINE +
     "User-preference embedding: when the user complains about how "
     "you handled a task, update the skill that governs that task — "
     "memory alone isn't enough. Memory says 'who the user is and "
@@ -331,10 +360,11 @@ _COMBINED_REVIEW_PROMPT = (
     "Protected skills (DO NOT edit these):\n"
     "  • Bundled skills (shipped with Hermes, e.g. 'hermes-agent').\n"
     "  • Hub-installed skills (installed via 'hermes skills install').\n"
-    "Pinned skills (marked via 'hermes curator pin') CAN be improved — "
-    "pin only blocks deletion/archive/consolidation by the curator, not "
-    "content updates. Patch them when a pitfall or missing step turns up, "
-    "same as any other agent-created skill.\n"
+    "  • Pinned skills (marked via 'hermes curator pin') — read-only "
+    "for this autonomous review; writes to them are refused by a guard. "
+    "If the lesson belongs in a pinned skill, encode it in an unpinned "
+    "companion skill or state it in your reply so the user can apply "
+    "it manually.\n"
     "If the only skills that need updating are protected, say\n"
     "'Nothing to save.' and stop.\n\n"
     "Do NOT capture as skills (these become persistent self-imposed "
@@ -578,6 +608,7 @@ def _run_review_in_thread(
     messages_snapshot: List[Dict],
     prompt: str,
     efficiency_ctx: Optional[Dict] = None,
+    compaction_ctx: Optional[Dict] = None,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -844,6 +875,19 @@ def _run_review_in_thread(
             except Exception as e:
                 logger.warning("efficiency outcome bookkeeping failed: %s", e)
 
+        # Compaction bookkeeping: only a successful full rewrite of the
+        # nominated skill resets its baseline; otherwise the next review
+        # re-nominates it. The accounting line (and the shrank-N% warning)
+        # is deterministic — it does not rely on the review model reporting.
+        if compaction_ctx:
+            try:
+                from agent.efficiency_review import apply_compaction_outcome
+                apply_compaction_outcome(
+                    compaction_ctx, review_messages, messages_snapshot, actions
+                )
+            except Exception as e:
+                logger.warning("compaction outcome bookkeeping failed: %s", e)
+
         if actions:
             summary = " · ".join(dict.fromkeys(actions))
             agent._safe_print(
@@ -934,8 +978,28 @@ def spawn_background_review_thread(
                 "efficiency review block failed; skill review proceeds without it: %s", e
             )
 
+    # Skill reviews may also carry a compaction nomination: a skill that
+    # accumulated too many patches since its last compaction baseline gets a
+    # deterministic full-read + full-rewrite instruction appended.
+    compaction_ctx: Optional[Dict] = None
+    if review_skills:
+        try:
+            from agent.efficiency_review import build_compaction_block, nominate_compaction
+            compaction_ctx = nominate_compaction(
+                threshold=getattr(agent, "skill_compaction_threshold", None)
+            )
+            if compaction_ctx:
+                prompt = prompt + build_compaction_block(compaction_ctx)
+        except Exception as e:
+            compaction_ctx = None
+            logger.warning(
+                "compaction nomination failed; skill review proceeds without it: %s", e
+            )
+
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt, efficiency_ctx)
+        _run_review_in_thread(
+            agent, messages_snapshot, prompt, efficiency_ctx, compaction_ctx
+        )
 
     return _target, prompt
 

@@ -490,6 +490,7 @@ def _empty_record() -> Dict[str, Any]:
         "last_viewed_at": None,
         "patch_count": 0,
         "last_patched_at": None,
+        "compacted_patch_count": 0,
         "created_at": _now_iso(),
         "state": STATE_ACTIVE,
         "pinned": False,
@@ -641,6 +642,18 @@ def bump_patch(skill_name: str) -> None:
         rec["patch_count"] = int(rec.get("patch_count") or 0) + 1
         rec["last_patched_at"] = _now_iso()
     _mutate(skill_name, _apply)
+
+
+def set_compaction_baseline(skill_name: str) -> None:
+    """Snapshot patch_count as the compaction baseline.
+
+    Called after a background-review compaction pass completed a full
+    rewrite of the skill; ``patch_count - compacted_patch_count`` is the
+    accumulation the next compaction nomination measures.
+    """
+    def _apply(rec: Dict[str, Any]) -> None:
+        rec["compacted_patch_count"] = int(rec.get("patch_count") or 0)
+    _mutate(skill_name, _apply, require_curation_eligible=True)
 
 
 def mark_agent_created(skill_name: str) -> None:
