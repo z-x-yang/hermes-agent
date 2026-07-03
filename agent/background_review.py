@@ -603,6 +603,21 @@ def build_memory_write_metadata(
     return {k: v for k, v in metadata.items() if v not in {None, ""}}
 
 
+def _format_review_summary(actions: List[str]) -> str:
+    """Format the user-visible review summary.
+
+    A single action stays inline after the '💾 Self-improvement review:'
+    prefix; several become a newline bullet list — compaction accounting and
+    efficiency escalation lines are long, and gluing them into one ' · '
+    chain is unreadable on Discord mobile. The same string feeds both the
+    CLI print and the platform callback.
+    """
+    unique = list(dict.fromkeys(actions))
+    if len(unique) == 1:
+        return unique[0]
+    return "".join(f"\n• {a}" for a in unique)
+
+
 def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
@@ -889,7 +904,7 @@ def _run_review_in_thread(
                 logger.warning("compaction outcome bookkeeping failed: %s", e)
 
         if actions:
-            summary = " · ".join(dict.fromkeys(actions))
+            summary = _format_review_summary(actions)
             agent._safe_print(
                 f"  💾 Self-improvement review: {summary}"
             )

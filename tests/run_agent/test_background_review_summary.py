@@ -128,3 +128,31 @@ def test_removed_or_replaced_relabels_by_target():
 
     assert "User profile updated" in actions
     assert "Memory updated" in actions
+
+
+# ---------------------------------------------------------------------------
+# _format_review_summary: one action inline, several become a bullet list
+# (the same string feeds both the CLI print and the Discord callback)
+# ---------------------------------------------------------------------------
+
+from agent.background_review import _format_review_summary
+
+
+def test_format_single_action_stays_inline():
+    assert _format_review_summary(["Memory updated"]) == "Memory updated"
+
+
+def test_format_multiple_actions_bulleted():
+    out = _format_review_summary([
+        "Skill 'a' patched",
+        "🧹 Compacted skill 'b' — folded 20 accumulated patches",
+    ])
+    assert out == (
+        "\n• Skill 'a' patched"
+        "\n• 🧹 Compacted skill 'b' — folded 20 accumulated patches"
+    )
+
+
+def test_format_dedupes_preserving_order():
+    out = _format_review_summary(["A", "B", "A"])
+    assert out == "\n• A\n• B"
