@@ -1064,6 +1064,18 @@ class _CodexCompletionsAdapter:
             if final is None:
                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
 
+            # Fail fast on terminal failure verdicts instead of returning an
+            # empty response that gets misdiagnosed as "HTTP 200 with no text"
+            # (which burns empty-200 retries on a deterministic rejection and
+            # hides the provider's real reason from the logs / classifier).
+            final_status = getattr(final, "status", None)
+            if final_status == "failed":
+                from agent.codex_responses_adapter import _format_responses_error
+                raise RuntimeError(
+                    "Codex auxiliary Responses stream failed: "
+                    + _format_responses_error(getattr(final, "error", None), "failed")
+                )
+
             # Extract text and tool calls from the Responses output.
             # Items may be SimpleNamespace (raw-event path) or dicts
             # (some legacy fallback paths), so handle both shapes.
@@ -1110,6 +1122,23 @@ class _CodexCompletionsAdapter:
                 timeout_timer.cancel()
 
         content = "".join(text_parts).strip() or None
+
+        # An incomplete terminal with NO text means the output budget was
+        # consumed before any visible text (e.g. reasoning burned a relay-side
+        # max_output_tokens cap). Surface the real reason instead of returning
+        # an empty response that reads as generic provider ill-health.
+        # Incomplete WITH partial text keeps returning the text — the
+        # validator/caller decides whether a truncated body is usable.
+        if content is None and not tool_calls_raw \
+                and getattr(final, "status", None) == "incomplete":
+            _details = getattr(final, "incomplete_details", None)
+            _reason = getattr(_details, "reason", None) \
+                or (_details.get("reason") if isinstance(_details, dict) else None) \
+                or "unknown"
+            raise RuntimeError(
+                "Codex auxiliary Responses stream ended incomplete with no "
+                f"output text (reason: {_reason})"
+            )
 
         # Build a response that looks like chat.completions
         message = SimpleNamespace(

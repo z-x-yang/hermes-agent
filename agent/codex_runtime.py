@@ -671,6 +671,32 @@ def _consume_codex_event_stream(
     # a single message item so downstream normalization has something to work with.
     if collected_output_items:
         output = list(collected_output_items)
+        # Relay backends (gptcodex) mangle long streams: after an internal
+        # restart (double response.created) the message item gets
+        # output_item.added but never output_item.done, while its full text
+        # still arrives via output_text.delta — then a clean
+        # response.completed. If only non-message items (reasoning) completed,
+        # the streamed text would be silently dropped and the whole response
+        # read as empty. Fold the deltas back in as a synthesized message item
+        # whenever no completed message item carries any text.
+        if collected_text_deltas:
+            has_message_text = any(
+                _event_field(part, "type") in ("output_text", "text")
+                and _event_field(part, "text", "")
+                for item in output
+                if _event_field(item, "type") == "message"
+                for part in (_event_field(item, "content") or [])
+            )
+            if not has_message_text:
+                output.append(SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(
+                        type="output_text",
+                        text="".join(collected_text_deltas),
+                    )],
+                ))
     elif collected_text_deltas and not has_tool_calls:
         assembled = "".join(collected_text_deltas)
         output = [SimpleNamespace(
