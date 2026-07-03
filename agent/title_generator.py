@@ -177,10 +177,37 @@ def maybe_auto_title(
 
     Only generates a title when:
     - This appears to be the first user→assistant exchange
+    - The session has never been compacted (a compaction means the
+      conversation is already past its opening)
     - No title is already set
     """
     if not session_db or not session_id or not user_message or not assistant_response:
         return
+
+    # A compacted session is, by definition, past its opening exchanges — so it
+    # must NOT be (re)titled here. Context compression rewrites the transcript,
+    # collapsing the user-message count back into the first-exchange range; the
+    # ``user_msg_count`` heuristic below is blind to that and would re-qualify a
+    # long, mid-conversation session as a "first exchange". If the opening
+    # exchanges never produced a title (e.g. the auxiliary title LLM was down, or
+    # early turns were pure-tool / errored with no clean final response), that
+    # stale heuristic then generates a title from post-compaction content and
+    # renames the live Discord thread *in the middle of the conversation* — the
+    # behaviour users complain about. ``get_session_compression_count`` is
+    # DB-backed and lineage-aware (covers both in-place and rotation compaction),
+    # so a value > 0 reliably means "already compacted at least once → skip".
+    try:
+        _count_fn = getattr(session_db, "get_session_compression_count", None)
+        if callable(_count_fn):
+            _compression_count = _count_fn(session_id)
+            # isinstance guard keeps test doubles / partial stubs that return a
+            # non-int from breaking the comparison; only a real positive count skips.
+            if isinstance(_compression_count, int) and _compression_count > 0:
+                return
+    except Exception:
+        # Never let a title-detection lookup break the turn — worst case we fall
+        # through to the count heuristic (pre-fix behaviour).
+        logger.debug("compression-count auto-title guard lookup failed", exc_info=True)
 
     # Count user messages in history to detect first exchange.
     # conversation_history includes the exchange that just happened,

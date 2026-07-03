@@ -279,6 +279,48 @@ class TestMaybeAutoTitle:
             time.sleep(0.1)
             mock_auto.assert_not_called()
 
+    def test_skips_if_session_already_compressed(self):
+        """A compacted session is past its opening — auto-title must not fire.
+
+        Compression rewrites the transcript, collapsing the user-message count
+        back into the first-exchange range. Without a compaction-aware guard
+        this re-qualifies a long, mid-conversation session as a "first
+        exchange", regenerates a title, and renames the live Discord thread
+        mid-conversation — the exact behaviour users complain about.
+        ``get_session_compression_count`` > 0 means the conversation has
+        already been compacted at least once, so titling must be skipped even
+        when the post-compaction history looks short.
+        """
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        db.get_session_compression_count.return_value = 1
+        history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            maybe_auto_title(db, "sess-1", "hello", "hi there", history)
+            import time
+            time.sleep(0.2)
+            mock_auto.assert_not_called()
+
+    def test_fires_when_never_compressed(self):
+        """A genuine first exchange (compression_count == 0) still titles."""
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        db.get_session_compression_count.return_value = 0
+        history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            maybe_auto_title(db, "sess-1", "hello", "hi there", history)
+            import time
+            time.sleep(0.2)
+            mock_auto.assert_called_once()
+
     def test_fires_on_first_exchange(self):
         """Should fire a background thread for the first exchange."""
         db = MagicMock()
