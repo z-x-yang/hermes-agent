@@ -303,6 +303,31 @@ def _normalize_responses_message_status(value: Any, *, default: str = "completed
     return default
 
 
+def _replayable_responses_message_id(item_id: Any) -> Optional[str]:
+    """Return a message item id that is safe to send back to the Responses
+    API, or ``None`` if it must be dropped.
+
+    The Responses API requires input *message* items to carry an id that
+    begins with ``msg`` (e.g. ``msg_abc``).  The ids it returns for other
+    item kinds — ``item_...`` (generic output items, notably on relays like
+    gptcodex), ``rs_...`` (reasoning), ``fc_...`` (function calls) — are
+    rejected with HTTP 400 ``invalid_id_prefix`` ("Expected an ID that begins
+    with 'msg'") when attached to a replayed message item.  Because these ids
+    are captured verbatim from the response and replayed on later turns, a
+    single non-``msg`` id poisons every subsequent turn in the session.
+
+    The id is an optional prefix-cache hint, not required for correctness
+    (reasoning items already replay with their id stripped — see the
+    ``store=False`` note in ``_chat_messages_to_responses_input``), so drop
+    anything that isn't a valid message id rather than sending a rejection.
+    """
+    if isinstance(item_id, str):
+        stripped = item_id.strip()
+        if stripped.startswith("msg"):
+            return stripped
+    return None
+
+
 def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]],
     *,
@@ -462,9 +487,9 @@ def _chat_messages_to_responses_input(
                             "status": _normalize_responses_message_status(raw_item.get("status")),
                             "content": normalized_content_parts,
                         }
-                        item_id = raw_item.get("id")
-                        if isinstance(item_id, str) and item_id.strip():
-                            replay_item["id"] = item_id.strip()
+                        replay_id = _replayable_responses_message_id(raw_item.get("id"))
+                        if replay_id is not None:
+                            replay_item["id"] = replay_id
                         phase = raw_item.get("phase")
                         if isinstance(phase, str) and phase.strip():
                             replay_item["phase"] = phase.strip()
@@ -716,9 +741,9 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
                 "status": _normalize_responses_message_status(item.get("status")),
                 "content": normalized_content,
             }
-            item_id = item.get("id")
-            if isinstance(item_id, str) and item_id.strip():
-                normalized_item["id"] = item_id.strip()
+            replay_id = _replayable_responses_message_id(item.get("id"))
+            if replay_id is not None:
+                normalized_item["id"] = replay_id
             phase = item.get("phase")
             if isinstance(phase, str) and phase.strip():
                 normalized_item["phase"] = phase.strip()

@@ -913,6 +913,67 @@ class TestChatMessagesToResponsesInputMessageItems:
         assert msg_items[0]["phase"] == "final_answer"
         assert msg_items[0]["content"][0]["text"] == "Hello world"
 
+    def test_drops_non_msg_message_id_on_replay(self, monkeypatch):
+        """A stored message item whose id is not `msg`-prefixed (e.g. the
+        `item_...` ids some relays like gptcodex return) must NOT be replayed
+        with that id — the Responses API rejects message items whose id does
+        not begin with `msg` (HTTP 400 invalid_id_prefix). The item is still
+        replayed for cache/coherence; only the invalid id is dropped."""
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        messages = [
+            {
+                "role": "assistant",
+                "content": "Hello world",
+                "codex_message_items": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "id": "item_5dae991a320545f883a7f608",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "Hello world"}],
+                    },
+                ],
+            },
+            {"role": "user", "content": "follow up"},
+        ]
+        items = _chat_messages_to_responses_input(messages)
+        msg_items = [i for i in items if i.get("type") == "message"]
+        assert len(msg_items) == 1
+        # Item still replayed, but the illegal id is stripped.
+        assert "id" not in msg_items[0]
+        assert msg_items[0]["phase"] == "final_answer"
+        assert msg_items[0]["content"][0]["text"] == "Hello world"
+
+    def test_preflight_drops_non_msg_message_id(self, monkeypatch):
+        """The outbound preflight is the last gate before the wire: it must
+        strip a non-`msg` id from a message item regardless of how it got
+        there (covers already-stored bad ids in resumed sessions), while
+        preserving a valid `msg`-prefixed id."""
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        raw_input = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "id": "item_bad_prefix_123",
+                "content": [{"type": "output_text", "text": "bad id"}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "id": "msg_good_prefix_456",
+                "content": [{"type": "output_text", "text": "good id"}],
+            },
+        ]
+        normalized = _preflight_codex_input_items(raw_input)
+        assert "id" not in normalized[0]
+        assert normalized[0]["content"][0]["text"] == "bad id"
+        assert normalized[1]["id"] == "msg_good_prefix_456"
+
     def test_fallback_to_plain_when_no_message_items(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
                             base_url="https://chatgpt.com/backend-api/codex")
