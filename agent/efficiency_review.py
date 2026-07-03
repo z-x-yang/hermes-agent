@@ -463,13 +463,64 @@ COMPACTION_THRESHOLD = 15
 # (dedup, decontradiction) produces slightly-smaller-or-equal output.
 SHRINK_WARN_PCT = 30
 
+# Skills whose SKILL.md body is below this size can't hold enough redundancy
+# to justify an autonomous full rewrite — the churn risk outweighs any
+# cleanup. They are never nominated.
+COMPACTION_MIN_BYTES = 12_000
 
-def nominate_compaction(threshold: Optional[int] = None) -> Optional[Dict]:
+# Literal the review states in its reply when it read the nominated skill
+# and judged it already clean — closes the loop without a rewrite.
+COMPACTION_CLEAN_SENTINEL = "COMPACTION VERDICT: CLEAN"
+
+
+def _skill_body_bytes(name: str) -> Optional[int]:
+    """Size of the skill's SKILL.md in bytes, or None when the skill (or its
+    SKILL.md) is missing on disk."""
+    from tools import skill_usage
+
+    try:
+        skill_dir = skill_usage._find_skill_dir(name)
+        if skill_dir is None:
+            return None
+        body = skill_dir / "SKILL.md"
+        if not body.is_file():
+            return None
+        return body.stat().st_size
+    except Exception as e:
+        logger.warning("compaction size check failed for %s: %s", name, e)
+        return None
+
+
+def _mentioned_in_snapshot(name: str, messages_snapshot: List[Dict]) -> bool:
+    """True when the session actually touched the skill's territory — its
+    name appears in message content or tool-call arguments. Compaction is
+    grounded in session context; a review must never blind-rewrite a skill
+    the conversation never mentioned."""
+    for msg in messages_snapshot or []:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and name in content:
+            return True
+        for tc in msg.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            if name in (fn.get("arguments") or "") or name in (fn.get("name") or ""):
+                return True
+    return False
+
+
+def nominate_compaction(
+    messages_snapshot: List[Dict], threshold: Optional[int] = None
+) -> Optional[Dict]:
     """Deterministically nominate at most ONE skill for a compaction pass.
 
-    Eligible: local curation-eligible skills, present on disk, active, not
-    pinned, with ``patch_count - compacted_patch_count >= threshold``. The
-    most overdue one wins; one nomination per review bounds the cost.
+    Eligible: local curation-eligible skills, present on disk with a body of
+    at least COMPACTION_MIN_BYTES, active, not pinned, MENTIONED in the
+    session snapshot (grounding — the reviewer has context on the skill's
+    territory), with ``patch_count - compacted_patch_count >= threshold``.
+    The most overdue one wins; one nomination per review bounds the cost.
     """
     from tools import skill_usage
 
@@ -485,7 +536,10 @@ def nominate_compaction(threshold: Optional[int] = None) -> Optional[Dict]:
             continue
         if not skill_usage.is_curation_eligible(name):
             continue
-        if skill_usage._find_skill_dir(name) is None:
+        if not _mentioned_in_snapshot(name, messages_snapshot):
+            continue
+        body_bytes = _skill_body_bytes(name)
+        if body_bytes is None or body_bytes < COMPACTION_MIN_BYTES:
             continue
         if best is None or overdue > best["overdue"]:
             best = {"name": name, "overdue": overdue}
@@ -493,18 +547,23 @@ def nominate_compaction(threshold: Optional[int] = None) -> Optional[Dict]:
 
 
 def build_compaction_block(nomination: Dict) -> str:
-    """Prompt block instructing the review to run a compaction pass."""
+    """Prompt block instructing the review to run a compaction check."""
     name = nomination["name"]
     overdue = nomination["overdue"]
     return (
         "\n\n--- SKILL COMPACTION (deterministic nomination) ---\n"
         f"Skill '{name}' has accumulated {overdue} patches since its last "
-        "compaction. Before any other skill work, run a compaction pass "
-        "on it:\n"
+        "compaction check. Before any other skill work, run a compaction "
+        "check on it:\n"
         "  1. Read the FULL current SKILL.md with skill_view.\n"
-        "  2. Rewrite it in one piece via skill_manage action=edit (not "
-        "patch — anchor-style patching is the wrong tool for "
-        "consolidation).\n"
+        "  2. JUDGE it. List the concrete defects you found: duplicate "
+        "rules, contradictions, confirmed-stale content. If you find "
+        f"NONE, do NOT edit — state the line '{COMPACTION_CLEAN_SENTINEL}' "
+        "in your reply and move on. A rewrite must be earned by defects, "
+        "never performed to satisfy the nomination.\n"
+        "  3. Only if defects exist, rewrite in one piece via skill_manage "
+        "action=edit (not patch — anchor-style patching is the wrong tool "
+        "for consolidation).\n"
         "Compaction removes ONLY three things: duplicate rules (merge "
         "into one sharpened line), contradictions (keep the newer lesson, "
         "delete the older), and content confirmed stale (e.g. it "
@@ -517,9 +576,9 @@ def build_compaction_block(nomination: Dict) -> str:
         "every activation stays in the body; low-frequency detail moves "
         "to references/ behind a pointer that names its trigger "
         "condition.\n"
-        "In your reply, account for what changed: how many duplicates "
-        "merged, which contradictions resolved, what was dropped and "
-        "why.\n"
+        "If you rewrote, account for what changed in your reply: how many "
+        "duplicates merged, which contradictions resolved, what was "
+        "dropped and why.\n"
     )
 
 
@@ -545,6 +604,19 @@ def _compaction_shrink_pct(name: str) -> Optional[int]:
         return None
 
 
+def _stated_clean_verdict(review_messages: List[Dict], prior_snapshot: List[Dict]) -> bool:
+    """True when FRESH assistant text from this review (beyond the inherited
+    prior snapshot) states the clean-verdict sentinel."""
+    fresh = (review_messages or [])[len(prior_snapshot or []):]
+    for msg in fresh:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and COMPACTION_CLEAN_SENTINEL in content:
+            return True
+    return False
+
+
 def apply_compaction_outcome(
     nomination: Optional[Dict],
     review_messages: List[Dict],
@@ -553,34 +625,46 @@ def apply_compaction_outcome(
 ) -> None:
     """Post-review bookkeeping for a compaction nomination.
 
-    Only a successful full rewrite (skill_manage action=edit of the
-    nominated skill, performed by the review itself) resets the baseline —
-    otherwise the next review re-nominates. The accounting line is
-    deterministic; a >SHRINK_WARN_PCT size drop is flagged because
-    legitimate compaction dedupes, it does not shorten.
+    Two outcomes close the loop (reset the baseline): a successful full
+    rewrite (skill_manage action=edit of the nominated skill, performed by
+    the review itself), or an explicit clean verdict — the review read the
+    skill and stated COMPACTION_CLEAN_SENTINEL. Neither → the next review
+    re-nominates. Accounting is honest: it reports what actually happened
+    (rewrite vs clean) and how many patches were pending, never a "folded
+    N patches" claim no one verified. A >SHRINK_WARN_PCT size drop on
+    rewrite is flagged because legitimate compaction dedupes, it does not
+    shorten.
     """
     if not nomination:
         return
     name = nomination.get("name")
+    overdue = nomination.get("overdue")
     rewrote = any(
         args.get("action") == "edit" and args.get("name") == name
         for args in _successful_skill_writes(review_messages, prior_snapshot)
     )
-    if not rewrote:
-        return
-    from tools import skill_usage
-    skill_usage.set_compaction_baseline(name)
-    line = (
-        f"🧹 Compacted skill '{name}' — folded "
-        f"{nomination.get('overdue')} accumulated patches"
-    )
-    shrink = _compaction_shrink_pct(name)
-    if shrink is not None and shrink > SHRINK_WARN_PCT:
-        line += (
-            f" · ⚠️ body shrank {shrink}% — compaction should dedupe, not "
-            "shorten; diff .history/ if unexpected"
+    if rewrote:
+        from tools import skill_usage
+        skill_usage.set_compaction_baseline(name)
+        line = (
+            f"🧹 Compaction: rewrote skill '{name}' "
+            f"({overdue} patches since last check)"
         )
-    actions.append(line)
+        shrink = _compaction_shrink_pct(name)
+        if shrink is not None and shrink > SHRINK_WARN_PCT:
+            line += (
+                f" · ⚠️ body shrank {shrink}% — compaction should dedupe, not "
+                "shorten; diff .history/ if unexpected"
+            )
+        actions.append(line)
+        return
+    if _stated_clean_verdict(review_messages, prior_snapshot):
+        from tools import skill_usage
+        skill_usage.set_compaction_baseline(name)
+        actions.append(
+            f"🧹 Compaction check: skill '{name}' judged clean — no rewrite "
+            f"needed ({overdue} patches since last check)"
+        )
 
 
 __all__ = [
@@ -594,4 +678,7 @@ __all__ = [
     "nominate_compaction",
     "build_compaction_block",
     "apply_compaction_outcome",
+    "COMPACTION_CLEAN_SENTINEL",
+    "COMPACTION_MIN_BYTES",
+    "COMPACTION_THRESHOLD",
 ]

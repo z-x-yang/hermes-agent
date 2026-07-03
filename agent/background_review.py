@@ -995,13 +995,16 @@ def spawn_background_review_thread(
 
     # Skill reviews may also carry a compaction nomination: a skill that
     # accumulated too many patches since its last compaction baseline gets a
-    # deterministic full-read + full-rewrite instruction appended.
+    # deterministic full-read + judge (+ rewrite only if defects) instruction
+    # appended. Nomination is grounded in the session snapshot — only skills
+    # this conversation actually touched are eligible.
     compaction_ctx: Optional[Dict] = None
     if review_skills:
         try:
             from agent.efficiency_review import build_compaction_block, nominate_compaction
             compaction_ctx = nominate_compaction(
-                threshold=getattr(agent, "skill_compaction_threshold", None)
+                messages_snapshot,
+                threshold=getattr(agent, "skill_compaction_threshold", None),
             )
             if compaction_ctx:
                 prompt = prompt + build_compaction_block(compaction_ctx)
