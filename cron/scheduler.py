@@ -31,7 +31,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -208,6 +208,32 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
             exc,
         )
         return None
+
+
+def _resolve_cron_reasoning_config(job: dict, cfg: Any) -> dict | None:
+    """Resolve reasoning config for a cron-spawned agent.
+
+    Per-job ``reasoning_effort`` wins over global
+    ``config.yaml agent.reasoning_effort``. Existing jobs without the field keep
+    the old global behavior. Invalid persisted values fail closed so a hand-edited
+    jobs.json cannot silently downgrade to a different setting.
+    """
+    from hermes_constants import parse_reasoning_effort
+
+    job_effort = str((job or {}).get("reasoning_effort") or "").strip()
+    if job_effort:
+        parsed = parse_reasoning_effort(job_effort)
+        if parsed is None:
+            raise ValueError(
+                f"Invalid cron job reasoning_effort {job_effort!r}; expected one of: none, minimal, low, medium, high, xhigh"
+            )
+        return parsed
+
+    agent_cfg = (cfg or {}).get("agent") if isinstance(cfg, dict) else {}
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
+    effort = str(agent_cfg.get("reasoning_effort", "")).strip()
+    return parse_reasoning_effort(effort)
 
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
@@ -2555,12 +2581,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except Exception:
             pass
 
-        # Reasoning config from config.yaml (raw value — a YAML boolean False
-        # means thinking disabled, see parse_reasoning_effort)
-        from hermes_constants import parse_reasoning_effort
-        reasoning_config = parse_reasoning_effort(
-            _cfg.get("agent", {}).get("reasoning_effort", "")
-        )
+        # Reasoning config: per-job override > config.yaml agent.reasoning_effort
+        reasoning_config = _resolve_cron_reasoning_config(job, _cfg)
 
         # Prefill messages from env or config.yaml. The top-level
         # prefill_messages_file key is canonical; agent.prefill_messages_file is

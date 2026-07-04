@@ -49,3 +49,14 @@ def test_cronjob_schema_workdir_description_matches_parallel_runtime_contract():
     assert "LLM-driven jobs with workdir run in the normal parallel pool" in desc
     assert "no_agent script-only jobs with workdir remain sequential" in desc
     assert "Jobs with workdir run sequentially" not in desc
+
+
+def test_cronjob_schema_exposes_reasoning_effort_override():
+    """`reasoning_effort` lets scheduled jobs pin thinking per job."""
+    from tools.cronjob_tools import CRONJOB_SCHEMA
+
+    prop = CRONJOB_SCHEMA["parameters"]["properties"]["reasoning_effort"]
+    assert prop["type"] == "string"
+    assert prop["enum"] == ["none", "minimal", "low", "medium", "high", "xhigh", ""]
+    assert "per-job" in prop["description"]
+    assert "empty string" in prop["description"]

@@ -159,6 +159,8 @@ def cron_list(show_all: bool = False):
         else:
             print(f"    Next run:  {next_run}")
         print(f"    Deliver:   {deliver_str}")
+        if job.get("reasoning_effort"):
+            print(f"    Reasoning: {job['reasoning_effort']}")
         if skills:
             print(f"    Skills:    {', '.join(skills)}")
         script = job.get("script")
@@ -315,6 +317,7 @@ def cron_create(args):
         skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
         no_agent=getattr(args, "no_agent", False) or None,
     )
     if not result.get("success"):
@@ -332,6 +335,8 @@ def cron_create(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
+    if job_data.get("reasoning_effort"):
+        print(f"  Reasoning: {job_data['reasoning_effort']}")
     print(f"  Next run: {result['next_run_at']}")
     _warn_if_gateway_not_running()
     return 0
@@ -378,6 +383,7 @@ def cron_edit(args):
         skills=final_skills,
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
         no_agent=getattr(args, "no_agent", None),
     )
     if not result.get("success"):
@@ -398,6 +404,8 @@ def cron_edit(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("workdir"):
         print(f"  Workdir: {updated['workdir']}")
+    if updated.get("reasoning_effort"):
+        print(f"  Reasoning: {updated['reasoning_effort']}")
     return 0
 
 

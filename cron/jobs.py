@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - non-Windows
     msvcrt = None
 from datetime import datetime, timedelta
 from pathlib import Path
-from hermes_constants import get_hermes_home
+from hermes_constants import VALID_REASONING_EFFORTS, get_hermes_home
 from typing import Optional, Dict, List, Any, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
@@ -744,6 +744,36 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     return str(resolved)
 
 
+_CRON_REASONING_EFFORTS = ("none", *VALID_REASONING_EFFORTS)
+
+
+def _normalize_reasoning_effort(
+    reasoning_effort: Optional[str], *, allow_clear: bool = True
+) -> Optional[str]:
+    """Validate and normalize a per-job reasoning effort override.
+
+    ``None`` means the caller did not set a per-job override. An empty string
+    clears an existing override when ``allow_clear`` is true. Unknown values are
+    rejected instead of silently falling back to global ``agent.reasoning_effort``.
+    """
+    if reasoning_effort is None:
+        return None
+    effort = str(reasoning_effort).strip().lower()
+    if not effort:
+        if allow_clear:
+            return None
+        raise ValueError(
+            "reasoning_effort cannot be empty here; omit it or use one of: "
+            + ", ".join(_CRON_REASONING_EFFORTS)
+        )
+    if effort not in _CRON_REASONING_EFFORTS:
+        raise ValueError(
+            "Invalid reasoning_effort %r. Expected one of: %s"
+            % (reasoning_effort, ", ".join(_CRON_REASONING_EFFORTS))
+        )
+    return effort
+
+
 def _resolve_default_model_snapshot() -> Optional[str]:
     """Resolve the global default model the same way the cron ticker does.
 
@@ -859,6 +889,7 @@ def create_job(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
@@ -882,6 +913,9 @@ def create_job(
         model: Optional per-job model override
         provider: Optional per-job provider override
         base_url: Optional per-job base URL override
+        reasoning_effort: Optional per-job reasoning effort override. Valid
+                values: none, minimal, low, medium, high, xhigh. When omitted,
+                the job follows config.yaml agent.reasoning_effort.
         script: Optional path to a script whose stdout feeds the job. With
                 ``no_agent=True`` the script IS the job — its stdout is
                 delivered verbatim. Without ``no_agent``, its stdout is
@@ -934,6 +968,7 @@ def create_job(
     normalized_model = _normalize_job_optional_text(model)
     normalized_provider = _normalize_job_optional_text(provider)
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
+    normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
@@ -992,6 +1027,7 @@ def create_job(
         "provider_snapshot": provider_snapshot,
         "model_snapshot": model_snapshot,
         "base_url": normalized_base_url,
+        "reasoning_effort": normalized_reasoning_effort,
         "script": normalized_script,
         "no_agent": normalized_no_agent,
         "context_from": context_from,

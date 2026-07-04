@@ -411,6 +411,59 @@ class TestUnifiedCronjobTool:
         assert result["success"] is True
         assert result["job"]["base_url"] == "https://legit.example/v1"
 
+    def test_create_list_and_clear_reasoning_effort_override(self):
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check",
+                schedule="every 1h",
+                reasoning_effort="high",
+            )
+        )
+        assert created["success"] is True
+        assert created["job"]["reasoning_effort"] == "high"
+        assert get_job(created["job_id"])["reasoning_effort"] == "high"
+
+        listing = json.loads(cronjob(action="list"))
+        assert listing["jobs"][0]["reasoning_effort"] == "high"
+
+        cleared = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                reasoning_effort="",
+            )
+        )
+        assert cleared["success"] is True
+        assert "reasoning_effort" not in cleared["job"]
+        assert get_job(created["job_id"]).get("reasoning_effort") is None
+
+    def test_reasoning_effort_rejects_invalid_values(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check",
+                schedule="every 1h",
+                reasoning_effort="maximum",
+            )
+        )
+        assert created["success"] is False
+        assert "reasoning_effort" in created["error"]
+        assert "high" in created["error"]
+
+        valid = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=valid["job_id"],
+                reasoning_effort="maximum",
+            )
+        )
+        assert updated["success"] is False
+        assert "reasoning_effort" in updated["error"]
+
     def test_create_skill_backed_job(self):
         result = json.loads(
             cronjob(

@@ -25,6 +25,10 @@ All of this is available to Hermes itself through the `cronjob` tool, so you can
 At creation, an unpinned job (one you don't give an explicit `provider`/`model`) follows the global default selected by `hermes model` — and Hermes **snapshots** that provider and model on the job. If the global default later changes, the job **fails closed**: it skips the run, makes no inference call, and sends an alert telling you to pin the provider/model explicitly (`cronjob action=update job_id=… provider=… model=…`) to proceed. This prevents an unattended job from silently inheriting a switch to a paid provider/model and spending money you didn't intend (#44585). To make a job deliberately track your global default, pin it to the new values after changing them. `hermes setup --portal` is the lowest-friction option for unattended runs since OAuth refresh is automatic. See [Nous Portal](/integrations/nous-portal).
 :::
 
+:::tip
+LLM-driven cron jobs can also pin their own reasoning effort independently from the global `agent.reasoning_effort` setting. Use `reasoning_effort="high"` with the `cronjob` tool, or `--reasoning-effort high` in `hermes cron create/edit`. Valid values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`; pass an empty string on update to clear the per-job override. Script-only `no_agent` jobs ignore this field.
+:::
+
 :::warning
 Cron-run sessions cannot recursively create more cron jobs. Hermes disables cron management tools inside cron executions to prevent runaway scheduling loops.
 :::
