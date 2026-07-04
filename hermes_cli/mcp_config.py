@@ -246,8 +246,17 @@ def _resolve_mcp_server_config(config: dict) -> dict:
     return _interpolate_env_vars(config)
 
 
+def _coerce_positive_timeout(value: Any, default: float) -> float:
+    """Return a positive float timeout, falling back on invalid input."""
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        return default
+    return timeout if timeout > 0 else default
+
+
 def _probe_single_server(
-    name: str, config: dict, connect_timeout: float = 30, *, details: Optional[dict] = None
+    name: str, config: dict, connect_timeout: Optional[float] = None, *, details: Optional[dict] = None
 ) -> List[Tuple[str, str]]:
     """Temporarily connect to one MCP server, list its tools, disconnect.
 
@@ -261,6 +270,19 @@ def _probe_single_server(
     issues = validate_mcp_server_entry(name, config)
     if issues:
         raise ValueError("; ".join(issues))
+
+    if connect_timeout is None:
+        # This probe path is also used by ``hermes mcp login``. For OAuth
+        # servers, the browser callback can legitimately take longer than the
+        # historical 30s connect default; honor explicit per-server
+        # ``connect_timeout`` so the outer ``_run_on_mcp_loop`` wrapper does
+        # not kill the login at 30+10 seconds. Do not use top-level
+        # ``timeout`` here: runtime treats that as the per-tool timeout, and
+        # long-running tools should not make dead discovery probes hang.
+        connect_timeout = _coerce_positive_timeout(
+            config.get("connect_timeout"),
+            30.0,
+        )
 
     from tools.mcp_tool import (
         _ensure_mcp_loop,

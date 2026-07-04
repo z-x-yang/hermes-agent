@@ -550,7 +550,6 @@ class TestProbeEnvResolution:
         monkeypatch.setenv("MCP_N8N_API_KEY", "jwt-token-xyz")
 
         seen = {}
-
         class _FakeTool:
             name = "do_thing"
             description = "a tool"
@@ -574,6 +573,58 @@ class TestProbeEnvResolution:
 
         assert tools == [("do_thing", "a tool")]
         assert seen["config"]["headers"]["Authorization"] == "Bearer jwt-token-xyz"
+
+    def test_probe_uses_configured_connect_timeout_for_oauth_login_window(self, monkeypatch):
+        """Probe timeout must honor per-server connect_timeout instead of hard 40s.
+
+        ``hermes mcp login`` uses this probe path to wait for the browser OAuth
+        callback. OAuth servers that need a longer callback window should set
+        ``connect_timeout``; plain ``timeout`` remains the runtime tool-call
+        timeout and must not make dead probes hang for minutes.
+        """
+        import hermes_cli.mcp_config as mc
+
+        seen = {}
+
+        def fake_run(coro, *, timeout):
+            seen["timeout"] = timeout
+            coro.close()
+
+        monkeypatch.setattr("tools.mcp_tool._ensure_mcp_loop", lambda: None)
+        monkeypatch.setattr("tools.mcp_tool._stop_mcp_loop_if_idle", lambda: None)
+        monkeypatch.setattr("tools.mcp_tool._run_on_mcp_loop", fake_run)
+
+        tools = mc._probe_single_server("notion", {
+            "url": "https://mcp.notion.com/mcp",
+            "auth": "oauth",
+            "timeout": 180,
+            "connect_timeout": 180,
+        })
+
+        assert tools == []
+        assert seen["timeout"] == 190
+
+    def test_probe_does_not_use_tool_timeout_as_connect_timeout(self, monkeypatch):
+        """Long tool-call timeout must not make failed discovery probes hang."""
+        import hermes_cli.mcp_config as mc
+
+        seen = {}
+
+        def fake_run(coro, *, timeout):
+            seen["timeout"] = timeout
+            coro.close()
+
+        monkeypatch.setattr("tools.mcp_tool._ensure_mcp_loop", lambda: None)
+        monkeypatch.setattr("tools.mcp_tool._stop_mcp_loop_if_idle", lambda: None)
+        monkeypatch.setattr("tools.mcp_tool._run_on_mcp_loop", fake_run)
+
+        mc._probe_single_server("slow-tool", {
+            "url": "https://example.com/mcp",
+            "timeout": 600,
+        })
+
+        assert seen["timeout"] == 40
+
 
 
 class TestStripBearerPrefix:
