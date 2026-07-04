@@ -247,7 +247,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, claim_oneshot_for_run
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -3251,13 +3251,35 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, advance_next_run keeps
-        # bumping next_run_at forward so the grace window never expires.
-        # mark_job_run() overwrites next_run_at on completion.
+        # Durably claim each due job FIRST, under the file lock, before any
+        # execution begins.  This preserves at-most-once semantics across
+        # processes (two gateway tickers, a restart that left a stale process):
+        #   - recurring: advance_next_run bumps next_run_at forward so a later
+        #     tick (any process) no longer sees it due.  For parallel jobs that
+        #     are already running it keeps bumping next_run_at forward so the
+        #     grace window never expires; mark_job_run() overwrites it on
+        #     completion.
+        #   - one-shot: advance_next_run is a no-op, so claim_oneshot_for_run
+        #     flips a durable state="running" marker instead.  A one-shot
+        #     already claimed by a LIVE runner loses the claim and is dropped
+        #     from this tick — this closes the duplicate-start hole where the
+        #     only guard was the per-process in-memory _running_job_ids set.
+        claimed_jobs: list = []
         for job in due_jobs:
-            advance_next_run(job["id"])
+            _sched = job.get("schedule")
+            _kind = _sched.get("kind") if isinstance(_sched, dict) else None
+            if _kind == "once":
+                if claim_oneshot_for_run(job["id"]):
+                    claimed_jobs.append(job)
+                else:
+                    logger.info(
+                        "One-shot job '%s' already claimed/running — skipping",
+                        job.get("name", job["id"]),
+                    )
+            else:
+                advance_next_run(job["id"])
+                claimed_jobs.append(job)
+        due_jobs = claimed_jobs
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.

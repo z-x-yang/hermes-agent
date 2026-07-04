@@ -1257,6 +1257,11 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
+                # Clear the built-in tick's in-flight running marker — a
+                # completed (or re-armed recurring) job must never keep a stale
+                # state="running"/started_at that would hide it from get_due_jobs.
+                job["started_at"] = None
+                job["run_owner"] = None
                 
                 # Increment completed count.  Finite one-shot jobs are
                 # pre-claimed by claim_dispatch() BEFORE the side effect runs
@@ -1432,6 +1437,122 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+def _local_host() -> str:
+    """Hostname used for run-owner attribution / liveness checks."""
+    try:
+        import socket
+        return socket.gethostname()
+    except Exception:
+        return "unknown"
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with ``pid`` currently exists on the local host."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    except OSError:
+        return False
+    return True
+
+
+def _machine_token() -> str:
+    """Stable machine identity for run-owner liveness checks.
+
+    ``uuid.getnode()`` is MAC-derived and stable per physical machine, so two
+    hosts that share a ``jobs.json`` (NFS) — even with the same hostname — never
+    collide. In its failure mode (MAC unreadable) getnode() returns a
+    per-process random value, which only ever makes two processes look like
+    DIFFERENT machines, i.e. it fails CLOSED toward never-reclaim (never a false
+    "dead"). This is intentionally stronger than a hostname compare, which can
+    collide across containers/replicas. ``HERMES_MACHINE_ID`` overrides it for
+    deployments that pin a stable id.
+    """
+    explicit = os.getenv("HERMES_MACHINE_ID", "").strip()
+    if explicit:
+        return explicit
+    return f"{uuid.getnode():x}"
+
+
+def _run_owner() -> Dict[str, Any]:
+    """Identity of the process that owns an in-flight run (for crash recovery)."""
+    return {"machine": _machine_token(), "pid": os.getpid(), "host": _local_host()}
+
+
+def _running_owner_alive(job: Dict[str, Any]) -> bool:
+    """Conservative liveness of a ``state=="running"`` job's owner.
+
+    Returns True (DO NOT reclaim) unless the owner is PROVABLY dead: it ran on
+    THIS machine AND its pid is gone. Anything we cannot positively verify —
+    a missing/malformed owner, a non-int pid, or a different/unverifiable
+    machine token — returns True (fail closed toward at-most-once: never
+    re-fire a run we cannot prove is dead). There is NO time-based TTL, so a
+    legitimately long-running job (owner alive) is never re-fired while it is
+    still running.
+
+    Known, accepted limitation (conservative by design — favors at-most-once
+    over availability per the spec): if the owning process crashed before
+    ``mark_job_run`` and the OS later reused its pid for an unrelated live
+    process, the job stays excluded (a wedge, not a duplicate) until manually
+    cleared. Distinguishing pid reuse needs process start-time (psutil), which
+    is out of scope here.
+    """
+    owner = job.get("run_owner")
+    if not isinstance(owner, dict):
+        return True  # unknown owner → never reclaim
+    if owner.get("machine") != _machine_token():
+        return True  # different / unverifiable machine → never reclaim
+    pid = owner.get("pid")
+    if not isinstance(pid, int):
+        return True  # malformed owner → fail closed, never reclaim
+    return _pid_alive(pid)
+
+
+def claim_oneshot_for_run(job_id: str) -> bool:
+    """Durably claim a due one-shot for a single execution (built-in tick path).
+
+    At-most-once across processes/tickers: returns True iff THIS caller flipped
+    the one-shot from not-running to running. A job already running under a LIVE
+    owner loses (returns False); a job running under a provably-dead owner is
+    reclaimed (crash recovery) and won.
+
+    This is the built-in ``tick`` counterpart to ``advance_next_run`` (which
+    only bumps recurring schedules and is a no-op for one-shots). Unlike the
+    external-provider CAS ``claim_job_for_fire``, it uses NO time-based TTL:
+    in-flight is gated by the durable ``state="running"`` marker plus owner
+    liveness (see ``_running_owner_alive``), so a legitimately long-running job
+    is never re-fired while alive. One-shot only — returns False for any other
+    kind so callers fall back to ``advance_next_run``.
+
+    Complements (does not replace) ``claim_dispatch`` (#38758): this guards
+    concurrent duplicate STARTS and re-arms crashed runs for retry; the
+    dispatch counter caps how many times a finite one-shot may fire in total,
+    so a self-destructing job cannot crash-retry forever.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] != job_id:
+                continue
+            if (job.get("schedule") or {}).get("kind") != "once":
+                return False
+            if not job.get("enabled", True) or job.get("state") == "paused":
+                return False
+            if job.get("state") == "running" and _running_owner_alive(job):
+                return False  # a live runner already owns this fire
+            job["state"] = "running"
+            job["started_at"] = _hermes_now().isoformat()
+            job["run_owner"] = _run_owner()
+            save_jobs(jobs)
+            return True
+        return False
+
+
 def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
@@ -1509,6 +1630,25 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     for job in jobs:
         if not job.get("enabled", True):
             continue
+
+        # An in-flight one-shot (durably marked running by claim_oneshot_for_run)
+        # is not due again — this is the cross-process at-most-once the in-memory
+        # _running_job_ids set cannot provide. If its runner is provably dead
+        # (crash/restart), re-arm it so it can retry; otherwise exclude it while
+        # it runs. NB: no time-based TTL — see _running_owner_alive.
+        if (job.get("schedule") or {}).get("kind") == "once" and job.get("state") == "running":
+            if _running_owner_alive(job):
+                continue
+            job["state"] = "scheduled"
+            job["started_at"] = None
+            job["run_owner"] = None
+            for rj in raw_jobs:
+                if rj["id"] == job["id"]:
+                    rj["state"] = "scheduled"
+                    rj["started_at"] = None
+                    rj["run_owner"] = None
+                    needs_save = True
+                    break
 
         next_run = job.get("next_run_at")
         if not next_run:

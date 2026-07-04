@@ -140,6 +140,8 @@ def cron_list(show_all: bool = False):
         skills = job.get("skills") or ([job["skill"]] if job.get("skill") else [])
         if state == "paused":
             status = color("[paused]", Colors.YELLOW)
+        elif state == "running":
+            status = color("[running]", Colors.CYAN)
         elif state == "completed":
             status = color("[completed]", Colors.BLUE)
         elif job.get("enabled", True):
@@ -151,7 +153,11 @@ def cron_list(show_all: bool = False):
         print(f"    Name:      {name}")
         print(f"    Schedule:  {schedule}")
         print(f"    Repeat:    {repeat_str}")
-        print(f"    Next run:  {next_run}")
+        if state == "running":
+            started_at = job.get("started_at")
+            print(f"    Running:   in flight since {started_at or '?'}")
+        else:
+            print(f"    Next run:  {next_run}")
         print(f"    Deliver:   {deliver_str}")
         if skills:
             print(f"    Skills:    {', '.join(skills)}")

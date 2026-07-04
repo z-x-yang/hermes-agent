@@ -2586,8 +2586,12 @@ class TestOneShotDispatchClaim:
         }
 
     def test_claim_runs_before_run_job(self):
+        # claim_oneshot_for_run is mocked True: the handed-in job is not in the
+        # real store, and the durable running-marker claim fails closed for
+        # store-less jobs — this test only cares about claim_dispatch ordering.
         order = []
         with patch("cron.scheduler.get_due_jobs", return_value=[self._oneshot()]), \
+             patch("cron.scheduler.claim_oneshot_for_run", return_value=True), \
              patch("cron.scheduler.claim_dispatch", side_effect=lambda _id: order.append("claim") or True), \
              patch("cron.scheduler.run_job", side_effect=lambda _j: order.append("run") or (True, "# out", "ok", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -2599,6 +2603,7 @@ class TestOneShotDispatchClaim:
 
     def test_refused_claim_skips_run_job(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._oneshot()]), \
+             patch("cron.scheduler.claim_oneshot_for_run", return_value=True), \
              patch("cron.scheduler.claim_dispatch", return_value=False), \
              patch("cron.scheduler.run_job") as run_mock, \
              patch("cron.scheduler.save_job_output"), \
