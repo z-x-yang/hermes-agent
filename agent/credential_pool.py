@@ -724,11 +724,12 @@ class CredentialPool:
         keeps the consumed refresh_token and the next ``_refresh_entry`` call
         would replay it and get a ``refresh_token_reused``-style 4xx.
 
-        Only applies to entries seeded from the singleton (``device_code``);
-        manually added entries are independent credentials with their own
-        refresh-token lifecycle.
+        Only applies to entries seeded from the singleton (``device_code``, or
+        the pre-0.18 ``loopback_pkce`` alias still present on disk); manually
+        added entries are independent credentials with their own refresh-token
+        lifecycle.
         """
-        if self.provider != "xai-oauth" or entry.source != "device_code":
+        if self.provider != "xai-oauth" or entry.source not in ("device_code", "loopback_pkce"):
             return entry
         try:
             with _auth_store_lock():
@@ -869,8 +870,10 @@ class CredentialPool:
         # Only sync entries that were seeded *from* a singleton.  Manually
         # added pool entries (source="manual:*") are independent credentials
         # and must not write back to the singleton.  All singleton-seeded
-        # device-code sources (nous, openai-codex, xAI) use ``device_code``.
-        if entry.source != "device_code":
+        # device-code sources (nous, openai-codex, xAI) use ``device_code``;
+        # pre-0.18 xAI entries on disk still carry the ``loopback_pkce`` alias
+        # for the same singleton lineage.
+        if entry.source not in ("device_code", "loopback_pkce"):
             return
         try:
             with _auth_store_lock():
@@ -1137,7 +1140,10 @@ class CredentialPool:
                 # refresh_token is dead.  Clear it from auth.json so the next
                 # session does not re-seed the same revoked credentials, and
                 # remove all singleton-seeded xAI entries from the in-memory
-                # pool. Mirrors the Nous quarantine path above.
+                # pool. Mirrors the Nous quarantine path above.  xAI singletons
+                # are ``device_code`` today but pre-0.18 on-disk entries still
+                # carry the ``loopback_pkce`` alias for the same lineage.
+                _XAI_SINGLETON_SOURCES = ("device_code", "loopback_pkce")
                 if auth_mod._is_terminal_xai_oauth_refresh_error(exc):
                     logger.debug(
                         "xAI OAuth refresh token is terminally invalid; clearing local token state"
@@ -1171,11 +1177,11 @@ class CredentialPool:
                         )
                     removed_ids = [
                         item.id for item in self._entries
-                        if item.source == "device_code"
+                        if item.source in _XAI_SINGLETON_SOURCES
                     ]
                     self._entries = [
                         item for item in self._entries
-                        if item.source != "device_code"
+                        if item.source not in _XAI_SINGLETON_SOURCES
                     ]
                     if self._current_id == entry.id:
                         self._current_id = None
@@ -1551,7 +1557,10 @@ class CredentialPool:
             return None
         singleton_sources = {
             "openai-codex": {"device_code"},
-            "xai-oauth": {"loopback_pkce"},
+            # ``device_code`` is the current xAI OAuth singleton source;
+            # ``loopback_pkce`` is the pre-0.18 alias still present in legacy
+            # on-disk auth.json entries.  Both are the same singleton lineage.
+            "xai-oauth": {"device_code", "loopback_pkce"},
             "nous": {"device_code"},
         }.get(self.provider, set())
         if not singleton_sources:

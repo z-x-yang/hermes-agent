@@ -828,8 +828,16 @@ def recover_with_credential_pool(
         # rotate immediately. This prevents the "cancel-between-429s" trap
         # where has_retried_429 (a local var) gets reset on each new prompt,
         # causing the pool to retry the same exhausted credential forever.
+        #
+        # Prefer the entry the failing request actually used (hint) so a
+        # concurrent lease that moved current() to a *different* exhausted key
+        # can't force this fresh key to skip its first retry. When the hint
+        # matches no entry (empty hint, or a rotated/unknown token), fall back
+        # to current() — this is a read-only status check, so it can't poison
+        # another credential, and preserves the upstream cancel-between-429s
+        # protection instead of silently treating the credential as healthy.
         hinted_entry = _entry_for_api_key_hint(pool, failed_api_key_hint)
-        current_entry = hinted_entry if failed_api_key_hint else pool.current()
+        current_entry = hinted_entry if hinted_entry is not None else pool.current()
         current_last_status = getattr(current_entry, "last_status", None) if current_entry else None
         if current_last_status == STATUS_EXHAUSTED:
             _ra().logger.info(
