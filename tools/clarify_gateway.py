@@ -108,7 +108,8 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
     for 10 minutes with zero activity touches and the gateway's inactivity
     watchdog kills the agent while the user is still typing.
 
-    Returns the resolved response string, or ``None`` on timeout.
+    ``timeout <= 0`` means wait indefinitely. Returns the resolved response
+    string, or ``None`` on timeout.
     """
     with _lock:
         entry = _entries.get(clarify_id)
@@ -120,13 +121,18 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
     except Exception:  # pragma: no cover - optional
         touch_activity_if_due = None
 
-    deadline = time.monotonic() + max(timeout, 0.0)
+    timeout = float(timeout or 0.0)
+    deadline = None if timeout <= 0 else time.monotonic() + timeout
     activity_state = {"last_touch": time.monotonic(), "start": time.monotonic()}
     while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        if entry.event.wait(timeout=min(1.0, remaining)):
+        if deadline is None:
+            wait_slice = 1.0
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wait_slice = min(1.0, remaining)
+        if entry.event.wait(timeout=wait_slice):
             break
         if touch_activity_if_due is not None:
             touch_activity_if_due(activity_state, "waiting for user clarify response")
@@ -271,7 +277,7 @@ def get_clarify_timeout() -> int:
     unblocks the agent thread instead of pinning the running-agent guard
     forever.  The old 600s default evicted the entry mid-think, so a late
     tap landed on a dead entry and the agent hung on ``running: clarify``
-    (#32762).
+    (#32762).  Set to 0 or a negative value to wait indefinitely.
 
     Reads ``agent.clarify_timeout`` from config.yaml.
     """

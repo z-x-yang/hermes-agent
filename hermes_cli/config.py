@@ -1040,8 +1040,9 @@ DEFAULT_CONFIG = {
         # Maximum time (seconds) the gateway will block an agent waiting for
         # a clarify-tool response from the user.  Hit this and the agent
         # unblocks with "[user did not respond within Xm]" so it can adapt
-        # rather than pinning the running-agent guard forever.  CLI clarify
-        # blocks indefinitely (input() is synchronous) and ignores this.
+        # rather than pinning the running-agent guard forever.  0 or a
+        # negative value disables the clarify timeout.  CLI clarify blocks
+        # indefinitely (input() is synchronous) and ignores this.
         # Default 3600 (1h): real users step away (meetings, AFK) and the
         # old 600s default evicted the entry mid-think, so a later button
         # tap landed on a dead entry (#32762).  Tradeoff: a higher value

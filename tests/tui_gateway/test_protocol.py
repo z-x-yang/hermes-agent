@@ -274,6 +274,16 @@ def test_clear_pending(server):
     assert server._answers["r1"] == ""
 
 
+def test_clarify_block_timeout_uses_shared_config(server, monkeypatch):
+    from tools import clarify_gateway as cm
+
+    monkeypatch.setattr(cm, "get_clarify_timeout", lambda: 0)
+    assert server._clarify_block_timeout() is None
+
+    monkeypatch.setattr(cm, "get_clarify_timeout", lambda: 45)
+    assert server._clarify_block_timeout() == 45
+
+
 # ── Session lookup ───────────────────────────────────────────────────
 
 

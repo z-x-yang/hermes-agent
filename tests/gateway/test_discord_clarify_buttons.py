@@ -155,6 +155,28 @@ class TestClarifyChoiceViewConstruction:
         assert "Tight" not in first_label
         assert "\u2026" not in first_label
 
+    def test_uses_shared_clarify_timeout_config(self, monkeypatch):
+        from tools import clarify_gateway as cm
+
+        monkeypatch.setattr(cm, "get_clarify_timeout", lambda: 123)
+        view = ClarifyChoiceView(
+            choices=["apple"],
+            clarify_id="cidTimeout",
+            allowed_user_ids=set(),
+        )
+        assert view.timeout == 123
+
+    def test_nonpositive_shared_clarify_timeout_disables_view_timeout(self, monkeypatch):
+        from tools import clarify_gateway as cm
+
+        monkeypatch.setattr(cm, "get_clarify_timeout", lambda: 0)
+        view = ClarifyChoiceView(
+            choices=["apple"],
+            clarify_id="cidNoTimeout",
+            allowed_user_ids=set(),
+        )
+        assert view.timeout is None
+
 
 # ===========================================================================
 # Choice callback → resolve_gateway_clarify
