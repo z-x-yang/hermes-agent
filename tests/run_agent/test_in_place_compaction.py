@@ -115,10 +115,15 @@ class TestInPlaceCompaction:
                 (sid,),
             ).fetchone()
             assert hit is not None
-            # Flush identity/cursor reset so next-turn appends diff against the
-            # compacted transcript (rebuilds the identity set on next flush).
-            assert agent._last_flushed_db_idx == 0
-            assert agent._flushed_db_message_ids == set()
+            # Flush identity/cursor re-baselined to the compacted transcript that
+            # archive_and_compact already inserted. A same-turn final flush must
+            # not append summary/tail duplicates.
+            assert agent._last_flushed_db_idx == len(compressed)
+            assert len(agent._flushed_db_message_ids) == len(compressed)
+            agent._flush_messages_to_session_db(compressed, messages)
+            after_flush = db.get_messages(sid, include_inactive=True)
+            assert len(after_flush) == 10
+            assert len(db.get_messages_as_conversation(sid)) == 2
             # Rotation-independent in-place signal set for the gateway.
             assert agent._last_compaction_in_place is True
             # Live transcript actually shrank.
