@@ -311,6 +311,38 @@ def test_default_run_conversation_warns_without_guardrail_halt():
     assert any("repeated_exact_failure_warning" in content for content in tool_contents)
 
 
+def test_default_run_conversation_halts_repeated_empty_required_tool_failure():
+    agent = _make_agent("image_generate", max_iterations=10)
+    empty_args = {}
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("image_generate", json.dumps(empty_args), f"c{i}")],
+        )
+        for i in range(1, 5)
+    ]
+    agent.client.chat.completions.create.side_effect = responses
+
+    with (
+        patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps({"error": "prompt is required for image generation"}),
+        ) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("debug the Notion AI MCP issue")
+
+    assert mock_hfc.call_count == 2
+    assert result["api_calls"] == 2
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["guardrail"]["code"] == "empty_required_args_failure_halt"
+    assert result["guardrail"]["tool_name"] == "image_generate"
+    assert "empty arguments" in result["final_response"]
+
+
 def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_halt_without_top_level_error():
     agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
     same_args = {"query": "same"}

@@ -5563,10 +5563,11 @@ class AIAgent:
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
         tool = decision.tool_name or "a tool"
+        detail = f" {decision.message}" if decision.message else ""
         return (
             f"I stopped retrying {tool} because it hit the tool-call guardrail "
             f"({decision.code}) after {decision.count} repeated non-progressing "
-            "attempts. The last tool result explains the blocker; the next step is "
+            f"attempts.{detail} The last tool result explains the blocker; the next step is "
             "to change strategy instead of repeating the same call."
         )
 

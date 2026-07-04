@@ -77,6 +77,7 @@ class ToolCallGuardrailConfig:
     hard_stop_enabled: bool = False
     exact_failure_warn_after: int = 2
     exact_failure_block_after: int = 5
+    empty_required_args_failure_halt_after: int = 2
     same_tool_failure_warn_after: int = 3
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
@@ -116,6 +117,13 @@ class ToolCallGuardrailConfig:
             exact_failure_block_after=_positive_int(
                 hard_stop_after.get("exact_failure", data.get("exact_failure_block_after")),
                 defaults.exact_failure_block_after,
+            ),
+            empty_required_args_failure_halt_after=_positive_int(
+                hard_stop_after.get(
+                    "empty_required_args_failure",
+                    data.get("empty_required_args_failure_halt_after"),
+                ),
+                defaults.empty_required_args_failure_halt_after,
             ),
             same_tool_failure_halt_after=_positive_int(
                 hard_stop_after.get("same_tool_failure", data.get("same_tool_failure_halt_after")),
@@ -325,6 +333,26 @@ class ToolCallGuardrailController:
             same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._same_tool_failure_counts[tool_name] = same_count
 
+            if (
+                _is_empty_required_args_failure(args, result)
+                and exact_count >= self.config.empty_required_args_failure_halt_after
+            ):
+                decision = ToolGuardrailDecision(
+                    action="halt",
+                    code="empty_required_args_failure_halt",
+                    message=(
+                        f"Stopped {tool_name}: it failed {exact_count} times with "
+                        "empty arguments while the tool reported missing required input. "
+                        "Stop calling this tool with empty arguments; inspect the user's "
+                        "request and provide the required fields or choose a relevant tool."
+                    ),
+                    tool_name=tool_name,
+                    count=exact_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
+
             if self.config.hard_stop_enabled and same_count >= self.config.same_tool_failure_halt_after:
                 decision = ToolGuardrailDecision(
                     action="halt",
@@ -483,6 +511,29 @@ def _missing_required_tool_args(tool_name: str, args: Mapping[str, Any]) -> tupl
         return ()
 
     return ()
+
+
+def _is_empty_required_args_failure(args: Mapping[str, Any], result: str | None) -> bool:
+    """Detect repeated empty-argument calls to tools that require input.
+
+    This is intentionally narrower than the general hard-stop guardrail: normal
+    repeated tool failures still only warn by default, while obviously invalid
+    ``tool({})`` calls that report missing required input circuit-break quickly.
+    """
+    if args:
+        return False
+    text = str(result or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            " is required",
+            "required for",
+            "missing required",
+            "field required",
+            "required property",
+            "expected string, got nonetype",
+        )
+    )
 
 
 def _result_hash(result: str | None) -> str:
