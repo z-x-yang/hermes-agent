@@ -2460,21 +2460,28 @@ def _canonicalize_legacy_singleton_sources(
         # Nothing legacy to migrate — leave canonical/other rows untouched.
         return False
 
-    def _has_tokens(entry: PooledCredential) -> bool:
-        return bool(
-            str(getattr(entry, "refresh_token", "") or "").strip()
-            or str(getattr(entry, "access_token", "") or "").strip()
-        )
+    def _refresh(entry: PooledCredential) -> str:
+        return str(getattr(entry, "refresh_token", "") or "").strip()
 
-    # Pick the surviving row for the singleton lineage.  Priority: a
-    # token-bearing canonical row, then a token-bearing legacy row, then any
-    # canonical row, then the first legacy row.  This guarantees a row that
-    # actually holds credentials is never dropped in favour of an empty one.
+    def _access(entry: PooledCredential) -> str:
+        return str(getattr(entry, "access_token", "") or "").strip()
+
+    # Pick the surviving row for the singleton lineage by *token durability*, not
+    # by list position.  For xAI OAuth the ``refresh_token`` is the load-bearing
+    # secret — an access-only row is nearly dead (its short-lived access token
+    # cannot be renewed once expired), and xAI's own usable-token contract
+    # requires both.  So a refresh-bearing row must always win over an access-only
+    # or empty one; otherwise a stale access-only ``device_code`` row could shadow
+    # a legacy row holding the only recoverable refresh token and erase it.
+    # Priority: canonical-with-refresh -> legacy-with-refresh -> canonical-with-
+    # access -> legacy-with-access -> any canonical -> first legacy.
     canonical = [e for e in lineage if e.source == "device_code"]
     legacy = [e for e in lineage if e.source == "loopback_pkce"]
     winner = (
-        next((e for e in canonical if _has_tokens(e)), None)
-        or next((e for e in legacy if _has_tokens(e)), None)
+        next((e for e in canonical if _refresh(e)), None)
+        or next((e for e in legacy if _refresh(e)), None)
+        or next((e for e in canonical if _access(e)), None)
+        or next((e for e in legacy if _access(e)), None)
         or (canonical[0] if canonical else legacy[0])
     )
 

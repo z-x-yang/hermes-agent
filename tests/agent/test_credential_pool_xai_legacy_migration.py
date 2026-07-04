@@ -128,6 +128,23 @@ def test_canonicalize_multiple_legacy_rows_keeps_the_token_bearing_one():
     assert entries[0].refresh_token == "r"
 
 
+def test_canonicalize_refresh_bearing_legacy_beats_access_only_canonical():
+    """xAI's usable-token contract needs BOTH access and refresh; the refresh
+    token is the recoverable secret.  A stale access-only canonical row must NOT
+    shadow a legacy row that still holds a valid refresh token."""
+    entries = [
+        _entry("device_code", id="canon", access_token="stale-access", refresh_token=""),
+        _entry("loopback_pkce", id="legacy", access_token="valid-access", refresh_token="valid-refresh"),
+    ]
+    changed = _canonicalize_legacy_singleton_sources("xai-oauth", entries)
+    assert changed is True
+    assert len(entries) == 1
+    assert entries[0].source == "device_code"
+    # The refresh-bearing legacy row wins — the recoverable secret survives.
+    assert entries[0].refresh_token == "valid-refresh"
+    assert entries[0].access_token == "valid-access"
+
+
 def test_canonicalize_conflicting_tokens_keeps_canonical_and_warns(caplog):
     """Two rows with DISTINCT valid refresh tokens is an unarbitrable conflict:
     keep the canonical row's token (never lose it silently) and log a warning."""
