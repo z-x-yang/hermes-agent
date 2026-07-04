@@ -3566,17 +3566,20 @@ class GatewaySlashCommandsMixin:
             try:
                 if await self._session_db.set_session_title(session_id, sanitized):
                     # Propagate the user-chosen title to visible platform
-                    # thread/topic names too. Auto-generated titles use the
-                    # same scheduler callbacks from the gateway run loop.
-                    for schedule_name, log_label in (
-                        ("_schedule_telegram_topic_title_rename", "Telegram topic"),
-                        ("_schedule_discord_thread_title_rename", "Discord thread"),
+                    # thread/topic names too. A manual /title is an explicit
+                    # request, so it must bypass Discord's "auto-rename at most
+                    # once per thread" guard — otherwise an already-auto-titled
+                    # thread could never be renamed on demand. Telegram topics
+                    # have no such guard, so they take no extra flag.
+                    for schedule_name, log_label, extra_kwargs in (
+                        ("_schedule_telegram_topic_title_rename", "Telegram topic", {}),
+                        ("_schedule_discord_thread_title_rename", "Discord thread", {"manual": True}),
                     ):
                         schedule_rename = getattr(self, schedule_name, None)
                         if callable(schedule_rename):
                             try:
                                 await asyncio.to_thread(
-                                    schedule_rename, source, session_id, sanitized
+                                    schedule_rename, source, session_id, sanitized, **extra_kwargs
                                 )
                             except Exception:
                                 logger.debug(

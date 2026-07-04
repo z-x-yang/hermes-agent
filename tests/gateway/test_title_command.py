@@ -210,8 +210,10 @@ class TestHandleTitleCommand:
         result = await runner._handle_title_command(event)
 
         assert "Session Thread Name" in result
+        # A manual /title must bypass Discord's at-most-once auto-rename guard,
+        # so the scheduler is invoked with manual=True.
         runner._schedule_discord_thread_title_rename.assert_called_once_with(
-            event.source, "test_session_123", "Session Thread Name"
+            event.source, "test_session_123", "Session Thread Name", manual=True
         )
         db.close()
 

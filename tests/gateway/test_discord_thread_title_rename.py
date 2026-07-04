@@ -141,3 +141,50 @@ async def test_auto_rename_still_fires_for_distinct_threads():
     assert adapter.rename_thread.await_count == 2
     assert adapter.has_auto_titled_thread("1111")
     assert adapter.has_auto_titled_thread("2222")
+
+
+@pytest.mark.asyncio
+async def test_manual_rename_bypasses_per_thread_guard():
+    """A manual ``/title`` rename must always fire, even when the thread was
+    already auto-titled — the at-most-once guard only governs AUTOMATIC titling.
+
+    Regression: the 0.18 port routed ``/title`` through this guarded scheduler,
+    so re-titling an already-named thread on demand was silently dropped.
+    """
+    runner, adapter = _make_runner_with_tracking_adapter()
+    source = _make_source(thread_id="1517731349685993587")
+
+    # Thread gets its one automatic title.
+    runner._schedule_discord_thread_title_rename(source, "sess-1", "Auto Title")
+    await asyncio.sleep(0.05)
+    assert adapter.rename_thread.await_count == 1
+
+    # A manual /title rename must still go through despite the guard.
+    runner._schedule_discord_thread_title_rename(
+        source, "sess-1", "User Chosen Title", manual=True
+    )
+    await asyncio.sleep(0.05)
+    assert adapter.rename_thread.await_count == 2
+    adapter.rename_thread.assert_awaited_with(
+        thread_id="1517731349685993587", name="User Chosen Title"
+    )
+
+
+@pytest.mark.asyncio
+async def test_manual_rename_marks_thread_so_later_auto_is_suppressed():
+    """A manual rename on a fresh thread still records it as titled, so a later
+    title-less session's AUTOMATIC rename does not override the user's name."""
+    runner, adapter = _make_runner_with_tracking_adapter()
+    source = _make_source(thread_id="9999")
+
+    runner._schedule_discord_thread_title_rename(
+        source, "sess-1", "User Chosen", manual=True
+    )
+    await asyncio.sleep(0.05)
+    assert adapter.rename_thread.await_count == 1
+    assert adapter.has_auto_titled_thread("9999")
+
+    # Later automatic rename for the same thread must be suppressed.
+    runner._schedule_discord_thread_title_rename(source, "sess-2", "Auto Would-Override")
+    await asyncio.sleep(0.05)
+    assert adapter.rename_thread.await_count == 1

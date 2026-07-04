@@ -13550,10 +13550,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         session_id: str,
         title: str,
+        *,
+        manual: bool = False,
     ) -> None:
-        """Schedule a Discord thread rename from the auto-title background thread.
+        """Schedule a Discord thread rename from a session title.
 
-        Renames a thread from a generated session title AT MOST ONCE per thread.
+        AUTOMATIC titling (``manual=False``, the auto-title background thread)
+        renames a thread from a generated session title AT MOST ONCE per thread.
         Auto-titling is keyed to the session, but a long-lived thread routinely
         gets fresh, title-less sessions (a gateway restart ends the prior
         session with ``agent_close``; the next message mints a new root session
@@ -13562,6 +13565,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session would re-title and rename an established thread mid-conversation
         — the behaviour the user hit. The adapter persists the "already
         auto-titled" set to disk so it survives restarts and session rotation.
+
+        A MANUAL rename (``manual=True``, from the ``/title`` command) is an
+        explicit user request and MUST always rename on demand — the
+        at-most-once guard is bypassed. It still marks the thread as titled so a
+        later title-less session's AUTOMATIC rename never overrides the
+        user-chosen name.
         """
         if not title or source.platform != Platform.DISCORD or not source.thread_id:
             return
@@ -13569,11 +13578,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter = self.adapters.get(source.platform) if getattr(self, "adapters", None) else None
         if adapter is not None and hasattr(adapter, "has_auto_titled_thread"):
             try:
-                if adapter.has_auto_titled_thread(thread_id):
+                if not manual and adapter.has_auto_titled_thread(thread_id):
                     return
                 # Claim the one-shot synchronously (before the fire-and-forget
                 # rename) so two turns racing to title the same thread can't both
-                # fire a rename.
+                # fire a rename. A manual rename also marks the thread so later
+                # automatic titling stays suppressed.
                 adapter.mark_auto_titled_thread(thread_id)
             except Exception:
                 logger.debug("Discord auto-title per-thread guard failed", exc_info=True)
