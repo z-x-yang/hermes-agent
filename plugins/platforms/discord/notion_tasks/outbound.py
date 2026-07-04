@@ -1,22 +1,22 @@
-"""Attach task buttons to OUTGOING messages.
+"""Attach the task card (numbered buttons + embed) to OUTGOING messages.
 
-Two delivery paths must render the ✓ 完成 button:
-  - the live gateway adapter (``DiscordAdapter.send`` -> discord.py View), and
+Two delivery paths must render it:
+  - the live gateway adapter (``DiscordAdapter.send`` -> discord.py View/Embed),
   - the standalone Discord HTTP path (``_standalone_send``), which is what
     ``hermes send`` uses from a cron/CLI process with no live adapter — this is
     how the email-reminder cron actually pushes its task messages.
 
 ``detect_task_links`` is the shared async step (parse links, verify each is a
-Tasks-DB page via Notion). ``standalone_task_components`` builds the raw Discord
-component JSON for the HTTP path and imports no ``discord`` module, so it is safe
-in a CLI process that has no discord.py client.
+Tasks-DB page via Notion). ``standalone_task_payload`` builds the raw Discord
+component + embed JSON for the HTTP path and imports no ``discord`` module, so
+it is safe in a CLI process that has no discord.py client.
 """
 from __future__ import annotations
 
 import logging
 
 from . import detection
-from .components import components_payload
+from .components import action_pairs_with_snooze, components_payload, task_card_embed
 
 logger = logging.getLogger(__name__)
 
@@ -50,26 +50,36 @@ async def detect_task_links(message: str, *, notion, tasks_ids=None) -> list[tup
     return out
 
 
-async def standalone_task_components(message: str) -> list[dict]:
-    """Raw Discord action-row JSON (``[]`` if none) for the HTTP send path.
+async def standalone_task_payload(message: str) -> tuple[list[dict], dict | None]:
+    """``(action_rows, card_embed)`` raw JSON for the HTTP send path.
+
+    ``([], None)`` when the message has no task links. Send-time card rows are
+    always "open" — this process has no tracker/snooze state; the click path
+    rebuilds the card from live state.
 
     Builds its own NotionClient (reads NOTION_API_KEY from the CLI process env).
-    Never raises into the send path: any failure logs and yields no buttons so
-    the message still goes out (the buttons can't appear, but delivery must not
+    Never raises into the send path: any failure logs and yields no attachments
+    so the message still goes out (the card can't appear, but delivery must not
     break).
     """
     if not detection.has_notion_link(message):
-        return []
+        return [], None
     try:
         from .notion_client import NotionClient
         tasks = await detect_task_links(message, notion=NotionClient())
     except Exception:
-        logger.warning("notion task: standalone component build failed; sending without buttons",
+        logger.warning("notion task: standalone task-card build failed; sending without card",
                        exc_info=True)
-        return []
+        return [], None
     if not tasks:
-        return []
+        return [], None
     if len(tasks) > 25:
         logger.warning("notion task: %d task links in one message; only first 25 get buttons",
                        len(tasks))
-    return components_payload([("done", pid) for pid, _ in tasks])
+    pairs = action_pairs_with_snooze([pid for pid, _title in tasks])
+    if len(pairs) < len(tasks[:25]) * 2:
+        logger.warning("notion task: not enough component slots for snooze on every task")
+    rows = [{"num": i, "title": title, "state": "open", "due_label": None,
+             "page_id": pid}
+            for i, (pid, title) in enumerate(tasks, start=1)]
+    return components_payload(pairs), task_card_embed(rows)

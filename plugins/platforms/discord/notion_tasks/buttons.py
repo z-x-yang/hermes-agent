@@ -11,22 +11,30 @@ import logging
 
 import discord
 
-from .components import CUSTOM_ID_RE, LABEL_DONE, LABEL_UNDO, make_custom_id  # noqa: F401 (re-exported)
+from .components import CUSTOM_ID_RE, make_custom_id, numbered_label  # noqa: F401 (re-exported)
 from .registry import get_active_controller
+from .snooze import snooze_choices
 
 logger = logging.getLogger(__name__)
 
 
 class TaskActionButton(discord.ui.DynamicItem[discord.ui.Button], template=CUSTOM_ID_RE):
-    def __init__(self, action: str, page_id: str, *, title: str | None = None):
+    def __init__(self, action: str, page_id: str, *, title: str | None = None,
+                 num: int | None = None):
         self.action = action
         self.page_id = page_id
         if action == "done":
-            label, style = (LABEL_DONE, discord.ButtonStyle.green)
+            style = discord.ButtonStyle.green
+        elif action in ("undo", "snooze"):
+            style = discord.ButtonStyle.secondary
         else:
-            label, style = (LABEL_UNDO, discord.ButtonStyle.secondary)
+            raise ValueError(f"unknown task action: {action!r}")
+        # Label is the row number only ("✓ 3") — the full task text lives in the
+        # card embed. num=None (from_custom_id rebuilds) gets the legacy label,
+        # which is never rendered anywhere.
         super().__init__(
-            discord.ui.Button(label=label, style=style, custom_id=make_custom_id(action, page_id))
+            discord.ui.Button(label=numbered_label(action, num), style=style,
+                              custom_id=make_custom_id(action, page_id))
         )
 
     @classmethod
@@ -45,5 +53,48 @@ class TaskActionButton(discord.ui.DynamicItem[discord.ui.Button], template=CUSTO
         await ctrl.handle_action(self.action, self.page_id, interaction)
 
 
-def build_button(action: str, page_id: str, *, title: str | None = None) -> TaskActionButton:
-    return TaskActionButton(action, page_id, title=title)
+def build_button(action: str, page_id: str, *, title: str | None = None,
+                 num: int | None = None) -> TaskActionButton:
+    return TaskActionButton(action, page_id, title=title, num=num)
+
+
+def build_snooze_select(
+    page_id: str,
+    *,
+    source_channel_id: str,
+    source_message_id: str,
+    source_content: str,
+    now=None,
+):
+    """Build the ephemeral select menu shown after clicking ⏰ 稍后提醒."""
+    options = [
+        discord.SelectOption(label=choice.label, value=choice.value, description=choice.description)
+        for choice in snooze_choices(now=now)
+    ]
+    select = discord.ui.Select(
+        placeholder="什么时候再提醒？",
+        options=options,
+        custom_id=f"ntask:snooze-select:{page_id}",
+    )
+
+    async def _callback(interaction: discord.Interaction):
+        ctrl = get_active_controller()
+        if ctrl is None:
+            logger.warning("notion task snooze selected but no active controller")
+            await interaction.response.send_message("功能暂不可用，请稍后再试。", ephemeral=True)
+            return
+        values = getattr(select, "values", None) or []
+        if not values:
+            await interaction.response.send_message("没有选中提醒时间。", ephemeral=True)
+            return
+        await ctrl.handle_snooze_choice(
+            page_id,
+            values[0],
+            interaction,
+            source_channel_id=source_channel_id,
+            source_message_id=source_message_id,
+            source_content=source_content,
+        )
+
+    select.callback = _callback
+    return select

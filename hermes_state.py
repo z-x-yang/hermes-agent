@@ -2085,17 +2085,52 @@ class SessionDB:
             )
         self._execute_write(_do)
 
-    def update_session_model(self, session_id: str, model: str) -> None:
-        """Update the model for a session after a mid-session switch.
+    def update_session_model(
+        self,
+        session_id: str,
+        model: str,
+        *,
+        provider: Optional[str] = None,
+        base_url: Optional[str] = None,
+        api_mode: Optional[str] = None,
+    ) -> None:
+        """Update the runtime route for a session after a mid-session switch.
 
         Unlike ``update_token_counts`` which uses ``COALESCE(model, ?)``
         (only filling in NULL), this unconditionally sets the model column
-        so that the dashboard reflects the user's latest /model choice.
+        so that status surfaces reflect the user's latest /model choice.  When
+        the caller knows the resolved provider/endpoint, persist those too;
+        otherwise `/status` can combine the new model with a stale billing
+        provider from the previous route (e.g. ``gpt-5.5 (custom)`` after
+        switching to OpenAI Codex).
         """
         def _do(conn):
+            assignments = ["model = ?"]
+            params: list[Any] = [model]
+            model_config_updates: list[tuple[str, Any]] = [("$.model", model)]
+
+            if provider is not None:
+                assignments.append("billing_provider = ?")
+                params.append(provider)
+                model_config_updates.append(("$.provider", provider))
+            if base_url is not None:
+                assignments.append("billing_base_url = ?")
+                params.append(base_url)
+                model_config_updates.append(("$.base_url", base_url))
+            if api_mode is not None:
+                model_config_updates.append(("$.api_mode", api_mode))
+
+            json_args = ", ".join(["?, ?"] * len(model_config_updates))
+            assignments.append(
+                f"model_config = json_set(COALESCE(model_config, '{{}}'), {json_args})"
+            )
+            for path, value in model_config_updates:
+                params.extend([path, value])
+
+            params.append(session_id)
             conn.execute(
-                "UPDATE sessions SET model = ? WHERE id = ?",
-                (model, session_id),
+                f"UPDATE sessions SET {', '.join(assignments)} WHERE id = ?",
+                tuple(params),
             )
         self._execute_write(_do)
 

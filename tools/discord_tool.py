@@ -122,6 +122,8 @@ _CHANNEL_TYPE_NAMES = {
     16: "media",
 }
 
+_THREAD_TYPE_IDS = frozenset({10, 11, 12})
+
 
 def _channel_type_name(type_id: int) -> str:
     return _CHANNEL_TYPE_NAMES.get(type_id, f"unknown({type_id})")
@@ -454,6 +456,28 @@ def _create_thread(
     })
 
 
+def _rename_thread(token: str, channel_id: str, name: str, **_kwargs: Any) -> str:
+    """Rename an existing Discord thread.
+
+    The Discord PATCH /channels/{id} endpoint can also rename normal channels
+    when the bot has MANAGE_CHANNELS. Keep this action scoped to threads so the
+    core Discord tool can safely expose it for session/thread housekeeping.
+    """
+    channel = _discord_request("GET", f"/channels/{channel_id}", token)
+    channel_type = channel.get("type")
+    if channel_type not in _THREAD_TYPE_IDS:
+        return json.dumps({
+            "error": f"Channel {channel_id} is {_channel_type_name(channel_type)}, not a Discord thread.",
+        })
+
+    updated = _discord_request("PATCH", f"/channels/{channel_id}", token, body={"name": name})
+    return json.dumps({
+        "success": True,
+        "thread_id": updated.get("id", channel_id),
+        "name": updated.get("name", name),
+    })
+
+
 def _add_role(token: str, guild_id: str, user_id: str, role_id: str, **_kwargs: Any) -> str:
     """Add a role to a guild member."""
     _discord_request("PUT", f"/guilds/{guild_id}/members/{user_id}/roles/{role_id}", token)
@@ -484,11 +508,12 @@ _ACTIONS = {
     "unpin_message": _unpin_message,
     "delete_message": _delete_message,
     "create_thread": _create_thread,
+    "rename_thread": _rename_thread,
     "add_role": _add_role,
     "remove_role": _remove_role,
 }
 
-_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread"})
+_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread", "rename_thread"})
 _ADMIN_ACTION_NAMES = frozenset(_ACTIONS.keys()) - _CORE_ACTION_NAMES
 
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
@@ -511,6 +536,7 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("unpin_message", "(channel_id, message_id)", "unpin a message"),
     ("delete_message", "(channel_id, message_id)", "delete a message"),
     ("create_thread", "(channel_id, name)", "create a public thread; optional message_id anchor"),
+    ("rename_thread", "(channel_id, name)", "rename an existing Discord thread"),
     ("add_role", "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", "(guild_id, user_id, role_id)", "remove a role"),
 ]
@@ -532,6 +558,7 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
     "unpin_message": ["channel_id", "message_id"],
     "delete_message": ["channel_id", "message_id"],
     "create_thread": ["channel_id", "name"],
+    "rename_thread": ["channel_id", "name"],
     "add_role": ["guild_id", "user_id", "role_id"],
     "remove_role": ["guild_id", "user_id", "role_id"],
 }
@@ -691,7 +718,7 @@ def _build_schema(
         },
         "name": {
             "type": "string",
-            "description": "New thread name (create_thread).",
+            "description": "Thread name (create_thread, rename_thread).",
         },
         "limit": {
             "type": "integer",
@@ -772,6 +799,9 @@ _ACTION_403_HINT = {
     ),
     "create_thread": (
         "Bot lacks CREATE_PUBLIC_THREADS in this channel, or cannot view it."
+    ),
+    "rename_thread": (
+        "Bot lacks MANAGE_THREADS for this thread, or cannot view it."
     ),
     "add_role": (
         "Either the bot lacks MANAGE_ROLES, or the target role sits higher "
@@ -906,7 +936,7 @@ def _run_discord_action(
 
 
 def discord_core(action: str, **kwargs) -> str:
-    """Execute a core Discord action (fetch_messages, search_members, create_thread)."""
+    """Execute a core Discord action (fetch/search/create/rename threads)."""
     return _run_discord_action(action, _CORE_ACTIONS, "discord", **kwargs)
 
 

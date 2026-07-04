@@ -12,12 +12,17 @@ Tests exercise the real ``_apply_session_model_override()`` and
 """
 
 from datetime import datetime
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+import yaml
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from hermes_state import SessionDB
 
 
 # ---------------------------------------------------------------------------
@@ -242,3 +247,114 @@ class TestIsIntentionalModelSwitch:
         }
 
         assert runner._is_intentional_model_switch(sk, "gpt-5.4") is False
+
+
+def _make_model_event(text: str) -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=_make_source(),
+    )
+
+
+def _openai_codex_switch_result():
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    return ModelSwitchResult(
+        success=True,
+        new_model="gpt-5.5",
+        target_provider="openai-codex",
+        provider_changed=True,
+        api_key="***",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_mode="codex_responses",
+        provider_label="OpenAI Codex",
+        is_global=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_status_uses_explicit_provider_after_model_switch(tmp_path, monkeypatch):
+    """`/status` must report the provider selected by `/model --provider`.
+
+    Regression: switching from a custom GPTCodex route to OpenAI Codex with the
+    same model name updated only ``sessions.model``. With no live cached agent,
+    `/status` then combined the new model with the stale ``billing_provider``
+    and showed ``gpt-5.5 (custom)`` immediately after a successful switch.
+    """
+    import gateway.run as gateway_run
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    cfg_path = hermes_home / "config.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "default": "gpt-5.5",
+                    "provider": "custom:gptcodex",
+                    "base_url": "https://gptcodex.top/v1",
+                },
+                "providers": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.create_session("sess-1", source="discord", model="gpt-5.5")
+    session_db.update_token_counts(
+        "sess-1",
+        billing_provider="custom",
+        billing_base_url="https://gptcodex.top/v1",
+        absolute=True,
+    )
+
+    runner = _make_runner()
+    source = _make_source()
+    session_key = build_session_key(source)
+    runner.session_store._generate_session_key = MagicMock(
+        side_effect=lambda src: build_session_key(src)
+    )
+    runner.session_store.get_or_create_session.return_value.session_key = session_key
+    runner.session_store.get_or_create_session.return_value.session_id = "sess-1"
+    runner._session_db = session_db
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **_kwargs: _openai_codex_switch_result(),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.resolve_display_context_length",
+        lambda *_args, **_kwargs: 272_000,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_cost_guard.expensive_model_warning",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: hermes_home)
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: hermes_home)
+
+    switch_reply = await runner._handle_model_command(
+        _make_model_event("/model gpt-5.5 --provider openai-codex")
+    )
+    assert switch_reply is not None
+    assert "OpenAI Codex" in switch_reply
+
+    row = session_db.get_session("sess-1")
+    assert row is not None
+    assert row["model"] == "gpt-5.5"
+    assert row["billing_provider"] == "openai-codex"
+    assert row["billing_base_url"] == "https://chatgpt.com/backend-api/codex"
+    stored_config = json.loads(row["model_config"])
+    assert stored_config["provider"] == "openai-codex"
+    assert stored_config["base_url"] == "https://chatgpt.com/backend-api/codex"
+    assert stored_config["api_mode"] == "codex_responses"
+
+    status = await runner._handle_status_command(_make_model_event("/status"))
+
+    assert "gpt-5.5" in status
+    assert "openai-codex" in status
+    assert "(custom)" not in status

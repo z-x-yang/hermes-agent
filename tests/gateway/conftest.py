@@ -136,6 +136,17 @@ def _ensure_discord_mock() -> None:
         def set_footer(self, *, text=None, icon_url=None, **_):
             self.footer = {"text": text, "icon_url": icon_url}
             return self
+        @classmethod
+        def from_dict(cls, data):
+            e = cls(title=data.get("title"), description=data.get("description"),
+                    color=data.get("color"))
+            if data.get("footer"):
+                e.footer = dict(data["footer"])
+            e._dict = dict(data)
+            return e
+        def to_dict(self):
+            return getattr(self, "_dict",
+                           {"title": self.title, "description": self.description})
     discord_mod.Embed = _FakeEmbed
 
     # ui.View / ui.Select / ui.Button: real classes (not MagicMock) so

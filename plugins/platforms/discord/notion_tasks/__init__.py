@@ -6,5 +6,6 @@ Submodules:
   tracker       — persistent page_id -> Discord message-location map
   registry      — module-level active-controller registry (breaks import cycle)
   buttons       — DynamicItem complete/undo button (restart-safe routing)
-  controller    — orchestration (render / complete / undo / sync / thread)
+  controller    — orchestration (render / complete / undo / snooze / sync / thread)
+  snooze        — persistent local snooze reminder store + preset time helpers
 """

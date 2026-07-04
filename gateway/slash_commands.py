@@ -542,6 +542,7 @@ class GatewaySlashCommandsMixin:
         base_url = ""
         context_used = 0
         context_total = 0
+        compression_count = 0
         if status_agent is not None and status_agent is not _AGENT_PENDING_SENTINEL:
             model_name = _clean_str(getattr(status_agent, "model", ""))
             provider_name = _clean_str(getattr(status_agent, "provider", ""))
@@ -550,6 +551,33 @@ class GatewaySlashCommandsMixin:
             if ctx is not None:
                 context_used = _int_value(getattr(ctx, "last_prompt_tokens", 0))
                 context_total = _int_value(getattr(ctx, "context_length", 0))
+                compression_count = _int_value(getattr(ctx, "compression_count", 0))
+
+        session_db = getattr(self, "_session_db", None)
+        if session_db:
+            try:
+                get_count = getattr(session_db, "get_session_compression_count", None)
+                if callable(get_count):
+                    compression_count = max(
+                        compression_count,
+                        _int_value(get_count(session_entry.session_id)),
+                    )
+                else:
+                    compression_count = max(
+                        compression_count,
+                        _int_value(session_row.get("compression_count")),
+                    )
+            except Exception:
+                compression_count = max(
+                    compression_count,
+                    _int_value(session_row.get("compression_count")),
+                )
+
+        if not model_name or not provider_name or not base_url:
+            override = getattr(self, "_session_model_overrides", {}).get(session_key, {}) or {}
+            model_name = model_name or _clean_str(override.get("model"))
+            provider_name = provider_name or _clean_str(override.get("provider"))
+            base_url = base_url or _clean_str(override.get("base_url"))
 
         model_name = model_name or _clean_str(session_row.get("model"))
         provider_name = provider_name or _clean_str(session_row.get("billing_provider"))
@@ -608,6 +636,8 @@ class GatewaySlashCommandsMixin:
             lines.append(model_line)
         if context_line:
             lines.append(context_line)
+        if compression_count:
+            lines.append(t("gateway.usage.label_compressions", count=compression_count))
         lines.extend([
             t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
             t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
@@ -1574,7 +1604,11 @@ class GatewaySlashCommandsMixin:
                                     event.source
                                 )
                                 await _sess_db.update_session_model(
-                                    _sess_entry.session_id, result.new_model
+                                    _sess_entry.session_id,
+                                    result.new_model,
+                                    provider=result.target_provider,
+                                    base_url=result.base_url,
+                                    api_mode=result.api_mode,
                                 )
                             except Exception as exc:
                                 logger.debug(
@@ -1819,7 +1853,11 @@ class GatewaySlashCommandsMixin:
                     if getattr(_sess_entry, "was_auto_reset", False):
                         _sess_entry.was_auto_reset = False
                     await _sess_db.update_session_model(
-                        _sess_entry.session_id, result.new_model
+                        _sess_entry.session_id,
+                        result.new_model,
+                        provider=result.target_provider,
+                        base_url=result.base_url,
+                        api_mode=result.api_mode,
                     )
                 except Exception as exc:
                     logger.debug(
@@ -3136,11 +3174,47 @@ class GatewaySlashCommandsMixin:
             if not runtime_kwargs.get("api_key"):
                 return t("gateway.compress.no_provider")
 
-            msgs = [
-                {"role": m.get("role"), "content": m.get("content")}
-                for m in history
-                if m.get("role") in {"user", "assistant"} and m.get("content")
-            ]
+            conversation_keys = {
+                "role",
+                "content",
+                "tool_calls",
+                "tool_call_id",
+                "tool_name",
+                "name",
+                "finish_reason",
+                "reasoning",
+                "reasoning_content",
+                "reasoning_details",
+                "codex_reasoning_items",
+                "codex_message_items",
+            }
+            msgs = []
+            for m in history:
+                role = m.get("role")
+                if role not in {"user", "assistant", "tool"}:
+                    continue
+                content = m.get("content")
+                has_content = content is not None and content != "" and content != []
+                # Preserve assistant tool_calls and tool results exactly like
+                # automatic compression.  A tool-call assistant message often
+                # has empty text content but non-empty tool_calls; dropping it
+                # or its paired role=tool result corrupts the replayable tail.
+                if not (has_content or m.get("tool_calls") or m.get("tool_call_id")):
+                    continue
+                # Keep only provider-replay/conversation fields.  DB persistence
+                # metadata such as timestamp/platform ids/token counts must not
+                # be reinserted into the compacted transcript: retained tail
+                # ordering is a transcript property, not wall-clock metadata.
+                # SessionDB live replay uses insertion order, so reinserted
+                # compacted rows reload as summary + retained tail in the same
+                # order we built them.
+                msgs.append(
+                    {
+                        key: m[key]
+                        for key in conversation_keys
+                        if key in m and m[key] is not None
+                    }
+                )
 
             # Boundary-aware split: only the head is summarized; the most
             # recent `keep_last` exchanges are preserved verbatim. The
@@ -3215,10 +3289,13 @@ class GatewaySlashCommandsMixin:
                     compressed = rejoin_compressed_head_and_tail(compressed, tail)
 
                 # _compress_context either rotated (legacy: ended the old
-                # session, created a continuation id — write compressed messages
-                # into the NEW session so the original stays searchable) or
-                # compacted in place (compression.in_place / #38763: same id,
-                # transcript replaced with the compacted set).
+                # session, created a continuation id) or compacted in place
+                # (compression.in_place / #38763: same id, durable write already
+                # performed via archive_and_compact).  Rotation needs the gateway
+                # to write the compressed transcript into the NEW session because
+                # the throwaway /compress agent will not do a normal final flush;
+                # in-place must NOT rewrite, or the soft-archived pre-compression
+                # rows are destroyed.
                 new_session_id = tmp_agent.session_id
                 rotated = new_session_id != session_entry.session_id
                 _in_place = bool(getattr(tmp_agent, "_last_compaction_in_place", False))
@@ -3231,22 +3308,20 @@ class GatewaySlashCommandsMixin:
                 # session_id while the handler still reported success — the
                 # user's active conversation would silently vanish from view.
                 # Writing first, and treating a write failure as fatal, keeps
-                # the old history reachable (on rotation the entry still points
-                # at it; in place the original transcript is untouched) and lets
-                # the outer handler surface a "compress failed" banner instead.
+                # the old history reachable and lets the outer handler surface
+                # a "compress failed" banner instead.
                 #
-                # The rewrite runs when EITHER rotation produced a new id OR
-                # in-place compaction succeeded. It is skipped in the THIRD
-                # case: _compress_context could NOT rotate AND was not in-place
-                # (e.g. legacy mode but _session_db unavailable / the DB split
-                # raised) — there session_id is unchanged for a FAILURE reason,
-                # and rewrite_transcript() would DELETE the original messages and
-                # replace them with only the compressed summary (permanent data
-                # loss #44794, #39704). In in-place mode the unchanged id is
-                # SUCCESS, so the rewrite is exactly right (and is the durable
-                # write when the throwaway /compress agent has no _session_db of
-                # its own).
-                if rotated or _in_place:
+                # Rewrite only after successful rotation. In-place compaction
+                # already persisted the compacted rows via archive_and_compact —
+                # rewrite_transcript() there would DELETE the soft-archived
+                # pre-compression rows and replace them with only the compressed
+                # summary (permanent data loss #44794, #39704). If neither
+                # rotation nor in-place archive happened (the THIRD case:
+                # _compress_context could NOT rotate AND was not in-place, e.g.
+                # legacy mode but _session_db unavailable / the DB split raised),
+                # session_id is unchanged for a FAILURE reason — preserve the
+                # original transcript.
+                if rotated:
                     if not self.session_store.rewrite_transcript(
                         new_session_id, compressed
                     ):
@@ -3254,12 +3329,33 @@ class GatewaySlashCommandsMixin:
                             f"failed to persist compressed transcript for "
                             f"session {new_session_id}"
                         )
-                    if rotated:
-                        session_entry.session_id = new_session_id
-                        self.session_store._save()
-                        await asyncio.to_thread(
-                            self._sync_telegram_topic_binding,
-                            source, session_entry, reason="compress-command",
+                    session_entry.session_id = new_session_id
+                    self.session_store._save()
+                    await asyncio.to_thread(
+                        self._sync_telegram_topic_binding,
+                        source, session_entry, reason="compress-command",
+                    )
+                elif _in_place:
+                    if partial and tail:
+                        session_db = getattr(tmp_agent, "_session_db", None) or getattr(self, "_session_db", None)
+                        if session_db is None:
+                            logger.warning(
+                                "Manual /compress here: in-place compaction "
+                                "reported success but no session_db is available "
+                                "to persist the rejoined tail; preserving "
+                                "original transcript instead of hard rewrite."
+                            )
+                        else:
+                            session_db.archive_and_compact(new_session_id, compressed)
+                            logger.debug(
+                                "Manual /compress here: persisted rejoined "
+                                "compressed head + tail via archive_and_compact."
+                            )
+                    else:
+                        logger.debug(
+                            "Manual /compress: in-place compaction already "
+                            "persisted compacted rows via archive_and_compact; "
+                            "skipping rewrite_transcript to preserve archived history."
                         )
                 else:
                     logger.warning(
@@ -3463,22 +3559,25 @@ class GatewaySlashCommandsMixin:
             # Set the title
             try:
                 if await self._session_db.set_session_title(session_id, sanitized):
-                    # Propagate the user-chosen title to the visible Telegram
-                    # forum topic name too. Auto-generated titles already rename
-                    # the topic; without this, /title only updated the DB title
-                    # and the topic kept its auto-assigned name. No-ops off
-                    # Telegram topic lanes and when auto-rename is disabled.
-                    schedule_rename = getattr(
-                        self, "_schedule_telegram_topic_title_rename", None
-                    )
-                    if callable(schedule_rename):
-                        try:
-                            await asyncio.to_thread(schedule_rename, source, session_id, sanitized)
-                        except Exception:
-                            logger.debug(
-                                "Failed to rename Telegram topic from /title",
-                                exc_info=True,
-                            )
+                    # Propagate the user-chosen title to visible platform
+                    # thread/topic names too. Auto-generated titles use the
+                    # same scheduler callbacks from the gateway run loop.
+                    for schedule_name, log_label in (
+                        ("_schedule_telegram_topic_title_rename", "Telegram topic"),
+                        ("_schedule_discord_thread_title_rename", "Discord thread"),
+                    ):
+                        schedule_rename = getattr(self, schedule_name, None)
+                        if callable(schedule_rename):
+                            try:
+                                await asyncio.to_thread(
+                                    schedule_rename, source, session_id, sanitized
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "Failed to rename %s from /title",
+                                    log_label,
+                                    exc_info=True,
+                                )
                     return t("gateway.title.set_to", title=sanitized)
                 else:
                     return t("gateway.title.not_found")

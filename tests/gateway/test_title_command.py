@@ -15,13 +15,16 @@ from gateway.session import SessionSource
 
 
 def _make_event(text="/title", platform=Platform.TELEGRAM,
-                user_id="12345", chat_id="67890"):
+                user_id="12345", chat_id="67890", thread_id=None):
     """Build a MessageEvent for testing."""
     source = SessionSource(
         platform=platform,
         user_id=user_id,
         chat_id=chat_id,
         user_name="testuser",
+        thread_id=thread_id,
+        chat_type="thread" if thread_id else "dm",
+        parent_chat_id=chat_id if thread_id else None,
     )
     return MessageEvent(text=text, source=source)
 
@@ -185,6 +188,30 @@ class TestHandleTitleCommand:
         assert "My Topic Name" in result
         runner._schedule_telegram_topic_title_rename.assert_called_once_with(
             event.source, "test_session_123", "My Topic Name"
+        )
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_set_title_propagates_to_discord_thread_rename(self, tmp_path):
+        """/title <name> also renames the visible Discord thread."""
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("test_session_123", "discord")
+
+        runner = _make_runner(session_db=db)
+        runner._schedule_discord_thread_title_rename = MagicMock()
+
+        event = _make_event(
+            text="/title Session Thread Name",
+            platform=Platform.DISCORD,
+            chat_id="1480933001889321195",
+            thread_id="1517731349685993587",
+        )
+        result = await runner._handle_title_command(event)
+
+        assert "Session Thread Name" in result
+        runner._schedule_discord_thread_title_rename.assert_called_once_with(
+            event.source, "test_session_123", "Session Thread Name"
         )
         db.close()
 

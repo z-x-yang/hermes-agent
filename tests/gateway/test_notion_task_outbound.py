@@ -14,6 +14,19 @@ TASK_PAGE = {
 NON_TASK = {"parent": {"type": "page_id"}, "properties": {}}
 
 
+def _fake_client(monkeypatch, page=TASK_PAGE):
+    from plugins.platforms.discord.notion_tasks import notion_client as nc
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def get_page(self, pid):
+            return page
+
+    monkeypatch.setattr(nc, "NotionClient", _FakeClient)
+
+
 @pytest.mark.asyncio
 async def test_detect_task_links_only_returns_task_pages():
     notion = SimpleNamespace(get_page=AsyncMock(side_effect=lambda pid: TASK_PAGE if pid == PID else NON_TASK))
@@ -46,44 +59,74 @@ async def test_detect_task_links_no_notion_substring_short_circuits():
 
 
 @pytest.mark.asyncio
-async def test_standalone_components_builds_done_button(monkeypatch):
-    from plugins.platforms.discord.notion_tasks import notion_client as nc
-
-    class _FakeClient:
-        def __init__(self, *a, **k):
-            pass
-
-        async def get_page(self, pid):
-            return TASK_PAGE
-
-    monkeypatch.setattr(nc, "NotionClient", _FakeClient)
-    rows = await outbound.standalone_task_components(f"[Reply](https://notion.so/{PID})")
+async def test_standalone_payload_builds_numbered_buttons_and_card(monkeypatch):
+    _fake_client(monkeypatch)
+    rows, embed = await outbound.standalone_task_payload(f"[Reply](https://notion.so/{PID})")
     assert len(rows) == 1
-    btn = rows[0]["components"][0]
-    assert btn["custom_id"] == f"ntask:done:{PID}" and btn["style"] == 3
+    buttons = rows[0]["components"]
+    assert [b["custom_id"] for b in buttons] == [f"ntask:done:{PID}", f"ntask:snooze:{PID}"]
+    assert buttons[0]["style"] == 3
+    # buttons carry only the row number; full title lives in the card embed
+    assert [b["label"] for b in buttons] == ["✓ 1", "⏰ 1"]
+    assert embed["title"] == "📋 任务"
+    assert f"1️⃣ [Reply](https://www.notion.so/{PID})" in embed["description"]
 
 
 @pytest.mark.asyncio
-async def test_standalone_components_builds_done_button_for_app_notion(monkeypatch):
-    from plugins.platforms.discord.notion_tasks import notion_client as nc
-
-    class _FakeClient:
-        def __init__(self, *a, **k):
-            pass
-
-        async def get_page(self, pid):
-            return TASK_PAGE
-
-    monkeypatch.setattr(nc, "NotionClient", _FakeClient)
-    rows = await outbound.standalone_task_components(
+async def test_standalone_payload_builds_buttons_for_app_notion(monkeypatch):
+    _fake_client(monkeypatch)
+    rows, embed = await outbound.standalone_task_payload(
         f"Notion: https://app.notion.com/p/Reply-to-Alice-{PID}"
     )
     assert len(rows) == 1
-    assert rows[0]["components"][0]["custom_id"] == f"ntask:done:{PID}"
+    assert [b["custom_id"] for b in rows[0]["components"]] == [f"ntask:done:{PID}", f"ntask:snooze:{PID}"]
+    # bare URL (no anchor) -> row title falls back to the Notion page title
+    assert f"1️⃣ [Reply to Alice](https://www.notion.so/{PID})" in embed["description"]
 
 
 @pytest.mark.asyncio
-async def test_standalone_components_never_raises_on_client_error(monkeypatch):
+async def test_standalone_payload_preserves_done_buttons_when_snooze_overflows(monkeypatch):
+    _fake_client(monkeypatch)
+    pids = [f"{i:032x}" for i in range(25)]
+    rows, embed = await outbound.standalone_task_payload(
+        " ".join(f"https://notion.so/{pid}" for pid in pids))
+    buttons = [button for row in rows for button in row["components"]]
+
+    assert len(buttons) == 25
+    assert [b["custom_id"] for b in buttons] == [f"ntask:done:{pid}" for pid in pids]
+    # every one of the 25 tasks keeps a numbered card row
+    assert embed["description"].count("\n") == 24
+
+
+@pytest.mark.asyncio
+async def test_standalone_payload_packs_task_groups_onto_shared_rows(monkeypatch):
+    """Two tasks × 2 buttons = 4 buttons fit one row; groups stay adjacent
+    (✓1 ⏰1 ✓2 ⏰2) so each task's controls remain visually paired."""
+    _fake_client(monkeypatch)
+    pid2 = "2f17a58d229e816f839bef72f6f2ec72"
+    text = f"[A](https://notion.so/{PID}) 和 [B](https://notion.so/{pid2})"
+    rows, embed = await outbound.standalone_task_payload(text)
+
+    assert len(rows) == 1  # both groups share one row instead of one row each
+    assert [b["custom_id"] for b in rows[0]["components"]] == [
+        f"ntask:done:{PID}", f"ntask:snooze:{PID}",
+        f"ntask:done:{pid2}", f"ntask:snooze:{pid2}"]
+    # button numbers match the card row order
+    assert [b["label"] for b in rows[0]["components"]] == [
+        "✓ 1", "⏰ 1", "✓ 2", "⏰ 2"]
+    assert f"1️⃣ [A](https://www.notion.so/{PID})" in embed["description"]
+    assert f"2️⃣ [B](https://www.notion.so/{pid2})" in embed["description"]
+
+
+@pytest.mark.asyncio
+async def test_standalone_payload_empty_when_no_task_links(monkeypatch):
+    _fake_client(monkeypatch, page=NON_TASK)
+    assert await outbound.standalone_task_payload(f"[x](https://notion.so/{PID})") == ([], None)
+    assert await outbound.standalone_task_payload("plain text") == ([], None)
+
+
+@pytest.mark.asyncio
+async def test_standalone_payload_never_raises_on_client_error(monkeypatch):
     from plugins.platforms.discord.notion_tasks import notion_client as nc
 
     class _Boom:
@@ -91,5 +134,5 @@ async def test_standalone_components_never_raises_on_client_error(monkeypatch):
             raise RuntimeError("no token")
 
     monkeypatch.setattr(nc, "NotionClient", _Boom)
-    # must degrade to [] (message still sends), not raise into delivery
-    assert await outbound.standalone_task_components(f"[x](https://notion.so/{PID})") == []
+    # must degrade to no attachments (message still sends), not raise into delivery
+    assert await outbound.standalone_task_payload(f"[x](https://notion.so/{PID})") == ([], None)

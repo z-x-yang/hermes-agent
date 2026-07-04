@@ -160,6 +160,77 @@ async def test_send_does_not_retry_on_unrelated_errors():
     assert send_calls[0]["reference"] is reference_obj
 
 
+@pytest.mark.asyncio
+async def test_delete_message_fetches_and_deletes_discord_message():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    msg = SimpleNamespace(delete=AsyncMock())
+    channel = SimpleNamespace(fetch_message=AsyncMock(return_value=msg))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    ok = await adapter.delete_message("555", "1234")
+
+    assert ok is True
+    channel.fetch_message.assert_awaited_once_with(1234)
+    msg.delete.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_delete_message_returns_false_when_discord_message_missing():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    channel = SimpleNamespace(fetch_message=AsyncMock(side_effect=RuntimeError("Unknown Message")))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    ok = await adapter.delete_message("555", "1234")
+
+    assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# Thread rename tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rename_thread_fetches_thread_and_edits_name():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    thread = SimpleNamespace(type=11, edit=AsyncMock())
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _channel_id: thread,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.rename_thread("800", "Session Title")
+
+    assert result.success is True
+    thread.edit.assert_awaited_once_with(name="Session Title")
+
+
+@pytest.mark.asyncio
+async def test_rename_thread_rejects_non_thread_channels():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    text_channel = SimpleNamespace(type=0, edit=AsyncMock())
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _channel_id: text_channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.rename_thread("800", "Session Title")
+
+    assert result.success is False
+    assert "not a Discord thread" in (result.error or "")
+    text_channel.edit.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Forum channel tests
 # ---------------------------------------------------------------------------

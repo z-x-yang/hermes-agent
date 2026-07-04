@@ -1,5 +1,6 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
+import json
 import sqlite3
 import time
 import pytest
@@ -288,19 +289,39 @@ class TestSessionLifecycle:
         db.create_session(session_id="s1", source="telegram",
                           model="xiaomi/mimo-v2.5-pro")
         # Token updates never change the model once set.
-        db.update_token_counts("s1", input_tokens=10, output_tokens=5,
-                               model="xiaomi/mimo-v2.5-pro")
+        db.update_token_counts(
+            "s1",
+            input_tokens=10,
+            output_tokens=5,
+            model="xiaomi/mimo-v2.5-pro",
+            billing_provider="custom",
+            billing_base_url="https://old.example/v1",
+        )
         assert db.get_session("s1")["model"] == "xiaomi/mimo-v2.5-pro"
 
-        # Explicit switch overwrites it.
-        db.update_session_model("s1", "xiaomi/mimo-v2.5")
-        assert db.get_session("s1")["model"] == "xiaomi/mimo-v2.5"
+        # Explicit switch overwrites the runtime route, not just model name.
+        db.update_session_model(
+            "s1",
+            "gpt-5.5",
+            provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            api_mode="codex_responses",
+        )
+        session = db.get_session("s1")
+        assert session["model"] == "gpt-5.5"
+        assert session["billing_provider"] == "openai-codex"
+        assert session["billing_base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert session["billing_mode"] is None
+        model_config = json.loads(session["model_config"])
+        assert model_config["provider"] == "openai-codex"
+        assert model_config["base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert model_config["api_mode"] == "codex_responses"
 
         # And a subsequent token update does NOT revert it (COALESCE no-ops
         # because the column is now non-NULL).
         db.update_token_counts("s1", input_tokens=10, output_tokens=5,
                                model="xiaomi/mimo-v2.5-pro")
-        assert db.get_session("s1")["model"] == "xiaomi/mimo-v2.5"
+        assert db.get_session("s1")["model"] == "gpt-5.5"
 
     def test_update_session_billing_route_overwrites_after_switch(self, db):
         """A mid-session provider switch must overwrite the billing route.

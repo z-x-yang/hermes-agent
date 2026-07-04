@@ -793,11 +793,21 @@ class DiscordAdapter(BasePlatformAdapter):
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
         self._threads = ThreadParticipationTracker("discord")
+        # Track threads that have already received an automatic session-title
+        # rename. Auto-titling is keyed to the *session*, but a long-lived
+        # thread routinely gets fresh, title-less sessions (a gateway restart
+        # ends the prior session with ``agent_close``; the next message mints a
+        # new root session with no parent and no title). Without a per-thread
+        # memory, each fresh session would re-title and rename a thread the user
+        # has been using for days. Persisted to disk (``discord_titled_threads
+        # .json``) so "named once" survives restarts and session rotation.
+        self._auto_titled_threads = ThreadParticipationTracker("discord_titled")
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._bot_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None
+        self._notion_snooze_task: Optional[asyncio.Task] = None
         # REST-level liveness probe.  discord.py's WS reconnect handles clean
         # drops, but a dead proxy / NAT can wedge the socket without delivering
         # a RST — sends time out forever and ``client.start()`` never exits, so
@@ -862,6 +872,33 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._notion_controller.on_thread_opened(thread)
         except Exception as exc:
             logger.warning("[%s] notion task on_thread_create failed: %s", self.name, exc)
+
+    def _start_notion_snooze_loop(self) -> None:
+        if self._notion_snooze_task and not self._notion_snooze_task.done():
+            return
+        self._notion_snooze_task = asyncio.create_task(self._run_notion_snooze_loop())
+
+    async def _run_notion_snooze_loop(self) -> None:
+        interval = float(os.getenv("DISCORD_NOTION_SNOOZE_POLL_SECONDS", "60") or "60")
+        interval = max(10.0, interval)
+        while True:
+            try:
+                await self._notion_controller.dispatch_due_snoozes()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[%s] notion task snooze dispatch failed: %s", self.name, exc, exc_info=True)
+            await asyncio.sleep(interval)
+
+    async def _cancel_notion_snooze_loop(self) -> None:
+        task = self._notion_snooze_task
+        self._notion_snooze_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     def _handle_bot_task_done(self, task: asyncio.Task) -> None:
         """Surface post-startup discord.py task exits to the gateway supervisor.
@@ -1064,6 +1101,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 adapter_self._post_connect_task = asyncio.create_task(
                     adapter_self._run_post_connect_initialization()
                 )
+                adapter_self._start_notion_snooze_loop()
 
             @self._client.event
             async def on_message(message: DiscordMessage):
@@ -1446,6 +1484,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._post_connect_task
             except asyncio.CancelledError:
                 pass
+
+        await self._cancel_notion_snooze_loop()
 
         self._running = False
         self._client = None
@@ -1977,21 +2017,23 @@ class DiscordAdapter(BasePlatformAdapter):
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
 
             # Notion task one-click: if the message carries Notion task links,
-            # attach a complete button per task. Cheap substring pre-filter
-            # before the controller does any network fetch. No tracker write
-            # here — the click handler captures location + content authoritatively.
-            # Done before the forum branch so forum starters get the button too.
+            # attach the task card (numbered buttons + embed). Cheap substring
+            # pre-filter before the controller does any network fetch. No tracker
+            # write here — the click handler captures location + content
+            # authoritatively. Done before the forum branch so forum starters
+            # get the card too.
+            task_embed = None
             from plugins.platforms.discord.notion_tasks import detection as notion_detection
             if view is None and notion_detection.has_notion_link(content):
                 try:
-                    view = await self._notion_controller.render_view_for_text(content)
+                    view, task_embed = await self._notion_controller.render_send_attachments(content)
                 except Exception as e:
                     logger.warning("[%s] notion task render failed: %s", self.name, e)
-                    view = None
+                    view, task_embed = None, None
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
-                return await self._send_to_forum(channel, content, view=view)
+                return await self._send_to_forum(channel, content, view=view, embed=task_embed)
 
             # Format and split message if needed
             formatted = self.format_message(content)
@@ -2000,9 +2042,18 @@ class DiscordAdapter(BasePlatformAdapter):
             message_ids = []
             reference = None
 
-            if reply_to and self._reply_to_mode != "off":
+            should_reference_reply = bool(reply_to) and self._reply_to_mode != "off"
+            if self._reply_to_mode == "final":
+                should_reference_reply = bool(
+                    should_reference_reply
+                    and isinstance(metadata, dict)
+                    and metadata.get("notify")
+                )
+
+            if should_reference_reply:
                 try:
-                    ref_msg = await channel.fetch_message(int(reply_to))
+                    reply_to_id = str(reply_to)
+                    ref_msg = await channel.fetch_message(int(reply_to_id))
                     if hasattr(ref_msg, "to_reference"):
                         reference = ref_msg.to_reference(fail_if_not_exists=False)
                     else:
@@ -2011,15 +2062,17 @@ class DiscordAdapter(BasePlatformAdapter):
                     logger.debug("Could not fetch reply-to message: %s", e)
 
             for i, chunk in enumerate(chunks):
-                # Notion task buttons ride on the first chunk only.
+                # The Notion task card (buttons + embed) rides on the first chunk only.
                 chunk_view = view if (i == 0 and view is not None) else None
                 if self._reply_to_mode == "all":
                     chunk_reference = reference
-                else:  # "first" (default) or "off"
+                else:  # "first" / "final" / invalid fallback
                     chunk_reference = reference if i == 0 else None
                 send_kwargs: Dict[str, Any] = {"content": chunk, "reference": chunk_reference}
                 if chunk_view is not None:
                     send_kwargs["view"] = chunk_view
+                if i == 0 and task_embed is not None:
+                    send_kwargs["embed"] = task_embed
                 try:
                     msg = await channel.send(**send_kwargs)
                 except Exception as e:
@@ -2068,7 +2121,8 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
-    async def _send_to_forum(self, forum_channel: Any, content: str, *, view: Any = None) -> SendResult:
+    async def _send_to_forum(self, forum_channel: Any, content: str, *, view: Any = None,
+                             embed: Any = None) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 
         Forum channels (type 15) don't support direct messages.  Instead we
@@ -2090,7 +2144,9 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             _thread_kwargs: Dict[str, Any] = {"name": thread_name, "content": starter_content}
             if view is not None:
-                _thread_kwargs["view"] = view  # task button rides on the forum starter
+                _thread_kwargs["view"] = view  # task card rides on the forum starter
+            if embed is not None:
+                _thread_kwargs["embed"] = embed
             thread = await forum_channel.create_thread(**_thread_kwargs)
         except Exception as e:
             logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
@@ -2184,6 +2240,49 @@ class DiscordAdapter(BasePlatformAdapter):
             raw_response={"thread_id": thread_id},
         )
 
+    def has_auto_titled_thread(self, thread_id: str) -> bool:
+        """Return True if this thread already got an automatic title rename.
+
+        Used by the gateway to rename a thread from a generated session title
+        at most once per thread — never again when a later, title-less session
+        is minted for the same thread (e.g. after a restart's ``agent_close``).
+        """
+        return str(thread_id) in self._auto_titled_threads
+
+    def mark_auto_titled_thread(self, thread_id: str) -> None:
+        """Persistently record that this thread has been auto-titled."""
+        self._auto_titled_threads.mark(str(thread_id))
+
+    async def rename_thread(self, thread_id: str, name: str) -> SendResult:
+        """Rename an existing Discord thread.
+
+        This intentionally refuses ordinary text/forum channels; automatic
+        session-title propagation should not mutate channel names.
+
+        NOTE: this is the low-level primitive shared by both automatic
+        session-title propagation and the manual ``/title`` command. The
+        "rename a thread at most once automatically" policy lives at the
+        automatic call site (gateway ``_schedule_discord_thread_title_rename``),
+        NOT here — ``/title`` must always be able to rename on demand.
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            channel = self._client.get_channel(int(thread_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(thread_id))
+            if not channel:
+                return SendResult(success=False, error=f"Thread {thread_id} not found")
+            if not self._is_thread_channel(channel):
+                return SendResult(success=False, error=f"Channel {thread_id} is not a Discord thread")
+
+            await channel.edit(name=name)
+            return SendResult(success=True, message_id=str(thread_id))
+        except Exception as e:  # pragma: no cover - defensive logging
+            logger.error("[%s] Failed to rename Discord thread %s: %s", self.name, thread_id, e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
     async def edit_message(
         self,
         chat_id: str,
@@ -2248,6 +2347,39 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
             return SendResult(success=False, error=str(e))
+
+    async def delete_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> bool:
+        """Delete a Discord message previously sent by the bot.
+
+        Fresh-final streaming uses this to remove stale preview messages after
+        sending the final reply as a fresh message.  Without this override the
+        base adapter returns False, leaving Discord users with duplicate-looking
+        preview + final chunks.
+        """
+        if not self._client:
+            return False
+        try:
+            channel = self._client.get_channel(int(chat_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(chat_id))
+            if not channel:
+                return False
+            msg = await channel.fetch_message(int(message_id))
+            await msg.delete()
+            return True
+        except Exception as e:
+            logger.debug(
+                "[%s] Failed to delete Discord message %s in %s: %s",
+                self.name,
+                message_id,
+                chat_id,
+                e,
+            )
+            return False
 
     @staticmethod
     def _is_length_overflow_error(err: Exception) -> bool:
@@ -5693,6 +5825,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 return True
         return False
 
+    def _is_thread_channel(self, channel: Any) -> bool:
+        """Best-effort check for whether a Discord channel is a thread."""
+        if channel is None:
+            return False
+        thread_cls = getattr(discord, "Thread", None)
+        if thread_cls and isinstance(channel, thread_cls):
+            return True
+        channel_type = getattr(channel, "type", None)
+        if channel_type is not None:
+            type_value = getattr(channel_type, "value", channel_type)
+            if type_value in {10, 11, 12}:
+                return True
+        return False
+
     def _get_effective_topic(self, channel: Any, is_thread: bool = False) -> Optional[str]:
         """Return the channel topic, falling back to the parent forum's topic for forum threads."""
         topic = getattr(channel, "topic", None)
@@ -7208,7 +7354,16 @@ def _define_discord_view_classes() -> None:
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
         ):
-            super().__init__(timeout=300)  # 5-minute timeout
+            try:
+                from tools.clarify_gateway import get_clarify_timeout
+                configured_timeout = get_clarify_timeout()
+            except Exception:
+                configured_timeout = 600
+            # Keep the Discord component lifetime aligned with the agent-side
+            # wait.  ``timeout=None`` means discord.py will not auto-disable the
+            # buttons; config ``agent.clarify_timeout <= 0`` therefore makes
+            # clarify prompts wait indefinitely instead of expiring in 5 minutes.
+            super().__init__(timeout=None if configured_timeout <= 0 else configured_timeout)
             self.choices = list(choices)[:24]
             self.clarify_id = clarify_id
             self.allowed_user_ids = allowed_user_ids
@@ -7482,13 +7637,14 @@ async def _standalone_send(
         last_data = None
         warnings = []
 
-        # Notion task one-click button for the standalone HTTP path. This is the
-        # path `hermes send` uses (the email-reminder cron pushes via it), so the
-        # button MUST be attached here — adapter.send() is not reached from a CLI
-        # process. Short-circuits cheaply when the message has no supported Notion link;
-        # never raises into delivery.
-        from plugins.platforms.discord.notion_tasks.outbound import standalone_task_components
-        task_components = await standalone_task_components(message)
+        # Notion task card (numbered buttons + embed) for the standalone HTTP
+        # path. This is the path `hermes send` uses (the email-reminder cron
+        # pushes via it), so the card MUST be attached here — adapter.send() is
+        # not reached from a CLI process. Short-circuits cheaply when the message
+        # has no supported Notion link; never raises into delivery. Runtime
+        # import so tests can monkeypatch the outbound module attribute.
+        from plugins.platforms.discord.notion_tasks import outbound as notion_outbound
+        task_components, task_embed = await notion_outbound.standalone_task_payload(message)
 
         # Thread endpoint: Discord threads are channels; send directly to the thread ID.
         if thread_id:
@@ -7553,6 +7709,8 @@ async def _standalone_send(
                         starter_message = {"content": message, "attachments": attachments_meta}
                         if task_components:
                             starter_message["components"] = task_components
+                            if task_embed:
+                                starter_message["embeds"] = [task_embed]
                         payload_json = json.dumps({"name": thread_name, "message": starter_message})
 
                         form = aiohttp.FormData()
@@ -7579,6 +7737,8 @@ async def _standalone_send(
                         _forum_message: Dict[str, Any] = {"content": message}
                         if task_components:
                             _forum_message["components"] = task_components
+                            if task_embed:
+                                _forum_message["embeds"] = [task_embed]
                         async with session.post(
                             thread_url,
                             headers=json_headers,
@@ -7614,6 +7774,8 @@ async def _standalone_send(
                 _text_payload: Dict[str, Any] = {"content": message}
                 if task_components:
                     _text_payload["components"] = task_components
+                    if task_embed:
+                        _text_payload["embeds"] = [task_embed]
                 async with session.post(url, headers=json_headers, json=_text_payload, **_req_kw) as resp:
                     if resp.status not in {200, 201}:
                         body = await resp.text()

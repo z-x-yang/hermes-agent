@@ -15,13 +15,28 @@ def test_make_and_match_custom_id():
     m = re.fullmatch(b.CUSTOM_ID_RE, cid)
     assert m and m.group("action") == "done" and m.group("page_id") == PID
 
+    snooze = b.make_custom_id("snooze", PID)
+    m2 = re.fullmatch(b.CUSTOM_ID_RE, snooze)
+    assert m2 and m2.group("action") == "snooze" and m2.group("page_id") == PID
 
-def test_build_button_labels_and_style():
-    done = b.build_button("done", PID, title="Reply to Alice")
-    assert "完成" in done.item.label
+
+def test_build_button_styles_and_labels():
+    # no number -> legacy full-text label (restart-rebuilt buttons, never shown)
+    done = b.build_button("done", PID)
     undo = b.build_button("undo", PID)
+    snooze = b.build_button("snooze", PID)
+    assert "完成" in done.item.label
     assert "撤销" in undo.item.label
+    assert "稍后" in snooze.item.label
     assert done.item.custom_id == f"ntask:done:{PID}"
+    assert snooze.item.custom_id == f"ntask:snooze:{PID}"
+
+
+def test_build_button_numbered_label():
+    # buttons carry ONLY the row number — full task text lives in the card embed
+    assert b.build_button("done", PID, num=3).item.label == "✓ 3"
+    assert b.build_button("snooze", PID, num=1).item.label == "⏰ 1"
+    assert b.build_button("undo", PID, num=2).item.label == "↩ 2"
 
 
 @pytest.mark.asyncio
