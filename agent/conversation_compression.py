@@ -580,6 +580,10 @@ def compress_context(
             pass
 
     try:
+        try:
+            setattr(agent.context_compressor, "_compression_audit_session_id", agent.session_id or None)
+        except Exception:
+            pass
         compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, force=force)
     except TypeError:
         # Plugin context engine with strict signature that doesn't accept
@@ -679,13 +683,52 @@ def compress_context(
                     # for search/recovery (Teknium review — keep one durable id
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
-                    agent._session_db.archive_and_compact(agent.session_id, compressed)
-                    # Reset the flush identity set so the next turn's appends are
-                    # diffed against the COMPACTED transcript: the compacted dicts
-                    # are passed as conversation_history next turn and skipped by
-                    # identity, so only genuinely new turn messages get appended
-                    # (no dup of the summary, no resurrection of dropped turns).
-                    agent._flushed_db_message_ids = set()
+                    output_row_ids = None
+                    if hasattr(agent._session_db, "archive_and_compact_returning_ids"):
+                        output_row_ids = agent._session_db.archive_and_compact_returning_ids(
+                            agent.session_id,
+                            compressed,
+                        )
+                    else:
+                        agent._session_db.archive_and_compact(agent.session_id, compressed)
+                    retained_tail_output_count = None
+                    audit_record = getattr(agent.context_compressor, "_last_compression_audit_record", None) or {}
+                    if audit_record.get("retained_tail_output_count") is not None:
+                        retained_tail_output_count = int(audit_record["retained_tail_output_count"])
+                    if output_row_ids is None:
+                        try:
+                            active_rows = agent._session_db.get_messages(agent.session_id)
+                            output_row_ids = [
+                                int(row["id"]) for row in active_rows
+                                if isinstance(row, dict) and row.get("id") is not None
+                            ]
+                        except Exception as _audit_err:
+                            output_row_ids = []
+                            logger.warning(
+                                "compression persist audit row-id lookup failed after successful archive: %s",
+                                _audit_err,
+                            )
+                    try:
+                        if hasattr(agent.context_compressor, "write_compression_persist_audit"):
+                            agent.context_compressor.write_compression_persist_audit(
+                                output_row_ids=output_row_ids,
+                                retained_tail_output_count=retained_tail_output_count,
+                            )
+                    except Exception as _audit_err:
+                        logger.warning("compression persist audit enrichment failed: %s", _audit_err)
+                    # archive_and_compact already inserted the compacted transcript
+                    # (summary + protected tail) as the live active rows. Re-baseline
+                    # the same-turn flush cursor to these exact dict identities so
+                    # _persist_session() / early-exit flushes do NOT append the
+                    # compressed summary and tail a second time (the flush honours
+                    # this seed one-shot and re-stamps _DB_PERSISTED_MARKER). Future
+                    # messages appended after this compaction have fresh identities
+                    # and will still be persisted normally.
+                    agent._flushed_db_message_ids = {
+                        id(msg) for msg in compressed if isinstance(msg, dict)
+                    }
+                    agent._flushed_db_message_session_id = agent.session_id
+                    agent._last_flushed_db_idx = len(compressed)
                     # Rotation-independent signal: the conversation was compacted in
                     # place (id unchanged). The gateway reads this (NOT an id-change
                     # diff) to re-baseline transcript handling.
@@ -794,10 +837,26 @@ def compress_context(
 
                 # Shared post-write steps (both modes target agent.session_id, which
                 # in-place keeps and rotation has already reassigned to the new id):
-                # refresh the stored system prompt and reset the flush cursor so the
-                # next turn re-bases its append diff.
+                # refresh the stored system prompt. Rotation still resets the flush
+                # cursor so the freshly-created child can receive its compressed
+                # transcript on the normal final flush. In-place compaction must NOT
+                # reset the cursor here: archive_and_compact already wrote the
+                # compacted transcript to the same session id and the in-place branch
+                # re-baselined the identity set to those dicts.
+                try:
+                    set_count = getattr(agent._session_db, "set_session_compression_count", None)
+                    if callable(set_count):
+                        _raw_cc = getattr(agent.context_compressor, "compression_count", 0)
+                        _safe_cc = int(_raw_cc) if isinstance(_raw_cc, (int, float, str)) else 0
+                        set_count(
+                            agent.session_id,
+                            _safe_cc,
+                        )
+                except Exception as _cc_err:
+                    logger.debug("Could not persist session compression count: %s", _cc_err)
                 agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
-                agent._last_flushed_db_idx = 0
+                if not (in_place and compacted_in_place):
+                    agent._last_flushed_db_idx = 0
             except Exception as e:
                 # If the rotation rolled back to the parent (orphan-avoidance
                 # above), agent.session_id is the still-indexed parent and
@@ -862,7 +921,7 @@ def compress_context(
         # storing it on _compression_warning lets replay_compression_warning
         # re-deliver it once a late-bound gateway status_callback is wired (#36908).
         _cc = agent.context_compressor.compression_count
-        if _cc >= 2:
+        if _cc >= 2 and getattr(agent, "compression_repeated_warning", True):
             _cc_msg = (
                 f"{agent.log_prefix}⚠️  Session compressed {_cc} times — "
                 f"accuracy may degrade. Consider /new to start fresh."

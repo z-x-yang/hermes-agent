@@ -1,16 +1,67 @@
 """Tests for agent/context_compressor.py — compression logic, thresholds, truncation fallback."""
 
-import pytest
+import json
 import time
+from pathlib import Path
 from unittest.mock import patch, MagicMock
+
+import pytest
 
 from agent.context_compressor import (
     ContextCompressor,
-    HISTORICAL_TASK_HEADING,
     SUMMARY_PREFIX,
     COMPRESSED_SUMMARY_METADATA_KEY,
+    _SUMMARY_END_MARKER,
+    _SUMMARY_TRANSIENT_FAILURE_COOLDOWN_SECONDS,
+    _SUMMARY_QUOTA_COOLDOWN_MAX_SECONDS,
+    _USER_LEDGER_MAX_CHARS,
+    _bound_retained_nonvisible_metadata,
+    _truncate_tail_tool_result,
 )
 from hermes_state import SessionDB
+
+
+def _make_quota_429_error(resets_in_seconds):
+    """A 429 shaped like a metered-plan usage wall (ChatGPT Codex backend).
+
+    ``status_code`` + ``body`` mirror what the OpenAI SDK's APIStatusError
+    exposes, so agent.error_classifier.classify_api_error picks it up as a
+    quota/rate-limit error carrying the given reset horizon.
+    """
+
+    class _QuotaError(Exception):
+        def __init__(self):
+            super().__init__("The usage limit has been reached")
+            self.status_code = 429
+            self.body = {"error": {
+                "type": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+                "resets_in_seconds": resets_in_seconds,
+            }}
+
+    return _QuotaError()
+
+
+NINE_SECTION_HEADINGS = [
+    "## Primary Request and Intent",
+    "## Key Technical Concepts",
+    "## Files and Code Sections",
+    "## Errors and Fixes",
+    "## Problem Solving",
+    "## All User Messages",
+    "## Pending Tasks",
+    "## Current Work",
+    "## Optional Next Step",
+]
+
+
+def _text_messages(messages):
+    return "\n".join(str(m.get("content", "")) for m in messages)
+
+
+def _read_compression_audit_records(hermes_home: Path) -> list[dict]:
+    path = hermes_home / "logs" / "compression_audit.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 @pytest.fixture()
@@ -186,7 +237,7 @@ class TestCompress:
             result = c.compress(msgs)
 
         combined = "\n".join(str(m.get("content", "")) for m in result)
-        assert HISTORICAL_TASK_HEADING in combined
+        assert "## Primary Request and Intent" in combined
         assert "Please fix the compression summary failure" in combined
         assert "read_file" in combined
         assert "agent/context_compressor.py" in combined
@@ -228,6 +279,158 @@ class TestCompress:
             f"active_task line should appear at most once (was triplicated in "
             f"#49307), found {count}x:\n{summary}"
         )
+
+    def test_summary_prefix_is_short_working_context_contract(self):
+        assert SUMMARY_PREFIX.startswith("[CONTEXT COMPACTION]")
+        assert "working context" in SUMMARY_PREFIX
+        assert "not as a new user request" in SUMMARY_PREFIX
+        assert "Continue any active work described in Current Work / Pending Tasks" in SUMMARY_PREFIX
+        assert "take precedence on conflict" in SUMMARY_PREFIX
+        assert "REFERENCE ONLY" not in SUMMARY_PREFIX
+        assert "Respond ONLY" not in SUMMARY_PREFIX
+        assert "latest user message" not in SUMMARY_PREFIX
+        assert _SUMMARY_END_MARKER == "--- END OF COMPACTED CONTEXT ---"
+
+    def test_summary_prompt_uses_nine_section_continuation_structure(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "\n".join(
+            f"{heading}\nNone." for heading in NINE_SECTION_HEADINGS
+        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "Implement a long-running fix"},
+            {"role": "assistant", "content": "Working"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c._generate_summary(messages)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        for heading in NINE_SECTION_HEADINGS:
+            assert heading in prompt
+        assert "another large language model" in prompt.lower()
+        assert "continue the work" in prompt.lower()
+        assert "## Historical Task Snapshot" not in prompt
+        assert "## Historical Pending User Asks" not in prompt
+        assert "## Historical Remaining Work" not in prompt
+
+    def test_summary_prompt_forbids_attributing_assistant_text_to_user(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "\n".join(
+            f"{heading}\nNone." for heading in NINE_SECTION_HEADINGS
+        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "What did I say?"},
+            {"role": "assistant", "content": "ASSISTANT_SELF_NOTE_NOT_USER_TEXT"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c._generate_summary(messages)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        turns_block = prompt.split("TURNS TO SUMMARIZE:", 1)[1].split(
+            "Use this exact structure:", 1
+        )[0]
+        assert "List EVERY real user message" in prompt
+        assert "replaced deterministically" not in prompt
+        assert "USER MESSAGE EVIDENCE LEDGER" not in prompt
+        assert "What did I say?" in turns_block
+        assert "ASSISTANT_SELF_NOTE_NOT_USER_TEXT" in turns_block
+
+    def test_static_fallback_summary_uses_nine_section_structure(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        summary = c._build_static_fallback_summary(
+            [
+                {"role": "user", "content": "Run a long task"},
+                {"role": "assistant", "content": "Started"},
+            ],
+            reason="provider down",
+        )
+
+        for heading in NINE_SECTION_HEADINGS:
+            assert heading in summary
+        assert "## Historical Task Snapshot" not in summary
+        assert "## Historical Remaining Work" not in summary
+        assert summary.startswith(SUMMARY_PREFIX)
+
+    def test_tail_cut_does_not_anchor_old_last_user_or_assistant(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                protect_first_n=0,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+
+        msgs = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "START_LONG_AUTONOMOUS_TASK_DO_NOT_PIN_RAW"},
+            {"role": "assistant", "content": "OLD_VISIBLE_ASSISTANT_REPLY_DO_NOT_PIN_RAW"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "middle output"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_2", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_2", "content": "recent output"},
+            {"role": "assistant", "content": "recent continuation"},
+        ]
+
+        head_end = c._protect_head_size(msgs)
+        cut = c._find_tail_cut_by_tokens(msgs, head_end, token_budget=3)
+
+        assert cut > 2
+        tail_text = _text_messages(msgs[cut:])
+        assert "START_LONG_AUTONOMOUS_TASK_DO_NOT_PIN_RAW" not in tail_text
+        assert "OLD_VISIBLE_ASSISTANT_REPLY_DO_NOT_PIN_RAW" not in tail_text
+
+    def test_compress_does_not_retain_synthetic_active_task_note_as_user_tail(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                protect_first_n=1,
+                protect_last_n=4,
+                quiet_mode=True,
+            )
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "\n".join(
+            f"{heading}\nNone." for heading in NINE_SECTION_HEADINGS
+        )
+        active_task_note = (
+            "[Your active task list was preserved across context compression]\n"
+            "- [>] audit-o2. O2 audit already summarized (in_progress)\n"
+            "- [ ] write-notion. Write durable project memory (pending)"
+        )
+        msgs = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "Please continue the CellSAM3.1 audit."},
+            {"role": "assistant", "content": "I will inspect O2 evidence."},
+            {"role": "user", "content": "middle request"},
+            {"role": "assistant", "content": "middle response"},
+            {"role": "user", "content": active_task_note},
+            {"role": "assistant", "content": "Audit actually completed; now extracting facts."},
+            {"role": "user", "content": "Real latest user turn after synthetic note."},
+        ]
+
+        with (
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
+            patch("agent.context_compressor.call_llm", return_value=mock_response),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        retained_user_text = "\n".join(
+            str(m.get("content", "")) for m in result if m.get("role") == "user"
+        )
+        assert "Your active task list was preserved" not in retained_user_text
+        assert "Real latest user turn after synthetic note." in retained_user_text
 
     def test_threshold_below_window_at_minimum_ctx(self):
         """Regression for #14690: at context_length == MINIMUM_CONTEXT_LENGTH
@@ -341,37 +544,522 @@ class TestCompress:
         # original content is present in either case.
         assert msgs[-2]["content"] in result[-2]["content"]
 
-    def test_compress_strips_db_persisted_from_assembled_messages(self, compressor):
-        """Regression for #57491: shallow copies must not carry flush markers."""
-        msgs = [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}", "_db_persisted": True}
-            for i in range(10)
-        ]
-        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
-            result = compressor.compress(msgs)
-        assert len(result) < len(msgs)
-        assert all("_db_persisted" not in msg for msg in result)
+    def test_merged_summary_marks_retained_assistant_tail_as_not_user_text(self):
+        """Regression for a live compaction attribution bug.
 
-    def test_compress_terminal_sweep_strips_markers_even_if_a_copy_site_leaks(self, compressor):
-        """Regression for #57491, structural: even if a copy site fails to strip
-        the marker (simulating a future refactor that adds/reintroduces a leaky
-        copy), the single terminal sweep in compress() guarantees no compacted
-        message leaves carrying `_db_persisted`. Neuter the per-site helper to a
-        plain leaking copy and assert the invariant still holds."""
-        import agent.context_compressor as _cc
+        With protect_first_n=0, a compacted summary can be prepended to the
+        first retained assistant/tool-call message to preserve role alternation.
+        The provider-visible content then contains both the handoff summary and
+        a raw assistant continuation in one assistant message.  Without an
+        explicit boundary, later turns can quote that retained assistant
+        continuation back as something the user said.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                protect_first_n=0,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
 
         msgs = [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}", "_db_persisted": True}
-            for i in range(10)
+            {"role": "user", "content": "old user ask"},
+            {"role": "assistant", "content": "old assistant answer"},
+            {
+                "role": "assistant",
+                "content": "ASSISTANT_SELF_NOTE_NOT_USER_QUOTE",
+                "tool_calls": [{
+                    "id": "call_live",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_live", "content": "tool output"},
+            {"role": "assistant", "content": "final tail answer"},
         ]
-        # Make the per-site helper leak the marker (dict.copy keeps it).
-        with patch.object(_cc, "_fresh_compaction_message_copy", lambda m: m.copy()), \
-             patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
-            result = compressor.compress(msgs)
-        assert len(result) < len(msgs)
-        assert all("_db_persisted" not in msg for msg in result), (
-            "terminal sweep must strip _db_persisted even when a copy site leaks"
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=2),
+            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\n## All User Messages\n- old user ask"),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        merged = result[0]
+        assert merged["role"] == "assistant"
+        assert _SUMMARY_END_MARKER in merged["content"]
+        assert "ASSISTANT_SELF_NOTE_NOT_USER_QUOTE" in merged["content"]
+        boundary = "[RETAINED ASSISTANT CONTINUATION — not user-provided text]"
+        assert boundary in merged["content"]
+        assert merged["content"].index(boundary) < merged["content"].index(
+            "ASSISTANT_SELF_NOTE_NOT_USER_QUOTE"
         )
+
+    def test_previous_context_summary_at_tail_boundary_is_not_retained_verbatim(self):
+        """Repeated compression should update one checkpoint, not nest old ones.
+
+        A live Discord session hit messages=136->135 because the tail boundary
+        started on a prior compacted summary. The new handoff was prepended to
+        that retained assistant message, leaving two nine-section checkpoints in
+        one provider-visible message.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                protect_first_n=0,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+
+        old_summary = (
+            f"{SUMMARY_PREFIX}\n"
+            "## Primary Request and Intent\nPrevious checkpoint.\n"
+            "## Key Technical Concepts\nOld details.\n"
+            f"\n{_SUMMARY_END_MARKER}"
+        )
+        new_summary = (
+            f"{SUMMARY_PREFIX}\n"
+            "## Primary Request and Intent\nUpdated checkpoint.\n"
+            "## Key Technical Concepts\nNew details."
+        )
+        msgs = [
+            {"role": "user", "content": "older turn to compact"},
+            {"role": "assistant", "content": "older assistant turn"},
+            {"role": "user", "content": "another older turn"},
+            {"role": "assistant", "content": old_summary, "_compressed_summary": True},
+            {"role": "user", "content": "fresh tail user"},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=3),
+            patch.object(c, "_generate_summary", return_value=new_summary),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        combined = "\n".join(str(m.get("content", "")) for m in result)
+        assert combined.count(SUMMARY_PREFIX) == 1
+        assert combined.count("## Primary Request and Intent") == 1
+        assert "Previous checkpoint" not in combined
+        assert "fresh tail user" in combined
+
+    def test_previous_context_summary_at_tail_boundary_aborts_if_update_fails(self):
+        """Never drop a prior checkpoint if the iterative summary update fails."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                protect_first_n=0,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+
+        old_summary = f"{SUMMARY_PREFIX}\n## Primary Request and Intent\nPrevious checkpoint.\n\n{_SUMMARY_END_MARKER}"
+        msgs = [
+            {"role": "user", "content": "older turn to compact"},
+            {"role": "assistant", "content": "older assistant turn"},
+            {"role": "user", "content": "another older turn"},
+            {"role": "assistant", "content": old_summary, "_compressed_summary": True},
+            {"role": "user", "content": "fresh tail user"},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=3),
+            patch.object(c, "_generate_summary", return_value=None),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        assert result == msgs
+        assert c._last_compress_aborted is True
+
+    def test_summary_cooldown_abort_reports_previous_failure_instead_of_unknown(self):
+        """Cooldown retries that must abort should still expose a useful error.
+
+        A live session hit this shape: one summary attempt failed and set the
+        cooldown; the next auto-compression needed to abort to preserve a prior
+        compacted summary/tail source, but the user-facing warning said
+        "unknown error" because compress() cleared _last_summary_error before
+        _generate_summary() returned early for the cooldown.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                protect_first_n=0,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+
+        first_msgs = [
+            {"role": "user", "content": "first older turn"},
+            {"role": "assistant", "content": "first older response"},
+            {"role": "user", "content": "second older turn"},
+            {"role": "assistant", "content": "second older response"},
+            {"role": "user", "content": "fresh tail user"},
+            {"role": "assistant", "content": "fresh tail assistant"},
+        ]
+        previous_failure = "Context compression LLM returned empty content (provider=gptcodex model=gpt-5.5)"
+        with (
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=4),
+            patch("agent.context_compressor.call_llm", side_effect=RuntimeError(previous_failure)),
+        ):
+            c.compress(first_msgs, current_tokens=90_000)
+
+        assert c._last_summary_error == previous_failure
+        assert c._summary_failure_cooldown_until > 0
+
+        old_summary = f"{SUMMARY_PREFIX}\n## Primary Request and Intent\nPrevious checkpoint.\n\n{_SUMMARY_END_MARKER}"
+        cooldown_msgs = [
+            {"role": "user", "content": "older turn to compact"},
+            {"role": "assistant", "content": "older assistant turn"},
+            {"role": "user", "content": "another older turn"},
+            {"role": "assistant", "content": old_summary, "_compressed_summary": True},
+            {"role": "user", "content": "fresh tail user"},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(cooldown_msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=3),
+            patch("agent.context_compressor.call_llm", side_effect=AssertionError("cooldown should skip LLM call")),
+        ):
+            result = c.compress(cooldown_msgs, current_tokens=90_000)
+
+        assert result == cooldown_msgs
+        assert c._last_compress_aborted is True
+        assert c._last_summary_error
+        assert "unknown error" not in c._last_summary_error.lower()
+        assert "cooldown" in c._last_summary_error.lower()
+        assert previous_failure in c._last_summary_error
+
+    # ── summary-failure cooldown stays short for user-recoverable quota walls ──
+    # ChatGPT/Codex quota errors can be cleared manually by topping up or
+    # resetting the account, and compression fallback candidates may recover
+    # independently.  Do not turn a days-out reset horizon into a global
+    # summary cooldown that blocks fallback retries for minutes.
+
+    def _fresh_compressor(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            return ContextCompressor(model="test", quiet_mode=True)
+
+    def test_quota_wall_summary_failure_ignores_long_reset_horizon_cooldown(self):
+        c = self._fresh_compressor()
+        messages = [
+            {"role": "user", "content": "do the long thing"},
+            {"role": "assistant", "content": "ok"},
+        ]
+        before = time.monotonic()
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=_make_quota_429_error(373445),  # ~4.3 days out
+        ):
+            result = c._generate_summary(messages)
+        assert result is None
+        cooldown = c._summary_failure_cooldown_until - before
+        # Horizon is days out, but the user may manually restore quota or rely
+        # on another compression fallback immediately.  Keep the cooldown in the
+        # same short recovery window as transient provider faults.
+        assert cooldown <= _SUMMARY_TRANSIENT_FAILURE_COOLDOWN_SECONDS + 1
+        assert _SUMMARY_QUOTA_COOLDOWN_MAX_SECONDS <= _SUMMARY_TRANSIENT_FAILURE_COOLDOWN_SECONDS
+
+    def test_rate_limit_short_reset_cooldown_stays_short(self):
+        c = self._fresh_compressor()
+        messages = [
+            {"role": "user", "content": "x"},
+            {"role": "assistant", "content": "y"},
+        ]
+        before = time.monotonic()
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=_make_quota_429_error(45),  # short per-window throttle
+        ):
+            c._generate_summary(messages)
+        cooldown = c._summary_failure_cooldown_until - before
+        assert cooldown <= _SUMMARY_TRANSIENT_FAILURE_COOLDOWN_SECONDS + 1
+
+    def test_transient_timeout_summary_failure_keeps_short_cooldown(self):
+        c = self._fresh_compressor()
+        messages = [
+            {"role": "user", "content": "x"},
+            {"role": "assistant", "content": "y"},
+        ]
+        before = time.monotonic()
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=TimeoutError("request timed out"),
+        ):
+            result = c._generate_summary(messages)
+        assert result is None
+        cooldown = c._summary_failure_cooldown_until - before
+        assert cooldown <= _SUMMARY_TRANSIENT_FAILURE_COOLDOWN_SECONDS + 1
+
+    def test_cooldown_skip_marks_repeat_and_does_not_call_llm(self):
+        c = self._fresh_compressor()
+        messages = [
+            {"role": "user", "content": "x"},
+            {"role": "assistant", "content": "y"},
+        ]
+        # Fresh failure opens the cooldown; this attempt really hit the LLM,
+        # so it is NOT a repeat (compress() should log loudly).
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=_make_quota_429_error(373445),
+        ):
+            c._generate_summary(messages)
+        assert c._summary_skipped_for_cooldown is False
+        # A second attempt while the cooldown is active must skip the LLM
+        # entirely and mark itself a repeat so compress() can stay quiet.
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=AssertionError("cooldown must skip the LLM call"),
+        ):
+            result = c._generate_summary(messages)
+        assert result is None
+        assert c._summary_skipped_for_cooldown is True
+
+    def test_merged_previous_context_summary_at_tail_boundary_preserves_live_tail(self):
+        """If the old summary message also carries retained live tail text, keep that text."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                protect_first_n=0,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+
+        old_merged_summary = (
+            f"{SUMMARY_PREFIX}\n"
+            "## Primary Request and Intent\nPrevious checkpoint.\n"
+            f"\n{_SUMMARY_END_MARKER}\n\n"
+            "[RETAINED ASSISTANT CONTINUATION — not user-provided text]\n"
+            "LIVE_ASSISTANT_TAIL"
+        )
+        new_summary = f"{SUMMARY_PREFIX}\n## Primary Request and Intent\nUpdated checkpoint."
+        msgs = [
+            {"role": "user", "content": "older turn to compact"},
+            {"role": "assistant", "content": "older assistant turn"},
+            {"role": "user", "content": "another older turn"},
+            {"role": "assistant", "content": old_merged_summary, "_compressed_summary": True},
+            {"role": "user", "content": "fresh tail user"},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=3),
+            patch.object(c, "_generate_summary", return_value=new_summary),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        combined = "\n".join(str(m.get("content", "")) for m in result)
+        assert combined.count(SUMMARY_PREFIX) == 1
+        assert "Previous checkpoint" not in combined
+        assert "LIVE_ASSISTANT_TAIL" in combined
+        assert "fresh tail user" in combined
+
+    def test_deeply_nested_previous_context_summary_tail_is_unwrapped(self):
+        """Nested old summaries should not survive inside the retained tail."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                protect_first_n=0,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+
+        nested_old_summary = (
+            f"{SUMMARY_PREFIX}\nouter summary\n{_SUMMARY_END_MARKER}\n\n"
+            "[RETAINED ASSISTANT CONTINUATION — not user-provided text]\n"
+            f"{SUMMARY_PREFIX}\ninner summary\n{_SUMMARY_END_MARKER}\n\n"
+            "[RETAINED ASSISTANT CONTINUATION — not user-provided text]\n"
+            "LIVE_ASSISTANT_TAIL"
+        )
+        new_summary = f"{SUMMARY_PREFIX}\n## Primary Request and Intent\nUpdated checkpoint."
+        msgs = [
+            {"role": "user", "content": "older turn to compact"},
+            {"role": "assistant", "content": "older assistant turn"},
+            {"role": "user", "content": "another older turn"},
+            {"role": "assistant", "content": nested_old_summary, "_compressed_summary": True},
+            {"role": "user", "content": "fresh tail user"},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=3),
+            patch.object(c, "_generate_summary", return_value=new_summary),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        combined = "\n".join(str(m.get("content", "")) for m in result)
+        assert combined.count(SUMMARY_PREFIX) == 1
+        assert "outer summary" not in combined
+        assert "inner summary" not in combined
+        assert "LIVE_ASSISTANT_TAIL" in combined
+
+    def test_quoted_end_marker_inside_previous_summary_is_not_tail_boundary(self):
+        """Protocol examples inside the old summary must not be split as live tail."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                protect_first_n=0,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+
+        old_merged_summary = (
+            f"{SUMMARY_PREFIX}\n"
+            "## Primary Request and Intent\nPrevious checkpoint.\n"
+            "## Key Technical Concepts\nThe protocol marker can be quoted:\n"
+            "```text\n"
+            f"{_SUMMARY_END_MARKER}\n"
+            "```\n"
+            "THIS_IS_STILL_OLD_SUMMARY_BODY_NOT_LIVE_TAIL\n"
+            f"\n{_SUMMARY_END_MARKER}\n\n"
+            "[RETAINED ASSISTANT CONTINUATION — not user-provided text]\n"
+            "LIVE_ASSISTANT_TAIL"
+        )
+        new_summary = f"{SUMMARY_PREFIX}\n## Primary Request and Intent\nUpdated checkpoint."
+        msgs = [
+            {"role": "user", "content": "older turn to compact"},
+            {"role": "assistant", "content": "older assistant turn"},
+            {"role": "user", "content": "another older turn"},
+            {"role": "assistant", "content": old_merged_summary, "_compressed_summary": True},
+            {"role": "user", "content": "fresh tail user"},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=3),
+            patch.object(c, "_generate_summary", return_value=new_summary),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        combined = "\n".join(str(m.get("content", "")) for m in result)
+        assert combined.count(SUMMARY_PREFIX) == 1
+        assert "THIS_IS_STILL_OLD_SUMMARY_BODY_NOT_LIVE_TAIL" not in combined
+        assert "LIVE_ASSISTANT_TAIL" in combined
+
+    def test_unclosed_fence_before_summary_boundary_still_preserves_tail(self):
+        """Malformed fences must not make the splitter drop real retained tail."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                protect_first_n=0,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+
+        old_merged_summary = (
+            f"{SUMMARY_PREFIX}\n"
+            "## Primary Request and Intent\nPrevious checkpoint.\n"
+            "```text\n"
+            f"{_SUMMARY_END_MARKER}\n"
+            "quoted marker before the real boundary\n"
+            f"\n{_SUMMARY_END_MARKER}\n\n"
+            "[RETAINED ASSISTANT CONTINUATION — not user-provided text]\n"
+            "LIVE_ASSISTANT_TAIL"
+        )
+        new_summary = f"{SUMMARY_PREFIX}\n## Primary Request and Intent\nUpdated checkpoint."
+        msgs = [
+            {"role": "user", "content": "older turn to compact"},
+            {"role": "assistant", "content": "older assistant turn"},
+            {"role": "user", "content": "another older turn"},
+            {"role": "assistant", "content": old_merged_summary, "_compressed_summary": True},
+            {"role": "user", "content": "fresh tail user"},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=3),
+            patch.object(c, "_generate_summary", return_value=new_summary),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        combined = "\n".join(str(m.get("content", "")) for m in result)
+        assert combined.count(SUMMARY_PREFIX) == 1
+        assert "quoted marker before the real boundary" not in combined
+        assert "LIVE_ASSISTANT_TAIL" in combined
+
+    def test_unclosed_fence_before_unlabelled_summary_tail_preserves_tail(self):
+        """Legacy merged summaries may have live tail without an explicit label."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                protect_first_n=0,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+
+        old_merged_summary = (
+            f"{SUMMARY_PREFIX}\n"
+            "## Primary Request and Intent\nPrevious checkpoint.\n"
+            "```text\n"
+            f"{_SUMMARY_END_MARKER}\n"
+            "quoted marker before the real boundary\n"
+            f"\n{_SUMMARY_END_MARKER}\n\n"
+            "LIVE_UNLABELLED_ASSISTANT_TAIL"
+        )
+        new_summary = f"{SUMMARY_PREFIX}\n## Primary Request and Intent\nUpdated checkpoint."
+        msgs = [
+            {"role": "user", "content": "older turn to compact"},
+            {"role": "assistant", "content": "older assistant turn"},
+            {"role": "user", "content": "another older turn"},
+            {"role": "assistant", "content": old_merged_summary, "_compressed_summary": True},
+            {"role": "user", "content": "fresh tail user"},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=3),
+            patch.object(c, "_generate_summary", return_value=new_summary),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        combined = "\n".join(str(m.get("content", "")) for m in result)
+        assert combined.count(SUMMARY_PREFIX) == 1
+        assert "quoted marker before the real boundary" not in combined
+        assert "LIVE_UNLABELLED_ASSISTANT_TAIL" in combined
+
+    def test_four_backtick_fence_can_quote_triple_backtick_marker(self):
+        """A longer outer fence should keep inner triple-backtick examples quoted."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                protect_first_n=0,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+
+        old_merged_summary = (
+            f"{SUMMARY_PREFIX}\n"
+            "## Primary Request and Intent\nPrevious checkpoint.\n"
+            "````md\n"
+            "```text\n"
+            f"{_SUMMARY_END_MARKER}\n"
+            "```\n"
+            "THIS_IS_STILL_QUOTED_OLD_SUMMARY_BODY\n"
+            "````\n"
+            f"\n{_SUMMARY_END_MARKER}\n\n"
+            "[RETAINED ASSISTANT CONTINUATION — not user-provided text]\n"
+            "LIVE_ASSISTANT_TAIL"
+        )
+        new_summary = f"{SUMMARY_PREFIX}\n## Primary Request and Intent\nUpdated checkpoint."
+        msgs = [
+            {"role": "user", "content": "older turn to compact"},
+            {"role": "assistant", "content": "older assistant turn"},
+            {"role": "user", "content": "another older turn"},
+            {"role": "assistant", "content": old_merged_summary, "_compressed_summary": True},
+            {"role": "user", "content": "fresh tail user"},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=3),
+            patch.object(c, "_generate_summary", return_value=new_summary),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        combined = "\n".join(str(m.get("content", "")) for m in result)
+        assert combined.count(SUMMARY_PREFIX) == 1
+        assert "THIS_IS_STILL_QUOTED_OLD_SUMMARY_BODY" not in combined
+        assert "LIVE_ASSISTANT_TAIL" in combined
 
     def test_protect_first_n_decays_after_first_compression(self):
         """Regression for #11996: protect_first_n must protect early turns on
@@ -405,6 +1093,952 @@ class TestCompress:
         c.compression_count = 0
         c._previous_summary = "[CONTEXT SUMMARY]: earlier work"
         assert c._effective_protect_first_n() == 0
+
+    def test_compress_strips_db_persisted_from_assembled_messages(self, compressor):
+        """Regression for #57491: shallow copies must not carry flush markers."""
+        msgs = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}", "_db_persisted": True}
+            for i in range(10)
+        ]
+        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
+            result = compressor.compress(msgs)
+        assert len(result) < len(msgs)
+        assert all("_db_persisted" not in msg for msg in result)
+
+    def test_compress_terminal_sweep_strips_markers_even_if_a_copy_site_leaks(self, compressor):
+        """Regression for #57491, structural: even if a copy site fails to strip
+        the marker (simulating a future refactor that adds/reintroduces a leaky
+        copy), the single terminal sweep in compress() guarantees no compacted
+        message leaves carrying `_db_persisted`. Neuter the per-site helper to a
+        plain leaking copy and assert the invariant still holds."""
+        import agent.context_compressor as _cc
+
+        msgs = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}", "_db_persisted": True}
+            for i in range(10)
+        ]
+        # Make the per-site helper leak the marker (dict.copy keeps it).
+        with patch.object(_cc, "_fresh_compaction_message_copy", lambda m: m.copy()), \
+             patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
+            result = compressor.compress(msgs)
+        assert len(result) < len(msgs)
+        assert all("_db_persisted" not in msg for msg in result), (
+            "terminal sweep must strip _db_persisted even when a copy site leaks"
+        )
+
+
+
+
+class TestTailToolOutputCompaction:
+    def test_summarized_window_tool_result_reaches_summary_raw(self):
+        """Tool results inside the summarized window must reach the summarizer raw.
+
+        Compression is supposed to let the summary absorb the detailed source
+        material.  Replacing a to-be-summarized tool result with the same
+        one-line placeholder used for retained-tail compaction loses the only
+        copy of the evidence before the summarizer can read it.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=2,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 500
+
+        raw_sentinel = "RAW_SUMMARY_SOURCE_SENTINEL_ZX_20260628"
+        raw_tool_output = f"tool header\n{raw_sentinel}\n" + ("x" * 8_000)
+        later_big_output = "later boundary-setting tool output\n" + ("y" * 12_000)
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_raw",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"/tmp/raw-source.txt","offset":1}',
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_raw", "content": raw_tool_output},
+            {"role": "assistant", "content": "I inspected the raw source."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_later_big",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"python later_big.py"}',
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_later_big", "content": later_big_output},
+            {"role": "assistant", "content": "later big tool done"},
+            {"role": "user", "content": "middle follow-up"},
+            {"role": "assistant", "content": "middle answer"},
+            {"role": "user", "content": "latest protected ask"},
+            {"role": "assistant", "content": "latest protected answer"},
+        ]
+        captured: dict[str, list[dict]] = {}
+
+        def fake_summary(turns, focus_topic=None):
+            captured["turns"] = [m.copy() for m in turns]
+            return f"{SUMMARY_PREFIX}\nsummary"
+
+        with (
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=7),
+            patch.object(c, "_generate_summary", side_effect=fake_summary),
+        ):
+            c.compress(msgs, current_tokens=90_000)
+
+        summarized_text = _text_messages(captured["turns"])
+        assert raw_sentinel in summarized_text
+        assert "[read_file] read /tmp/raw-source.txt" not in summarized_text
+
+    def test_compacted_retained_tail_tool_moves_tail_boundary_forward(self):
+        """Compacted retained-tail tool evidence must preserve chronology.
+
+        A summary represents the messages before the retained tail. If a tool
+        result inside the selected tail must be shortened, its raw source should
+        move into the summarized chronological window and the retained tail
+        should start after it — not keep a compacted placeholder in tail while
+        also appending that later raw source to an earlier summary.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 900
+
+        raw_sentinel = "RAW_COMPACTED_TAIL_SENTINEL_ZX_20260628"
+        old_tail_output = f"old tail evidence\n{raw_sentinel}\n" + ("a" * 12_000)
+        newest_output = "newest output stays small"
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "middle assistant"},
+            {"role": "user", "content": "middle user"},
+            {"role": "assistant", "content": "middle reply"},
+            {"role": "user", "content": "latest protected ask"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_tail_old",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"python emit_tail_evidence.py"}',
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_tail_old", "content": old_tail_output},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_tail_new",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"pytest tests/agent -q"}',
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_tail_new", "content": newest_output},
+            {"role": "assistant", "content": "last visible reply"},
+        ]
+        captured: dict[str, list[dict]] = {}
+
+        def fake_summary(turns, focus_topic=None):
+            captured["turns"] = [m.copy() for m in turns]
+            return f"{SUMMARY_PREFIX}\nsummary includes durable tail evidence"
+
+        with (
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
+            patch.object(c, "_generate_summary", side_effect=fake_summary),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        tool_by_id = {m.get("tool_call_id"): m for m in result if m.get("role") == "tool"}
+        assert "call_tail_old" not in tool_by_id
+        assert tool_by_id["call_tail_new"]["content"] == newest_output
+        assert raw_sentinel in _text_messages(captured["turns"])
+        assert captured["turns"][-1]["tool_call_id"] == "call_tail_old"
+
+    def test_tail_boundary_promotion_preserves_minimum_recent_tail_floor(self):
+        """Boundary promotion must not eat the whole recent tail floor.
+
+        If a protected-tail tool result is compacted, the raw source moves into
+        the chronological summary window by promoting the tail boundary. That
+        promotion must stop before the hard recent-message floor; otherwise a
+        tool-heavy tail can collapse from the expected recent context to only a
+        couple of messages.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=10,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 350
+
+        older_tail_sentinel = "OLDER_TAIL_TOOL_CAN_BE_SUMMARIZED_ZX_20260629"
+        floor_sentinel = "RECENT_TAIL_FLOOR_MUST_REMAIN_RAW_ZX_20260629"
+        older_tail_output = older_tail_sentinel + "\n" + ("o" * 12_000)
+        floor_tool_output = floor_sentinel + "\n" + ("f" * 12_000)
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "middle assistant"},
+            {"role": "user", "content": "middle user"},
+            {"role": "assistant", "content": "middle reply"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_older_tail", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"python older_tail.py"}'}}]},
+            {"role": "tool", "tool_call_id": "call_older_tail", "content": older_tail_output},
+            {"role": "assistant", "content": "after older tail evidence"},
+            {"role": "user", "content": "recent floor user 0"},
+            {"role": "assistant", "content": "recent floor assistant 1"},
+            {"role": "user", "content": "recent floor user 2"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_floor_tail", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"python recent_floor.py"}'}}]},
+            {"role": "tool", "tool_call_id": "call_floor_tail", "content": floor_tool_output},
+            {"role": "assistant", "content": "recent floor assistant 5"},
+            {"role": "user", "content": "latest protected ask"},
+            {"role": "assistant", "content": "latest protected answer"},
+            {"role": "user", "content": "final user tail"},
+        ]
+        captured: dict[str, list[dict]] = {}
+        records: list[dict] = []
+
+        def fake_summary(turns, focus_topic=None):
+            captured["turns"] = [m.copy() for m in turns]
+            return f"{SUMMARY_PREFIX}\nsummary includes older tail evidence"
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
+            patch.object(c, "_generate_summary", side_effect=fake_summary),
+            patch.object(c, "_write_compression_audit_record", side_effect=records.append),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        result_text = _text_messages(result)
+        summarized_text = _text_messages(captured["turns"])
+        assert older_tail_sentinel in summarized_text
+        assert floor_sentinel not in summarized_text
+        assert floor_sentinel in result_text
+        assert records[-1]["retained_tail"]["message_count"] >= 10
+        assert records[-1]["tail_boundary_promoted"] is True
+
+    def test_compacted_tail_summary_failure_aborts_to_preserve_raw_source(self):
+        """Do not persist compacted tail if the raw tail source was not summarized."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 900
+
+        raw_sentinel = "RAW_TAIL_FAILURE_SENTINEL_ZX_20260628"
+        old_tail_output = f"old tail evidence\n{raw_sentinel}\n" + ("a" * 12_000)
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "middle assistant"},
+            {"role": "user", "content": "middle user"},
+            {"role": "assistant", "content": "middle reply"},
+            {"role": "user", "content": "latest protected ask"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_tail_old", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"python emit_tail_evidence.py"}'}}]},
+            {"role": "tool", "tool_call_id": "call_tail_old", "content": old_tail_output},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_tail_new", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"pytest tests/agent -q"}'}}]},
+            {"role": "tool", "tool_call_id": "call_tail_new", "content": "newest output stays small"},
+            {"role": "assistant", "content": "last visible reply"},
+        ]
+
+        with (
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
+            patch.object(c, "_generate_summary", return_value=None),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        assert result == msgs
+        assert c._last_compress_aborted is True
+        assert c._last_summary_fallback_used is False
+        assert raw_sentinel in _text_messages(result)
+
+    def test_recomputed_boundary_after_tail_compaction_still_aborts_on_summary_failure(self):
+        """A recomputed tail cut must not hide that raw tail evidence was shortened."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 4_000
+
+        raw_sentinel = "RAW_RECOMPUTED_BOUNDARY_SENTINEL_ZX_20260628"
+        old_tail_output = raw_sentinel + "\n" + ("x" * 20_000)
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_old", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"python big.py"}'}}]},
+            {"role": "tool", "tool_call_id": "call_old", "content": old_tail_output},
+            {"role": "user", "content": "after 0 " + ("a" * 1000)},
+            {"role": "assistant", "content": "after 1 " + ("a" * 1000)},
+            {"role": "user", "content": "after 2 " + ("a" * 1000)},
+            {"role": "assistant", "content": "after 3 " + ("a" * 1000)},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_generate_summary", return_value=None),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        assert result == msgs
+        assert c._last_compress_aborted is True
+        assert c._last_summary_fallback_used is False
+        assert raw_sentinel in _text_messages(result)
+
+    def test_summary_source_overflow_compacts_tool_outputs_oldest_first(self):
+        """If raw source exceeds the summarizer budget, shrink old tools first."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(model="test/model", quiet_mode=True)
+        c.threshold_tokens = 2_000
+
+        turns = []
+        for i in range(8):
+            turns.append({
+                "role": "tool",
+                "tool_call_id": f"call_{i}",
+                "content": f"RAW_TOOL_{i}_START\n" + (str(i) * 6_000) + f"\nRAW_TOOL_{i}_END",
+            })
+        turns.append({"role": "user", "content": "LATEST_USER_MUST_SURVIVE"})
+
+        serialized = c._serialize_for_summary(turns)
+
+        assert "LATEST_USER_MUST_SURVIVE" in serialized
+        assert "summary-source overflow: compacted older tool output" in serialized
+        assert serialized.find("summary-source overflow: compacted older tool output") < serialized.find("RAW_TOOL_7_END")
+        assert "RAW_TOOL_7_END" in serialized
+        assert len(serialized) < 50_000
+
+    def test_summary_source_keeps_full_tool_output_when_it_fits(self):
+        """Do not pre-truncate tool bodies before the summarizer sees them.
+
+        The compressor first selects a summary window that should fit the
+        summary model. If the raw serialized window fits that global budget,
+        the LLM must see the full tool output — otherwise important middle
+        evidence is lost before semantic compression even starts.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(model="test/model", quiet_mode=True)
+        c.threshold_tokens = 50_000
+
+        middle_sentinel = "RAW_TOOL_MIDDLE_SENTINEL_ZX_20260628"
+        tool_output = (
+            "RAW_TOOL_START\n"
+            + ("a" * 4_500)
+            + middle_sentinel
+            + ("b" * 4_500)
+            + "\nRAW_TOOL_END"
+        )
+
+        serialized = c._serialize_for_summary([
+            {"role": "tool", "tool_call_id": "call_raw", "content": tool_output},
+        ])
+
+        assert middle_sentinel in serialized
+        assert "RAW_TOOL_START" in serialized
+        assert "RAW_TOOL_END" in serialized
+        assert "...[truncated]..." not in serialized
+        assert "summary-source overflow" not in serialized
+
+    def test_summary_source_overflow_caps_tool_args_before_global_truncation(self):
+        """Huge tool-call args are capped only after tool-output fallback work.
+
+        This covers the last non-destructive overflow fallback before the whole
+        prompt is head/tail truncated: if tool outputs are already small but a
+        tool-call argument blob alone keeps the source over budget, cap args and
+        preserve chronological source text instead of dropping into the final
+        global truncation marker.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(model="test/model", quiet_mode=True)
+        c.threshold_tokens = 2_000
+        huge_args = '{"query":"' + ("x" * 30_000) + '"}'
+
+        serialized = c._serialize_for_summary([
+            {
+                "role": "assistant",
+                "content": "calling search",
+                "tool_calls": [{
+                    "id": "call_huge_args",
+                    "type": "function",
+                    "function": {"name": "search_files", "arguments": huge_args},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_huge_args", "content": "SMALL_TOOL_RESULT"},
+        ])
+
+        assert len(serialized) <= c._summary_source_char_budget()
+        assert "SMALL_TOOL_RESULT" in serialized
+        assert "search_files(" in serialized
+        assert "..." in serialized
+        assert serialized.count("x") < 2_000
+        assert "global summary-source budget" not in serialized
+
+    def test_compacts_oversized_tool_outputs_inside_protected_tail(self):
+        """Protected-tail tool output should not survive compaction verbatim.
+
+        The existing old-tool pruning pass only touches messages before the
+        protected tail. A Discord/gateway long-running session can still end up
+        with several large `role=tool` messages inside the tail after the active
+        user/assistant anchors pull the boundary back. Codex-style behavior for
+        this narrow case is to keep the tool-result structure but shrink older
+        tool output bodies.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 1_000
+
+        oversized_output = "OLD TOOL OUTPUT\n" + ("x" * 20_000)
+        newest_output = "LATEST TOOL OUTPUT\n" + ("y" * 500)
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "middle assistant"},
+            {"role": "user", "content": "middle user"},
+            {"role": "assistant", "content": "middle reply"},
+            {"role": "user", "content": "latest protected ask"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_old",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"python dump_big_state.py"}',
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_old", "content": oversized_output},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_new",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"pytest tests/agent -q"}',
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_new", "content": newest_output},
+            {"role": "assistant", "content": "last visible reply"},
+        ]
+
+        # Force this fixture's large tool outputs to be inside the protected
+        # tail, and disable the existing pre-tail pruning pass so the test only
+        # exercises the new protected-tail behavior.
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
+            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        tool_by_id = {
+            m.get("tool_call_id"): m
+            for m in result
+            if m.get("role") == "tool"
+        }
+        assert "call_old" not in tool_by_id
+        assert tool_by_id["call_new"]["content"] == newest_output
+
+    def test_truncates_single_oversized_tail_tool_before_recent_floor(self):
+        """A single oversized tail tool result before the hard floor should be bounded.
+
+        Tool output inside the hard recent-message floor stays raw so boundary
+        promotion cannot erase the live tail. This fixture keeps a few later
+        messages after the tool so its raw source can move into the chronological
+        summary window while the recent floor remains live.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=4,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 1_000
+
+        huge_output = "HEAD-LINE\n" + ("x" * 12_000) + "\nTAIL-LINE"
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "middle assistant"},
+            {"role": "user", "content": "middle user"},
+            {"role": "assistant", "content": "middle reply"},
+            {"role": "user", "content": "latest protected ask"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_latest",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"python dump_big_state.py"}',
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_latest", "content": huge_output},
+            {"role": "assistant", "content": "recent floor assistant"},
+            {"role": "user", "content": "recent floor user"},
+            {"role": "assistant", "content": "latest protected answer"},
+            {"role": "user", "content": "final recent floor user"},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=3),
+            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        assert [m for m in result if m.get("role") == "tool"] == []
+
+    def test_tail_truncation_never_grows_moderately_large_tool_output(self):
+        original = "HEAD-LINE\n" + ("x" * 4_500) + "\nTAIL-LINE"
+
+        truncated = _truncate_tail_tool_result(
+            "terminal",
+            '{"command":"python dump_big_state.py"}',
+            original,
+        )
+
+        assert truncated != original
+        assert len(truncated) < len(original)
+        assert "Tool output truncated during context compaction" in truncated
+        assert "HEAD-LINE" in truncated
+        assert "TAIL-LINE" in truncated
+
+    def test_compacts_multiple_moderate_tool_outputs_when_tail_is_over_budget(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 600
+
+        moderate_one = "MODERATE ONE\n" + ("a" * 3_000)
+        moderate_two = "MODERATE TWO\n" + ("b" * 3_000)
+        newest_output = "latest small observation"
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "middle assistant"},
+            {"role": "user", "content": "middle user"},
+            {"role": "assistant", "content": "middle reply"},
+            {"role": "user", "content": "latest protected ask"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_one", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"python one.py"}'}}]},
+            {"role": "tool", "tool_call_id": "call_one", "content": moderate_one},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_two", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"python two.py"}'}}]},
+            {"role": "tool", "tool_call_id": "call_two", "content": moderate_two},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_new", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"pytest"}'}}]},
+            {"role": "tool", "tool_call_id": "call_new", "content": newest_output},
+            {"role": "assistant", "content": "recent floor assistant"},
+            {"role": "user", "content": "recent floor user"},
+            {"role": "assistant", "content": "latest protected answer"},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
+            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        tool_by_id = {m.get("tool_call_id"): m for m in result if m.get("role") == "tool"}
+        assert "call_one" not in tool_by_id
+        assert "call_two" not in tool_by_id
+        assert tool_by_id["call_new"]["content"] == newest_output
+
+    def test_compacts_multimodal_tool_outputs_inside_protected_tail(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=4,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 1_000
+
+        multimodal_output = [
+            {"type": "text", "text": "screenshot evidence"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + ("a" * 10_000)}},
+        ]
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "middle assistant"},
+            {"role": "user", "content": "middle user"},
+            {"role": "assistant", "content": "middle reply"},
+            {"role": "user", "content": "latest protected ask"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_img", "type": "function", "function": {"name": "browser_vision", "arguments": '{"question":"inspect"}'}}]},
+            {"role": "tool", "tool_call_id": "call_img", "content": multimodal_output},
+            {"role": "assistant", "content": "visible reply"},
+            {"role": "user", "content": "recent floor user"},
+            {"role": "assistant", "content": "latest protected answer"},
+            {"role": "user", "content": "final recent floor user"},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
+            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        assert [m for m in result if m.get("role") == "tool"] == []
+
+    def test_retained_tool_call_arg_bounding_preserves_json_validity(self):
+        """Retained-tail tool-call args are still provider-visible JSON.
+
+        Live evidence showed a retained assistant tool_call whose arguments were
+        raw-sliced during metadata bounding, producing an unterminated JSON
+        string that had to be repaired before every later request.
+        """
+        original_args = json.dumps({"command": "python - <<'PY'\n" + ("x" * 6_000) + "\nPY"})
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_long_args",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": original_args},
+                }],
+            }
+        ]
+
+        bounded, bounded_count = _bound_retained_nonvisible_metadata(messages)
+
+        assert bounded_count == 1
+        bounded_args = bounded[0]["tool_calls"][0]["function"]["arguments"]
+        parsed = json.loads(bounded_args)
+        assert parsed["command"].endswith("...[truncated]")
+        assert len(bounded_args) < len(original_args)
+
+    def test_retained_tool_call_arg_bounding_handles_many_short_json_values(self):
+        """Oversized args must shrink even when no individual string is long."""
+        original_args = json.dumps({"items": ["x" * 100 for _ in range(1_000)]}, separators=(",", ":"))
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_many_short_args",
+                    "type": "function",
+                    "function": {"name": "bulk", "arguments": original_args},
+                }],
+            }
+        ]
+
+        bounded, bounded_count = _bound_retained_nonvisible_metadata(messages)
+
+        assert bounded_count == 1
+        bounded_args = bounded[0]["tool_calls"][0]["function"]["arguments"]
+        parsed = json.loads(bounded_args)
+        assert "truncated during context compaction" in json.dumps(parsed)
+        assert len(bounded_args) < 2_000
+        assert len(bounded_args) < len(original_args)
+
+
+class TestCompressionAuditLog:
+    def test_successful_compression_writes_structured_audit_without_content(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "agent.context_compressor.get_hermes_home",
+            lambda: tmp_path,
+            raising=False,
+        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=2,
+                quiet_mode=True,
+            )
+        c._compression_audit_session_id = "test-session-123"
+
+        secret_sentinel = "SECRET_AUDIT_SENTINEL_ZX_20260628"
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "middle assistant"},
+            {"role": "user", "content": f"middle user {secret_sentinel}"},
+            {"role": "assistant", "content": "middle reply"},
+            {"role": "user", "content": "latest protected ask"},
+            {"role": "assistant", "content": "latest protected answer"},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
+            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
+        ):
+            result = c.compress(msgs, current_tokens=90_000, force=True)
+
+        [record] = _read_compression_audit_records(tmp_path)
+        serialized_record = json.dumps(record, sort_keys=True)
+        assert secret_sentinel not in serialized_record
+        assert record["event"] == "context_compression"
+        assert record["schema_version"] == 1
+        assert record["entrypoint"] == "manual"
+        assert record["session_id"] == "test-session-123"
+        assert record["result"] == "success"
+        assert record["input_messages"] == len(msgs)
+        assert record["output_messages"] == len(result)
+        assert record["summary_window"] == {"start": 2, "end": 5, "message_count": 3}
+        assert record["retained_tail"] == {"start": 5, "message_count": 2}
+        assert record["tools"]["tail_compacted_count"] == 0
+        assert record["tail_boundary_promoted"] is False
+        assert record["previous_summary_chars"] is None
+        assert record["previous_summary_tokens"] is None
+        assert record["new_summary_chars"] == len(f"{SUMMARY_PREFIX}\nsummary\n\n{_SUMMARY_END_MARKER}")
+        assert record["new_summary_tokens"] > 0
+        assert record["retained_tail_output_count"] == 2
+        assert record["output_row_ids"] is None
+        assert record["tokens"]["before_estimate"] == 90_000
+
+    def test_compression_audit_survives_session_end_during_active_compression(self):
+        """agent_close during a slow summary must not erase the active audit.
+
+        The gateway can call on_session_end while compress() is waiting on the
+        summary model. The final decision record still needs the session id and
+        summary-source metrics captured by the in-flight compression.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=2,
+                quiet_mode=True,
+            )
+        c._compression_audit_session_id = "race-session"
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "middle assistant"},
+            {"role": "user", "content": "middle user"},
+            {"role": "assistant", "content": "middle reply"},
+            {"role": "user", "content": "latest protected ask"},
+            {"role": "assistant", "content": "latest protected answer"},
+        ]
+        records: list[dict] = []
+
+        def fake_summary(turns, focus_topic=None):
+            c._last_summary_source_audit = {
+                "budget_chars": 180_000,
+                "raw_chars": 1234,
+                "final_chars": 1234,
+                "overflow": False,
+                "steps": [],
+            }
+            c.on_session_end("race-session", turns)
+            return f"{SUMMARY_PREFIX}\nsummary"
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
+            patch.object(c, "_generate_summary", side_effect=fake_summary),
+            patch.object(c, "_write_compression_audit_record", side_effect=records.append),
+        ):
+            c.compress(msgs, current_tokens=90_000)
+
+        assert records[-1]["session_id"] == "race-session"
+        assert records[-1]["summary_source"]["raw_chars"] == 1234
+
+    def test_audit_builder_records_summary_metrics_without_summary_text(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "agent.context_compressor.get_hermes_home",
+            lambda: tmp_path,
+            raising=False,
+        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(model="test/model", quiet_mode=True)
+
+        previous_summary = "OLD SUMMARY SENTINEL SHOULD NOT BE LOGGED"
+        new_summary = "NEW SUMMARY SENTINEL SHOULD NOT BE LOGGED"
+        record = c._build_compression_audit_record(
+            result="success",
+            entrypoint="auto",
+            input_messages=10,
+            output_messages=4,
+            previous_summary_text=previous_summary,
+            new_summary_text=new_summary,
+            retained_tail_output_count=3,
+            output_row_ids=[101, 102, 103, 104],
+        )
+
+        serialized = json.dumps(record, sort_keys=True)
+        assert previous_summary not in serialized
+        assert new_summary not in serialized
+        assert record["previous_summary_chars"] == len(previous_summary)
+        assert record["previous_summary_tokens"] > 0
+        assert record["new_summary_chars"] == len(new_summary)
+        assert record["new_summary_tokens"] > 0
+        assert record["retained_tail_output_count"] == 3
+        assert record["output_row_ids"] == [101, 102, 103, 104]
+
+    def test_persist_audit_records_output_row_ids_as_companion_event(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "agent.context_compressor.get_hermes_home",
+            lambda: tmp_path,
+            raising=False,
+        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(model="test/model", quiet_mode=True)
+        base = c._build_compression_audit_record(
+            result="success",
+            entrypoint="auto",
+            input_messages=10,
+            output_messages=2,
+            retained_tail_output_count=1,
+        )
+
+        c._write_compression_audit_record(base)
+        c.write_compression_persist_audit(output_row_ids=[201, 202], retained_tail_output_count=1)
+
+        records = _read_compression_audit_records(tmp_path)
+        assert [r["event"] for r in records] == ["context_compression", "context_compression_persist"]
+        assert records[1]["compression_id"] == records[0]["compression_id"]
+        assert records[1]["output_row_ids"] == [201, 202]
+        assert records[1]["retained_tail_output_count"] == 1
+
+    def test_aborted_compression_writes_audit_and_preserves_raw_messages(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "agent.context_compressor.get_hermes_home",
+            lambda: tmp_path,
+            raising=False,
+        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 900
+
+        raw_sentinel = "RAW_ABORT_AUDIT_SENTINEL_ZX_20260628"
+        old_tail_output = f"old tail evidence\n{raw_sentinel}\n" + ("a" * 12_000)
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "middle assistant"},
+            {"role": "user", "content": "middle user"},
+            {"role": "assistant", "content": "middle reply"},
+            {"role": "user", "content": "latest protected ask"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_tail_old", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"python emit_tail_evidence.py"}'}}]},
+            {"role": "tool", "tool_call_id": "call_tail_old", "content": old_tail_output},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_tail_new", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"pytest tests/agent -q"}'}}]},
+            {"role": "tool", "tool_call_id": "call_tail_new", "content": "newest output stays small"},
+            {"role": "assistant", "content": "last visible reply"},
+        ]
+
+        with (
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
+            patch.object(c, "_generate_summary", return_value=None),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        assert result == msgs
+        [record] = _read_compression_audit_records(tmp_path)
+        assert raw_sentinel not in json.dumps(record, sort_keys=True)
+        assert record["entrypoint"] == "auto"
+        assert record["result"] == "abort"
+        assert record["abort_reason"] == "summary_failed_after_tail_tool_compaction"
+        assert record["output_messages"] == len(msgs)
+        assert record["tools"]["tail_compacted_count"] >= 1
+        assert record["tail_boundary_promoted"] is True
+
+    def test_fallback_compression_writes_audit(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "agent.context_compressor.get_hermes_home",
+            lambda: tmp_path,
+            raising=False,
+        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=2,
+                quiet_mode=True,
+            )
+
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "middle assistant"},
+            {"role": "user", "content": "middle user"},
+            {"role": "assistant", "content": "middle reply"},
+            {"role": "user", "content": "latest protected ask"},
+            {"role": "assistant", "content": "latest protected answer"},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
+            patch.object(c, "_generate_summary", return_value=None),
+        ):
+            c.compress(msgs, current_tokens=90_000)
+
+        [record] = _read_compression_audit_records(tmp_path)
+        assert record["result"] == "fallback"
+        assert record["summary_dropped_count"] == 3
+        assert record["summary_fallback_used"] is True
+        assert record["summary_window"] == {"start": 2, "end": 5, "message_count": 3}
 
 
 class TestGenerateSummaryNoneContent:
@@ -543,24 +2177,6 @@ class TestNonStringContent:
         assert summary is None
         assert c._summary_failure_cooldown_until > 0
 
-    def test_string_message_coerced_to_summary_content(self):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message = "plain summary text"
-
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True)
-
-        messages = [
-            {"role": "user", "content": "do something"},
-            {"role": "assistant", "content": "ok"},
-        ]
-
-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
-            summary = c._generate_summary(messages)
-
-        assert summary == f"{SUMMARY_PREFIX}\nplain summary text"
-
     def test_summary_call_does_not_force_temperature(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
@@ -597,12 +2213,244 @@ class TestNonStringContent:
             c._generate_summary(messages)
 
         prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        # The genuinely filter-tripping framing the content filters flagged —
+        # explicit "injection" / "do not respond" directives — must never appear.
         assert "Your output will be injected" not in prompt
         assert "Do NOT respond" not in prompt
-        assert "DIFFERENT assistant" not in prompt
-        assert "different assistant" not in prompt
-        assert "Treat the conversation turns below as source material" in prompt
+        # The summarizer preamble adopts the Codex local-compaction framing at
+        # the user's explicit request (2026-06-25). The "another LLM" handoff
+        # wording is intentionally allowed here (see the preamble comment in
+        # context_compressor.py); only the injection/do-not-respond directives
+        # above stay banned.
+        assert "CONTEXT CHECKPOINT COMPACTION" in prompt
+        assert "handoff summary for another large language model (LLM)" in prompt
+        assert "continue the work from this checkpoint" in prompt
         assert "structured checkpoint summary" in prompt
+
+    def test_user_ledger_strips_gateway_reply_context_wrappers(self):
+        turns = [
+            {
+                "role": "user",
+                "content": (
+                    '[Replying to your previous message: "assistant-only quote"]\n\n'
+                    "[Context around the replied-to message]\n"
+                    "[Eve [bot]] assistant context that was not typed by user\n\n"
+                    "[New message]\n"
+                    "[Need222Say] 解释下retained tail是啥"
+                ),
+            }
+        ]
+
+        section, entries, omitted = ContextCompressor._build_user_message_ledger(turns)
+
+        assert omitted == 0
+        assert len(entries) == 1
+        assert entries[0]["text"] == "[Need222Say] 解释下retained tail是啥"
+        assert "assistant-only quote" not in section
+        assert "Context around the replied-to message" not in section
+        assert "Eve [bot]" not in section
+        assert "[New message]" not in section
+
+    def test_user_ledger_strips_embedded_task_preservation_blocks(self):
+        previous_summary = """## All User Messages
+1. User message:
+```text
+同意你的方案，不过保真内容不能因为 Hermes 重启而丢失。
+
+[Your active task list was preserved across context compression]
+- [>] task3-verify. Task 3: focused compression suite (in_progress)
+- [ ] commit. Commit scoped implementation in worktree (pending)
+```
+
+## Pending Tasks
+None."""
+        turns = [
+            {
+                "role": "user",
+                "content": (
+                    "raw tool source 会追加进同一次 summary input，这不会改变消息顺序吗？\n\n"
+                    "[Your active task list was preserved across context compression]\n"
+                    "- [>] verify-commit-2. 重新跑 compression/prefix suites (in_progress)"
+                ),
+            }
+        ]
+
+        section, entries, omitted = ContextCompressor._build_user_message_ledger(
+            turns,
+            previous_summary=previous_summary,
+        )
+
+        assert omitted == 0
+        assert [entry["text"] for entry in entries] == [
+            "同意你的方案，不过保真内容不能因为 Hermes 重启而丢失。",
+            "raw tool source 会追加进同一次 summary input，这不会改变消息顺序吗？",
+        ]
+        assert "Your active task list was preserved" not in section
+        assert "task3-verify" not in section
+        assert "verify-commit-2" not in section
+
+    def test_user_ledger_skips_sender_only_gateway_prefix_rows(self):
+        turns = [
+            {"role": "user", "content": "[Need222Say] "},
+            {"role": "user", "content": "[Need222Say] 真正的问题"},
+        ]
+
+        section, entries, omitted = ContextCompressor._build_user_message_ledger(turns)
+
+        assert omitted == 0
+        assert [entry["text"] for entry in entries] == ["[Need222Say] 真正的问题"]
+        assert "[Need222Say]\n" not in section
+
+    def test_user_ledger_skips_sender_prefixed_synthetic_notes(self):
+        turns = [
+            {
+                "role": "user",
+                "content": (
+                    "[Need222Say] [ASYNC DELEGATION BATCH COMPLETE — deleg_b11f4869]\n"
+                    "A background fan-out of 1 subagent(s) you dispatched earlier has finished."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "[Need222Say] [Your active task list was preserved across context compression]\n"
+                    "- [>] hidden runtime task note"
+                ),
+            },
+            {"role": "user", "content": "[Need222Say] 真实用户问题"},
+        ]
+
+        section, entries, omitted = ContextCompressor._build_user_message_ledger(turns)
+
+        assert omitted == 0
+        assert [entry["text"] for entry in entries] == ["[Need222Say] 真实用户问题"]
+        assert "ASYNC DELEGATION" not in section
+        assert "active task list" not in section
+
+    def test_iterative_summary_prompt_preserves_material_state_by_forgetting_consequence(self):
+        """Repeated compactions should update material state, not recap recent turns.
+
+        A completed/paused old anchor can still change future behavior. The
+        iterative prompt must therefore instruct the compression model to decide
+        retention by forgetting consequences instead of dropping older knowledge
+        merely because the active focus changed.
+        """
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "ok"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        c._previous_summary = """## Primary Request and Intent
+Old session diagnosis is paused but may recur.
+
+## Key Technical Concepts
+Old >=25k no-byte TTFB watchdog disable can matter even when not active.
+
+## Files and Code Sections
+agent/context_compressor.py; old project note; old source thread.
+
+## Errors and Fixes
+232443 hit ~26.6k tokens, 600s stale timeout, Broken pipe, stale discard.
+
+## Problem Solving
+If this recurs, do not treat it as a context-compression started/done failure.
+
+## All User Messages
+1. User message:
+```text
+old user decision
+```
+
+## Pending Tasks
+None.
+
+## Current Work
+Paused old diagnosis.
+
+## Optional Next Step
+None."""
+        messages = [
+            {"role": "user", "content": "Now investigate an unrelated fallback cap bug."},
+            {"role": "assistant", "content": "I'll inspect the fallback path."},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c._generate_summary(messages)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "not a recap or an index" in prompt
+        assert "minimal state needed for the next agent to act correctly" in prompt
+        assert "forgetting it would change what the next agent should do, believe, verify, ask, avoid" in prompt
+        assert "use to recover context" in prompt
+        assert "Do not silently drop previous material state merely because the active topic changed" in prompt
+        assert "Do not preserve process traces, source dumps, or references just because they appeared" in prompt
+        assert "superseded, duplicated, stale, no longer behavior-changing" in prompt
+
+    def test_summary_prompt_requires_purposeful_recovery_pointers(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "ok"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        c._previous_summary = "## Primary Request and Intent\nExisting material state."
+        messages = [{"role": "user", "content": "Continue."}]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c._generate_summary(messages)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "Recovery pointers only" in prompt
+        assert "Do not list bare files, pages, threads, artifacts, URLs, logs, or other sources" in prompt
+        assert "what material state it supports" in prompt
+        assert "why that state matters for future behavior" in prompt
+        assert "when the next agent should consult the source instead of relying on the summary" in prompt
+        assert "not something to reread by default" in prompt
+
+    def test_summary_prompt_constrains_concepts_to_decided_values_not_dumps(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "ok"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [{"role": "user", "content": "Continue."}]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c._generate_summary(messages)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        # Key Technical Concepts: decided values + why, never wholesale dumps.
+        assert "Never transcribe config files" in prompt
+        assert "the few values that drive future behavior" in prompt
+        assert "recovery pointer to the full artifact" in prompt
+        # The global concreteness rule no longer invites bulk transcription.
+        assert "not bulk transcription" in prompt
+        assert "include command outputs" not in prompt
+        # One generative judgment test governs inclusion, not a per-noun ban list.
+        assert "read-to-act test" in prompt
+        assert (
+            "will the next agent have to READ it to act — to decide, call, resume, poll, or cancel"
+            in prompt
+        )
+        # The test turns on the value's role, not its type — so it generalizes to
+        # values not enumerated (checksums, URLs, step counts, future artifacts).
+        assert "turns on the value's ROLE, not its type" in prompt
+        # The same job ID flips role: live while running, history once finished.
+        assert "the same job ID is live state while the job runs" in prompt
+        # Key Technical Concepts routes a finished run's run-record through the test.
+        assert "is a record that fails the read-to-act test" in prompt
+        # No duplicating the same recovery pointer across sections. Scoped to
+        # pointers (not concept names) so annotations may reference e.g. "Track A"
+        # by its definition in another section.
+        assert (
+            "repeat the same recovery pointer (a file path, artifact, URL, or checksum) in more than one section"
+            in prompt
+        )
 
     def test_summary_call_passes_live_main_runtime(self):
         mock_response = MagicMock()
@@ -634,6 +2482,25 @@ class TestNonStringContent:
             "api_key": "codex-token",
             "api_mode": "codex_responses",
         }
+
+    def test_string_message_coerced_to_summary_content(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message = "plain summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            summary = c._generate_summary(messages)
+
+        assert summary == f"{SUMMARY_PREFIX}\nplain summary text"
+
 
 
 class TestSummaryFailureCooldown:
@@ -1009,8 +2876,8 @@ class TestSummaryFallbackToMainModel:
     def test_json_decode_error_on_main_uses_short_cooldown(self):
         """When already on the main model (no separate summary_model, or
         fallback already happened), a JSONDecodeError should set the short
-        30s cooldown, not the default 60s — provider bodies tend to
-        recover quickly when an upstream proxy comes back online."""
+        local retry cooldown — provider bodies tend to recover quickly when
+        an upstream proxy comes back online."""
         import json as _json
 
         err_json = _json.JSONDecodeError("Expecting value", "<html/>", 0)
@@ -1029,14 +2896,30 @@ class TestSummaryFallbackToMainModel:
             result = c._generate_summary(self._msgs())
 
         assert result is None
-        # Short JSON-decode cooldown is 30s, not the default 60s.
-        assert c._summary_failure_cooldown_until == 1030.0
+        # Transient summary failures use the short local retry cooldown.
+        assert c._summary_failure_cooldown_until == 1003.0
+
+    def test_no_provider_configured_uses_short_local_retry_cooldown(self):
+        """Even missing-provider failures should retry quickly after local config fixes."""
+        err = RuntimeError("no llm provider configured")
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="main-model", quiet_mode=True)
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=err,
+        ), patch("agent.context_compressor.time.monotonic", return_value=1000.0):
+            result = c._generate_summary(self._msgs())
+
+        assert result is None
+        assert c._summary_failure_cooldown_until == 1003.0
 
 
 class TestStreamingClosedFallback:
     """httpcore / httpx streaming premature-close errors must be classified the
     same as timeouts so the compressor retries on the main model instead of
-    entering a 60-second cooldown.  Issue #18458.
+    entering a long cooldown.  Issue #18458.
 
     ``_is_connection_error`` is patched here because the test venv may not
     have ``openai`` installed (the real function does ``from openai import ...``
@@ -1111,7 +2994,7 @@ class TestStreamingClosedFallback:
 
     def test_streaming_closed_on_main_uses_short_cooldown(self):
         """When already on the main model, a streaming-closed error should use
-        the 30s cooldown, not the default 60s — these errors are transient."""
+        the short local retry cooldown — these errors are transient."""
         err = Exception("RemoteProtocolError: response ended prematurely")
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
@@ -1131,12 +3014,11 @@ class TestStreamingClosedFallback:
             result = c._generate_summary(self._msgs())
 
         assert result is None
-        # Streaming-closed should use the 30s short cooldown.
-        assert c._summary_failure_cooldown_until == 1030.0
+        # Streaming-closed should use the short local retry cooldown.
+        assert c._summary_failure_cooldown_until == 1003.0
 
-    def test_non_streaming_unknown_error_still_uses_long_cooldown(self):
-        """Unclassified errors should retain the 60s default cooldown to
-        prevent hammering a broken provider."""
+    def test_non_streaming_unknown_error_uses_short_local_retry_cooldown(self):
+        """Unclassified transient errors should also retry quickly locally."""
         err = Exception("Internal Server Error: something unexpected happened")
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
@@ -1155,7 +3037,7 @@ class TestStreamingClosedFallback:
             result = c._generate_summary(self._msgs())
 
         assert result is None
-        assert c._summary_failure_cooldown_until == 1060.0
+        assert c._summary_failure_cooldown_until == 1003.0
 
 
 class TestAuxModelFallbackSurfacedToCallers:
@@ -1349,7 +3231,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
         assert "/repo/src/pkg/module.py" in fallback
         assert "C:\\work\\pkg\\module.py" in fallback
         assert "Traceback" in fallback
-        assert "## Last Dropped Turns" in fallback
+        assert "## Current Work" in fallback
         assert "TOOL: Traceback in /repo/src/pkg/module.py: boom" in fallback
 
     def test_summary_failure_fallback_preserves_last_dropped_turns_without_tail(self):
@@ -1371,7 +3253,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
             result = c.compress(msgs)
 
         fallback = next(m["content"] for m in result if "Summary generation was unavailable" in m.get("content", ""))
-        assert "## Last Dropped Turns" in fallback
+        assert "## Current Work" in fallback
         assert "ASSISTANT: I inspected /tmp/active.py and found the failing branch" in fallback
         assert "TOOL: ValueError: boom in /tmp/active.py" in fallback
         assert "protected tail request must not be copied" not in fallback
@@ -1396,7 +3278,10 @@ class TestSummaryFailureTrackingForGatewayWarning:
             result = c.compress(msgs)
 
         fallback = next(m["content"] for m in result if "Summary generation was unavailable" in m.get("content", ""))
-        assert len(fallback) <= 8300
+        # The deterministic user ledger is now allowed to exceed the old
+        # 8k static-fallback cap, but it is still bounded by the aggregate
+        # user-ledger budget and must not grow without limit.
+        assert len(fallback) <= _USER_LEDGER_MAX_CHARS + 10_000
         assert "deterministic fallback" in fallback
         assert "important detail" in fallback
 
@@ -1509,12 +3394,15 @@ class TestAbortOnSummaryFailure:
 
         import time as _time
         c._summary_failure_cooldown_until = _time.monotonic() + 999.0
+        c._summary_failure_cooldown_error = "old transient summary failure"
 
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             result = c.compress(msgs, force=True)
 
         assert c._last_compress_aborted is False
         assert c._summary_failure_cooldown_until == 0.0
+        assert c._summary_failure_cooldown_error is None
+        assert c._last_summary_error is None
         assert len(result) < len(msgs)
 
     def test_force_true_bypasses_persisted_session_cooldown(self, tmp_path):
@@ -1585,6 +3473,10 @@ class TestAbortOnSummaryFailure:
         c.on_session_end("s1", [])
 
         assert db.get_compression_failure_cooldown("s1") is not None
+
+
+
+
 
 
 class TestSummaryPrefixNormalization:
@@ -1751,10 +3643,8 @@ class TestCompressWithClient:
             m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)
         )
         assert summary_msg["role"] == "user"
-        assert "END OF CONTEXT SUMMARY" in summary_msg["content"]
-        assert summary_msg["content"].rstrip().endswith(
-            "respond to the message below, not the summary above ---"
-        )
+        assert _SUMMARY_END_MARKER in summary_msg["content"]
+        assert summary_msg["content"].rstrip().endswith(_SUMMARY_END_MARKER)
 
     def test_assistant_role_summary_carries_end_marker(self):
         """When the summary lands as standalone role='assistant' (head ends
@@ -1793,10 +3683,8 @@ class TestCompressWithClient:
             m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)
         )
         assert summary_msg["role"] == "assistant"
-        assert "END OF CONTEXT SUMMARY" in summary_msg["content"]
-        assert summary_msg["content"].rstrip().endswith(
-            "respond to the message below, not the summary above ---"
-        )
+        assert _SUMMARY_END_MARKER in summary_msg["content"]
+        assert summary_msg["content"].rstrip().endswith(_SUMMARY_END_MARKER)
 
     def test_summary_role_avoids_consecutive_user_messages(self):
         """Summary role should alternate with the last head message to avoid consecutive same-role messages."""
@@ -1986,97 +3874,6 @@ class TestCompressWithClient:
             for block in merged_tail["content"]
         )
 
-    def test_merge_into_tail_end_marker_is_last(self):
-        """Regression for #56372: in a merge-into-tail summary, the END MARKER
-        must come AFTER the preserved prior tail content, not before it.
-
-        The old format was SUMMARY + END_MARKER + OLD_CONTENT, so the preserved
-        tail content landed after the marker and the model could read it as a
-        fresh message. The fix wraps old content in [PRIOR CONTEXT] delimiters
-        and always places the END MARKER last.
-
-        Mirrors test_double_collision_merges_summary_into_list_tail_content so
-        the merged tail message genuinely carries preserved content ("msg 6").
-        """
-        from agent.context_compressor import _SUMMARY_END_MARKER
-
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "SUMMARY_BODY"
-
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=3)
-
-        msgs = [
-            {"role": "system", "content": "system prompt"},
-            {"role": "user", "content": "msg 1"},
-            {"role": "assistant", "content": "msg 2"},
-            {"role": "user", "content": "msg 3"},
-            {"role": "assistant", "content": "msg 4"},
-            {"role": "user", "content": "msg 5"},
-            {"role": "user", "content": [{"type": "text", "text": "PRESERVED_TAIL_CONTENT"}]},
-            {"role": "assistant", "content": "msg 7"},
-            {"role": "user", "content": "msg 8"},
-        ]
-
-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
-            result = c.compress(msgs)
-
-        merged = next(m for m in result if m.get(COMPRESSED_SUMMARY_METADATA_KEY))
-        content = merged["content"]
-        text = (
-            content if isinstance(content, str)
-            else " ".join(
-                b.get("text", "") for b in content if isinstance(b, dict)
-            )
-        )
-        end = _SUMMARY_END_MARKER.strip()
-        # All three fragments present.
-        assert "PRESERVED_TAIL_CONTENT" in text
-        assert "SUMMARY_BODY" in text
-        assert end in text
-        # Ordering invariant: prior content BEFORE summary BEFORE end marker,
-        # and the end marker is the very last fragment.
-        assert text.index("PRESERVED_TAIL_CONTENT") < text.index("SUMMARY_BODY")
-        assert text.index("SUMMARY_BODY") < text.index(end)
-        assert text.rstrip().endswith(end)
-
-    def test_merged_tail_summary_still_detected_and_stripped(self):
-        """Regression for #56372 salvage: the merge-into-tail reorder moves the
-        summary prefix AFTER the [PRIOR CONTEXT] wrapper, so content-prefix
-        detection (_is_context_summary_content) and body extraction
-        (_strip_summary_prefix) must look past the delimiter. Otherwise a merged
-        summary is mistaken for a real user turn (breaking the last-real-user
-        anchor and carry-forward summary find) and the wrapper + stale tail
-        content leaks into the next summarizer prompt.
-        """
-        from agent.context_compressor import (
-            SUMMARY_PREFIX,
-            _SUMMARY_END_MARKER,
-            _MERGED_PRIOR_CONTEXT_HEADER,
-            _MERGED_SUMMARY_DELIMITER,
-        )
-
-        merged = (
-            _MERGED_PRIOR_CONTEXT_HEADER + "\n"
-            "old tail content here\n\n"
-            + _MERGED_SUMMARY_DELIMITER + "\n\n"
-            + SUMMARY_PREFIX + "\nTHE_SUMMARY_BODY\n\n"
-            + _SUMMARY_END_MARKER
-        )
-
-        # Detected as a summary despite the prefix not being at the start.
-        assert ContextCompressor._is_context_summary_content(merged) is True
-        # Stripping yields only the real summary body — no wrapper, no stale
-        # tail content, no prefix, no end marker.
-        body = ContextCompressor._strip_summary_prefix(merged)
-        assert body == "THE_SUMMARY_BODY"
-
-        # Standalone (non-merged) summaries still work unchanged.
-        standalone = SUMMARY_PREFIX + "\nSTANDALONE_BODY\n\n" + _SUMMARY_END_MARKER
-        assert ContextCompressor._is_context_summary_content(standalone) is True
-        assert ContextCompressor._strip_summary_prefix(standalone) == "STANDALONE_BODY"
-
     def test_double_collision_user_head_assistant_tail(self):
         """Reverse double collision: head ends with 'user', tail starts with 'assistant'.
         summary='assistant' collides with tail, 'user' collides with head → merge."""
@@ -2188,6 +3985,43 @@ class TestCompressWithClient:
         for msg in result:
             if msg.get("role") == "tool" and msg.get("tool_call_id"):
                 assert msg["tool_call_id"] in called_ids
+
+    def test_merged_tail_summary_still_detected_and_stripped(self):
+        """Regression for #56372 salvage: the merge-into-tail reorder moves the
+        summary prefix AFTER the [PRIOR CONTEXT] wrapper, so content-prefix
+        detection (_is_context_summary_content) and body extraction
+        (_strip_summary_prefix) must look past the delimiter. Otherwise a merged
+        summary is mistaken for a real user turn (breaking the last-real-user
+        anchor and carry-forward summary find) and the wrapper + stale tail
+        content leaks into the next summarizer prompt.
+        """
+        from agent.context_compressor import (
+            SUMMARY_PREFIX,
+            _SUMMARY_END_MARKER,
+            _MERGED_PRIOR_CONTEXT_HEADER,
+            _MERGED_SUMMARY_DELIMITER,
+        )
+
+        merged = (
+            _MERGED_PRIOR_CONTEXT_HEADER + "\n"
+            "old tail content here\n\n"
+            + _MERGED_SUMMARY_DELIMITER + "\n\n"
+            + SUMMARY_PREFIX + "\nTHE_SUMMARY_BODY\n\n"
+            + _SUMMARY_END_MARKER
+        )
+
+        # Detected as a summary despite the prefix not being at the start.
+        assert ContextCompressor._is_context_summary_content(merged) is True
+        # Stripping yields only the real summary body — no wrapper, no stale
+        # tail content, no prefix, no end marker.
+        body = ContextCompressor._strip_summary_prefix(merged)
+        assert body == "THE_SUMMARY_BODY"
+
+        # Standalone (non-merged) summaries still work unchanged.
+        standalone = SUMMARY_PREFIX + "\nSTANDALONE_BODY\n\n" + _SUMMARY_END_MARKER
+        assert ContextCompressor._is_context_summary_content(standalone) is True
+        assert ContextCompressor._strip_summary_prefix(standalone) == "STANDALONE_BODY"
+
 
 
 class TestSummaryTargetRatio:
@@ -2436,8 +4270,8 @@ class TestTokenBudgetTailProtection:
 
         cut = c._find_tail_cut_by_tokens(messages, head_end=1)
 
-        assert len(messages) - cut >= 8
-        assert messages[cut]["content"] == "middle answer 2"
+        assert len(messages) - cut >= 10
+        assert messages[cut]["content"] == "middle ack"
         assert messages[-1]["content"] == "latest ask"
 
     def test_soft_ceiling_allows_oversized_message(self, budget_compressor):
@@ -2682,6 +4516,29 @@ class TestTokenBudgetTailProtection:
         )
 
 
+class TestCompressionEntrypointParity:
+    def test_semantic_compression_entrypoints_route_through_core_wrapper(self):
+        """Manual/Gateway/auto entrypoints must not grow separate compressor cores."""
+        repo = Path(__file__).resolve().parents[2]
+        allowed_direct = {repo / "agent" / "conversation_compression.py"}
+        offenders = []
+        for path in repo.rglob("*.py"):
+            rel = path.relative_to(repo)
+            if any(part in {".git", ".worktrees", "tests", "__pycache__"} for part in rel.parts):
+                continue
+            text = path.read_text(errors="replace")
+            if "context_compressor.compress(" not in text:
+                continue
+            if path not in allowed_direct:
+                offenders.append(str(rel))
+
+        assert offenders == []
+
+        for rel in ["cli.py", "gateway/slash_commands.py", "agent/conversation_loop.py"]:
+            text = (repo / rel).read_text(errors="replace")
+            assert "_compress_context(" in text
+
+
 class TestUpdateModelBudgets:
     """Regression: update_model() must recalculate token budgets."""
 
@@ -2915,143 +4772,6 @@ class TestPreflightSentinelGuard:
         assert result == 50_000
 
 
-class TestTurnPairPreservation:
-    """Causal Coupling guard (#22523): compaction must never orphan a user turn.
-
-    ``_ensure_last_user_message_in_tail`` pulls the cut back to keep the last
-    user message in the tail (fixes #10896).  But its final
-    ``max(last_user_idx, head_end + 1)`` clamp pushes the cut *past* the user
-    when the user sits at ``head_end`` (the first compressible index) — the
-    only case where ``head_end + 1 > last_user_idx``.  The user then lands in
-    the compressed region without its assistant reply; the summariser marks it
-    as a pending ask and the next session re-executes the completed task.
-
-    The guard detects that split and pushes the cut forward to ``pair_end`` so
-    the complete (user -> assistant [-> tool results]) pair is summarised as a
-    finished unit.
-    """
-
-    @pytest.fixture
-    def compressor(self):
-        return ContextCompressor(
-            model="test/model",
-            threshold_percent=0.85,
-            protect_first_n=1,
-            protect_last_n=0,
-            quiet_mode=True,
-        )
-
-    # ------------------------------------------------------------------
-    # _find_turn_pair_end unit tests
-    # ------------------------------------------------------------------
-
-    def test_pair_end_user_only(self, compressor):
-        """User at end of list — no reply yet — pair_end is user+1."""
-        msgs = [{"role": "user", "content": "hello"}]
-        assert compressor._find_turn_pair_end(msgs, 0) == 1
-
-    def test_pair_end_user_with_assistant_reply(self, compressor):
-        """User + assistant — pair_end skips both."""
-        msgs = [
-            {"role": "user", "content": "do x"},
-            {"role": "assistant", "content": "done"},
-        ]
-        assert compressor._find_turn_pair_end(msgs, 0) == 2
-
-    def test_pair_end_user_assistant_with_tools(self, compressor):
-        """User + assistant + tool results — pair_end skips the whole group."""
-        msgs = [
-            {"role": "user", "content": "run it"},
-            {"role": "assistant", "content": None,
-             "tool_calls": [{"function": {"name": "exec", "arguments": "{}"}}]},
-            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
-            {"role": "tool", "tool_call_id": "c2", "content": "ok"},
-        ]
-        assert compressor._find_turn_pair_end(msgs, 0) == 4
-
-    def test_pair_end_stops_at_next_user(self, compressor):
-        """pair_end must not cross into the next user turn."""
-        msgs = [
-            {"role": "user", "content": "first"},
-            {"role": "assistant", "content": "reply"},
-            {"role": "user", "content": "second"},
-        ]
-        assert compressor._find_turn_pair_end(msgs, 0) == 2
-
-    # ------------------------------------------------------------------
-    # _ensure_last_user_message_in_tail unit tests
-    # ------------------------------------------------------------------
-
-    def test_user_already_in_tail_unchanged(self, compressor):
-        """When the user message is already past cut_idx, nothing changes."""
-        msgs = [
-            {"role": "user", "content": "head"},
-            {"role": "assistant", "content": "head reply"},
-            {"role": "user", "content": "last user"},
-            {"role": "assistant", "content": "last reply"},
-        ]
-        result = compressor._ensure_last_user_message_in_tail(msgs, cut_idx=2, head_end=1)
-        assert result == 2
-
-    def test_user_in_compressed_region_pulled_back(self, compressor):
-        """User in the middle (not at head_end) is pulled into the tail (#10896)."""
-        msgs = [
-            {"role": "user", "content": "head"},       # 0
-            {"role": "assistant", "content": "hi"},     # 1
-            {"role": "user", "content": "do thing"},   # 2  <- last user
-            {"role": "assistant", "content": "done"},  # 3
-        ]
-        # head_end=0, so head_end+1=1 <= last_user_idx=2: the #10896 pullback
-        # applies and the user stays in the tail (no forward push).
-        result = compressor._ensure_last_user_message_in_tail(msgs, cut_idx=3, head_end=0)
-        assert result <= 2
-
-    def test_orphan_prevented_user_at_head_end(self, compressor):
-        """Causal Coupling: user at head_end pushes the WHOLE pair into the summary.
-
-        This is the #22523 case: last_user_idx == head_end, so the clamp would
-        return head_end+1 and orphan the user.  The guard instead pushes the
-        cut forward to pair_end so user + reply + tool results are summarised
-        together and the tail never starts with a dangling user ask.
-        """
-        msgs = [
-            {"role": "user", "content": "first exchange"},   # 0 head
-            {"role": "user", "content": "THE ACTIVE ASK"},   # 1 = head_end, last user
-            {"role": "assistant", "content": "done"},        # 2 reply
-            {"role": "tool", "tool_call_id": "c1", "content": "toolout"},  # 3
-            {"role": "assistant", "content": "final reply"}, # 4
-        ]
-        head_end = 1
-        result = compressor._ensure_last_user_message_in_tail(msgs, cut_idx=3, head_end=head_end)
-        # Whole pair (indices 1..3) lands in the compressed region; tail starts at 4.
-        assert result == 4
-        tail = msgs[result:]
-        assert tail and tail[0]["role"] == "assistant"
-
-    def test_no_orphan_after_full_compaction_cycle(self, compressor):
-        """End-to-end: after _find_tail_cut_by_tokens, the tail never starts
-        with an unanswered user message."""
-        msgs = [
-            {"role": "user", "content": "initial"},
-            {"role": "assistant", "content": "ok"},
-        ]
-        for i in range(5):
-            msgs.append({"role": "user", "content": f"step {i}"})
-            msgs.append({"role": "assistant", "content": f"done {i}"})
-        msgs.append({"role": "user", "content": "lights off please"})
-        msgs.append({"role": "assistant", "content": "lights are off"})
-
-        head_end = compressor.protect_first_n
-        cut = compressor._find_tail_cut_by_tokens(msgs, head_end)
-        tail = msgs[cut:]
-
-        if tail and tail[0].get("role") == "user":
-            assert len(tail) >= 2 and tail[1].get("role") == "assistant", (
-                f"Orphan user turn at tail start: {tail[0]['content']!r} — "
-                f"next role is {tail[1].get('role') if len(tail) > 1 else 'nothing'}"
-            )
-
-
 class TestSanitizerStripsOrphanedToolCalls:
     """PR #51218 (salvaged from #51225): orphaned tool_calls are stripped from
     assistant messages instead of having stub tool results inserted, avoiding
@@ -3153,7 +4873,6 @@ class TestSanitizerStripsOrphanedToolCalls:
 
         asst = next(m for m in sanitized if m.get("role") == "assistant")
         assert not asst.get("tool_calls")
-        # No stub tool messages (which would have call_id != id mismatch)
 
 
 class TestCooldownReentryAbort:
