@@ -16,6 +16,37 @@ from hermes_cli.active_sessions import active_session_registry_snapshot
 from tui_gateway import server
 
 
+@pytest.fixture(autouse=True)
+def _isolate_tui_gateway_state_db(tmp_path, monkeypatch):
+    """Keep TUI gateway tests from writing to the developer's real state.db."""
+    try:
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    except Exception:
+        pass
+
+    old_db = server._db
+    if old_db is not None:
+        try:
+            old_db.close()
+        except Exception:
+            pass
+    server._db = None
+    server._db_error = None
+    try:
+        yield
+    finally:
+        current_db = server._db
+        if current_db is not None:
+            try:
+                current_db.close()
+            except Exception:
+                pass
+        server._db = None
+        server._db_error = None
+
+
 def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -3305,6 +3336,73 @@ def test_config_set_model_uses_live_switch_path(monkeypatch):
     assert seen["args"] == ("sid", "session-key", "new/model")
 
 
+def test_model_switch_marker_does_not_persist_empty_system_only_session():
+    """A model switch before first user message must not create an Untitled row."""
+    calls: list[tuple] = []
+
+    class _DB:
+        def get_session(self, session_id):
+            calls.append(("get_session", session_id))
+            return None
+
+        def get_messages_as_conversation(self, session_id):
+            calls.append(("history", session_id))
+            return []
+
+        def append_message(self, **kwargs):
+            calls.append(("append", kwargs))
+
+    session = _session(
+        agent=types.SimpleNamespace(_session_db=_DB()),
+        history=[],
+        session_key="k-B",
+    )
+
+    server._append_model_switch_marker(session, model="zai/glm-5.1", provider="zai")
+
+    assert [call[0] for call in calls] == ["get_session"]
+    assert session["history"] == [
+        {
+            # persisted/kept as a user message (#48338): strict OpenAI-style
+            # providers reject non-leading system messages.
+            "role": "user",
+            "content": (
+                "[System: The active model for this chat has changed to zai/glm-5.1 "
+                "via provider zai. From this point forward, use this runtime metadata "
+                "when answering questions about what model/provider is active.]"
+            ),
+        }
+    ]
+
+
+def test_model_switch_marker_persists_after_real_conversation_activity():
+    calls: list[tuple] = []
+
+    class _DB:
+        def get_session(self, session_id):
+            calls.append(("get_session", session_id))
+            return {"id": session_id}
+
+        def get_messages_as_conversation(self, session_id):
+            calls.append(("history", session_id))
+            return [{"role": "user", "content": "draw a cat"}]
+
+        def append_message(self, **kwargs):
+            calls.append(("append", kwargs))
+
+    session = _session(
+        agent=types.SimpleNamespace(_session_db=_DB()),
+        history=[{"role": "user", "content": "draw a cat"}],
+        session_key="real-session",
+    )
+
+    server._append_model_switch_marker(session, model="new/model", provider="custom")
+
+    assert calls[-1][0] == "append"
+    assert calls[-1][1]["session_id"] == "real-session"
+    assert calls[-1][1]["role"] == "user"
+
+
 def test_config_set_model_requires_confirmation_for_expensive_model(monkeypatch):
     class _Agent:
         provider = "openrouter"
@@ -5636,8 +5734,144 @@ def test_session_list_returns_clean_error_when_state_db_is_unavailable(monkeypat
 
     resp = server.handle_request({"id": "1", "method": "session.list", "params": {}})
 
-    assert "error" in resp
+    assert resp["error"]["code"] == 5006
     assert "state.db unavailable: locking protocol" in resp["error"]["message"]
+
+
+def test_session_list_filters_system_only_model_switch_shell(monkeypatch):
+    class _DB:
+        def list_sessions_rich(self, *, source=None, limit=200, offset=0, **_kwargs):
+            return [
+                {
+                    "id": "k-B",
+                    "source": "tui",
+                    "title": "Partial Answer Complete",
+                    "preview": "",
+                    "started_at": 2,
+                    "message_count": 1,
+                },
+                {
+                    "id": "real",
+                    "source": "tui",
+                    "title": "",
+                    "preview": "hello",
+                    "started_at": 1,
+                    "message_count": 2,
+                },
+            ]
+
+        def get_messages_as_conversation(self, session_id):
+            if session_id == "k-B":
+                return [
+                    {
+                        "role": "system",
+                        "content": "[System: The active model for this chat has changed]",
+                    }
+                ]
+            return [{"role": "user", "content": "hello"}]
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    resp = server.handle_request({"id": "1", "method": "session.list", "params": {}})
+
+    assert [s["id"] for s in resp["result"]["sessions"]] == ["real"]
+
+
+def test_session_list_keeps_projected_compression_tip_with_real_root(monkeypatch):
+    class _DB:
+        def list_sessions_rich(self, *, source=None, limit=200, offset=0, **_kwargs):
+            return [
+                {
+                    "id": "tip",
+                    "source": "tui",
+                    "title": "",
+                    "preview": "",
+                    "started_at": 2,
+                    "message_count": 1,
+                    "_lineage_root_id": "root",
+                },
+                {
+                    "id": "ghost",
+                    "source": "tui",
+                    "title": "",
+                    "preview": "",
+                    "started_at": 1,
+                    "message_count": 1,
+                },
+            ]
+
+        def get_messages_as_conversation(self, session_id):
+            if session_id == "root":
+                return [{"role": "user", "content": "real conversation"}]
+            return [{"role": "system", "content": "model switched"}]
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    resp = server.handle_request({"id": "1", "method": "session.list", "params": {}})
+
+    assert [s["id"] for s in resp["result"]["sessions"]] == ["tip"]
+
+
+def test_session_most_recent_skips_system_only_model_switch_shell(monkeypatch):
+    class _DB:
+        def list_sessions_rich(self, *, source=None, limit=200, offset=0, **_kwargs):
+            return [
+                {"id": "ghost", "source": "tui", "preview": "", "message_count": 1},
+                {"id": "real", "source": "cli", "preview": "hello", "message_count": 1},
+            ]
+
+        def get_messages_as_conversation(self, session_id):
+            if session_id == "ghost":
+                return [{"role": "system", "content": "model switched"}]
+            return [{"role": "user", "content": "hello"}]
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    resp = server.handle_request({"id": "1", "method": "session.most_recent", "params": {}})
+
+    assert resp["result"]["session_id"] == "real"
+
+
+def test_session_list_pages_past_filtered_metadata_shells(monkeypatch):
+    calls = []
+
+    class _DB:
+        def list_sessions_rich(self, *, source=None, limit=200, offset=0, **_kwargs):
+            calls.append((limit, offset))
+            if offset == 0:
+                return [
+                    {
+                        "id": f"ghost-{i}",
+                        "source": "tui",
+                        "title": "",
+                        "preview": "",
+                        "started_at": 300 - i,
+                        "message_count": 1,
+                    }
+                    for i in range(200)
+                ]
+            return [
+                {
+                    "id": "real",
+                    "source": "cli",
+                    "title": "",
+                    "preview": "hello",
+                    "started_at": 1,
+                    "message_count": 1,
+                }
+            ]
+
+        def get_messages_as_conversation(self, session_id):
+            if str(session_id).startswith("ghost-"):
+                return [{"role": "system", "content": "model switched"}]
+            return [{"role": "user", "content": "hello"}]
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    resp = server.handle_request({"id": "1", "method": "session.list", "params": {"limit": 1}})
+
+    assert [s["id"] for s in resp["result"]["sessions"]] == ["real"]
+    assert calls[:2] == [(200, 0), (200, 200)]
 
 
 # --------------------------------------------------------------------------
@@ -6317,7 +6551,10 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
     """Drops `tool` rows like session.list does, returns the first hit."""
 
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False):
+        def list_sessions_rich(self, *, source=None, limit=200, offset=0, **_kwargs):
+            # only the first page has rows; the pagination loop stops on [].
+            if offset:
+                return []
             return [
                 {"id": "tool-1", "source": "tool", "title": "noise", "started_at": 100},
                 {"id": "tui-1", "source": "tui", "title": "real", "started_at": 99},
