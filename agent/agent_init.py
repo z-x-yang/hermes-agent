@@ -264,7 +264,7 @@ def init_agent(
             None or empty = let OpenRouter pick the strongest available coder.
         session_id (str): Pre-generated session ID for logging (optional, auto-generated if not provided)
         tool_progress_callback (callable): Callback function(tool_name, args_preview) for progress notifications
-        clarify_callback (callable): Callback function(question, choices) -> str for interactive user questions.
+        clarify_callback (callable): Callback function(question, choices, context) -> str for interactive user questions.
             Provided by the platform layer (CLI or gateway). If None, the clarify tool returns an error.
         max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
         reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).

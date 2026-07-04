@@ -11432,7 +11432,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             outcome = outcome[:119] + "…"
         _cprint(f"\n{_DIM}{icon} {label}: {detail} → {outcome}{_RST}")
 
-    def _clarify_callback(self, question, choices):
+    def _clarify_callback(self, question, choices, context=None):
         """
         Platform callback for the clarify tool. Called from the agent thread.
 
@@ -11449,6 +11449,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         self._clarify_state = {
             "question": question,
+            "context": (context or "").strip() or None,
             "choices": choices if not is_open_ended else [],
             "selected": 0,
             "response_queue": response_queue,
@@ -13281,7 +13282,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 selected = state["selected"]
                 choices = state.get("choices") or []
                 if selected < len(choices):
-                    state["response_queue"].put(choices[selected])
+                    state["response_queue"].put(choices[selected]["label"])
                     self._clarify_state = None
                     event.app.invalidate()
                 else:
@@ -13497,7 +13498,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     # Map index to choice (treating "Other" as the last option)
                     if idx < len(choices):
                         # Select a numbered choice
-                        self._clarify_state["response_queue"].put(choices[idx])
+                        self._clarify_state["response_queue"].put(choices[idx]["label"])
                         self._clarify_state = None
                         self._clarify_freetext = False
                         event.app.invalidate()
@@ -14356,9 +14357,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 return []
 
             question = state["question"]
+            context = state.get("context")
             choices = state.get("choices") or []
             selected = state.get("selected", 0)
-            preview_lines = _wrap_panel_text(question, 60)
+
+            def _choice_line(choice):
+                desc = (choice.get("description") or "").strip()
+                return f"{choice['label']} — {desc}" if desc else choice["label"]
+
+            preview_lines = []
+            if context:
+                preview_lines.extend(_wrap_panel_text(context, 60))
+                preview_lines.append("")
+            preview_lines.extend(_wrap_panel_text(question, 60))
             for i, choice in enumerate(choices):
                 # Show number prefix for quick selection (1-9 for items 1-9, 0 for 10th item)
                 if i < 9:
@@ -14371,7 +14382,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     prefix = f"❯ {num_prefix}. "
                 else:
                     prefix = f"  {num_prefix}. "
-                preview_lines.extend(_wrap_panel_text(f"{prefix}{choice}", 60, subsequent_indent="    "))
+                preview_lines.extend(_wrap_panel_text(f"{prefix}{_choice_line(choice)}", 60, subsequent_indent="    "))
             # "Other" option in preview
             other_num = len(choices) + 1
             if other_num < 10:
@@ -14404,7 +14415,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         prefix = f'❯ {num_prefix}. '
                     else:
                         prefix = f'  {num_prefix}. '
-                    for wrapped in _wrap_panel_text(f"{prefix}{choice}", inner_text_width, subsequent_indent="    "):
+                    for wrapped in _wrap_panel_text(f"{prefix}{_choice_line(choice)}", inner_text_width, subsequent_indent="    "):
                         choice_wrapped.append((i, wrapped))
                 # Trailing Other row(s)
                 other_idx = len(choices)
@@ -14477,6 +14488,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 # so the rendered question never exceeds max_question_rows.
                 keep = max(0, max_question_rows - 1)
                 question_wrapped = question_wrapped[:keep] + ["… (question truncated)"]
+
+            # Context shares the same row budget as the question and is
+            # truncated (or dropped) before the question ever loses a row —
+            # only the leftover budget after the question is used for
+            # context, and the blank separator row between context and
+            # question counts against that budget too.
+            context_wrapped = []
+            if context and max_question_rows > 0:
+                context_budget = max_question_rows - len(question_wrapped)
+                # Need room for at least one context body row plus the
+                # separator; a budget of 1 could only hold the separator, so
+                # drop context entirely below that.
+                if context_budget > 1:
+                    body_budget = context_budget - 1
+                    context_wrapped = _wrap_panel_text(context, inner_text_width)
+                    if len(context_wrapped) > body_budget:
+                        keep = max(0, body_budget - 1)
+                        context_wrapped = context_wrapped[:keep] + ["… (context truncated)"]
+                    context_wrapped.append("")
+            question_wrapped = context_wrapped + question_wrapped
 
             lines = []
             # Box top border

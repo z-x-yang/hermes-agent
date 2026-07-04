@@ -87,21 +87,27 @@ class TestTelegramSendClarify:
         result = await adapter.send_clarify(
             chat_id="12345",
             question="Which option?",
-            choices=["alpha", "beta", "gamma"],
+            choices=[
+                {"label": "alpha", "description": "the first way"},
+                {"label": "beta", "description": "the second way"},
+                {"label": "gamma", "description": ""},
+            ],
             clarify_id="cid1",
             session_key="sk1",
+            context="Background sentence.",
         )
+        kwargs = adapter._bot.send_message.call_args[1]
+        assert "Background sentence." in kwargs["text"]
+        assert "Which option?" in kwargs["text"]
+        assert "1. <b>alpha</b> — the first way" in kwargs["text"]
+        assert "2. <b>beta</b> — the second way" in kwargs["text"]
+        assert "3. <b>gamma</b>" in kwargs["text"]
+        assert "3. <b>gamma</b> —" not in kwargs["text"]
 
         assert result.success is True
         assert result.message_id == "100"
 
-        kwargs = adapter._bot.send_message.call_args[1]
         assert kwargs["chat_id"] == 12345
-        assert "Which option?" in kwargs["text"]
-        # Full option text rendered in the message body (not just buttons)
-        assert "1. alpha" in kwargs["text"]
-        assert "2. beta" in kwargs["text"]
-        assert "3. gamma" in kwargs["text"]
         # InlineKeyboardMarkup with N+1 buttons (3 choices + Other)
         markup = kwargs["reply_markup"]
         assert markup is not None
@@ -139,7 +145,7 @@ class TestTelegramSendClarify:
         result = await adapter.send_clarify(
             chat_id="12345",
             question="?",
-            choices=["a"],
+            choices=[{"label": "a", "description": ""}],
             clarify_id="cid3",
             session_key="sk3",
         )
@@ -158,7 +164,7 @@ class TestTelegramSendClarify:
         result = await adapter.send_clarify(
             chat_id="12345",
             question="?",
-            choices=[long_choice],
+            choices=[{"label": long_choice, "description": ""}],
             clarify_id="cid4",
             session_key="sk4",
         )
@@ -180,7 +186,7 @@ class TestTelegramSendClarify:
         await adapter.send_clarify(
             chat_id="12345",
             question="<script>alert(1)</script>",
-            choices=["x"],
+            choices=[{"label": "x", "description": ""}],
             clarify_id="cid5",
             session_key="sk5",
         )
@@ -206,7 +212,16 @@ class TestTelegramClarifyCallback:
 
         adapter = _make_adapter()
         # Pre-register a clarify entry so the callback can look up the choice text
-        cm.register("cidA", "sk-cb", "Pick", ["red", "green", "blue"])
+        cm.register(
+            "cidA",
+            "sk-cb",
+            "Pick",
+            [
+                {"label": "red", "description": ""},
+                {"label": "green", "description": ""},
+                {"label": "blue", "description": ""},
+            ],
+        )
         adapter._clarify_state["cidA"] = "sk-cb"
 
         query = AsyncMock()
@@ -247,7 +262,7 @@ class TestTelegramClarifyCallback:
         from tools import clarify_gateway as cm
 
         adapter = _make_adapter()
-        cm.register("cidB", "sk-cb-other", "Pick", ["x", "y"])
+        cm.register("cidB", "sk-cb-other", "Pick", [{"label": "x", "description": ""}, {"label": "y", "description": ""}])
         adapter._clarify_state["cidB"] = "sk-cb-other"
 
         query = AsyncMock()
@@ -311,7 +326,7 @@ class TestTelegramClarifyCallback:
         from tools import clarify_gateway as cm
 
         adapter = _make_adapter()
-        cm.register("cidC", "sk-auth", "Pick", ["a", "b"])
+        cm.register("cidC", "sk-auth", "Pick", [{"label": "a", "description": ""}, {"label": "b", "description": ""}])
         adapter._clarify_state["cidC"] = "sk-auth"
 
         # Hook up a runner that says NOT authorized
@@ -421,7 +436,7 @@ class TestTelegramClarifyCallback:
         from tools import clarify_gateway as cm
 
         adapter = _make_adapter()
-        cm.register("cidD", "sk-inv", "Q?", ["a"])
+        cm.register("cidD", "sk-inv", "Q?", [{"label": "a", "description": ""}])
         adapter._clarify_state["cidD"] = "sk-inv"
 
         query = AsyncMock()
@@ -482,7 +497,10 @@ class TestBaseAdapterClarifyFallback:
         result = await adapter.send_clarify(
             chat_id="c",
             question="Pick a fruit",
-            choices=["apple", "banana"],
+            choices=[
+                {"label": "apple", "description": ""},
+                {"label": "banana", "description": "the yellow one"},
+            ],
             clarify_id="x",
             session_key="s",
         )
@@ -492,6 +510,10 @@ class TestBaseAdapterClarifyFallback:
         assert "Pick a fruit" in text
         assert "1." in text and "apple" in text
         assert "2." in text and "banana" in text
+        # A choice with a description renders "label — description"; an empty
+        # description renders the label alone (no trailing separator).
+        assert "banana — the yellow one" in text
+        assert "apple — " not in text
 
     @pytest.mark.asyncio
     async def test_open_ended_fallback_renders_question_only(self):

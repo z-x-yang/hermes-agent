@@ -5583,6 +5583,7 @@ class DiscordAdapter(BasePlatformAdapter):
         choices: Optional[list],
         clarify_id: str,
         session_key: str,
+        context: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Render a clarify prompt with one Discord button per choice.
@@ -5597,12 +5598,12 @@ class DiscordAdapter(BasePlatformAdapter):
         plain embed text — no buttons. The gateway's text-intercept captures
         the next message in this session and resolves the clarify.
 
-        Choice normalisation: ``choices`` may contain bare strings OR dicts
-        (LLMs sometimes emit ``[{"description": "..."}]`` instead of bare
-        strings, which would otherwise render as raw Python repr on the
-        button label). Dict choices are unwrapped against the canonical
-        LLM tool-call keys ``label``, ``description``, ``text``, ``title``
-        in that order. Dicts with none of those keys are dropped.
+        Choices arrive pre-normalized from tools.clarify_tool as
+        ``{"label", "description"}`` dicts — label is the canonical answer
+        (what buttons resolve with), description is render-only. The embed
+        lists ``N. **label** — description`` per option; buttons carry only
+        the number (Discord caps labels at 80 chars, mobile truncates far
+        shorter).
         """
         if not self._client or not DISCORD_AVAILABLE:
             return SendResult(success=False, error="Not connected")
@@ -5618,7 +5619,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Discord embed description limit is 4096; trim conservatively.
             max_desc = 4088
-            body = str(question or "").strip()
+            q = str(question or "").strip()
+            ctx = str(context or "").strip()
+            # Context (plain) above the bolded question so the ask stands out.
+            body = f"{ctx}\n\n**{q}**" if ctx else q
             if len(body) > max_desc:
                 body = body[: max_desc - 3] + "..."
 
@@ -5628,41 +5632,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 color=discord.Color.orange(),
             )
 
-            # Normalise choices: LLMs sometimes emit `[{"description": "..."}]`
-            # instead of bare strings, which would render as raw Python repr on
-            # the button label. Unwrap the common shapes, then stringify.
-            def _flatten_choice(c):
-                if c is None:
-                    return ""
-                if isinstance(c, str):
-                    return c.strip()
-                if isinstance(c, dict):
-                    # Prefer the canonical LLM tool-call user-facing keys
-                    # in the order the LLM is most likely to emit them.
-                    # 'name' and 'value' are deliberately NOT here: they're
-                    # Discord-component-shaped fields that could appear in
-                    # dicts that aren't meant to be choices (e.g., a
-                    # developer-error wiring that passes a Button-shaped
-                    # object). Picking them would leak raw enum values
-                    # or 4-char model identifiers onto user-facing buttons.
-                    # If a dict has none of the canonical keys, drop it
-                    # rather than picking some random field — a garbage
-                    # button label is worse than no button at all.
-                    for key in ("label", "description", "text", "title"):
-                        v = c.get(key)
-                        if isinstance(v, str) and v.strip():
-                            return v.strip()
-                    return ""
-                if isinstance(c, (list, tuple)):
-                    return " ".join(_flatten_choice(x) for x in c).strip()
-                return str(c).strip()
-
-            clean_choices = [
-                s for s in (_flatten_choice(c) for c in (choices or [])) if s
-            ]
+            # Choices are pre-normalized {"label", "description"} dicts.
             # Discord allows up to 5 buttons per row, 5 rows per view = 25.
-            # We reserve one slot for the "Other" button, so cap at 24 choices.
-            clean_choices = clean_choices[:24]
+            # We reserve one slot for the "Other" button, so cap at 24.
+            clean_choices = list(choices or [])[:24]
+            labels = [c["label"] for c in clean_choices]
 
             if clean_choices:
                 # Full option text goes in the embed body -- Discord
@@ -5681,7 +5655,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     inline=False,
                 )
                 view = ClarifyChoiceView(
-                    choices=clean_choices,
+                    choices=labels,
                     clarify_id=clarify_id,
                     allowed_user_ids=self._allowed_user_ids,
                     allowed_role_ids=self._allowed_role_ids,
@@ -6563,18 +6537,20 @@ class DiscordAdapter(BasePlatformAdapter):
 
 
 def _chunk_numbered_choices(choices, *, limit=1024):
-    """Render choices as a numbered list ("1. a", "2. b", ...) packed into
+    """Render choices as a numbered list ("1. **a** — desc", ...) packed into
     chunks that each fit Discord's 1024-char embed-field value limit.
 
-    Full option text lives in the embed body rather than on button labels
-    (Discord caps labels at 80 chars; mobile truncates far shorter). Long
-    lists span multiple fields; a single option longer than one whole field
-    is hard-truncated with an ellipsis (extreme -- MAX_CHOICES caps real
-    lists at 4) so the message can still be sent.
+    ``choices`` is a list of pre-normalized ``{"label", "description"}``
+    dicts. Full option text lives in the embed body rather than on button
+    labels (Discord caps labels at 80 chars; mobile truncates far shorter).
+    Long lists span multiple fields; a single option longer than one whole
+    field is hard-truncated with an ellipsis (extreme -- MAX_CHOICES caps
+    real lists at 4) so the message can still be sent.
     """
     lines = []
     for i, choice in enumerate(choices):
-        line = f"{i + 1}. {choice}"
+        desc = (choice.get("description") or "").strip()
+        line = f"{i + 1}. **{choice['label']}**" + (f" — {desc}" if desc else "")
         if len(line) > limit:
             line = line[: limit - 1] + "\u2026"
         lines.append(line)
@@ -7454,7 +7430,7 @@ def _define_discord_view_classes() -> None:
                 from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
                 entry = _clarify_entries.get(self.clarify_id)
                 if entry and entry.choices and 0 <= index < len(entry.choices):
-                    resolved_text = entry.choices[index]
+                    resolved_text = entry.choices[index]["label"]
             except Exception:
                 resolved_text = None
             if resolved_text is None:

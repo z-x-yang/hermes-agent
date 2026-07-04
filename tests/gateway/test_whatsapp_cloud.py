@@ -1597,7 +1597,11 @@ class TestSendClarifyButtons:
         result = await adapter.send_clarify(
             chat_id="15551234567",
             question="Pick one",
-            choices=["Alpha", "Bravo", "Charlie"],
+            choices=[
+                {"label": "Alpha", "description": "first option"},
+                {"label": "Bravo", "description": "second option"},
+                {"label": "Charlie", "description": ""},
+            ],
             clarify_id="abc123",
             session_key="sess-1",
         )
@@ -1612,8 +1616,38 @@ class TestSendClarifyButtons:
         assert buttons[0]["reply"]["id"] == "cl:abc123:0"
         assert buttons[2]["reply"]["id"] == "cl:abc123:2"
         body_text = payload["interactive"]["body"]["text"]
-        assert "Alpha" in body_text and "Bravo" in body_text and "Charlie" in body_text
+        assert "1. Alpha — first option" in body_text
+        assert "2. Bravo — second option" in body_text
+        # Empty description → no dash suffix.
+        assert "3. Charlie" in body_text
+        assert "3. Charlie —" not in body_text
         assert adapter._clarify_state["abc123"] == "sess-1"
+
+    @pytest.mark.asyncio
+    async def test_context_renders_above_question(self):
+        """``context`` (when present) renders as a leading paragraph."""
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(200, {"messages": [{"id": "wamid.ctx"}]})
+        )
+
+        result = await adapter.send_clarify(
+            chat_id="15551234567",
+            question="Pick one",
+            choices=[
+                {"label": "Alpha", "description": ""},
+                {"label": "Bravo", "description": ""},
+            ],
+            clarify_id="ctx1",
+            session_key="sess-ctx",
+            context="I found two matching files.",
+        )
+
+        assert result.success
+        payload = adapter._http_client.post.call_args.kwargs["json"]
+        body_text = payload["interactive"]["body"]["text"]
+        assert body_text.startswith("I found two matching files.\n\n❓ Pick one")
 
     @pytest.mark.asyncio
     async def test_four_choices_promoted_to_list_mode(self):
@@ -1627,7 +1661,12 @@ class TestSendClarifyButtons:
         result = await adapter.send_clarify(
             chat_id="15551234567",
             question="Pick one",
-            choices=["A", "B", "C", "D"],
+            choices=[
+                {"label": "A", "description": ""},
+                {"label": "B", "description": ""},
+                {"label": "C", "description": ""},
+                {"label": "D", "description": ""},
+            ],
             clarify_id="q2",
             session_key="sess-2",
         )
@@ -1641,6 +1680,43 @@ class TestSendClarifyButtons:
         assert rows[3]["id"] == "cl:q2:3"
         assert rows[4]["id"] == "cl:q2:other"
         assert "Other" in rows[4]["title"]
+        # List rows: "description" field carries the choice's label
+        # (truncated to 72 chars), since Task 1 moved the human-readable
+        # text into c["label"].
+        assert rows[0]["description"] == "A"
+        assert rows[3]["description"] == "D"
+
+    @pytest.mark.asyncio
+    async def test_list_mode_row_description_uses_truncated_label(self):
+        """List-row ``description`` reads the dict's ``label`` key, not the
+        raw dict, and truncates to 72 chars."""
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(200, {"messages": [{"id": "wamid.q2b"}]})
+        )
+
+        long_label = "L" * 100
+        result = await adapter.send_clarify(
+            chat_id="15551234567",
+            question="Pick one",
+            choices=[
+                {"label": long_label, "description": "irrelevant"},
+                {"label": "B", "description": ""},
+                {"label": "C", "description": ""},
+                {"label": "D", "description": ""},
+            ],
+            clarify_id="q2b",
+            session_key="sess-2b",
+        )
+
+        assert result.success
+        payload = adapter._http_client.post.call_args.kwargs["json"]
+        rows = payload["interactive"]["action"]["sections"][0]["rows"]
+        assert len(rows[0]["description"]) <= 72
+        assert rows[0]["description"].startswith("L")
+        # The choice's own "description" field must NOT leak into the row.
+        assert "irrelevant" not in rows[0]["description"]
 
     @pytest.mark.asyncio
     async def test_open_ended_falls_back_to_plain_text(self):
@@ -1681,7 +1757,10 @@ class TestSendClarifyButtons:
         result = await adapter.send_clarify(
             chat_id="15551234567",
             question="hi",
-            choices=["yes", "no"],
+            choices=[
+                {"label": "yes", "description": ""},
+                {"label": "no", "description": ""},
+            ],
             clarify_id="dead",
             session_key="sess-x",
         )
@@ -1777,8 +1856,56 @@ class TestSendSlashConfirmButtons:
 class TestDispatchInteractiveReplyClarify:
     """Inbound side: button-tap → clarify resolver."""
 
+    def setup_method(self):
+        from tools import clarify_gateway as cm
+        with cm._lock:
+            cm._entries.clear()
+            cm._session_index.clear()
+
     @pytest.mark.asyncio
-    async def test_clarify_tap_resolves_and_pops_state(self, monkeypatch):
+    async def test_clarify_tap_resolves_with_canonical_label(self, monkeypatch):
+        """The tap payload's ``title`` only carries the numeric label
+        ("3"); the resolved response must be the real choice label from
+        the registered entry, not the digit."""
+        from tools import clarify_gateway as cm
+        cm.register("q1", "sess-1", "Pick", [
+            {"label": "Alpha", "description": ""},
+            {"label": "Bravo", "description": ""},
+            {"label": "Charlie", "description": ""},
+        ])
+
+        adapter = _make_adapter()
+        adapter._clarify_state["q1"] = "sess-1"
+
+        captured = {}
+
+        def fake_resolve(clarify_id, response):
+            captured["clarify_id"] = clarify_id
+            captured["response"] = response
+            return True
+
+        monkeypatch.setattr(
+            "tools.clarify_gateway.resolve_gateway_clarify", fake_resolve
+        )
+
+        raw = {
+            "from": "15551234567",
+            "type": "interactive",
+            "interactive": {
+                "type": "button_reply",
+                "button_reply": {"id": "cl:q1:2", "title": "3"},
+            },
+        }
+        handled = await adapter._dispatch_interactive_reply(raw, {})
+
+        assert handled is True
+        assert captured == {"clarify_id": "q1", "response": "Charlie"}
+        assert "q1" not in adapter._clarify_state
+
+    @pytest.mark.asyncio
+    async def test_clarify_tap_falls_back_to_title_when_entry_missing(self, monkeypatch):
+        """If the gateway entry vanished (race / stale state), fall back
+        to the tap's own title text rather than raising."""
         adapter = _make_adapter()
         adapter._clarify_state["q1"] = "sess-1"
 

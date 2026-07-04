@@ -15,54 +15,6 @@ from hermes_cli.secret_prompt import masked_secret_prompt
 from hermes_constants import display_hermes_home
 
 
-def clarify_callback(cli, question, choices):
-    """Prompt for clarifying question through the TUI.
-
-    Sets up the interactive selection UI, then blocks until the user
-    responds. Returns the user's choice or a timeout message.
-    """
-    from cli import CLI_CONFIG
-
-    timeout = CLI_CONFIG.get("clarify", {}).get("timeout", 120)
-    response_queue = queue.Queue()
-    is_open_ended = not choices
-
-    cli._clarify_state = {
-        "question": question,
-        "choices": choices if not is_open_ended else [],
-        "selected": 0,
-        "response_queue": response_queue,
-    }
-    cli._clarify_deadline = _time.monotonic() + timeout
-    cli._clarify_freetext = is_open_ended
-
-    if hasattr(cli, "_app") and cli._app:
-        cli._app.invalidate()
-
-    while True:
-        try:
-            result = response_queue.get(timeout=1)
-            cli._clarify_deadline = 0
-            return result
-        except queue.Empty:
-            remaining = cli._clarify_deadline - _time.monotonic()
-            if remaining <= 0:
-                break
-            if hasattr(cli, "_app") and cli._app:
-                cli._app.invalidate()
-
-    cli._clarify_state = None
-    cli._clarify_freetext = False
-    cli._clarify_deadline = 0
-    if hasattr(cli, "_app") and cli._app:
-        cli._app.invalidate()
-    cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
-    return (
-        "The user did not provide a response within the time limit. "
-        "Use your best judgement to make the choice and proceed."
-    )
-
-
 def prompt_for_secret(cli, var_name: str, prompt: str, metadata=None) -> dict:
     """Prompt for a secret value through the TUI (e.g. API keys for skills).
 

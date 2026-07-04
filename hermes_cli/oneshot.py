@@ -373,13 +373,16 @@ def _run_agent(
     return (result.get("final_response") or "", result)
 
 
-def _oneshot_clarify_callback(question: str, choices=None) -> str:
+def _oneshot_clarify_callback(
+    question: str, choices=None, context: Optional[str] = None
+) -> str:
     """Clarify is disabled in oneshot mode — tell the agent to pick a
     default and proceed instead of stalling or erroring."""
     if choices:
+        labels = [c["label"] for c in choices]
         return (
             f"[oneshot mode: no user available. Pick the best option from "
-            f"{choices} using your own judgment and continue.]"
+            f"{labels} using your own judgment and continue.]"
         )
     return (
         "[oneshot mode: no user available. Make the most reasonable "

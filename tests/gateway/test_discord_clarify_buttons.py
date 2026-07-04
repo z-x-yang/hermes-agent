@@ -191,7 +191,11 @@ class TestClarifyChoiceResolve:
     @pytest.mark.asyncio
     async def test_choice_resolves_with_canonical_choice_text(self):
         from tools import clarify_gateway as cm
-        cm.register("cidA", "sk-A", "Pick", ["red", "green", "blue"])
+        cm.register("cidA", "sk-A", "Pick", [
+            {"label": "red", "description": ""},
+            {"label": "green", "description": ""},
+            {"label": "blue", "description": ""},
+        ])
 
         view = ClarifyChoiceView(
             choices=["red", "green", "blue"],
@@ -206,7 +210,13 @@ class TestClarifyChoiceResolve:
         with cm._lock:
             entry = cm._entries.get("cidA")
         assert entry is not None
+        # Must be the plain label string -- not a dict, and not a
+        # stringified dict (the exact latent bug this test guards against:
+        # entry.choices[index] is a {"label","description"} dict since
+        # Task 2, and resolve_gateway_clarify str()s whatever it's given).
         assert entry.response == "green"
+        assert isinstance(entry.response, str)
+        assert entry.response != str({"label": "green", "description": ""})
         assert entry.event.is_set()
         # Buttons disabled
         assert all(b.disabled for b in view.children)
@@ -252,7 +262,7 @@ class TestClarifyChoiceResolve:
     @pytest.mark.asyncio
     async def test_unauthorized_user_rejected(self):
         from tools import clarify_gateway as cm
-        cm.register("cidC", "sk-C", "Pick", ["x"])
+        cm.register("cidC", "sk-C", "Pick", [{"label": "x", "description": ""}])
 
         # Allowlist set, user not in it
         view = ClarifyChoiceView(
@@ -288,7 +298,10 @@ class TestClarifyOtherButton:
     @pytest.mark.asyncio
     async def test_other_flips_entry_to_awaiting_text(self):
         from tools import clarify_gateway as cm
-        cm.register("cidD", "sk-D", "Pick", ["x", "y"])
+        cm.register("cidD", "sk-D", "Pick", [
+            {"label": "x", "description": ""},
+            {"label": "y", "description": ""},
+        ])
 
         view = ClarifyChoiceView(
             choices=["x", "y"],
@@ -317,7 +330,7 @@ class TestClarifyOtherButton:
     @pytest.mark.asyncio
     async def test_other_unauthorized_user_rejected(self):
         from tools import clarify_gateway as cm
-        cm.register("cidE", "sk-E", "Pick", ["x"])
+        cm.register("cidE", "sk-E", "Pick", [{"label": "x", "description": ""}])
 
         view = ClarifyChoiceView(
             choices=["x"],
@@ -345,6 +358,70 @@ class TestDiscordSendClarify:
         _clear_clarify_state()
 
     @pytest.mark.asyncio
+    async def test_embed_lists_label_and_description(self):
+        adapter = _make_adapter(allowed_users={"42"})
+        channel = MagicMock()
+        sent_msg = MagicMock()
+        sent_msg.id = 9001
+        channel.send = AsyncMock(return_value=sent_msg)
+        adapter._client.get_channel = MagicMock(return_value=channel)
+
+        await adapter.send_clarify(
+            chat_id="9001",
+            question="Which framing?",
+            choices=[
+                {"label": "Tight and short", "description": "Covers all 3 audiences without dumbing down"},
+                {"label": "Long form", "description": "Full detail, slower read"},
+            ],
+            clarify_id="cidLD",
+            session_key="sk-LD",
+        )
+        embed_text = _embed_text(channel.send.call_args.kwargs["embed"])
+        assert "1. **Tight and short** — Covers all 3 audiences without dumbing down" in embed_text
+        assert "2. **Long form** — Full detail, slower read" in embed_text
+
+    @pytest.mark.asyncio
+    async def test_context_renders_above_bold_question(self):
+        adapter = _make_adapter(allowed_users={"42"})
+        channel = MagicMock()
+        sent_msg = MagicMock()
+        sent_msg.id = 9002
+        channel.send = AsyncMock(return_value=sent_msg)
+        adapter._client.get_channel = MagicMock(return_value=channel)
+
+        await adapter.send_clarify(
+            chat_id="9001",
+            question="Which framing?",
+            choices=[{"label": "A", "description": "aa"}],
+            clarify_id="cidCtx",
+            session_key="sk-Ctx",
+            context="Two drafts exist; they differ only in length.",
+        )
+        desc = channel.send.call_args.kwargs["embed"].description
+        assert desc.startswith("Two drafts exist; they differ only in length.")
+        assert "**Which framing?**" in desc
+
+    @pytest.mark.asyncio
+    async def test_empty_description_renders_label_only(self):
+        adapter = _make_adapter(allowed_users={"42"})
+        channel = MagicMock()
+        sent_msg = MagicMock()
+        sent_msg.id = 9003
+        channel.send = AsyncMock(return_value=sent_msg)
+        adapter._client.get_channel = MagicMock(return_value=channel)
+
+        await adapter.send_clarify(
+            chat_id="9001",
+            question="Go?",
+            choices=[{"label": "yes", "description": ""}],
+            clarify_id="cidNoDesc",
+            session_key="sk-ND",
+        )
+        embed_text = _embed_text(channel.send.call_args.kwargs["embed"])
+        assert "1. **yes**" in embed_text
+        assert "1. **yes** —" not in embed_text
+
+    @pytest.mark.asyncio
     async def test_multi_choice_attaches_view(self):
         adapter = _make_adapter(allowed_users={"42"})
         channel = MagicMock()
@@ -356,7 +433,11 @@ class TestDiscordSendClarify:
         result = await adapter.send_clarify(
             chat_id="9001",
             question="Pick a color",
-            choices=["red", "green", "blue"],
+            choices=[
+                {"label": "red", "description": ""},
+                {"label": "green", "description": ""},
+                {"label": "blue", "description": ""},
+            ],
             clarify_id="cidM",
             session_key="sk-M",
         )
@@ -408,7 +489,7 @@ class TestDiscordSendClarify:
         await adapter.send_clarify(
             chat_id="9001",
             question="?",
-            choices=["a"],
+            choices=[{"label": "a", "description": ""}],
             clarify_id="cidT",
             session_key="sk-T",
             metadata={"thread_id": "7777"},
@@ -424,7 +505,7 @@ class TestDiscordSendClarify:
         result = await adapter.send_clarify(
             chat_id="9001",
             question="?",
-            choices=["a"],
+            choices=[{"label": "a", "description": ""}],
             clarify_id="cidNC",
             session_key="sk-NC",
         )
@@ -432,7 +513,11 @@ class TestDiscordSendClarify:
         assert "Not connected" in (result.error or "")
 
     @pytest.mark.asyncio
-    async def test_filters_empty_and_whitespace_choices(self):
+    async def test_caps_at_24_real_choices(self):
+        # Choices arrive pre-normalized from tools.clarify_tool -- send_clarify
+        # no longer filters empty/whitespace entries itself, but it still caps
+        # the button+field count at 24 (+ 1 "Other" = 25, Discord's component
+        # limit).
         adapter = _make_adapter()
         channel = MagicMock()
         sent_msg = MagicMock()
@@ -440,150 +525,21 @@ class TestDiscordSendClarify:
         channel.send = AsyncMock(return_value=sent_msg)
         adapter._client.get_channel = MagicMock(return_value=channel)
 
+        choices = [{"label": f"choice-{i}", "description": ""} for i in range(30)]
         await adapter.send_clarify(
             chat_id="9001",
             question="?",
-            choices=["", "  ", "real-choice", None],
+            choices=choices,
             clarify_id="cidF",
             session_key="sk-F",
         )
         kwargs = channel.send.call_args.kwargs
         view = kwargs["view"]
-        # Only 1 real choice + 1 Other = 2 children
-        assert len(view.children) == 2
-        # Button carries the number; the choice text lives in the embed body.
+        # 24 numeric + 1 Other = 25 children
+        assert len(view.children) == 25
         assert view.children[0].label == "1."
-        assert "real-choice" in _embed_text(kwargs["embed"])
+        assert "choice-0" in _embed_text(kwargs["embed"])
 
-    @pytest.mark.asyncio
-    async def test_unwraps_dict_choices_to_description(self):
-        # LLMs sometimes emit [{"description": "..."}] instead of bare strings
-        # — the renderer must unwrap common dict shapes, not str() the whole
-        # dict into a Python repr on the button label.
-        adapter = _make_adapter()
-        channel = MagicMock()
-        sent_msg = MagicMock()
-        sent_msg.id = 555
-        channel.send = AsyncMock(return_value=sent_msg)
-        adapter._client.get_channel = MagicMock(return_value=channel)
-
-        malformed = [
-            {"description": "Tight, well-illustrated"},
-            {"label": "Use label key"},
-            {"text": "Use text key"},
-            "normal-string",  # strings still pass through
-        ]
-        await adapter.send_clarify(
-            chat_id="9001",
-            question="?",
-            choices=malformed,
-            clarify_id="cidU",
-            session_key="sk-U",
-        )
-        kwargs = channel.send.call_args.kwargs
-        embed_text = _embed_text(kwargs["embed"])
-        # No raw Python repr should leak into the embed body.
-        assert "{'" not in embed_text
-        assert "':" not in embed_text
-        # Each dict unwrapped to its inner string, rendered in the embed.
-        assert "Tight, well-illustrated" in embed_text
-        assert "Use label key" in embed_text
-        assert "Use text key" in embed_text
-        assert "normal-string" in embed_text
-        # Buttons stay numeric (no text on labels).
-        view = kwargs["view"]
-        numeric = view.children[:-1]  # exclude Other
-        assert [b.label for b in numeric] == [f"{k + 1}." for k in range(len(numeric))]
-
-    @pytest.mark.asyncio
-    async def test_unwrap_prefers_description_over_name_in_multi_key_dict(self):
-        # When the LLM emits both 'name' (often a short identifier in
-        # OpenAI-style tool calls) and 'description' (the user-facing text),
-        # the renderer must surface 'description'. The user should never see
-        # a 4-char model identifier on a button label.
-        adapter = _make_adapter()
-        channel = MagicMock()
-        sent_msg = MagicMock()
-        sent_msg.id = 666
-        channel.send = AsyncMock(return_value=sent_msg)
-        adapter._client.get_channel = MagicMock(return_value=channel)
-
-        await adapter.send_clarify(
-            chat_id="9001",
-            question="?",
-            choices=[{"name": "tight", "description": "Tight, well-illustrated"}],
-            clarify_id="cidN",
-            session_key="sk-N",
-        )
-        kwargs = channel.send.call_args.kwargs
-        embed_text = _embed_text(kwargs["embed"])
-        assert "Tight, well-illustrated" in embed_text
-        # The 'name' value (a short identifier) must NOT have leaked.
-        assert "tight" not in embed_text, f"'name' leaked into embed: {embed_text!r}"
-
-    @pytest.mark.asyncio
-    async def test_unwrap_prefers_label_over_description(self):
-        # When both 'label' and 'description' are present, 'label' wins.
-        # 'label' is the canonical short user-facing text in most LLM tool
-        # conventions; 'description' is the longer explanation.
-        adapter = _make_adapter()
-        channel = MagicMock()
-        sent_msg = MagicMock()
-        sent_msg.id = 777
-        channel.send = AsyncMock(return_value=sent_msg)
-        adapter._client.get_channel = MagicMock(return_value=channel)
-
-        await adapter.send_clarify(
-            chat_id="9001",
-            question="?",
-            choices=[{"label": "Short", "description": "Long verbose explanation"}],
-            clarify_id="cidL",
-            session_key="sk-L",
-        )
-        kwargs = channel.send.call_args.kwargs
-        embed_text = _embed_text(kwargs["embed"])
-        assert "Short" in embed_text
-        # The longer description must NOT have leaked.
-        assert "Long verbose" not in embed_text, (
-            f"'description' leaked over 'label': {embed_text!r}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_unwrap_does_not_pick_value_or_name_alone(self):
-        # 'name' and 'value' are Discord-component-shaped fields that could
-        # accidentally appear in dicts not intended as choices (e.g., a
-        # developer-error in the gateway wiring). The renderer should not
-        # surface them as button labels — only the well-known LLM tool-call
-        # keys (label, description, text, title) should win.
-        adapter = _make_adapter()
-        channel = MagicMock()
-        sent_msg = MagicMock()
-        sent_msg.id = 888
-        channel.send = AsyncMock(return_value=sent_msg)
-        adapter._client.get_channel = MagicMock(return_value=channel)
-
-        await adapter.send_clarify(
-            chat_id="9001",
-            question="?",
-            choices=[
-                {"name": "only_name_here"},   # should be filtered out
-                {"value": "only_value_here"},  # should be filtered out
-                {"description": "real choice"},
-            ],
-            clarify_id="cidNV",
-            session_key="sk-NV",
-        )
-        kwargs = channel.send.call_args.kwargs
-        view = kwargs["view"]
-        numeric = view.children[:-1]  # exclude Other
-        # Only the well-formed dict survives -> 1 numeric button.
-        assert len(numeric) == 1, (
-            f"Expected 1 choice, got {len(numeric)}: {[b.label for b in numeric]!r}"
-        )
-        embed_text = _embed_text(kwargs["embed"])
-        assert "real choice" in embed_text
-        assert "only_name_here" not in embed_text, f"name leaked: {embed_text!r}"
-        assert "only_value_here" not in embed_text, f"value leaked: {embed_text!r}"
     @pytest.mark.asyncio
     async def test_embed_lists_full_choice_text_untruncated(self):
         # The whole point of the redesign: a long option appears IN FULL in
@@ -602,14 +558,17 @@ class TestDiscordSendClarify:
         await adapter.send_clarify(
             chat_id="9001",
             question="Which framing?",
-            choices=[long_choice, "Short one"],
+            choices=[
+                {"label": long_choice, "description": ""},
+                {"label": "Short one", "description": ""},
+            ],
             clarify_id="cidFull",
             session_key="sk-Full",
         )
         embed_text = _embed_text(channel.send.call_args.kwargs["embed"])
         # Full text present verbatim, numbered, and NOT truncated.
-        assert "1. " + long_choice in embed_text
-        assert "2. Short one" in embed_text
+        assert f"1. **{long_choice}**" in embed_text
+        assert "2. **Short one**" in embed_text
         assert long_choice + "\u2026" not in embed_text
 
 
@@ -619,25 +578,38 @@ class TestDiscordSendClarify:
 
 class TestChunkNumberedChoices:
     """Full choice text is packed into embed fields, each <= Discord's 1024
-    per-field limit, splitting across fields when needed."""
+    per-field limit, splitting across fields when needed.
+
+    ``choices`` is a list of pre-normalized ``{"label", "description"}``
+    dicts (Task 1's clarify_tool contract) — each line renders as
+    ``N. **label** — description``.
+    """
 
     def test_single_field_when_under_limit(self):
         from plugins.platforms.discord.adapter import _chunk_numbered_choices
-        assert _chunk_numbered_choices(["a", "b", "c"]) == ["1. a\n2. b\n3. c"]
+        choices = [
+            {"label": "a", "description": ""},
+            {"label": "b", "description": ""},
+            {"label": "c", "description": ""},
+        ]
+        assert _chunk_numbered_choices(choices) == [
+            "1. **a**\n2. **b**\n3. **c**"
+        ]
 
     def test_splits_across_fields_when_exceeding_limit(self):
         from plugins.platforms.discord.adapter import _chunk_numbered_choices
-        big = "x" * 600  # two "N. " + 600 lines can't share one 1024 field
-        chunks = _chunk_numbered_choices([big, big])
+        big = "x" * 600  # two "N. **...**" lines can't share one 1024 field
+        choices = [{"label": big, "description": ""}, {"label": big, "description": ""}]
+        chunks = _chunk_numbered_choices(choices)
         assert len(chunks) == 2
-        assert chunks[0].startswith("1. ")
-        assert chunks[1].startswith("2. ")
+        assert chunks[0].startswith("1. **")
+        assert chunks[1].startswith("2. **")
         assert all(len(c) <= 1024 for c in chunks)
 
     def test_hard_truncates_single_oversized_line(self):
         from plugins.platforms.discord.adapter import _chunk_numbered_choices
         huge = "y" * 2000  # a single option longer than a whole field
-        chunks = _chunk_numbered_choices([huge])
+        chunks = _chunk_numbered_choices([{"label": huge, "description": ""}])
         assert len(chunks) == 1
         assert len(chunks[0]) <= 1024
         assert chunks[0].endswith("\u2026")

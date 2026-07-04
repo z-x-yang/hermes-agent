@@ -50,7 +50,11 @@ class _ClarifyEntry:
     clarify_id: str
     session_key: str
     question: str
-    choices: Optional[List[str]]
+    # Canonical choice shape from tools.clarify_tool._normalize_choice:
+    # [{"label": str, "description": str}, ...].  The label is what gets
+    # returned as the user's answer; description is render-only.
+    choices: Optional[List[Dict[str, str]]]
+    context: Optional[str] = None
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
@@ -60,7 +64,8 @@ class _ClarifyEntry:
             "clarify_id": self.clarify_id,
             "session_key": self.session_key,
             "question": self.question,
-            "choices": list(self.choices) if self.choices else None,
+            "context": self.context,
+            "choices": [dict(c) for c in self.choices] if self.choices else None,
         }
 
 
@@ -79,7 +84,8 @@ def register(
     clarify_id: str,
     session_key: str,
     question: str,
-    choices: Optional[List[str]],
+    choices: Optional[List[Dict[str, str]]],
+    context: Optional[str] = None,
 ) -> _ClarifyEntry:
     """Register a pending clarify request and return the entry.
 
@@ -90,7 +96,8 @@ def register(
         clarify_id=clarify_id,
         session_key=session_key,
         question=question,
-        choices=list(choices) if choices else None,
+        choices=[dict(c) for c in choices] if choices else None,
+        context=context,
         # Open-ended (no choices) → next message IS the response, no buttons needed.
         awaiting_text=not bool(choices),
     )
@@ -194,18 +201,19 @@ def get_pending_for_session(
 
 
 def _coerce_text_response(entry: _ClarifyEntry, response: str) -> str:
-    """Map typed choice replies to canonical choice text, otherwise keep custom text."""
+    """Map typed choice replies to the canonical choice label, otherwise keep custom text."""
     text = str(response).strip()
     if entry.choices:
+        labels = [c["label"] for c in entry.choices]
         try:
             idx = int(text) - 1
         except ValueError:
             idx = -1
-        if 0 <= idx < len(entry.choices):
-            return entry.choices[idx]
-        for choice in entry.choices:
-            if text.casefold() == str(choice).strip().casefold():
-                return str(choice).strip()
+        if 0 <= idx < len(labels):
+            return labels[idx]
+        for label in labels:
+            if text.casefold() == label.strip().casefold():
+                return label.strip()
     return text
 
 

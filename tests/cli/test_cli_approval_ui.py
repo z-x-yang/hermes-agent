@@ -462,7 +462,7 @@ class TestModalPaintNow:
     def test_clarify_prompt_paints_under_both_gates(self):
         cli = _make_real_paint_cli_stub()
         value = self._drive(
-            cli, lambda: cli._clarify_callback("Pick one", ["a", "b"]),
+            cli, lambda: cli._clarify_callback("Pick one", [{"label": "a", "description": ""}, {"label": "b", "description": ""}]),
             "_clarify_state",
         )
         assert value == "a"
@@ -628,7 +628,7 @@ class TestPersistPromptSummary:
         result = {}
 
         def _run():
-            result["value"] = cli._clarify_callback("Pick a path?", ["A", "B"])
+            result["value"] = cli._clarify_callback("Pick a path?", [{"label": "A", "description": ""}, {"label": "B", "description": ""}])
 
         with patch.object(cli_module, "_cprint", printed.append):
             t = threading.Thread(target=_run, daemon=True)

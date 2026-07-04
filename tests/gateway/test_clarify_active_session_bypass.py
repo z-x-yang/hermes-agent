@@ -78,7 +78,7 @@ async def test_active_session_routes_typed_choice_clarify_reply_to_runner_not_bu
         thread_sessions_per_user=adapter.config.extra.get("thread_sessions_per_user", False),
     )
     adapter._active_sessions[session_key] = asyncio.Event()
-    cm.register("clarify-1", session_key, "Pick one", ["A", "B"])
+    cm.register("clarify-1", session_key, "Pick one", [{"label": "A", "description": ""}, {"label": "B", "description": ""}])
 
     await adapter.handle_message(event)
 

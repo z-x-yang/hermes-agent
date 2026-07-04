@@ -3114,6 +3114,7 @@ class BasePlatformAdapter(ABC):
         choices: Optional[list],
         clarify_id: str,
         session_key: str,
+        context: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a clarify prompt to the user.
@@ -3144,11 +3145,17 @@ class BasePlatformAdapter(ABC):
         user's reply instead of timing out.
         Adapters with native button UIs (Telegram, Discord) SHOULD
         override this for a richer UX.
+        Choices arrive pre-normalized as {"label", "description"} dicts from
+        tools.clarify_tool; the label is the canonical answer text.
         """
+        header = f"{context}\n\n❓ {question}" if context else f"❓ {question}"
         if choices:
-            lines = [f"❓ {question}", ""]
+            lines = [header, ""]
             for i, choice in enumerate(choices, start=1):
-                lines.append(f"  {i}. {choice}")
+                desc = (choice.get("description") or "").strip()
+                lines.append(
+                    f"  {i}. {choice['label']}" + (f" — {desc}" if desc else "")
+                )
             lines.append("")
             lines.append("Reply with the number, the option text, or your own answer.")
             text = "\n".join(lines)
@@ -3157,7 +3164,7 @@ class BasePlatformAdapter(ABC):
             from tools.clarify_gateway import mark_awaiting_text
             mark_awaiting_text(clarify_id)
         else:
-            text = f"❓ {question}"
+            text = header
         return await self.send(
             chat_id=chat_id,
             content=text,

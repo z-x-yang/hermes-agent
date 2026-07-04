@@ -674,6 +674,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         choices: Optional[list],
         clarify_id: str,
         session_key: str,
+        context: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Render a clarify prompt as native WhatsApp interactive buttons.
@@ -703,11 +704,16 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # options aren't truncated to the 20-char button label cap.
         # Truncate choices to MAX_CHOICES (4) — the tool layer enforces
         # this already, but be defensive.
-        choices_list = [str(c).strip() for c in choices[:10] if str(c).strip()]
+        # Choices are pre-normalized {"label", "description"} dicts.
+        choices_list = list(choices[:10]) if choices else []
         option_lines = "\n".join(
-            f"{i + 1}. {c}" for i, c in enumerate(choices_list)
+            f"{i + 1}. {c['label']}"
+            + (f" — {d}" if (d := (c.get('description') or '').strip()) else "")
+            for i, c in enumerate(choices_list)
         )
-        body_text = self._truncate_body(f"❓ {question}\n\n{option_lines}")
+        ctx = str(context or "").strip()
+        header = f"{ctx}\n\n❓ {question}" if ctx else f"❓ {question}"
+        body_text = self._truncate_body(f"{header}\n\n{option_lines}" if option_lines else header)
 
         if len(choices_list) <= 3:
             buttons = [
@@ -734,7 +740,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 rows.append({
                     "id": f"cl:{clarify_id}:{idx}",
                     "title": self._truncate_button_label(f"{idx + 1}", limit=24),
-                    "description": self._truncate_button_label(choice_text, limit=72),
+                    "description": self._truncate_button_label(choice_text["label"], limit=72),
                 })
             rows.append({
                 "id": f"cl:{clarify_id}:other",
@@ -1664,13 +1670,17 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 # Put state back so a follow-up text can still resolve.
                 self._clarify_state[clarify_id] = session_key
                 return False
-            # Use the title text as the resolved response so the agent
-            # sees the human-readable answer, not the index. Title is
-            # the numeric label ("1", "2", ...) so we look up the
-            # full choice from the original prompt — but we didn't
-            # persist that. Fall back to passing the index; the agent
-            # has the prompt in context and can interpret it.
-            response_text = str(inner.get("title") or str(idx + 1))
+            # Resolve with the canonical label from the registered entry —
+            # the tap payload only carries the numeric title.
+            resolved_label = None
+            try:
+                from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
+                entry = _clarify_entries.get(clarify_id)
+                if entry and entry.choices and 0 <= idx < len(entry.choices):
+                    resolved_label = entry.choices[idx]["label"]
+            except Exception:
+                resolved_label = None
+            response_text = resolved_label or str(inner.get("title") or str(idx + 1))
             resolved = resolve_gateway_clarify(clarify_id, response_text)
             if not resolved:
                 # Resolver couldn't find a waiter (e.g. agent already

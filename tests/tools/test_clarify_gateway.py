@@ -33,7 +33,7 @@ class TestClarifyPrimitive:
         """resolve_gateway_clarify unblocks wait_for_response with the chosen string."""
         from tools import clarify_gateway as cm
 
-        cm.register("id1", "sk1", "Pick one", ["A", "B", "C"])
+        cm.register("id1", "sk1", "Pick one", [{"label": "A", "description": ""}, {"label": "B", "description": ""}, {"label": "C", "description": ""}])
 
         def resolver():
             time.sleep(0.05)
@@ -60,7 +60,7 @@ class TestClarifyPrimitive:
         """Multi-choice clarify should NOT be in text-capture mode initially."""
         from tools import clarify_gateway as cm
 
-        entry = cm.register("id3", "sk3", "Pick", ["X", "Y"])
+        entry = cm.register("id3", "sk3", "Pick", [{"label": "X", "description": ""}, {"label": "Y", "description": ""}])
         assert entry.awaiting_text is False
         assert cm.get_pending_for_session("sk3") is None
 
@@ -68,7 +68,7 @@ class TestClarifyPrimitive:
         """Gateway typed replies must see active choice prompts too."""
         from tools import clarify_gateway as cm
 
-        cm.register("id3b", "sk3b", "Pick", ["X", "Y"])
+        cm.register("id3b", "sk3b", "Pick", [{"label": "X", "description": ""}, {"label": "Y", "description": ""}])
         pending = cm.get_pending_for_session("sk3b", include_choice_prompts=True)
         assert pending is not None
         assert pending.clarify_id == "id3b"
@@ -77,7 +77,7 @@ class TestClarifyPrimitive:
         """Typed numbers should resolve to the canonical choice string."""
         from tools import clarify_gateway as cm
 
-        cm.register("id3c", "sk3c", "Pick", ["X", "Y"])
+        cm.register("id3c", "sk3c", "Pick", [{"label": "X", "description": ""}, {"label": "Y", "description": ""}])
         assert cm.resolve_text_response_for_session("sk3c", "2") is True
         assert cm.wait_for_response("id3c", timeout=0.1) == "Y"
 
@@ -85,7 +85,7 @@ class TestClarifyPrimitive:
         """Arbitrary typed text should resolve as a custom Other answer."""
         from tools import clarify_gateway as cm
 
-        cm.register("id3d", "sk3d", "Pick", ["X", "Y"])
+        cm.register("id3d", "sk3d", "Pick", [{"label": "X", "description": ""}, {"label": "Y", "description": ""}])
         custom = "None of those are valid options"
         assert cm.resolve_text_response_for_session("sk3d", custom) is True
         assert cm.wait_for_response("id3d", timeout=0.1) == custom
@@ -94,7 +94,7 @@ class TestClarifyPrimitive:
         """mark_awaiting_text makes get_pending_for_session find the entry."""
         from tools import clarify_gateway as cm
 
-        cm.register("id4", "sk4", "Pick", ["X", "Y"])
+        cm.register("id4", "sk4", "Pick", [{"label": "X", "description": ""}, {"label": "Y", "description": ""}])
         assert cm.get_pending_for_session("sk4") is None
 
         flipped = cm.mark_awaiting_text("id4")
@@ -114,7 +114,7 @@ class TestClarifyPrimitive:
         """wait_for_response returns None when no resolve fires within the timeout."""
         from tools import clarify_gateway as cm
 
-        cm.register("id5", "sk5", "Q?", ["A"])
+        cm.register("id5", "sk5", "Q?", [{"label": "A", "description": ""}])
         result = cm.wait_for_response("id5", timeout=0.2)
         assert result is None
 
@@ -122,7 +122,7 @@ class TestClarifyPrimitive:
         """timeout <= 0 disables the clarify timeout instead of expiring immediately."""
         from tools import clarify_gateway as cm
 
-        cm.register("id5b", "sk5b", "Q?", ["A"])
+        cm.register("id5b", "sk5b", "Q?", [{"label": "A", "description": ""}])
 
         def resolver():
             time.sleep(0.05)
@@ -142,7 +142,7 @@ class TestClarifyPrimitive:
         """A late resolve on a finished entry doesn't blow up."""
         from tools import clarify_gateway as cm
 
-        cm.register("id6", "sk6", "Q?", ["A"])
+        cm.register("id6", "sk6", "Q?", [{"label": "A", "description": ""}])
         # Time out, entry gets cleaned up
         cm.wait_for_response("id6", timeout=0.1)
         # Late button click — should not raise
@@ -153,7 +153,7 @@ class TestClarifyPrimitive:
         """clear_session unblocks blocked threads with empty response."""
         from tools import clarify_gateway as cm
 
-        cm.register("id7", "sk7", "Q?", ["A"])
+        cm.register("id7", "sk7", "Q?", [{"label": "A", "description": ""}])
 
         def waiter():
             return cm.wait_for_response("id7", timeout=10.0)
@@ -170,7 +170,7 @@ class TestClarifyPrimitive:
     def test_has_pending(self):
         from tools import clarify_gateway as cm
 
-        cm.register("id8", "sk8", "Q?", ["A"])
+        cm.register("id8", "sk8", "Q?", [{"label": "A", "description": ""}])
         assert cm.has_pending("sk8") is True
         assert cm.has_pending("nonexistent") is False
 
@@ -178,7 +178,7 @@ class TestClarifyPrimitive:
         """unregister_notify cancels any pending clarify so threads unwind."""
         from tools import clarify_gateway as cm
 
-        cm.register("id9", "sk9", "Q?", ["A"])
+        cm.register("id9", "sk9", "Q?", [{"label": "A", "description": ""}])
 
         def waiter():
             return cm.wait_for_response("id9", timeout=10.0)
@@ -229,7 +229,7 @@ class TestGatewayTextIntercept:
         from tools import clarify_gateway as cm
 
         # Older multi-choice (not awaiting text)
-        cm.register("first", "sk", "Q1?", ["A"])
+        cm.register("first", "sk", "Q1?", [{"label": "A", "description": ""}])
         # Newer open-ended (awaiting text)
         cm.register("second", "sk", "Q2?", None)
 
@@ -249,7 +249,7 @@ class TestGatewayTextIntercept:
         is called so the gateway text-intercept can capture the reply."""
         from tools import clarify_gateway as cm
 
-        entry = cm.register("id-tf", "sk-tf", "Pick one", ["A", "B", "C"])
+        entry = cm.register("id-tf", "sk-tf", "Pick one", [{"label": "A", "description": ""}, {"label": "B", "description": ""}, {"label": "C", "description": ""}])
         # Initially, multi-choice does NOT await text (button path)
         assert entry.awaiting_text is False
 
@@ -264,3 +264,39 @@ class TestGatewayTextIntercept:
         
         # Clean up
         cm.clear_session("sk-tf")
+
+
+def test_entry_stores_context_and_dict_choices():
+    from tools import clarify_gateway as cg
+    entry = cg.register(
+        clarify_id="t-ctx1",
+        session_key="sess-ctx1",
+        question="Q?",
+        choices=[{"label": "a", "description": "aa"}],
+        context="Some background.",
+    )
+    try:
+        assert entry.context == "Some background."
+        assert entry.choices == [{"label": "a", "description": "aa"}]
+        assert entry.signature()["context"] == "Some background."
+    finally:
+        cg.clear_session("sess-ctx1")
+
+
+def test_coerce_numeric_reply_returns_label():
+    from tools import clarify_gateway as cg
+    entry = cg.register(
+        clarify_id="t-num1",
+        session_key="sess-num1",
+        question="Q?",
+        choices=[
+            {"label": "staging", "description": "test cluster"},
+            {"label": "prod", "description": "production"},
+        ],
+    )
+    try:
+        assert cg._coerce_text_response(entry, "2") == "prod"
+        assert cg._coerce_text_response(entry, "PROD") == "prod"
+        assert cg._coerce_text_response(entry, "my own answer") == "my own answer"
+    finally:
+        cg.clear_session("sess-num1")

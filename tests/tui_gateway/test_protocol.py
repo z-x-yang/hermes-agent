@@ -284,6 +284,24 @@ def test_clarify_block_timeout_uses_shared_config(server, monkeypatch):
     assert server._clarify_block_timeout() == 45
 
 
+def test_clarify_callback_forwards_context(server, monkeypatch):
+    captured = {}
+    def fake_block(event, sid, payload, timeout=None):
+        captured["event"] = event
+        captured["payload"] = payload
+        return "ok"
+    monkeypatch.setattr(server, "_block", fake_block)
+    cbs = server._agent_cbs("sid-x")
+    # 3-arg contract + context forwarded into the block payload
+    result = cbs["clarify_callback"](
+        "Which?", [{"label": "a", "description": "aa"}], "some context"
+    )
+    assert result == "ok"
+    assert captured["event"] == "clarify.request"
+    assert captured["payload"]["context"] == "some context"
+    assert captured["payload"]["choices"] == [{"label": "a", "description": "aa"}]
+
+
 # ── Session lookup ───────────────────────────────────────────────────
 
 

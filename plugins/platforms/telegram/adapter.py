@@ -4328,6 +4328,7 @@ class TelegramAdapter(BasePlatformAdapter):
         choices: Optional[list],
         clarify_id: str,
         session_key: str,
+        context: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Render a clarify prompt with one inline button per choice.
@@ -4345,16 +4346,23 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            text = f"❓ {_html.escape(question)}"
+            ctx = str(context or "").strip()
+            text = (
+                f"{_html.escape(ctx)}\n\n" if ctx else ""
+            ) + f"❓ <b>{_html.escape(question)}</b>"
             thread_id = self._metadata_thread_id(metadata)
 
             if choices:
-                # Render full option text in the message body so mobile
-                # users can read long choices that would be truncated in
-                # inline button labels.  Buttons keep short numeric labels
-                # (1, 2, …, Other) to avoid Telegram truncation.
+                # Full option text in the message body (mobile-safe); buttons
+                # keep short numeric labels. Choices are pre-normalized
+                # {"label", "description"} dicts.
                 option_lines = "\n".join(
-                    f"{i + 1}. {_html.escape(str(c))}"
+                    f"{i + 1}. <b>{_html.escape(c['label'])}</b>"
+                    + (
+                        f" — {_html.escape(d)}"
+                        if (d := (c.get('description') or '').strip())
+                        else ""
+                    )
                     for i, c in enumerate(choices)
                 )
                 text += f"\n\n{option_lines}"
@@ -5169,7 +5177,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
                     entry = _clarify_entries.get(clarify_id)
                     if entry and entry.choices and 0 <= idx < len(entry.choices):
-                        resolved_text = entry.choices[idx]
+                        resolved_text = entry.choices[idx]["label"]
                 except Exception:
                     resolved_text = None
 
