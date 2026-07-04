@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from gateway.run import _stream_delivery_confirmation, _streamed_final_matches_response
 
 
 def _make_adapter(*, supports_delete: bool = True) -> MagicMock:
@@ -720,3 +721,141 @@ class TestFinalAndSegmentBoundaryContracts:
 
         assert consumer.final_response_sent is False
         assert consumer.final_content_delivered is False
+
+    @pytest.mark.asyncio
+    async def test_exact_streamed_text_can_suppress_after_spurious_segment_break(self):
+        """Regression for Discord duplicate finals after restart.
+
+        A late display-close/segment boundary can clear the consumer's final
+        delivery flags even though the exact final response already reached
+        Discord through streaming.  The gateway must still have a content-match
+        fallback so it suppresses the normal final send only when the streamed
+        text equals the agent's final response.
+        """
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter=adapter,
+            chat_id="chat",
+            config=StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=""),
+        )
+        final_text = "This exact final answer already reached Discord."
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta(final_text)
+        await asyncio.sleep(0.05)
+        consumer.on_delta(None)  # type: ignore[arg-type]  # stale boundary after visible final text
+        consumer.finish()
+        await task
+
+        assert consumer.final_response_sent is False
+        assert consumer.final_content_delivered is False
+        assert _streamed_final_matches_response(consumer, final_text) is True
+        assert _stream_delivery_confirmation(consumer, final_text)[0] is True
+        assert _stream_delivery_confirmation(
+            consumer,
+            final_text,
+            response_transformed=True,
+        )[0] is False
+
+    @pytest.mark.asyncio
+    async def test_split_streamed_text_can_suppress_after_spurious_segment_break(self):
+        """The content-match fallback must use the full source text, not only the last chunk."""
+        adapter = _make_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 24
+        adapter.truncate_message = MagicMock(return_value=["chunk one", "chunk two"])
+        adapter.send.side_effect = [
+            SimpleNamespace(success=True, message_id="chunk-1"),
+            SimpleNamespace(success=True, message_id="chunk-2"),
+        ]
+        consumer = GatewayStreamConsumer(
+            adapter=adapter,
+            chat_id="chat",
+            config=StreamConsumerConfig(edit_interval=10.0, buffer_threshold=10_000, cursor=""),
+        )
+        final_text = "A" * 700 + "\n" + "B" * 700
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta(final_text)
+        consumer.on_delta(None)  # type: ignore[arg-type]
+        consumer.finish()
+        await task
+
+        assert consumer.final_response_sent is False
+        assert consumer.final_content_delivered is False
+        assert _streamed_final_matches_response(consumer, final_text) is True
+        assert _stream_delivery_confirmation(consumer, final_text)[0] is True
+
+    @pytest.mark.asyncio
+    async def test_partial_split_delivery_does_not_suppress_normal_final(self):
+        """If an overflow split only partly lands, the gateway must still resend the final."""
+        adapter = _make_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 24
+        adapter.truncate_message = MagicMock(return_value=["chunk one", "chunk two"])
+        adapter.send.side_effect = [
+            SimpleNamespace(success=True, message_id="chunk-1"),
+            SimpleNamespace(success=False, message_id=None),
+        ]
+        consumer = GatewayStreamConsumer(
+            adapter=adapter,
+            chat_id="chat",
+            config=StreamConsumerConfig(edit_interval=10.0, buffer_threshold=10_000, cursor=""),
+        )
+        final_text = "A" * 700 + "\n" + "B" * 700
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta(final_text)
+        consumer.on_delta(None)  # type: ignore[arg-type]
+        consumer.finish()
+        await task
+
+        assert consumer.final_response_sent is False
+        assert consumer.final_content_delivered is False
+        assert _streamed_final_matches_response(consumer, final_text) is False
+        assert _stream_delivery_confirmation(consumer, final_text)[0] is False
+
+    @pytest.mark.asyncio
+    async def test_partial_final_split_keeps_gateway_resend_possible(self):
+        """A final split must not be marked delivered unless every chunk lands."""
+        adapter = _make_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 24
+        adapter.truncate_message = MagicMock(return_value=["chunk one", "chunk two"])
+        adapter.send.side_effect = [
+            SimpleNamespace(success=True, message_id="chunk-1"),
+            SimpleNamespace(success=False, message_id=None),
+        ]
+        consumer = GatewayStreamConsumer(
+            adapter=adapter,
+            chat_id="chat",
+            config=StreamConsumerConfig(edit_interval=10.0, buffer_threshold=10_000, cursor=""),
+        )
+        final_text = "A" * 700 + "\n" + "B" * 700
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta(final_text)
+        consumer.finish()
+        await task
+
+        assert consumer.final_response_sent is False
+        assert consumer.final_content_delivered is False
+        assert _streamed_final_matches_response(consumer, final_text) is False
+        assert _stream_delivery_confirmation(consumer, final_text)[0] is False
+
+    @pytest.mark.asyncio
+    async def test_content_match_fallback_rejects_true_preamble(self):
+        """A real tool preamble must not suppress a different final answer."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter=adapter,
+            chat_id="chat",
+            config=StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=""),
+        )
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("Let me check that.")
+        await asyncio.sleep(0.05)
+        consumer.on_delta(None)  # type: ignore[arg-type]
+        consumer.finish()
+        await task
+
+        assert _streamed_final_matches_response(consumer, "The actual answer is 42.") is False
+        assert _stream_delivery_confirmation(consumer, "The actual answer is 42.")[0] is False
