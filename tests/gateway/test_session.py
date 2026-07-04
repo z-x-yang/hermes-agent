@@ -725,6 +725,90 @@ class TestSessionStoreLookupBySessionId:
         assert store.lookup_by_session_id("") is None
 
 
+class TestSessionStoreOriginRefresh:
+    @pytest.fixture()
+    def store(self, tmp_path):
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            s = SessionStore(sessions_dir=tmp_path, config=config)
+        s._db = None
+        s._loaded = True
+        return s
+
+    def test_existing_session_refreshes_origin_message_id(self, store):
+        first = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chan-1",
+            chat_name="Server / #ask",
+            chat_type="group",
+            user_id="user-1",
+            user_name="Need222Say",
+            message_id="old-msg",
+        )
+        entry = store.get_or_create_session(first)
+
+        latest = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chan-1",
+            chat_name="Server / #ask",
+            chat_type="group",
+            user_id="user-1",
+            user_name="Need222Say",
+            chat_topic="updated topic",
+            message_id="latest-msg",
+        )
+        same_entry = store.get_or_create_session(latest)
+
+        assert same_entry is entry
+        assert same_entry.origin.message_id == "latest-msg"
+        assert same_entry.origin.chat_topic == "updated topic"
+
+    def test_resume_pending_session_refreshes_origin_message_id_from_real_source(self, store):
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chan-1",
+            chat_type="group",
+            user_id="user-1",
+            message_id="old-msg",
+        )
+        entry = store.get_or_create_session(source)
+        store.mark_resume_pending(entry.session_key, reason="restart_interrupted")
+
+        latest = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chan-1",
+            chat_type="group",
+            user_id="user-1",
+            message_id="latest-user-msg",
+        )
+        resumed_entry = store.get_or_create_session(latest)
+
+        assert resumed_entry is entry
+        assert resumed_entry.origin.message_id == "latest-user-msg"
+
+    def test_normal_existing_session_does_not_reuse_stale_message_id_when_latest_has_none(self, store):
+        first = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chan-1",
+            chat_type="group",
+            user_id="user-1",
+            message_id="old-msg",
+        )
+        entry = store.get_or_create_session(first)
+
+        latest_without_anchor = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chan-1",
+            chat_type="group",
+            user_id="user-1",
+            message_id=None,
+        )
+        same_entry = store.get_or_create_session(latest_without_anchor)
+
+        assert same_entry is entry
+        assert same_entry.origin.message_id is None
+
+
 class TestWhatsAppSessionKeyConsistency:
     """Regression: WhatsApp session keys must collapse JID/LID aliases to a
     single stable identity for both DM chat_ids and group participant_ids."""

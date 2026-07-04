@@ -1559,12 +1559,14 @@ class SessionStore:
                             if _fw > 0 and (now - _ref_time).total_seconds() > _fw:
                                 reset_reason = "resume_pending_expired"
                             else:
+                                entry.origin = source
                                 entry.updated_at = now
                                 self._save()
                                 return entry
                     else:
                         reset_reason = self._should_reset(entry, source)
                     if not reset_reason:
+                        entry.origin = source
                         entry.updated_at = now
                         self._save()
                         return entry
