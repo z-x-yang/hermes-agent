@@ -1340,10 +1340,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
         old_model = agent.model
 
-        # Clear the per-config context_length override so the fallback
-        # model's actual context window is resolved instead of inheriting
-        # the stale value from the previous model.  See #22387.
-        agent._config_context_length = None
+        # Preserve any explicit model.context_length override for the temporary
+        # fallback route.  Operators use this as a hard cap for the active
+        # session; clearing it here makes same-model fallbacks such as
+        # openai-codex/gpt-5.5 -> gptcodex/gpt-5.5 fall through to the direct
+        # API catalog value (1.05M) instead of the configured Codex cap (272K).
+        # Deliberate /model switches clear the override in switch_model(); a
+        # transient fallback should not silently widen the live context window.
         agent.model = fb_model
         agent.provider = fb_provider
         agent.base_url = fb_base_url

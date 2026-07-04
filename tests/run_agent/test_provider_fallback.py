@@ -211,6 +211,43 @@ class TestFallbackChainAdvancement:
             assert agent._try_activate_fallback() is True
             assert agent.api_mode == "anthropic_messages"
 
+    def test_fallback_preserves_configured_context_length_cap(self):
+        """Fallback activation must not discard model.context_length overrides.
+
+        The primary OpenAI Codex route may be capped lower than a custom fallback
+        serving the same model id. If the explicit cap is cleared before
+        resolving the fallback context, gpt-5.5 falls through to its 1.05M
+        direct-API catalog value and /status reports the wrong live window.
+        """
+        fbs = [{"provider": "gptcodex", "model": "gpt-5.5"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent.provider = "openai-codex"
+        agent.model = "gpt-5.5"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._config_context_length = 272_000
+
+        def _ctx(_model, **kwargs):
+            cap = kwargs.get("config_context_length")
+            return int(cap) if cap else 1_050_000
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url="https://gptcodex.top/v1/"),
+                    "gpt-5.5",
+                ),
+            ),
+            patch("agent.model_metadata.get_model_context_length", side_effect=_ctx),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.context_compressor.context_length == 272_000
+
 
 # ── Pool-rotation vs fallback gating (#11314) ────────────────────────────
 
