@@ -59,6 +59,10 @@ MUTATING_TOOL_NAMES = frozenset(
     }
 )
 
+_CRONJOB_ACTIONS_REQUIRING_JOB_ID = frozenset(
+    {"update", "pause", "resume", "remove", "run"}
+)
+
 
 @dataclass(frozen=True)
 class ToolCallGuardrailConfig:
@@ -239,7 +243,25 @@ class ToolCallGuardrailController:
         return self._halt_decision
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
-        signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+        args = _coerce_args(args)
+        signature = ToolCallSignature.from_call(tool_name, args)
+        missing = _missing_required_tool_args(tool_name, args)
+        if missing:
+            missing_list = ", ".join(missing)
+            decision = ToolGuardrailDecision(
+                action="block",
+                code="missing_required_tool_args",
+                message=(
+                    f"Blocked {tool_name} before execution: missing required "
+                    f"argument(s): {missing_list}. Provide the required field(s) "
+                    "or choose a tool that matches the request."
+                ),
+                tool_name=tool_name,
+                count=1,
+                signature=signature,
+            )
+            self._halt_decision = decision
+            return decision
         if not self.config.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -425,6 +447,42 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
 
 def _coerce_args(args: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return args if isinstance(args, Mapping) else {}
+
+
+def _has_required_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def _missing_required_tool_args(tool_name: str, args: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return required fields missing from a tool call before dispatch.
+
+    This is a preflight for tools whose empty/missing required arguments are
+    known to be invalid and should never reach side-effecting implementations.
+    It intentionally stays narrow: optional-argument tools and unknown plugin
+    tools are allowed through unless we know their required contract here.
+    """
+    if tool_name == "terminal":
+        if not _has_required_value(args.get("command")):
+            return ("command",)
+        return ()
+
+    if tool_name == "cronjob":
+        action = args.get("action")
+        if not _has_required_value(action):
+            return ("action",)
+        normalized = str(action).strip().lower()
+        if (
+            normalized in _CRONJOB_ACTIONS_REQUIRING_JOB_ID
+            and not _has_required_value(args.get("job_id"))
+        ):
+            return ("job_id",)
+        return ()
+
+    return ()
 
 
 def _result_hash(result: str | None) -> str:

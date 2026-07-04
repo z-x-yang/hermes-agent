@@ -92,8 +92,8 @@ def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_e
     _seed_exact_failures(agent, "web_search", args)
     starts = []
     progress = []
-    agent.tool_start_callback = lambda *a, **k: starts.append((a, k))
-    agent.tool_progress_callback = lambda *a, **k: progress.append((a, k))
+    setattr(agent, "tool_start_callback", lambda *a, **k: starts.append((a, k)))
+    setattr(agent, "tool_progress_callback", lambda *a, **k: progress.append((a, k)))
     tc = _mock_tool_call("web_search", json.dumps(args), "c-soft")
     msg = SimpleNamespace(content="", tool_calls=[tc])
     messages = []
@@ -118,8 +118,8 @@ def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution
     _seed_exact_failures(agent, "web_search", args)
     starts = []
     progress = []
-    agent.tool_start_callback = lambda *a, **k: starts.append((a, k))
-    agent.tool_progress_callback = lambda *a, **k: progress.append((a, k))
+    setattr(agent, "tool_start_callback", lambda *a, **k: starts.append((a, k)))
+    setattr(agent, "tool_progress_callback", lambda *a, **k: progress.append((a, k)))
     tc = _mock_tool_call("web_search", json.dumps(args), "c-block")
     msg = SimpleNamespace(content="", tool_calls=[tc])
     messages = []
@@ -238,6 +238,49 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
 
 
+def test_default_sequential_path_blocks_empty_terminal_args_before_execution():
+    agent = _make_agent("terminal")
+    starts = []
+    progress = []
+    setattr(agent, "tool_start_callback", lambda *a, **k: starts.append((a, k)))
+    setattr(agent, "tool_progress_callback", lambda *a, **k: progress.append((a, k)))
+    tc = _mock_tool_call("terminal", "{}", "c-empty-terminal")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    mock_hfc.assert_not_called()
+    assert starts == []
+    assert progress == []
+    assert len(messages) == 1
+    assert messages[0]["role"] == "tool"
+    assert messages[0]["tool_call_id"] == "c-empty-terminal"
+    assert "missing_required_tool_args" in messages[0]["content"]
+    assert "command" in messages[0]["content"]
+    assert "Invalid command: expected string" not in messages[0]["content"]
+    assert agent._tool_guardrail_halt_decision is not None
+    assert agent._tool_guardrail_halt_decision.code == "missing_required_tool_args"
+
+
+def test_default_sequential_path_blocks_empty_cronjob_args_before_execution():
+    agent = _make_agent("cronjob")
+    tc = _mock_tool_call("cronjob", "{}", "c-empty-cron")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    mock_hfc.assert_not_called()
+    assert len(messages) == 1
+    assert messages[0]["tool_call_id"] == "c-empty-cron"
+    assert "missing_required_tool_args" in messages[0]["content"]
+    assert "action" in messages[0]["content"]
+    assert "job_id is required for action" not in messages[0]["content"]
+
+
 def test_default_run_conversation_warns_without_guardrail_halt():
     agent = _make_agent("web_search", max_iterations=10)
     same_args = {"query": "same"}
@@ -353,3 +396,43 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+def test_gateway_finish_managed_guardrail_halt_callback_does_not_receive_none_boundary():
+    """Gateway stream consumers get finish() separately; don't send a trailing
+    ``None`` after a synthesized guardrail final response or it is interpreted
+    as a real tool boundary and the gateway may duplicate the final send.
+    """
+    agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
+    same_args = {"query": "same"}
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", json.dumps(same_args), f"c{i}")],
+        )
+        for i in range(1, 10)
+    ]
+    assert agent.client is not None
+    agent.client.chat.completions.create.side_effect = responses
+
+    deltas: list = []
+
+    def gateway_callback(delta):
+        deltas.append(delta)
+
+    setattr(gateway_callback, "_hermes_finish_controls_stream_done", True)
+    setattr(agent, "stream_delta_callback", gateway_callback)
+    setattr(agent, "_disable_streaming", True)
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("search repeatedly")
+
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    final_index = deltas.index(result["final_response"])
+    assert None not in deltas[final_index + 1:]

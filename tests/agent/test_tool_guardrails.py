@@ -256,3 +256,45 @@ def test_reset_for_turn_clears_bounded_guardrail_state():
 
     assert controller.before_call("web_search", {"query": "same"}).action == "allow"
     assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "allow"
+
+
+def test_empty_terminal_args_are_blocked_before_tool_execution_by_default():
+    controller = ToolCallGuardrailController()
+
+    decision = controller.before_call("terminal", {})
+
+    assert decision.action == "block"
+    assert decision.code == "missing_required_tool_args"
+    assert decision.tool_name == "terminal"
+    assert decision.count == 1
+    assert "command" in decision.message
+    assert "missing required" in decision.message.lower()
+
+
+def test_empty_cronjob_args_are_blocked_before_tool_execution_by_default():
+    controller = ToolCallGuardrailController()
+
+    decision = controller.before_call("cronjob", {})
+
+    assert decision.action == "block"
+    assert decision.code == "missing_required_tool_args"
+    assert decision.tool_name == "cronjob"
+    assert decision.count == 1
+    assert "action" in decision.message
+
+
+def test_cronjob_actions_that_target_existing_jobs_require_job_id():
+    controller = ToolCallGuardrailController()
+
+    decision = controller.before_call("cronjob", {"action": "pause"})
+
+    assert decision.action == "block"
+    assert decision.code == "missing_required_tool_args"
+    assert "job_id" in decision.message
+
+
+def test_required_args_preflight_allows_valid_minimal_calls():
+    controller = ToolCallGuardrailController()
+
+    assert controller.before_call("terminal", {"command": "pwd"}).action == "allow"
+    assert controller.before_call("cronjob", {"action": "list"}).action == "allow"

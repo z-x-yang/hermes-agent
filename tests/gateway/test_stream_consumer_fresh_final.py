@@ -663,3 +663,60 @@ class TestTelegramAdapterDeleteMessage:
         import inspect
         sig = inspect.signature(BasePlatformAdapter.delete_message)
         assert list(sig.parameters)[:3] == ["self", "chat_id", "message_id"]
+
+
+class TestFinalAndSegmentBoundaryContracts:
+    """Contracts around end-of-stream and tool-boundary delivery flags."""
+
+    @staticmethod
+    def _sent_texts(adapter) -> list[str]:
+        return [c.kwargs.get("content", "") for c in adapter.send.call_args_list]
+
+    @pytest.mark.asyncio
+    async def test_split_final_on_done_suppresses_normal_send(self):
+        adapter = _make_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 24
+        chunks = ["(1/2) " + "A" * 250, "(2/2) " + "B" * 250]
+        adapter.truncate_message = MagicMock(return_value=chunks)
+        adapter.send.side_effect = [
+            SimpleNamespace(success=True, message_id="chunk-1"),
+            SimpleNamespace(success=True, message_id="chunk-2"),
+        ]
+        consumer = GatewayStreamConsumer(
+            adapter=adapter,
+            chat_id="chat",
+            config=StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=""),
+        )
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("A" * 700 + "\n" + "B" * 700)
+        consumer.finish()
+        await task
+
+        assert consumer.final_response_sent is True
+        assert consumer.final_content_delivered is True
+        assert self._sent_texts(adapter) == chunks
+
+    @pytest.mark.asyncio
+    async def test_real_segment_break_followed_by_finish_is_not_final_delivery(self):
+        """A true tool-boundary None must not suppress the later normal final.
+
+        If a model streams a preamble and then calls a tool, the boundary can
+        race with turn completion/error.  That preamble is not the final answer,
+        even if ``finish()`` arrives before the consumer drains the boundary.
+        """
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter=adapter,
+            chat_id="chat",
+            config=StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=""),
+        )
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("Let me check that.")
+        consumer.on_delta(None)  # type: ignore[arg-type]  # real tool boundary
+        consumer.finish()
+        await task
+
+        assert consumer.final_response_sent is False
+        assert consumer.final_content_delivered is False

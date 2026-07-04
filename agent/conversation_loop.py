@@ -4578,8 +4578,10 @@ def run_conversation(
                         agent._safe_print(f"\n{final_response}\n")
                         if agent.stream_delta_callback:
                             try:
-                                agent.stream_delta_callback(final_response)
-                                agent.stream_delta_callback(None)
+                                stream_cb = agent.stream_delta_callback
+                                stream_cb(final_response)
+                                if not getattr(stream_cb, "_hermes_finish_controls_stream_done", False):
+                                    stream_cb(None)
                             except Exception:
                                 pass
                     break
