@@ -100,6 +100,110 @@ _GATEWAY_RAW_TEXT_PLATFORMS = frozenset(
 )
 
 
+def _streamed_final_matches_response(stream_consumer: Any, final_response: str) -> bool:
+    """Return True when streamed visible text exactly equals final response.
+
+    This is a narrow duplicate-send fallback for cases where a stale segment
+    boundary cleared final-delivery flags after the final text had already
+    reached the chat.  It intentionally requires exact normalized equality so
+    real tool-call preambles never suppress a different final answer.
+    """
+    if stream_consumer is None or not final_response:
+        return False
+    delivered = getattr(stream_consumer, "last_delivered_text", "") or ""
+    if not isinstance(delivered, str) or not delivered.strip():
+        return False
+    try:
+        from gateway.stream_consumer import GatewayStreamConsumer
+        cleaner = GatewayStreamConsumer._clean_for_display
+    except Exception:
+        cleaner = lambda text: text or ""
+    return cleaner(delivered).strip() == cleaner(final_response).strip()
+
+
+def _stream_delivery_confirmation(
+    stream_consumer: Any,
+    final_response: str,
+    *,
+    response_previewed: bool = False,
+    response_transformed: bool = False,
+) -> tuple[bool, bool, bool, bool, bool]:
+    """Return final-delivery confirmation plus its component flags.
+
+    The tuple is ``(confirmed, streamed, previewed, content_delivered,
+    content_matches_final)``.  Plugin-transformed responses deliberately cannot
+    be confirmed by prior streamed text because the user still needs the
+    transformed final version.
+    """
+    streamed = bool(
+        stream_consumer and getattr(stream_consumer, "final_response_sent", False)
+    )
+    previewed = bool(response_previewed)
+    content_delivered = bool(
+        stream_consumer and getattr(stream_consumer, "final_content_delivered", False)
+    )
+    is_empty_sentinel = not final_response or final_response == "(empty)"
+    content_matches_final = bool(
+        not response_transformed
+        and not is_empty_sentinel
+        and stream_consumer
+        and _streamed_final_matches_response(stream_consumer, final_response)
+    )
+    confirmed = bool(
+        not response_transformed
+        and not is_empty_sentinel
+        and (streamed or previewed or content_delivered or content_matches_final)
+    )
+    return confirmed, streamed, previewed, content_delivered, content_matches_final
+
+
+def _stream_consumer_reply_options(platform: Any, adapter: Any) -> dict[str, bool]:
+    """Return reply/fresh-final flags for the stream consumer.
+
+    Discord ``reply_to_mode=final`` means previews must stay quiet, but the
+    completed streamed answer still has to be a fresh reply so Discord can add
+    the mention; edits cannot add reply metadata after the fact.
+    """
+    reply_to_mode = (
+        getattr(adapter, "_reply_to_mode", None)
+        or getattr(getattr(adapter, "config", None), "reply_to_mode", None)
+        or "first"
+    )
+    final_reply_only = bool(
+        platform == Platform.DISCORD
+        and str(reply_to_mode).lower() == "final"
+    )
+    return {
+        "reply_to_initial": not final_reply_only,
+        "force_fresh_final": final_reply_only,
+        "fresh_final_reply_to_initial": final_reply_only,
+    }
+
+
+def _stream_consumer_buffers_answer(
+    platform: Any, adapter: Any, *, base_buffer_only: bool
+) -> bool:
+    """Whether the stream consumer should buffer the answer instead of
+    streaming it as deletable previews.
+
+    Discord ``reply_to_mode=final`` must deliver the turn-final answer as a
+    *fresh* reply so it can carry the @mention — an edit cannot add a reply
+    reference after the fact.  If the answer is streamed as previews first, the
+    fresh-final re-send has to delete those previews, and any delete Discord
+    rate-limits or drops survives as a duplicated last block (more likely the
+    more the answer splits, since each block adds another send + delete to the
+    burst).  Buffering routes the answer through the no-preview send path,
+    which pings exactly once on the first block and never needs cleanup.
+
+    ``base_buffer_only`` preserves a buffer decision already made for other
+    reasons (e.g. Matrix suppresses the streaming cursor by buffering).
+    """
+    return bool(
+        base_buffer_only
+        or _stream_consumer_reply_options(platform, adapter)["force_fresh_final"]
+    )
+
+
 def _gateway_surface_passes_raw_text(platform: Any) -> bool:
     """True only for programmatic/local surfaces that must keep raw text."""
     return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
@@ -1707,6 +1811,84 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _hard_exit_process(code: int, reason: str) -> None:
+    """Exit the gateway process without giving asyncio.run a chance to hang.
+
+    Service-managed /restart reaches this only after GatewayRunner.stop() has
+    already drained/interrupted work, disconnected adapters, closed SessionDB,
+    and released the runtime lock. A normal ``raise SystemExit`` from inside the
+    asyncio runner can still block while Python cancels stray background tasks,
+    which leaves launchd/systemd unable to relaunch the gateway.
+    """
+    try:
+        logger.info("Hard-exiting gateway with code %s (%s)", code, reason)
+    except Exception:
+        pass
+    os._exit(int(code))
+
+
+def _coerce_gateway_lifecycle_home_channel(
+    platform: Platform,
+    platform_cfg: Optional[PlatformConfig],
+    fallback_home: Optional[HomeChannel],
+) -> Optional[HomeChannel]:
+    """Return the lifecycle-notification target for a platform.
+
+    By default gateway restart/shutdown pings go to the platform home channel.
+    Operators can route only those lifecycle pings elsewhere without changing
+    normal cron / send_message home-channel delivery by setting one of these in
+    the platform's ``extra`` block:
+
+    - ``gateway_restart_notification_channel``: scalar chat id or a dict with
+      ``chat_id``/``channel_id``/``id``, optional ``name`` and ``thread_id``.
+    - ``gateway_restart_notification_chat_id`` plus optional
+      ``gateway_restart_notification_thread_id`` and
+      ``gateway_restart_notification_channel_name``.
+    """
+    if platform_cfg is None:
+        return fallback_home
+
+    extra = platform_cfg.extra if isinstance(platform_cfg.extra, dict) else {}
+    raw = extra.get("gateway_restart_notification_channel")
+    chat_id: Optional[Any] = None
+    name: Optional[Any] = None
+    thread_id: Optional[Any] = None
+
+    if isinstance(raw, dict):
+        chat_id = (
+            raw.get("chat_id")
+            or raw.get("channel_id")
+            or raw.get("home_chat_id")
+            or raw.get("id")
+        )
+        name = raw.get("name") or raw.get("channel_name")
+        thread_id = raw.get("thread_id") or raw.get("topic_id")
+    elif raw is not None:
+        chat_id = raw
+
+    chat_id = extra.get("gateway_restart_notification_chat_id") or chat_id
+    thread_id = extra.get("gateway_restart_notification_thread_id") or thread_id
+    name = extra.get("gateway_restart_notification_channel_name") or name
+
+    if chat_id is None or str(chat_id).strip() == "":
+        return fallback_home
+
+    if name is None and fallback_home is not None:
+        name = fallback_home.name
+
+    coerced_thread_id = (
+        str(thread_id)
+        if thread_id is not None and str(thread_id).strip()
+        else None
+    )
+    return HomeChannel(
+        platform=platform,
+        chat_id=str(chat_id),
+        name=str(name or ""),
+        thread_id=coerced_thread_id,
+    )
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -1747,6 +1929,7 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
             continue
         return f"{platform.value}: open policy without allow-all opt-in"
     return None
+
 
 
 # Sentinel placed into _running_agents immediately when a session starts
@@ -2565,6 +2748,75 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     if agent_result.get("completed") is False:
         return False
     return True
+
+
+def _compression_exhaustion_auto_reset_enabled(config: Any) -> bool:
+    """Return whether compression exhaustion should auto-reset the session."""
+    return bool(getattr(config, "auto_reset_on_compression_exhaustion", True))
+
+
+def _compression_exhaustion_manual_recovery_notice() -> str:
+    """User-facing notice when compression exhaustion is left for manual recovery."""
+    return (
+        "\n\n⚠️ Session paused — the conversation exceeded the maximum context "
+        "size and could not be compressed further. I did not start a fresh "
+        "session automatically. Use /compress, /compress here N, /resume, or "
+        "/new when you decide how to recover."
+    )
+
+
+def _apply_compression_exhaustion_policy(
+    runner: Any,
+    *,
+    agent_result: dict,
+    session_entry: Any,
+    session_key: str,
+    source: Any,
+    response: str,
+) -> tuple[Any, str]:
+    """Apply gateway recovery policy after the agent exhausts compression."""
+    if not (agent_result.get("compression_exhausted") and session_entry and session_key):
+        return session_entry, response
+
+    if not _compression_exhaustion_auto_reset_enabled(getattr(runner, "config", None)):
+        logger.info(
+            "Compression exhausted in session %s; auto-reset disabled by config.",
+            getattr(session_entry, "session_id", None),
+        )
+        return session_entry, (response or "") + _compression_exhaustion_manual_recovery_notice()
+
+    logger.info(
+        "Auto-resetting session %s after compression exhaustion.",
+        getattr(session_entry, "session_id", None),
+    )
+    new_entry = runner.session_store.reset_session(session_key)
+    runner._evict_cached_agent(session_key)
+    runner._session_model_overrides.pop(session_key, None)
+    runner._set_session_reasoning_override(session_key, None)
+    if hasattr(runner, "_pending_model_notes"):
+        runner._pending_model_notes.pop(session_key, None)
+    if new_entry is not None:
+        # Drop the stale reference to the bloated compressed child and
+        # re-point the Telegram topic binding at the fresh session.
+        # Compression rotated session_entry.session_id to the oversized
+        # compressed child earlier this turn (the agent-result sync), and
+        # that _sync also rewrote the (chat_id, thread_id) -> bloated-child
+        # binding. reset_session swaps in a clean, parentless session, but
+        # without re-syncing the binding the next inbound message in this
+        # topic gets switch_session'd back onto the bloated child by the
+        # binding-heal walk, reloads the oversized transcript, and re-triggers
+        # compression exhaustion forever (#35809 — regression of the
+        # #9893/#10063 auto-reset). No-op on non-topic lanes.
+        session_entry = new_entry
+        runner._sync_telegram_topic_binding(
+            source, session_entry, reason="compression-exhausted-reset",
+        )
+    response = (response or "") + (
+        "\n\n🔄 Session auto-reset — the conversation exceeded the "
+        "maximum context size and could not be compressed further. "
+        "Your next message will start a fresh session."
+    )
+    return session_entry, response
 
 
 def _preserve_queued_followup_history_offset(
@@ -5488,9 +5740,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Deduplicate only identical delivery targets. Thread/topic-aware
             # platforms can share a parent chat while still routing to distinct
             # destinations via metadata.
-            dedup_key = (platform_str, chat_id, str(thread_id) if thread_id else None)
-            if dedup_key in notified:
-                continue
+            source_dedup_key = (platform_str, chat_id, str(thread_id) if thread_id else None)
 
             try:
                 platform = Platform(platform_str)
@@ -5506,27 +5756,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     continue
 
-                reply_to_message_id = getattr(source, "message_id", None) if source is not None else None
-                if reply_to_message_id is None and restart_source is not None:
-                    try:
-                        restart_platform = restart_source.platform.value
-                        restart_chat_id = str(restart_source.chat_id)
-                        restart_thread_id = str(restart_source.thread_id) if restart_source.thread_id else None
-                        if (restart_platform, restart_chat_id, restart_thread_id) == dedup_key:
-                            reply_to_message_id = getattr(restart_source, "message_id", None)
-                    except Exception:
-                        pass
+                lifecycle_home = _coerce_gateway_lifecycle_home_channel(
+                    platform,
+                    platform_cfg,
+                    None,
+                )
+                if lifecycle_home is not None and lifecycle_home.chat_id:
+                    chat_id = str(lifecycle_home.chat_id)
+                    thread_id = lifecycle_home.thread_id
+                    chat_type = None
+                    reply_to_message_id = None
+                    log_target = "lifecycle target"
+                else:
+                    chat_type = getattr(source, "chat_type", None) if source is not None else None
+                    reply_to_message_id = getattr(source, "message_id", None) if source is not None else None
+                    if reply_to_message_id is None and restart_source is not None:
+                        try:
+                            restart_platform = restart_source.platform.value
+                            restart_chat_id = str(restart_source.chat_id)
+                            restart_thread_id = str(restart_source.thread_id) if restart_source.thread_id else None
+                            if (restart_platform, restart_chat_id, restart_thread_id) == source_dedup_key:
+                                reply_to_message_id = getattr(restart_source, "message_id", None)
+                        except Exception:
+                            pass
+                    log_target = "active chat"
+
+                dedup_key = (platform_str, chat_id, str(thread_id) if thread_id else None)
+                if dedup_key in notified:
+                    continue
 
                 metadata = self._thread_metadata_for_target(
                     platform,
                     chat_id,
                     thread_id,
-                    chat_type=getattr(source, "chat_type", None) if source is not None else None,
+                    chat_type=chat_type,
                     reply_to_message_id=reply_to_message_id,
                     adapter=adapter,
                 )
 
-                result = await adapter.send(chat_id, msg, metadata=metadata)
+                result = await adapter.send(
+                    chat_id,
+                    msg,
+                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to %s:%s: %s",
@@ -5538,8 +5810,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 notified.add(dedup_key)
                 logger.info(
-                    "Sent shutdown notification to active chat %s:%s",
-                    platform_str, chat_id,
+                    "Sent shutdown notification to %s %s:%s",
+                    log_target,
+                    platform_str,
+                    chat_id,
                 )
             except Exception as e:
                 logger.debug(
@@ -5547,9 +5821,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform_str, chat_id, e,
                 )
 
-        if self._restart_requested and restart_source is not None:
-            logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
-            return
+        skip_fallback_home = self._restart_requested and restart_source is not None
 
         # Suppress ONLY the home-channel broadcast when the drain that is ending
         # in this shutdown asked us to be quiet (e.g. a NAS auto-update image
@@ -5583,11 +5855,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ``RuntimeError: dictionary changed size during iteration`` —
         # observed in a user report during gateway shutdown.
         for platform, adapter in list(self.adapters.items()):
-            home = self.config.get_home_channel(platform)
+            platform_cfg = self.config.platforms.get(platform)
+            home = _coerce_gateway_lifecycle_home_channel(
+                platform,
+                platform_cfg,
+                None if skip_fallback_home else self.config.get_home_channel(platform),
+            )
             if not home or not home.chat_id:
                 continue
 
-            platform_cfg = self.config.platforms.get(platform)
             if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
                 logger.info(
                     "Shutdown notification suppressed for home channel: %s has gateway_restart_notification=false",
@@ -5606,6 +5882,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     home.thread_id,
                     adapter=adapter,
                 )
+                metadata = _non_conversational_metadata(metadata, platform=platform)
                 if metadata:
                     result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
                 else:
@@ -6328,6 +6605,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if marker is not None and (now - marker).total_seconds() > window:
                 continue
 
+            # Startup synthetic resume is a one-shot per resume marker.  If the
+            # gateway is killed while this empty internal turn is in-flight,
+            # resume_pending intentionally remains set so the next *real* user
+            # message can continue the transcript — but startup must not
+            # synthesize the same empty turn again forever.  The attempt marker
+            # is reset whenever mark_resume_pending() writes a new marker and
+            # cleared when resume_pending clears after a successful turn.
+            attempted_at = getattr(entry, "last_startup_auto_resume_at", None)
+            if attempted_at is not None:
+                if marker is None or attempted_at >= marker:
+                    continue
+
             # Already being resumed (e.g. scheduled at startup and still
             # in-flight) — don't synthesize a second continuation turn.
             if entry.session_key in self._running_agents:
@@ -6364,6 +6653,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
+            # One-shot claim: record the startup auto-resume attempt BEFORE
+            # spawning the task so a crash mid-resume cannot re-synthesize
+            # the same empty continuation turn on every restart.
+            try:
+                if not self.session_store.mark_startup_auto_resume_scheduled(
+                    entry.session_key
+                ):
+                    continue
+            except Exception as exc:
+                logger.warning(
+                    "Skipping auto-resume for %s: failed to record attempt: %s",
+                    entry.session_key,
+                    exc,
+                )
+                continue
+
             # Claim the session slot *before* spawning the task so that an
             # inbound message arriving between task creation and the task's
             # first await (where _process_message_background sets the real
@@ -6380,6 +6685,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 text="",
                 message_type=MessageType.TEXT,
                 source=source,
+                # There is no new inbound platform message for this synthetic
+                # turn, but final-only reply semantics (notably Discord) still
+                # need the original trigger id from the persisted origin so the
+                # resumed final answer can notify the user instead of becoming
+                # an unanchored plain send.
+                message_id=getattr(source, "message_id", None),
                 internal=True,
             )
             task = asyncio.create_task(
@@ -7020,13 +7331,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # of a restart cycle (see _is_stale_restart_redelivery).
         if _restart_notification_pending() or planned_restart_notification_pending:
             self._booted_from_restart = True
-        await self._send_restart_notification()
+        restart_notification_target = await self._send_restart_notification()
+        if restart_notification_target is not None:
+            await self._send_home_channel_startup_notifications(
+                skip_targets={restart_notification_target},
+                require_configured_target=True,
+            )
 
         # Broadcast a lightweight "gateway is back" message to configured home
         # channels only for non-chat planned restarts (terminal/SIGUSR1/service
         # paths). Chat-originated /restart already has a precise reply target
-        # in .restart_notify.json, so keep that lifecycle in the originating
-        # chat/topic instead of also leaking it to the configured home channel.
+        # in .restart_notify.json, so the fallback home lifecycle stays in the
+        # originating chat/topic. A separately configured lifecycle target still
+        # receives the ops notification above.
         if planned_restart_notification_pending:
             try:
                 await self._send_home_channel_startup_notifications(
@@ -11369,43 +11686,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
             # When compression is exhausted, the session is permanently too
-            # large to process.  Auto-reset it so the next message starts
-            # fresh instead of replaying the same oversized context in an
-            # infinite fail loop.  (#9893)
-            if agent_result.get("compression_exhausted") and session_entry and session_key:
-                logger.info(
-                    "Auto-resetting session %s after compression exhaustion.",
-                    session_entry.session_id,
-                )
-                new_entry = self.session_store.reset_session(session_key)
-                self._evict_cached_agent(session_key)
-                self._session_model_overrides.pop(session_key, None)
-                self._set_session_reasoning_override(session_key, None)
-                if hasattr(self, "_pending_model_notes"):
-                    self._pending_model_notes.pop(session_key, None)
-                if new_entry is not None:
-                    # Drop the stale reference to the bloated compressed child and
-                    # re-point the Telegram topic binding at the fresh session.
-                    # Compression rotated session_entry.session_id to the oversized
-                    # compressed child earlier this turn (the agent-result sync
-                    # above), and that _sync also rewrote the (chat_id, thread_id)
-                    # -> bloated-child binding. reset_session swaps in a clean,
-                    # parentless session, but without re-syncing the binding the
-                    # next inbound message in this topic gets switch_session'd back
-                    # onto the bloated child by the binding-heal walk, reloads the
-                    # oversized transcript, and re-triggers compression exhaustion
-                    # forever (#35809 — regression of the #9893/#10063 auto-reset).
-                    # No-op on non-topic lanes.
-                    session_entry = new_entry
-                    await asyncio.to_thread(
-                        self._sync_telegram_topic_binding,
-                        source, session_entry, reason="compression-exhausted-reset",
-                    )
-                response = (response or "") + (
-                    "\n\n🔄 Session auto-reset — the conversation exceeded the "
-                    "maximum context size and could not be compressed further. "
-                    "Your next message will start a fresh session."
-                )
+            # large to process.  The recovery policy decides whether to keep
+            # the historical automatic reset or stop and let the user choose
+            # /compress, /resume, or /new explicitly.
+            session_entry, response = _apply_compression_exhaustion_policy(
+                self,
+                agent_result=agent_result,
+                session_entry=session_entry,
+                session_key=session_key,
+                source=source,
+                response=response,
+            )
 
             ts = time.time()  # Unix epoch float — consistent with DB storage
             
@@ -13194,6 +13485,107 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         future.add_done_callback(_log_rename_failure)
 
+    def _sanitize_discord_thread_title(self, title: str) -> str:
+        """Return a Discord thread-safe name from a generated session title."""
+        cleaned = re.sub(r"\s+", " ", str(title or "")).strip()
+        if not cleaned:
+            return "Hermes Chat"
+        # Discord channel/thread names are capped at 100 chars. Leave room for
+        # an ASCII ellipsis to avoid repeated churn when a long title is reused.
+        if len(cleaned) > 100:
+            cleaned = cleaned[:97].rstrip() + "..."
+        return cleaned
+
+    async def _rename_discord_thread_for_session_title(
+        self,
+        source: SessionSource,
+        session_id: str,
+        title: str,
+    ) -> None:
+        """Best-effort rename of a Discord thread when Hermes titles a session."""
+        if source.platform != Platform.DISCORD or not source.thread_id:
+            return
+
+        adapter = self.adapters.get(source.platform) if getattr(self, "adapters", None) else None
+        rename_thread = getattr(adapter, "rename_thread", None) if adapter is not None else None
+        if not callable(rename_thread):
+            return
+
+        thread_name = self._sanitize_discord_thread_title(title)
+        try:
+            result = rename_thread(
+                thread_id=str(source.thread_id),
+                name=thread_name,
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            if result is not None and getattr(result, "success", True) is False:
+                logger.debug(
+                    "Failed to rename Discord thread for session title: %s",
+                    getattr(result, "error", None),
+                )
+        except Exception:
+            logger.debug("Failed to rename Discord thread for auto-generated title", exc_info=True)
+
+    def _schedule_discord_thread_title_rename(
+        self,
+        source: SessionSource,
+        session_id: str,
+        title: str,
+    ) -> None:
+        """Schedule a Discord thread rename from the auto-title background thread.
+
+        Renames a thread from a generated session title AT MOST ONCE per thread.
+        Auto-titling is keyed to the session, but a long-lived thread routinely
+        gets fresh, title-less sessions (a gateway restart ends the prior
+        session with ``agent_close``; the next message mints a new root session
+        with no parent and no title). The per-session title guard can't see that
+        the *thread* was already named days ago, so without this check every new
+        session would re-title and rename an established thread mid-conversation
+        — the behaviour the user hit. The adapter persists the "already
+        auto-titled" set to disk so it survives restarts and session rotation.
+        """
+        if not title or source.platform != Platform.DISCORD or not source.thread_id:
+            return
+        thread_id = str(source.thread_id)
+        adapter = self.adapters.get(source.platform) if getattr(self, "adapters", None) else None
+        if adapter is not None and hasattr(adapter, "has_auto_titled_thread"):
+            try:
+                if adapter.has_auto_titled_thread(thread_id):
+                    return
+                # Claim the one-shot synchronously (before the fire-and-forget
+                # rename) so two turns racing to title the same thread can't both
+                # fire a rename.
+                adapter.mark_auto_titled_thread(thread_id)
+            except Exception:
+                logger.debug("Discord auto-title per-thread guard failed", exc_info=True)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = getattr(self, "_gateway_loop", None)
+        if loop is None or loop.is_closed():
+            return
+        try:
+            copied_source = dataclasses.replace(source)
+        except Exception:
+            copied_source = source
+        future = safe_schedule_threadsafe(
+            self._rename_discord_thread_for_session_title(copied_source, session_id, title),
+            loop,
+            logger=logger,
+            log_message="Discord thread title rename failed to schedule",
+        )
+        if future is None:
+            return
+
+        def _log_rename_failure(fut) -> None:
+            try:
+                fut.result()
+            except Exception:
+                logger.debug("Discord thread title rename failed", exc_info=True)
+
+        future.add_done_callback(_log_rename_failure)
+
     _TELEGRAM_CAPABILITY_HINT_COOLDOWN_S = 300.0
 
     def _should_send_telegram_capability_hint(self, source: SessionSource) -> bool:
@@ -14221,23 +14613,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         *,
         skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
+        require_configured_target: bool = False,
     ) -> set[tuple[str, str, Optional[str]]]:
         """Notify configured home channels that the gateway is back online.
 
         The notification is best-effort and sent once per connected platform
         home channel. ``skip_targets`` lets startup avoid duplicate messages
         when a more specific restart notification is queued for the same chat.
+        When ``require_configured_target`` is true, only an explicitly configured
+        lifecycle target is used; fallback home channels are skipped.
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
         message = "♻️ Gateway online — Hermes is back and ready."
 
         for platform, adapter in self.adapters.items():
-            home = self.config.get_home_channel(platform)
+            platform_cfg = self.config.platforms.get(platform)
+            home = _coerce_gateway_lifecycle_home_channel(
+                platform,
+                platform_cfg,
+                None if require_configured_target else self.config.get_home_channel(platform),
+            )
             if not home or not home.chat_id:
                 continue
 
-            platform_cfg = self.config.platforms.get(platform)
             if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
                 logger.info(
                     "Home-channel startup notification suppressed: %s has gateway_restart_notification=false",
@@ -14326,7 +14725,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=getattr(context.source, "profile", "") or "",
+            profile=getattr(context.source, "profile", None) or "",
+            guild_id=str(context.source.guild_id) if getattr(context.source, "guild_id", None) else "",
+            parent_chat_id=str(context.source.parent_chat_id) if getattr(context.source, "parent_chat_id", None) else "",
             async_delivery=_async_delivery,
         )
 
@@ -16049,6 +16450,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if source.platform == Platform.TELEGRAM
                         else 0.0
                     )
+                    _reply_options = _stream_consumer_reply_options(
+                        source.platform, _adapter,
+                    )
+                    # Final-only Discord replies buffer the answer so it is only
+                    # ever sent once (as the fresh reply that carries the
+                    # @mention) — no deletable previews, no duplicate last block.
+                    _buffer_only = _stream_consumer_buffers_answer(
+                        source.platform, _adapter, base_buffer_only=_buffer_only,
+                    )
                     _consumer_cfg = StreamConsumerConfig(
                         edit_interval=_scfg.edit_interval,
                         buffer_threshold=_scfg.buffer_threshold,
@@ -16057,6 +16467,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         fresh_final_after_seconds=_fresh_final_secs,
                         transport=_scfg.transport or "edit",
                         chat_type=getattr(source, "chat_type", "") or "",
+                        **_reply_options,
                     )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
@@ -17341,6 +17752,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             if source.platform == Platform.TELEGRAM
                             else 0.0
                         )
+                        _discord_final_reply_only = False
+                        if source.platform == Platform.DISCORD:
+                            try:
+                                _discord_adapter = self.adapters.get(Platform.DISCORD)
+                                _discord_final_reply_only = (
+                                    getattr(_discord_adapter, "_reply_to_mode", "") == "final"
+                                )
+                            except Exception:
+                                _discord_final_reply_only = False
+                        # Final-only Discord replies buffer the answer so it is
+                        # only ever sent once (as the fresh reply that carries
+                        # the @mention) — no deletable previews, no duplicate
+                        # last block.
+                        _buffer_only = _buffer_only or _discord_final_reply_only
                         _consumer_cfg = StreamConsumerConfig(
                             edit_interval=_scfg.edit_interval,
                             buffer_threshold=_scfg.buffer_threshold,
@@ -17349,6 +17774,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             fresh_final_after_seconds=_fresh_final_secs,
                             transport=_scfg.transport or "edit",
                             chat_type=getattr(source, "chat_type", "") or "",
+                            reply_to_initial=not _discord_final_reply_only,
+                            force_fresh_final=_discord_final_reply_only,
+                            fresh_final_reply_to_initial=_discord_final_reply_only,
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
@@ -17368,6 +17796,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             def _stream_delta_cb(text: str) -> None:
                                 if _run_still_current():
                                     _stream_consumer.on_delta(text)
+                            # The gateway consumer receives the real end-of-stream
+                            # signal via _stream_consumer.finish() after the agent
+                            # returns.  A trailing callback(None) after synthesized
+                            # final text (guardrail halt) would be interpreted as a
+                            # tool boundary and clear final-delivery flags, causing
+                            # duplicate normal final sends on Discord.
+                            setattr(
+                                _stream_delta_cb,
+                                "_hermes_finish_controls_stream_done",
+                                True,
+                            )
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
@@ -17685,6 +18124,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.memory_notifications = str(_mem_notif).lower() if _mem_notif else "on"
 
             # ------------------------------------------------------------------
+            # Ordering barrier for direct mid-turn platform sends.
+            #
+            # Clarify cards and approval prompts are scheduled DIRECTLY onto the
+            # event loop from the agent's worker thread.  The assistant text of
+            # the same turn is handed to the stream consumer, which — in
+            # reply_to_mode=final (buffer_only) — holds it buffered until its
+            # next poll tick.  Without a barrier the directly-scheduled card
+            # wins that race and posts ABOVE the text.  This blocks the worker
+            # thread until the consumer has flushed the buffered text, so the
+            # card lands below it.  No-op / bounded when no consumer is active.
+            # ------------------------------------------------------------------
+            def _flush_stream_before_direct_send(timeout: float = 2.0) -> None:
+                sc = stream_consumer_holder[0] if stream_consumer_holder else None
+                if sc is None or not hasattr(sc, "flush_barrier"):
+                    return
+                try:
+                    ev = sc.flush_barrier()
+                except Exception:
+                    logger.debug("flush_barrier failed to queue", exc_info=True)
+                    return
+                if not ev.wait(timeout):
+                    logger.debug(
+                        "flush_barrier timed out after %.1fs — sending anyway", timeout
+                    )
+
+            # ------------------------------------------------------------------
             # Clarify callback: present a clarify prompt and block on a response.
             #
             # Runs on the agent's worker thread (see clarify_tool's synchronous
@@ -17718,6 +18183,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _status_adapter.pause_typing_for_chat(_status_chat_id)
                 except Exception:
                     pass
+
+                # Let the buffered assistant text of this turn land first so
+                # the clarify card appears below it, not above it.
+                _flush_stream_before_direct_send()
 
                 send_ok = False
                 fut = safe_schedule_threadsafe(
@@ -17753,7 +18222,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timeout = _clarify_mod.get_clarify_timeout()
                 response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
                 if response is None or response == "":
-                    # Timeout or session-boundary cancellation
+                    # Timeout or session-boundary cancellation.  When timeout
+                    # is disabled (<=0), this can only be cancellation / cleanup.
+                    if timeout <= 0:
+                        return "[clarify prompt was cancelled before the user responded]"
                     return f"[user did not respond within {int(timeout / 60)}m]"
                 return response
 
@@ -17851,6 +18323,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # (send_exec_approval) and plain-text fallback paths below use
                 # the redacted value.
                 cmd = _redact_approval_command(cmd)
+
+                # Let the buffered assistant text of this turn land first so
+                # the approval prompt appears below it, not above it (same
+                # ordering race as the clarify card).
+                _flush_stream_before_direct_send()
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
@@ -18362,6 +18839,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             effective_session_id,
                             title,
                         )
+                    elif source.platform == Platform.DISCORD and source.thread_id:
+                        maybe_auto_title_kwargs["title_callback"] = lambda title: self._schedule_discord_thread_title_rename(
+                            source,
+                            effective_session_id,
+                            title,
+                        )
                     maybe_auto_title(
                         getattr(self._session_db, "_db", self._session_db),
                         effective_session_id,
@@ -18655,26 +19138,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("Long-running notification error: %s", _ne)
 
         _notify_task = asyncio.create_task(_notify_long_running())
-
-        def _stream_confirmed_final_delivery(
-            consumer,
-            final_text: str,
-            *,
-            previewed: bool = False,
-        ) -> bool:
-            """Return True only when the actual final reply reached the user."""
-            if consumer is None:
-                return False
-            if getattr(consumer, "final_response_sent", False):
-                return True
-            if previewed:
-                has_delivered_text = getattr(consumer, "has_delivered_text", None)
-                if callable(has_delivered_text):
-                    try:
-                        return bool(has_delivered_text(final_text))
-                    except Exception:
-                        return False
-            return False
 
         try:
             # Run in thread pool to not block.  Use an *inactivity*-based
@@ -19027,7 +19490,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
 
-                was_interrupted = result.get("interrupted")
+                result_dict = result or {}
+                was_interrupted = result_dict.get("interrupted")
                 if not was_interrupted:
                     # Queued message after normal completion — deliver the first
                     # response before processing the queued follow-up.
@@ -19044,12 +19508,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 pass
                         except Exception as e:
                             logger.debug("Stream consumer wait before queued message failed: %s", e)
-                    _previewed = bool(result.get("response_previewed"))
-                    first_response = result.get("final_response", "")
-                    _already_streamed = _stream_confirmed_final_delivery(
+                    _previewed = bool(result_dict.get("response_previewed"))
+                    first_response = result_dict.get("final_response", "")
+                    _transformed = bool(result_dict.get("response_transformed"))
+                    (
+                        _already_streamed,
+                        _streamed,
+                        _previewed,
+                        _content_delivered,
+                        _content_matches_final,
+                    ) = _stream_delivery_confirmation(
                         _sc,
                         first_response,
-                        previewed=_previewed,
+                        response_previewed=_previewed,
+                        response_transformed=_transformed,
                     )
                     if first_response and not _already_streamed:
                         try:
@@ -19255,35 +19727,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"
             # response_previewed means the interim_assistant_callback already
-            # saw the final text, but only suppress the normal send if that
-            # exact final text was delivered. Unrelated commentary/progress
-            # must not be mistaken for the final response (#14238).
-            _previewed = bool(response.get("response_previewed"))
-            _content_delivered = bool(
-                _sc and getattr(_sc, "final_content_delivered", False)
+            # sent the final text via the adapter (non-streaming path).
+            _transformed = bool(response.get("response_transformed"))
+            (
+                _delivery_confirmed,
+                _streamed,
+                _previewed,
+                _content_delivered,
+                _content_matches_final,
+            ) = _stream_delivery_confirmation(
+                _sc,
+                _final,
+                response_previewed=bool(response.get("response_previewed")),
+                response_transformed=_transformed,
             )
             # Plugin hooks (e.g. transform_llm_output) may have appended content
             # after streaming finished — when the response was transformed, always
             # send the final version so the appended content reaches the client.
-            _transformed = bool(response.get("response_transformed"))
-            # Only suppress the normal send when the actual final reply reached
-            # the user: the stream consumer streamed it (final_response_sent /
-            # final_content_delivered), or the interim preview delivered that
-            # *exact* final text. Unrelated commentary/progress shown during a
-            # compression/session split must not be mistaken for the final
-            # response (#14238).
-            _streamed = _stream_confirmed_final_delivery(
-                _sc,
-                _final,
-                previewed=_previewed,
-            )
-            if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
+            if _delivery_confirmed:
                 logger.info(
-                    "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
+                    "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s content_match=%s).",
                     session_key or "?",
                     _streamed,
                     _previewed,
                     _content_delivered,
+                    _content_matches_final,
                 )
                 response["already_sent"] = True
             elif not _is_empty_sentinel and _transformed and _sc is not None:
@@ -20066,6 +20534,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         pass
 
     if runner.exit_code is not None:
+        if getattr(runner, "_restart_via_service", False):
+            _hard_exit_process(
+                int(runner.exit_code), "service-managed gateway restart"
+            )
         raise SystemExit(runner.exit_code)
 
     # When an unexpected SIGTERM caused the shutdown and it wasn't a planned
@@ -20086,11 +20558,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Older restart paths may reach here without ``runner.exit_code`` set.
     # Keep the historical non-zero fallback for service-managed restarts.
     if runner._restart_via_service:
+        code = int(runner.exit_code or 75)
         logger.info(
-            "Exiting with code 75 (service-restart requested) so the service "
-            "manager relaunches the gateway."
+            "Exiting with code %s (service-restart requested) so the service "
+            "manager relaunches the gateway.",
+            code,
         )
-        raise SystemExit(75)
+        _hard_exit_process(code, "service-managed gateway restart")
+        raise SystemExit(code)
 
     return True
 

@@ -1,5 +1,6 @@
 import asyncio
 from collections import OrderedDict
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -132,11 +133,37 @@ def make_restart_runner(
     )
     runner.request_restart = GatewayRunner.request_restart.__get__(runner, GatewayRunner)
     runner._is_user_authorized = lambda _source: True
+    # Disable the #30719 restart-loop breaker (max_restarts=0): tests call
+    # _schedule_resume_pending_sessions() many times per process, which would
+    # otherwise accumulate boots in the (tmp) HERMES_HOME and trip the guard.
+    runner._restart_loop_guard_config = lambda: (0, 60)
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
     runner.pairing_store = MagicMock()
     runner.session_store = MagicMock()
     runner.session_store._entries = {}
+
+    def mark_resume_pending(session_key: str, reason: str = "restart_timeout") -> bool:
+        entry = runner.session_store._entries.get(session_key)
+        if entry is None or getattr(entry, "suspended", False):
+            return False
+        entry.resume_pending = True
+        entry.resume_reason = reason
+        entry.last_resume_marked_at = datetime.now()
+        entry.last_startup_auto_resume_at = None
+        return True
+
+    def mark_startup_auto_resume_scheduled(session_key: str) -> bool:
+        entry = runner.session_store._entries.get(session_key)
+        if entry is None or not getattr(entry, "resume_pending", False):
+            return False
+        entry.last_startup_auto_resume_at = datetime.now()
+        return True
+
+    runner.session_store.mark_resume_pending.side_effect = mark_resume_pending
+    runner.session_store.mark_startup_auto_resume_scheduled.side_effect = (
+        mark_startup_auto_resume_scheduled
+    )
     runner.delivery_router = MagicMock()
 
     platform_adapter = adapter or RestartTestAdapter()

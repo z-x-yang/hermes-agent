@@ -311,3 +311,62 @@ class TestTerminalIntegration:
         assert "OPENAI_API_KEY" not in child_env
         assert "ANTHROPIC_API_KEY" not in child_env
         assert child_env["PATH"] == "/usr/bin"
+
+
+class TestSessionMetadataInjection:
+    """ContextVar->env bridge must carry source-scoping session fields."""
+
+    def test_new_session_fields_reach_subprocess_env(self, monkeypatch):
+        from tools.environments.local import _make_run_env
+        from gateway.session_context import (
+            set_session_vars,
+            clear_session_vars,
+            get_session_env,
+        )
+        for name in (
+            "HERMES_SESSION_PROFILE",
+            "HERMES_SESSION_GUILD_ID",
+            "HERMES_SESSION_PARENT_CHAT_ID",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        tokens = set_session_vars(
+            profile="prof-a",
+            guild_id="guild-1",
+            parent_chat_id="parent-7",
+        )
+        try:
+            assert get_session_env("HERMES_SESSION_PROFILE") == "prof-a"
+            assert get_session_env("HERMES_SESSION_GUILD_ID") == "guild-1"
+            assert get_session_env("HERMES_SESSION_PARENT_CHAT_ID") == "parent-7"
+            env = _make_run_env({})
+            assert env.get("HERMES_SESSION_PROFILE") == "prof-a"
+            assert env.get("HERMES_SESSION_GUILD_ID") == "guild-1"
+            assert env.get("HERMES_SESSION_PARENT_CHAT_ID") == "parent-7"
+        finally:
+            clear_session_vars(tokens)
+
+    def test_empty_session_fields_not_injected(self, monkeypatch):
+        from tools.environments.local import _make_run_env
+        from gateway.session_context import set_session_vars, clear_session_vars
+        for name in (
+            "HERMES_SESSION_PROFILE",
+            "HERMES_SESSION_GUILD_ID",
+            "HERMES_SESSION_PARENT_CHAT_ID",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        tokens = set_session_vars(platform="discord")
+        try:
+            env = _make_run_env({})
+            # 0.18 cross-session leak guard: once the session-context
+            # machinery is engaged, explicitly-empty ContextVars are
+            # bridged as "" (overriding any stale last-writer-wins
+            # os.environ global) rather than omitted. The guarantee this
+            # test cares about is unchanged: the child never sees a
+            # foreign session's value.
+            assert env.get("HERMES_SESSION_PROFILE", "") == ""
+            assert env.get("HERMES_SESSION_GUILD_ID", "") == ""
+            assert env.get("HERMES_SESSION_PARENT_CHAT_ID", "") == ""
+        finally:
+            clear_session_vars(tokens)

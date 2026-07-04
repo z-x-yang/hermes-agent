@@ -83,6 +83,9 @@ _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
 # so background-process notifications stay inside the originating Telegram
 # private-chat topic (those lanes route only with thread id + reply anchor).
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
+_SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
+_SESSION_GUILD_ID: ContextVar = ContextVar("HERMES_SESSION_GUILD_ID", default=_UNSET)
+_SESSION_PARENT_CHAT_ID: ContextVar = ContextVar("HERMES_SESSION_PARENT_CHAT_ID", default=_UNSET)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
@@ -125,6 +128,8 @@ _VAR_MAP = {
     "HERMES_SESSION_ID": _SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_SESSION_GUILD_ID": _SESSION_GUILD_ID,
+    "HERMES_SESSION_PARENT_CHAT_ID": _SESSION_PARENT_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -158,6 +163,8 @@ def set_session_vars(
     session_id: str = "",
     message_id: str = "",
     profile: str = "",
+    guild_id: str = "",
+    parent_chat_id: str = "",
     cwd: str = "",
     async_delivery: bool = True,
 ) -> list:
@@ -193,6 +200,8 @@ def set_session_vars(
         _SESSION_ID.set(session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
+        _SESSION_GUILD_ID.set(guild_id),
+        _SESSION_PARENT_CHAT_ID.set(parent_chat_id),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -227,6 +236,8 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _SESSION_GUILD_ID,
+        _SESSION_PARENT_CHAT_ID,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a

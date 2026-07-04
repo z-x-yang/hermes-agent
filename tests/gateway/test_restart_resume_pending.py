@@ -32,8 +32,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import GatewayConfig, HomeChannel, Platform
-from gateway.platforms.base import MessageEvent, MessageType, SendResult
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+from gateway.platforms.base import (
+    MessageEvent,
+    MessageType,
+    SendResult,
+    _reply_anchor_for_event,
+)
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
     _auto_continue_freshness_window,
@@ -250,6 +255,22 @@ class TestSessionEntryResumeFields:
         assert restored.resume_reason == "restart_timeout"
         assert restored.last_resume_marked_at == now
 
+    def test_roundtrip_with_startup_auto_resume_attempt_marker(self):
+        now = datetime(2026, 4, 18, 12, 0, 0)
+        attempted = now + timedelta(seconds=3)
+        entry = SessionEntry(
+            session_key="agent:main:telegram:dm:1",
+            session_id="sid",
+            created_at=now,
+            updated_at=now,
+            resume_pending=True,
+            resume_reason="restart_timeout",
+            last_resume_marked_at=now,
+            last_startup_auto_resume_at=attempted,
+        )
+        restored = SessionEntry.from_dict(entry.to_dict())
+        assert restored.last_startup_auto_resume_at == attempted
+
     def test_from_dict_legacy_without_resume_fields(self):
         """Old sessions.json without the new fields deserialize cleanly."""
         now = datetime.now()
@@ -281,6 +302,7 @@ class TestSessionEntryResumeFields:
         assert restored.resume_pending is True
         assert restored.resume_reason == "restart_timeout"
         assert restored.last_resume_marked_at is None
+        assert restored.last_startup_auto_resume_at is None
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +321,7 @@ class TestMarkResumePending:
         assert refreshed.resume_pending is True
         assert refreshed.resume_reason == "restart_timeout"
         assert refreshed.last_resume_marked_at is not None
+        assert refreshed.last_startup_auto_resume_at is None
 
     def test_custom_reason_persists(self, tmp_path):
         store = _make_store(tmp_path)
@@ -350,6 +373,26 @@ class TestClearResumePending:
         assert e.resume_pending is False
         assert e.resume_reason is None
         assert e.last_resume_marked_at is None
+        assert e.last_startup_auto_resume_at is None
+
+
+class TestMarkStartupAutoResumeScheduled:
+    def test_records_attempt_for_pending_session(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        store.mark_resume_pending(entry.session_key)
+
+        assert store.mark_startup_auto_resume_scheduled(entry.session_key) is True
+        assert store._entries[entry.session_key].last_startup_auto_resume_at is not None
+
+    def test_returns_false_for_non_pending_session(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+
+        assert store.mark_startup_auto_resume_scheduled(entry.session_key) is False
+        assert store._entries[entry.session_key].last_startup_auto_resume_at is None
 
     def test_returns_false_when_not_pending(self, tmp_path):
         store = _make_store(tmp_path)
@@ -1075,6 +1118,99 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     # _handle_message_with_agent owns the system-note injection so we don't
     # double it up.
     assert event.text == ""
+    assert (
+        runner.session_store._entries[pending_entry.session_key]
+        .last_startup_auto_resume_at
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_reuses_origin_message_id_for_discord_reply_anchor():
+    """Synthetic Discord resume events must still reply/ping the triggering user message.
+
+    Final-only Discord notifications resolve their reply target from
+    MessageEvent.message_id. A startup auto-resume has no new inbound platform
+    message, so it must copy the persisted origin message id onto the synthetic
+    event instead of only keeping it on event.source.
+    """
+    runner, adapter = make_restart_runner()
+    runner.adapters[Platform.DISCORD] = adapter
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="discord-channel",
+        chat_type="group",
+        user_id="user-1",
+        user_name="Need222Say",
+        message_id="discord-trigger-msg",
+    )
+    pending_entry = SessionEntry(
+        session_key="agent:main:discord:group:discord-channel:user-1",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.DISCORD,
+        chat_type="group",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    assert runner._schedule_resume_pending_sessions(platform=Platform.DISCORD) == 1
+    await asyncio.sleep(0)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.internal is True
+    assert event.message_id == "discord-trigger-msg"
+    assert _reply_anchor_for_event(event) == "discord-trigger-msg"
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_is_one_shot_until_new_resume_marker():
+    """A killed startup must not synthesize the same empty resume forever."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="resume-chat", thread_id="topic-1")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:group:resume-chat:topic-1",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+    adapter.handle_message.assert_awaited_once()
+
+    # Simulate process death before the synthetic turn completes. The running
+    # slot is gone after restart, but the persistent attempt marker remains.
+    runner._running_agents.clear()
+    runner._running_agents_ts.clear()
+    adapter.handle_message.reset_mock()
+
+    assert runner._schedule_resume_pending_sessions() == 0
+    adapter.handle_message.assert_not_called()
+
+    # A new interrupted turn writes a new resume marker and gets one new startup
+    # attempt.
+    runner.session_store.mark_resume_pending(
+        pending_entry.session_key,
+        reason="restart_timeout",
+    )
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+    adapter.handle_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1606,6 +1742,146 @@ async def test_restart_home_channel_notification_not_deduped_across_threads():
     assert len(adapter.sent) == 2
     assert adapter.sent_calls[0][2] == {"thread_id": "topic-7"}
     assert adapter.sent_calls[1][2] is None
+
+
+@pytest.mark.asyncio
+async def test_active_session_shutdown_notification_uses_lifecycle_target_when_configured():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="daily-42", thread_id="daily-thread")
+    session_key = runner._session_key_for_source(source)
+    runner._running_agents = {session_key: MagicMock()}
+    runner._cache_session_source(session_key, source)
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="daily-42",
+        name="Daily Home",
+    )
+    runner.config.platforms[Platform.TELEGRAM].extra[
+        "gateway_restart_notification_channel"
+    ] = {
+        "chat_id": "ops-42",
+        "name": "Ops Alerts",
+        "thread_id": "ops-thread",
+    }
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    sent_calls = getattr(adapter, "sent_calls")
+    assert len(sent_calls) == 1
+    assert sent_calls[0][0] == "ops-42"
+    assert sent_calls[0][2] == {"thread_id": "ops-thread"}
+
+
+@pytest.mark.asyncio
+async def test_discord_shutdown_lifecycle_notification_is_non_conversational():
+    runner, adapter = make_restart_runner()
+    runner.config.platforms = {
+        Platform.DISCORD: PlatformConfig(
+            enabled=True,
+            token="***",
+            home_channel=HomeChannel(
+                platform=Platform.DISCORD,
+                chat_id="daily-42",
+                name="Daily Home",
+            ),
+            extra={"gateway_restart_notification_channel": "ops-42"},
+        )
+    }
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    sent_calls = getattr(adapter, "sent_calls")
+    assert len(sent_calls) == 1
+    assert sent_calls[0][0] == "ops-42"
+    assert sent_calls[0][2] == {"non_conversational": True}
+
+
+@pytest.mark.asyncio
+async def test_idle_in_chat_restart_sends_configured_lifecycle_target_not_home():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="daily-42", thread_id="daily-thread")
+    runner._restart_requested = True
+    runner._restart_command_source = source
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="daily-42",
+        name="Daily Home",
+    )
+    runner.config.platforms[Platform.TELEGRAM].extra[
+        "gateway_restart_notification_channel"
+    ] = "ops-42"
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    sent_calls = getattr(adapter, "sent_calls")
+    assert len(sent_calls) == 1
+    assert sent_calls[0][0] == "ops-42"
+
+
+@pytest.mark.asyncio
+async def test_restart_home_channel_notification_uses_lifecycle_target_when_configured():
+    runner, adapter = make_restart_runner()
+    runner._restart_requested = True
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="daily-42",
+        name="Daily Home",
+    )
+    runner.config.platforms[Platform.TELEGRAM].extra[
+        "gateway_restart_notification_channel"
+    ] = {
+        "chat_id": "ops-42",
+        "name": "Ops Alerts",
+        "thread_id": "topic-ops",
+    }
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    sent_calls = getattr(adapter, "sent_calls")
+    assert len(sent_calls) == 1
+    assert sent_calls[0][0] == "ops-42"
+    assert sent_calls[0][2] == {"thread_id": "topic-ops"}
+
+
+@pytest.mark.asyncio
+async def test_startup_home_channel_notification_uses_lifecycle_target_when_configured():
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="daily-42",
+        name="Daily Home",
+    )
+    runner.config.platforms[Platform.TELEGRAM].extra[
+        "gateway_restart_notification_channel"
+    ] = "ops-42"
+    runner.config.platforms[Platform.TELEGRAM].extra[
+        "gateway_restart_notification_channel_name"
+    ] = "Ops Alerts"
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    sent_calls = getattr(adapter, "sent_calls")
+    assert len(sent_calls) == 1
+    assert sent_calls[0][0] == "ops-42"
+    assert delivered == {(Platform.TELEGRAM.value, "ops-42", None)}
+
+
+@pytest.mark.asyncio
+async def test_startup_configured_only_skips_fallback_home_without_lifecycle_target():
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="daily-42",
+        name="Daily Home",
+    )
+
+    delivered = await runner._send_home_channel_startup_notifications(
+        require_configured_target=True,
+    )
+
+    assert getattr(adapter, "sent_calls") == []
+    assert delivered == set()
 
 
 @pytest.mark.asyncio

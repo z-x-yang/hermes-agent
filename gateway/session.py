@@ -668,6 +668,11 @@ class SessionEntry:
     resume_pending: bool = False
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
+    # Timestamp of the gateway-startup synthetic empty auto-resume turn for
+    # the current resume marker.  This prevents a crash/restart loop from
+    # synthesizing the same empty turn forever.  A real user message still
+    # resumes the pending session through the normal resume_pending path.
+    last_startup_auto_resume_at: Optional[datetime] = None
 
     # Session-scoped /model override (model/provider/base_url ONLY — never
     # credentials).  ``_session_model_overrides`` in the gateway runner is
@@ -704,6 +709,11 @@ class SessionEntry:
                 if self.last_resume_marked_at
                 else None
             ),
+            "last_startup_auto_resume_at": (
+                self.last_startup_auto_resume_at.isoformat()
+                if self.last_startup_auto_resume_at
+                else None
+            ),
             "is_fresh_reset": self.is_fresh_reset,
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
@@ -738,6 +748,14 @@ class SessionEntry:
             except (TypeError, ValueError):
                 last_resume_marked_at = None
 
+        last_startup_auto_resume_at = None
+        _lsara = data.get("last_startup_auto_resume_at")
+        if _lsara:
+            try:
+                last_startup_auto_resume_at = datetime.fromisoformat(_lsara)
+            except (TypeError, ValueError):
+                last_startup_auto_resume_at = None
+
         session_key = data["session_key"]
         session_id = data["session_id"]
 
@@ -770,6 +788,7 @@ class SessionEntry:
             resume_pending=data.get("resume_pending", False),
             resume_reason=data.get("resume_reason"),
             last_resume_marked_at=last_resume_marked_at,
+            last_startup_auto_resume_at=last_startup_auto_resume_at,
             is_fresh_reset=data.get("is_fresh_reset", False),
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
@@ -1716,9 +1735,28 @@ class SessionStore:
                 entry.resume_pending = True
                 entry.resume_reason = reason
                 entry.last_resume_marked_at = _now()
+                entry.last_startup_auto_resume_at = None
                 self._save()
                 return True
         return False
+
+    def mark_startup_auto_resume_scheduled(self, session_key: str) -> bool:
+        """Record that startup synthesized an auto-resume turn for a marker.
+
+        The marker is scoped to the current ``resume_pending`` episode.  It is
+        cleared when a new resume marker is written and when resume_pending is
+        cleared.  Keeping it persistent protects against the exact failure mode
+        where the gateway starts, schedules empty internal resume turns, gets
+        killed before they complete, and repeats forever on the next start.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or not entry.resume_pending:
+                return False
+            entry.last_startup_auto_resume_at = _now()
+            self._save()
+            return True
 
     def clear_resume_pending(self, session_key: str) -> bool:
         """Clear the resume-pending flag after a successful resumed turn.
@@ -1737,6 +1775,7 @@ class SessionStore:
             entry.resume_pending = False
             entry.resume_reason = None
             entry.last_resume_marked_at = None
+            entry.last_startup_auto_resume_at = None
             self._save()
             return True
 
@@ -1828,6 +1867,7 @@ class SessionStore:
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
                     entry.last_resume_marked_at = _now()
+                    entry.last_startup_auto_resume_at = None
                     count += 1
             if count:
                 self._save()
