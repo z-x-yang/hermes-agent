@@ -23,10 +23,13 @@ _PERSISTABLE_PROVIDER_SOURCES = frozenset({
     ("nous", "device_code"),
     ("openai-codex", "device_code"),
     ("xai-oauth", "device_code"),
-    # Legacy alias: pre-0.18 auth.json wrote xAI OAuth singletons with source
-    # ``loopback_pkce`` before it was unified to ``device_code``.  Keep it
-    # persistable so on-disk entries written by older Hermes are not pruned as
-    # borrowed on the first ``load_pool`` after the upgrade.
+    # Legacy: pre-0.18 auth.json wrote xAI OAuth singletons with source
+    # ``loopback_pkce`` before it was unified to ``device_code``.  Kept
+    # persistable so the disk-boundary sanitizer does not strip the tokens off a
+    # legacy row during the single ``load_pool`` where
+    # ``_canonicalize_legacy_singleton_sources`` migrates it to ``device_code``.
+    # After that migration the source is ``device_code`` on disk and this entry
+    # is only a fail-safe for as-yet-unmigrated pools.
     ("xai-oauth", "loopback_pkce"),
 })
 

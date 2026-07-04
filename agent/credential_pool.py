@@ -724,12 +724,12 @@ class CredentialPool:
         keeps the consumed refresh_token and the next ``_refresh_entry`` call
         would replay it and get a ``refresh_token_reused``-style 4xx.
 
-        Only applies to entries seeded from the singleton (``device_code``, or
-        the pre-0.18 ``loopback_pkce`` alias still present on disk); manually
-        added entries are independent credentials with their own refresh-token
-        lifecycle.
+        Only applies to entries seeded from the singleton (``device_code``);
+        manually added entries are independent credentials with their own
+        refresh-token lifecycle.  Legacy pre-0.18 ``loopback_pkce`` rows are
+        migrated to ``device_code`` at pool load, so no alias is needed here.
         """
-        if self.provider != "xai-oauth" or entry.source not in ("device_code", "loopback_pkce"):
+        if self.provider != "xai-oauth" or entry.source != "device_code":
             return entry
         try:
             with _auth_store_lock():
@@ -870,10 +870,10 @@ class CredentialPool:
         # Only sync entries that were seeded *from* a singleton.  Manually
         # added pool entries (source="manual:*") are independent credentials
         # and must not write back to the singleton.  All singleton-seeded
-        # device-code sources (nous, openai-codex, xAI) use ``device_code``;
-        # pre-0.18 xAI entries on disk still carry the ``loopback_pkce`` alias
-        # for the same singleton lineage.
-        if entry.source not in ("device_code", "loopback_pkce"):
+        # device-code sources (nous, openai-codex, xAI) use ``device_code``
+        # (legacy pre-0.18 xAI ``loopback_pkce`` rows are migrated to it at
+        # pool load).
+        if entry.source != "device_code":
             return
         try:
             with _auth_store_lock():
@@ -1141,9 +1141,8 @@ class CredentialPool:
                 # session does not re-seed the same revoked credentials, and
                 # remove all singleton-seeded xAI entries from the in-memory
                 # pool. Mirrors the Nous quarantine path above.  xAI singletons
-                # are ``device_code`` today but pre-0.18 on-disk entries still
-                # carry the ``loopback_pkce`` alias for the same lineage.
-                _XAI_SINGLETON_SOURCES = ("device_code", "loopback_pkce")
+                # use ``device_code`` (legacy pre-0.18 ``loopback_pkce`` rows are
+                # migrated to it at pool load).
                 if auth_mod._is_terminal_xai_oauth_refresh_error(exc):
                     logger.debug(
                         "xAI OAuth refresh token is terminally invalid; clearing local token state"
@@ -1177,11 +1176,11 @@ class CredentialPool:
                         )
                     removed_ids = [
                         item.id for item in self._entries
-                        if item.source in _XAI_SINGLETON_SOURCES
+                        if item.source == "device_code"
                     ]
                     self._entries = [
                         item for item in self._entries
-                        if item.source not in _XAI_SINGLETON_SOURCES
+                        if item.source != "device_code"
                     ]
                     if self._current_id == entry.id:
                         self._current_id = None
@@ -1557,10 +1556,9 @@ class CredentialPool:
             return None
         singleton_sources = {
             "openai-codex": {"device_code"},
-            # ``device_code`` is the current xAI OAuth singleton source;
-            # ``loopback_pkce`` is the pre-0.18 alias still present in legacy
-            # on-disk auth.json entries.  Both are the same singleton lineage.
-            "xai-oauth": {"device_code", "loopback_pkce"},
+            # All device-code singletons use ``device_code`` in 0.18; legacy
+            # pre-0.18 xAI ``loopback_pkce`` rows are migrated to it at pool load.
+            "xai-oauth": {"device_code"},
             "nous": {"device_code"},
         }.get(self.provider, set())
         if not singleton_sources:
@@ -2423,6 +2421,48 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
     return changed, active_sources
 
 
+def _canonicalize_legacy_singleton_sources(
+    provider: str, entries: List[PooledCredential]
+) -> bool:
+    """Migrate pre-0.18 xAI OAuth pool entries onto the unified singleton source.
+
+    0.17 surfaced the xAI OAuth singleton in the pool as ``source=loopback_pkce``.
+    0.18 unified every device-code singleton (nous, openai-codex, xAI) onto
+    ``device_code``.  A pool persisted by 0.17 therefore carries a
+    ``loopback_pkce`` row that no 0.18 runtime path recognizes: the singleton
+    seed only ever upserts ``device_code`` and ``_upsert_entry`` matches by exact
+    source, so without this migration the legacy row would coexist with a freshly
+    seeded ``device_code`` entry — two pool entries for the *same* single-use
+    OAuth refresh token.  Rotation across that pair replays a consumed refresh
+    token and terminally quarantines the whole lineage (``refresh_token_reused``).
+
+    Rewriting the source to ``device_code`` here — before seed and prune — makes
+    the seed's exact-source upsert update the existing row in place, keeping the
+    lineage a single credential and letting it persist under the 0.18 canonical
+    source.  Idempotent: pools already on ``device_code`` are untouched.  If a
+    ``device_code`` row already exists (a partially migrated pool), the legacy
+    duplicate is dropped rather than merged into a second ``device_code`` entry.
+    """
+    if provider != "xai-oauth":
+        return False
+    if not any(entry.source == "loopback_pkce" for entry in entries):
+        return False
+    has_device_code = any(entry.source == "device_code" for entry in entries)
+    migrated: List[PooledCredential] = []
+    for entry in entries:
+        if entry.source != "loopback_pkce":
+            migrated.append(entry)
+            continue
+        if has_device_code:
+            # Canonical entry already present for this singleton lineage — drop
+            # the legacy duplicate instead of minting a second device_code row.
+            continue
+        migrated.append(replace(entry, source="device_code"))
+        has_device_code = True
+    entries[:] = migrated
+    return True
+
+
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)
@@ -2438,6 +2478,12 @@ def load_pool(provider: str) -> CredentialPool:
     )
     entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries]
 
+    # Migrate pre-0.18 xAI OAuth entries (source=loopback_pkce) onto the unified
+    # device_code singleton source *before* seeding, so the singleton seed's
+    # exact-source upsert updates the existing row in place instead of creating a
+    # duplicate credential sharing one single-use refresh token.
+    legacy_migrated = _canonicalize_legacy_singleton_sources(provider, entries)
+
     if provider.startswith(CUSTOM_POOL_PREFIX):
         # Custom endpoint pool — seed from custom_providers config and model config
         custom_changed, custom_sources = _seed_custom_pool(provider, entries)
@@ -2446,7 +2492,7 @@ def load_pool(provider: str) -> CredentialPool:
     else:
         singleton_changed, singleton_sources = _seed_from_singletons(provider, entries)
         env_changed, env_sources = _seed_from_env(provider, entries)
-        changed = raw_needs_sanitization or singleton_changed or env_changed
+        changed = raw_needs_sanitization or singleton_changed or env_changed or legacy_migrated
         # ``load_pool()`` is a non-destructive read for env-seeded entries: a
         # process missing a provider env var must not delete the persisted
         # pool entry for every other process (#9331). File-backed singletons
