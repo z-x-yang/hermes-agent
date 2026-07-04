@@ -68,6 +68,16 @@ def test_verify_on_stop_auto_is_off_for_cron_sessions(clear_verify_env):
     assert verify_on_stop_enabled({"agent": {"verify_on_stop": "auto"}}) is False
 
 
+def test_verify_on_stop_is_off_for_cron_agent_platform(clear_verify_env):
+    # The scheduler also constructs cron agents with agent.platform="cron".
+    # That local agent fact must be enough to suppress the stop-loop even if
+    # global env/context state is missing or an admin forced verify_on_stop on.
+    assert verify_on_stop_enabled(
+        {"agent": {"verify_on_stop": True}},
+        platform="cron",
+    ) is False
+
+
 def test_verify_on_stop_auto_sentinel_resolves_to_surface_default(clear_verify_env):
     # The legacy "auto" sentinel is still honored when set explicitly: it falls
     # through to the surface-aware default (ON interactive, OFF messaging).

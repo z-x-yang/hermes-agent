@@ -142,18 +142,26 @@ def _session_is_messaging_surface() -> bool:
     return False
 
 
-def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
+def verify_on_stop_enabled(
+    config: dict[str, Any] | None = None,
+    *,
+    platform: str | None = None,
+) -> bool:
     """Return whether edit -> verify-before-finish behavior is enabled.
 
-    Precedence: an explicit ``HERMES_VERIFY_ON_STOP`` env var wins, then an
-    explicit ``agent.verify_on_stop`` config value. The config default is
-    ``"auto"`` (see ``DEFAULT_CONFIG``) — surface-aware: ON for interactive
-    coding surfaces (CLI, TUI, desktop) and programmatic callers, OFF for
-    conversational messaging surfaces (Telegram, Discord, etc.) where the
-    verification narrative would reach a human as chat noise. An explicit
-    bool forces the behavior in either direction. A missing or unrecognized
-    value falls back to the surface-aware ``"auto"`` default.
+    Precedence: a cron agent platform is always disabled because its final
+    response is auto-delivered to a user-facing target; then an explicit
+    ``HERMES_VERIFY_ON_STOP`` env var wins, then an explicit boolean
+    ``agent.verify_on_stop`` config value, then a surface-aware default. The
+    config default is the sentinel ``"auto"`` (see
+    ``DEFAULT_CONFIG``), which resolves to ON for interactive coding surfaces
+    (CLI, TUI, desktop) and programmatic callers, and OFF for conversational
+    messaging surfaces (Telegram, Discord, etc.) where the verification
+    narrative would otherwise reach a human as chat noise.
     """
+    if str(platform or "").strip().lower() == "cron":
+        return False
+
     env = os.environ.get("HERMES_VERIFY_ON_STOP")
     if env is not None:
         return env.strip().lower() not in {"0", "false", "no", "off"}
