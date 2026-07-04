@@ -3346,7 +3346,13 @@ class GatewaySlashCommandsMixin:
                                 "original transcript instead of hard rewrite."
                             )
                         else:
-                            session_db.archive_and_compact(new_session_id, compressed)
+                            # SessionDB is synchronous; offload the SQLite work
+                            # so it never blocks the gateway event loop.
+                            await asyncio.to_thread(
+                                session_db.archive_and_compact,
+                                new_session_id,
+                                compressed,
+                            )
                             logger.debug(
                                 "Manual /compress here: persisted rejoined "
                                 "compressed head + tail via archive_and_compact."

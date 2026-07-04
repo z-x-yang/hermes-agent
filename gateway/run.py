@@ -138,7 +138,6 @@ def _stream_delivery_confirmation(
     streamed = bool(
         stream_consumer and getattr(stream_consumer, "final_response_sent", False)
     )
-    previewed = bool(response_previewed)
     content_delivered = bool(
         stream_consumer and getattr(stream_consumer, "final_content_delivered", False)
     )
@@ -149,10 +148,23 @@ def _stream_delivery_confirmation(
         and stream_consumer
         and _streamed_final_matches_response(stream_consumer, final_response)
     )
+    # ``response_previewed`` alone does NOT confirm final delivery: the interim
+    # preview may have carried unrelated commentary/progress (e.g. "I'll inspect
+    # the repo first.") while the session split mid-turn and the actual final
+    # answer was never delivered.  Confirm the previewed path ONLY when the
+    # stream consumer actually delivered the *exact* final text (#14238 /
+    # #35809 previewed-split). No consumer -> nothing was previewed to the user.
+    previewed = bool(response_previewed)
+    previewed_delivered = bool(
+        previewed
+        and not is_empty_sentinel
+        and stream_consumer is not None
+        and stream_consumer.has_delivered_text(final_response)
+    )
     confirmed = bool(
         not response_transformed
         and not is_empty_sentinel
-        and (streamed or previewed or content_delivered or content_matches_final)
+        and (streamed or previewed_delivered or content_delivered or content_matches_final)
     )
     return confirmed, streamed, previewed, content_delivered, content_matches_final
 
@@ -2765,7 +2777,7 @@ def _compression_exhaustion_manual_recovery_notice() -> str:
     )
 
 
-def _apply_compression_exhaustion_policy(
+async def _apply_compression_exhaustion_policy(
     runner: Any,
     *,
     agent_result: dict,
@@ -2775,47 +2787,53 @@ def _apply_compression_exhaustion_policy(
     response: str,
 ) -> tuple[Any, str]:
     """Apply gateway recovery policy after the agent exhausts compression."""
-    if not (agent_result.get("compression_exhausted") and session_entry and session_key):
-        return session_entry, response
+    # When compression is exhausted, the session is permanently too large to
+    # process. Auto-reset it so the next message starts fresh instead of
+    # replaying the same oversized context in an infinite fail loop (#9893),
+    # unless our fork's config gate leaves recovery to the user (/compress,
+    # /resume, /new).
+    if agent_result.get("compression_exhausted") and session_entry and session_key:
+        if not _compression_exhaustion_auto_reset_enabled(getattr(runner, "config", None)):
+            logger.info(
+                "Compression exhausted in session %s; auto-reset disabled by config.",
+                getattr(session_entry, "session_id", None),
+            )
+            return session_entry, (
+                (response or "") + _compression_exhaustion_manual_recovery_notice()
+            )
 
-    if not _compression_exhaustion_auto_reset_enabled(getattr(runner, "config", None)):
         logger.info(
-            "Compression exhausted in session %s; auto-reset disabled by config.",
+            "Auto-resetting session %s after compression exhaustion.",
             getattr(session_entry, "session_id", None),
         )
-        return session_entry, (response or "") + _compression_exhaustion_manual_recovery_notice()
-
-    logger.info(
-        "Auto-resetting session %s after compression exhaustion.",
-        getattr(session_entry, "session_id", None),
-    )
-    new_entry = runner.session_store.reset_session(session_key)
-    runner._evict_cached_agent(session_key)
-    runner._session_model_overrides.pop(session_key, None)
-    runner._set_session_reasoning_override(session_key, None)
-    if hasattr(runner, "_pending_model_notes"):
-        runner._pending_model_notes.pop(session_key, None)
-    if new_entry is not None:
-        # Drop the stale reference to the bloated compressed child and
-        # re-point the Telegram topic binding at the fresh session.
-        # Compression rotated session_entry.session_id to the oversized
-        # compressed child earlier this turn (the agent-result sync), and
-        # that _sync also rewrote the (chat_id, thread_id) -> bloated-child
-        # binding. reset_session swaps in a clean, parentless session, but
-        # without re-syncing the binding the next inbound message in this
-        # topic gets switch_session'd back onto the bloated child by the
-        # binding-heal walk, reloads the oversized transcript, and re-triggers
-        # compression exhaustion forever (#35809 — regression of the
-        # #9893/#10063 auto-reset). No-op on non-topic lanes.
-        session_entry = new_entry
-        runner._sync_telegram_topic_binding(
-            source, session_entry, reason="compression-exhausted-reset",
+        new_entry = runner.session_store.reset_session(session_key)
+        runner._evict_cached_agent(session_key)
+        runner._session_model_overrides.pop(session_key, None)
+        runner._set_session_reasoning_override(session_key, None)
+        if hasattr(runner, "_pending_model_notes"):
+            runner._pending_model_notes.pop(session_key, None)
+        if new_entry is not None:
+            # Drop the stale reference to the bloated compressed child and
+            # re-point the Telegram topic binding at the fresh session.
+            # Compression rotated session_entry.session_id to the oversized
+            # compressed child earlier this turn (the agent-result sync), and
+            # that _sync also rewrote the (chat_id, thread_id) -> bloated-child
+            # binding. reset_session swaps in a clean, parentless session, but
+            # without re-syncing the binding the next inbound message in this
+            # topic gets switch_session'd back onto the bloated child by the
+            # binding-heal walk, reloads the oversized transcript, and re-triggers
+            # compression exhaustion forever (#35809 — regression of the
+            # #9893/#10063 auto-reset). No-op on non-topic lanes.
+            session_entry = new_entry
+            await asyncio.to_thread(
+                runner._sync_telegram_topic_binding,
+                source, session_entry, reason="compression-exhausted-reset",
+            )
+        response = (response or "") + (
+            "\n\n🔄 Session auto-reset — the conversation exceeded the "
+            "maximum context size and could not be compressed further. "
+            "Your next message will start a fresh session."
         )
-    response = (response or "") + (
-        "\n\n🔄 Session auto-reset — the conversation exceeded the "
-        "maximum context size and could not be compressed further. "
-        "Your next message will start a fresh session."
-    )
     return session_entry, response
 
 
@@ -11689,7 +11707,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # large to process.  The recovery policy decides whether to keep
             # the historical automatic reset or stop and let the user choose
             # /compress, /resume, or /new explicitly.
-            session_entry, response = _apply_compression_exhaustion_policy(
+            session_entry, response = await _apply_compression_exhaustion_policy(
                 self,
                 agent_result=agent_result,
                 session_entry=session_entry,
