@@ -95,6 +95,58 @@ def test_canonicalize_only_touches_xai_oauth():
     assert entries[0].source == "loopback_pkce"
 
 
+# ── partial-migration token safety (codex re-review Finding 1) ──────────────
+
+
+def test_canonicalize_keeps_valid_legacy_over_empty_device_code():
+    """Stale/empty canonical row + token-bearing legacy row: the surviving
+    device_code row MUST carry the legacy row's tokens, not the empty ones.
+    Blindly keeping device_code here would delete the only usable credential."""
+    entries = [
+        _entry("device_code", id="canon", access_token="", refresh_token=""),
+        _entry("loopback_pkce", id="legacy", access_token="valid-at", refresh_token="valid-rt"),
+    ]
+    changed = _canonicalize_legacy_singleton_sources("xai-oauth", entries)
+    assert changed is True
+    assert len(entries) == 1
+    assert entries[0].source == "device_code"
+    assert entries[0].refresh_token == "valid-rt"
+    assert entries[0].access_token == "valid-at"
+
+
+def test_canonicalize_multiple_legacy_rows_keeps_the_token_bearing_one():
+    """First legacy row empty, second holds the tokens: the tokens survive,
+    not the row that happens to come first in list order."""
+    entries = [
+        _entry("loopback_pkce", id="empty", access_token="", refresh_token=""),
+        _entry("loopback_pkce", id="valid", access_token="a", refresh_token="r"),
+    ]
+    changed = _canonicalize_legacy_singleton_sources("xai-oauth", entries)
+    assert changed is True
+    assert len(entries) == 1
+    assert entries[0].source == "device_code"
+    assert entries[0].refresh_token == "r"
+
+
+def test_canonicalize_conflicting_tokens_keeps_canonical_and_warns(caplog):
+    """Two rows with DISTINCT valid refresh tokens is an unarbitrable conflict:
+    keep the canonical row's token (never lose it silently) and log a warning."""
+    import logging
+
+    entries = [
+        _entry("device_code", id="canon", access_token="a1", refresh_token="r1"),
+        _entry("loopback_pkce", id="legacy", access_token="a2", refresh_token="r2"),
+    ]
+    with caplog.at_level(logging.WARNING):
+        changed = _canonicalize_legacy_singleton_sources("xai-oauth", entries)
+    assert changed is True
+    assert len(entries) == 1
+    assert entries[0].source == "device_code"
+    # Canonical row's token is retained (not silently swapped for the legacy one).
+    assert entries[0].refresh_token == "r1"
+    assert any("conflicting refresh tokens" in rec.message for rec in caplog.records)
+
+
 # ── end-to-end load_pool (the exact regression codex flagged) ───────────────
 
 

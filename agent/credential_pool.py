@@ -2436,30 +2436,81 @@ def _canonicalize_legacy_singleton_sources(
     OAuth refresh token.  Rotation across that pair replays a consumed refresh
     token and terminally quarantines the whole lineage (``refresh_token_reused``).
 
-    Rewriting the source to ``device_code`` here — before seed and prune — makes
-    the seed's exact-source upsert update the existing row in place, keeping the
-    lineage a single credential and letting it persist under the 0.18 canonical
-    source.  Idempotent: pools already on ``device_code`` are untouched.  If a
-    ``device_code`` row already exists (a partially migrated pool), the legacy
-    duplicate is dropped rather than merged into a second ``device_code`` entry.
+    Collapsing to ``device_code`` here — before seed and prune — makes the seed's
+    exact-source upsert update the existing row in place, keeping the lineage a
+    single credential and letting it persist under the 0.18 canonical source.
+    Idempotent: pools already on ``device_code`` (with no legacy row) are untouched.
+
+    A partially migrated pool can hold BOTH a ``device_code`` row and a
+    ``loopback_pkce`` row for the one lineage.  These rows are NOT interchangeable:
+    a stale/empty ``device_code`` row may coexist with a legacy row that still
+    holds the only valid token pair (e.g. the legacy row refreshed and persisted
+    while the canonical row did not).  Blindly keeping ``device_code`` and dropping
+    the legacy row would then delete the only usable credential.  So the surviving
+    row is chosen by token material — a token-bearing row always wins over an empty
+    one — never by list position.  When two rows carry *different* non-empty refresh
+    tokens there is no safe automatic merge, so we keep the canonical row's tokens
+    and log a visible warning rather than silently discarding a live secret.
     """
     if provider != "xai-oauth":
         return False
-    if not any(entry.source == "loopback_pkce" for entry in entries):
+    lineage_sources = ("device_code", "loopback_pkce")
+    lineage = [e for e in entries if e.source in lineage_sources]
+    if not any(e.source == "loopback_pkce" for e in lineage):
+        # Nothing legacy to migrate — leave canonical/other rows untouched.
         return False
-    has_device_code = any(entry.source == "device_code" for entry in entries)
-    migrated: List[PooledCredential] = []
+
+    def _has_tokens(entry: PooledCredential) -> bool:
+        return bool(
+            str(getattr(entry, "refresh_token", "") or "").strip()
+            or str(getattr(entry, "access_token", "") or "").strip()
+        )
+
+    # Pick the surviving row for the singleton lineage.  Priority: a
+    # token-bearing canonical row, then a token-bearing legacy row, then any
+    # canonical row, then the first legacy row.  This guarantees a row that
+    # actually holds credentials is never dropped in favour of an empty one.
+    canonical = [e for e in lineage if e.source == "device_code"]
+    legacy = [e for e in lineage if e.source == "loopback_pkce"]
+    winner = (
+        next((e for e in canonical if _has_tokens(e)), None)
+        or next((e for e in legacy if _has_tokens(e)), None)
+        or (canonical[0] if canonical else legacy[0])
+    )
+
+    # Surface a genuine credential conflict instead of silently dropping tokens:
+    # multiple lineage rows with distinct non-empty refresh tokens means one is a
+    # stale rotation we cannot arbitrate here.  We keep ``winner`` (canonical-first
+    # by the selection above) but must not do so quietly.
+    distinct_refresh = {
+        str(getattr(e, "refresh_token", "") or "").strip()
+        for e in lineage
+        if str(getattr(e, "refresh_token", "") or "").strip()
+    }
+    if len(distinct_refresh) > 1:
+        logger.warning(
+            "xai-oauth pool has %d singleton-lineage rows with conflicting refresh "
+            "tokens during loopback_pkce->device_code migration; keeping the "
+            "canonical/first token-bearing row (%s) and dropping the rest — "
+            "re-login if xAI auth fails.",
+            len(distinct_refresh), winner.id,
+        )
+
+    # Rebuild: keep non-lineage rows in place, replace the winner's slot with the
+    # canonicalized winner, drop every other lineage row.
+    rebuilt: List[PooledCredential] = []
+    placed = False
     for entry in entries:
-        if entry.source != "loopback_pkce":
-            migrated.append(entry)
+        if entry.source not in lineage_sources:
+            rebuilt.append(entry)
             continue
-        if has_device_code:
-            # Canonical entry already present for this singleton lineage — drop
-            # the legacy duplicate instead of minting a second device_code row.
-            continue
-        migrated.append(replace(entry, source="device_code"))
-        has_device_code = True
-    entries[:] = migrated
+        if entry is winner and not placed:
+            rebuilt.append(
+                entry if entry.source == "device_code" else replace(entry, source="device_code")
+            )
+            placed = True
+        # all other lineage rows are dropped (collapsed into the winner)
+    entries[:] = rebuilt
     return True
 
 
