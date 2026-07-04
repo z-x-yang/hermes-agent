@@ -23,19 +23,23 @@ afterEach(cleanup)
 // editor's textContent WITHOUT firing an input event, so the React `draft`
 // state stays stale while the DOM already holds the text.
 function Harness({
+  attachmentCount = 0,
   busy = false,
   disabled = false,
   queued = [],
   onSubmit,
   onQueue,
+  onSteer = () => undefined,
   onCancel,
   onDrain
 }: {
+  attachmentCount?: number
   busy?: boolean
   disabled?: boolean
   queued?: readonly string[]
   onSubmit: (text: string) => void
   onQueue: (text: string) => void
+  onSteer?: (text: string) => void
   onCancel: () => void
   onDrain: () => void
 }) {
@@ -44,7 +48,7 @@ function Harness({
   // Mirrors `useAuiState(s => s.composer.text)` — updated only via setText, so
   // it lags the DOM until React re-renders (the source of the bug).
   const [draft, setDraft] = useState('')
-  const attachments: unknown[] = []
+  const attachments: unknown[] = Array.from({ length: attachmentCount }, (_, index) => ({ id: index }))
 
   const composerPlainText = (el: HTMLElement) => el.textContent ?? ''
 
@@ -73,7 +77,9 @@ function Harness({
     const payloadPresent = text.trim().length > 0 || attachments.length > 0
 
     if (busy) {
-      if (payloadPresent) {
+      if (text.trim().startsWith('/')) {
+        onSubmit(text)
+      } else if (payloadPresent) {
         onQueue(text)
       } else {
         onCancel()
@@ -86,6 +92,24 @@ function Harness({
   }
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    // New shortcut contract: plain Enter steers while busy; Cmd/Ctrl+Enter is
+    // the explicit queue/send chord. Both read the live DOM text so fast typing
+    // cannot lose the just-entered draft before React state catches up.
+    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.shiftKey) {
+      event.preventDefault()
+
+      const editorText = editorRef.current ? composerPlainText(editorRef.current) : draftRef.current
+      const hasLivePayload = editorText.trim().length > 0 || attachments.length > 0
+
+      if (disabled || (busy && !hasLivePayload)) {
+        return
+      }
+
+      submitDraft()
+
+      return
+    }
+
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
 
@@ -96,13 +120,23 @@ function Harness({
         return
       }
 
-      if (!busy && !hasLivePayload && queued.length > 0) {
-        onDrain()
+      if (busy) {
+        if (editorText.trim().startsWith('/')) {
+          submitDraft()
+
+          return
+        }
+
+        if (hasLivePayload) {
+          onSteer(editorText.trim())
+        }
 
         return
       }
 
-      if (busy && !hasLivePayload) {
+      if (!hasLivePayload && queued.length > 0) {
+        onDrain()
+
         return
       }
 
@@ -146,13 +180,22 @@ describe('composer Enter submit — live DOM vs stale composer state (#39630)', 
     expect(onSubmit).toHaveBeenCalledWith('hello world')
   })
 
-  it('queues a fast-typed message while busy instead of draining the queue or cancelling', async () => {
+  it('steers a fast-typed message on plain Enter while busy instead of queueing or cancelling', async () => {
+    const onSteer = vi.fn()
     const onQueue = vi.fn()
     const onDrain = vi.fn()
     const onCancel = vi.fn()
 
     const { getByTestId } = render(
-      <Harness busy onCancel={onCancel} onDrain={onDrain} onQueue={onQueue} onSubmit={vi.fn()} queued={['queued-1']} />
+      <Harness
+        busy
+        onCancel={onCancel}
+        onDrain={onDrain}
+        onQueue={onQueue}
+        onSteer={onSteer}
+        onSubmit={vi.fn()}
+        queued={['queued-1']}
+      />
     )
 
     const editor = getByTestId('editor')
@@ -162,9 +205,58 @@ describe('composer Enter submit — live DOM vs stale composer state (#39630)', 
       fireEvent.keyDown(editor, { key: 'Enter' })
     })
 
-    expect(onQueue).toHaveBeenCalledWith('urgent follow-up')
+    expect(onSteer).toHaveBeenCalledWith('urgent follow-up')
+    expect(onQueue).not.toHaveBeenCalled()
     expect(onDrain).not.toHaveBeenCalled()
     expect(onCancel).not.toHaveBeenCalled()
+  })
+
+  it('queues a busy draft with Cmd+Enter instead of steering it', async () => {
+    const onSteer = vi.fn()
+    const onQueue = vi.fn()
+
+    const { getByTestId } = render(
+      <Harness busy onCancel={vi.fn()} onDrain={vi.fn()} onQueue={onQueue} onSteer={onSteer} onSubmit={vi.fn()} />
+    )
+
+    const editor = getByTestId('editor')
+
+    await act(async () => {
+      editor.textContent = 'queue this after the run'
+      fireEvent.keyDown(editor, { key: 'Enter', metaKey: true })
+    })
+
+    expect(onQueue).toHaveBeenCalledWith('queue this after the run')
+    expect(onSteer).not.toHaveBeenCalled()
+  })
+
+  it('executes busy slash controls on plain Enter even when attachments are present', async () => {
+    const onSubmit = vi.fn()
+    const onSteer = vi.fn()
+    const onQueue = vi.fn()
+
+    const { getByTestId } = render(
+      <Harness
+        attachmentCount={1}
+        busy
+        onCancel={vi.fn()}
+        onDrain={vi.fn()}
+        onQueue={onQueue}
+        onSteer={onSteer}
+        onSubmit={onSubmit}
+      />
+    )
+
+    const editor = getByTestId('editor')
+
+    await act(async () => {
+      editor.textContent = '/help'
+      fireEvent.keyDown(editor, { key: 'Enter' })
+    })
+
+    expect(onSubmit).toHaveBeenCalledWith('/help')
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(onQueue).not.toHaveBeenCalled()
   })
 
   it('treats an empty Enter while busy as a no-op (never an accidental Stop)', async () => {

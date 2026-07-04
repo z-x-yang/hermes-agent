@@ -1657,8 +1657,9 @@ export const en: Translations = {
       'composer.mention': 'reference files, folders, urls, git',
       'composer.slash': 'slash command palette',
       'composer.help': 'this quick help (delete to dismiss)',
-      'composer.sendNewline': 'send · Shift+Enter for newline',
-      'composer.sendQueued': 'send next queued turn',
+      'composer.sendNewline': 'send when idle · Shift+Enter for newline',
+      'composer.steer': 'steer the running turn',
+      'composer.sendQueued': 'queue current draft · send next queued turn',
       'keybinds.openPanel': 'all keyboard shortcuts',
       'composer.cancel': 'close popover · cancel run',
       'composer.history': 'cycle popover / history'

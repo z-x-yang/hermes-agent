@@ -6,6 +6,7 @@ import { composerFill, composerSurfaceGlass } from '@/components/chat/composer-d
 import { Button } from '@/components/ui/button'
 import { useI18n } from '@/i18n'
 import { chatMessageText } from '@/lib/chat-messages'
+import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
 import { triggerHaptic } from '@/lib/haptics'
 import { cn } from '@/lib/utils'
@@ -206,7 +207,6 @@ export function ChatBar({
     activeQueueSessionKeyRef,
     attachments,
     busy,
-    canSteer,
     clearDraft,
     disabled,
     draftRef,
@@ -542,15 +542,20 @@ export function ChatBar({
       return
     }
 
-    // Cmd/Ctrl+Enter is reserved for steering the live run — never a send.
-    // Steer when there's a steerable draft, otherwise swallow it so it can't
-    // surprise-send. (Plain Enter still queues while busy / sends when idle.)
+    // Cmd/Ctrl+Enter is the explicit queue/send chord. While busy it queues the
+    // current draft (never Stop on an empty editor); while idle it behaves like
+    // a normal submit. Plain Enter below is the low-latency steer path mid-turn.
     if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.shiftKey) {
       event.preventDefault()
 
-      if (canSteer) {
-        steerDraft()
+      const editorText = editorRef.current ? composerPlainText(editorRef.current) : draftRef.current
+      const hasLivePayload = editorText.trim().length > 0 || attachments.length > 0
+
+      if (disabled || (busy && !hasLivePayload)) {
+        return
       }
+
+      submitDraft()
 
       return
     }
@@ -578,11 +583,27 @@ export function ChatBar({
       }
 
       // Empty Enter while busy is a no-op — interrupting is explicit (Stop/Esc),
-      // never a stray Enter after sending. With a payload, submitDraft queues it.
-      // Gate on the live DOM payload (not the render-lagged composer state) so a
-      // message typed fast / via IME while busy still reaches submitDraft() and
-      // gets queued instead of being mistaken for an empty Enter.
+      // never a stray Enter after sending. Gate on the live DOM payload (not the
+      // render-lagged composer state) so a message typed fast / via IME while
+      // busy is not mistaken for an empty Enter.
       if (busy && !hasLivePayload) {
+        return
+      }
+
+      // Busy with a payload: plain Enter is the low-latency steer path. Slash
+      // commands are controls, not chat nudges — submitDraft executes them
+      // immediately. Attachments cannot ride a steer frame (steerDraft no-ops),
+      // so they require the explicit Cmd+Enter queue chord / queue button. A
+      // queue-edit save still routes through submitDraft.
+      if (busy && !queueEdit) {
+        if (SLASH_COMMAND_RE.test(editorText.trim())) {
+          submitDraft()
+
+          return
+        }
+
+        steerDraft(editorText)
+
         return
       }
 

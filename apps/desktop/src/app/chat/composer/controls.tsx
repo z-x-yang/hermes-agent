@@ -71,13 +71,13 @@ export function ComposerControls({
 }) {
   const { t } = useI18n()
   const c = t.composer
-  const steerCombo = formatCombo('mod+enter')
+  const steerCombo = formatCombo('enter')
   const steerLabel = `${c.steer} (${steerCombo})`
 
   const steerTip = (
     <span className="inline-flex items-center gap-1.5">
       {c.steer}
-      <KbdCombo combo="mod+enter" size="sm" variant="inverted" />
+      <KbdCombo combo="enter" size="sm" variant="inverted" />
     </span>
   )
 
@@ -98,7 +98,9 @@ export function ComposerControls({
             aria-label={steerLabel}
             className={GHOST_ICON_BTN}
             disabled={disabled}
-            onClick={onSteer}
+            // Explicit zero-arg call: steerDraft takes an optional live-text
+            // override, and React would otherwise pass the MouseEvent into it.
+            onClick={() => onSteer()}
             size="icon"
             type="button"
             variant="ghost"

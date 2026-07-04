@@ -1582,8 +1582,9 @@ export const zhHant = defineLocale({
       'composer.mention': '參照檔案、資料夾、URL、git',
       'composer.slash': '斜線指令面板',
       'composer.help': '此快速說明（刪除以關閉）',
-      'composer.sendNewline': '傳送 · Shift+Enter 換行',
-      'composer.sendQueued': '傳送下一個排隊的回合',
+      'composer.sendNewline': '空閒時傳送 · Shift+Enter 換行',
+      'composer.steer': '引導正在執行的回合',
+      'composer.sendQueued': '排隊目前草稿 · 傳送下一個排隊回合',
       'keybinds.openPanel': '所有鍵盤快捷鍵',
       'composer.cancel': '關閉彈出視窗 · 取消執行',
       'composer.history': '循環彈出視窗 / 歷史記錄'

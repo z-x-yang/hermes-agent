@@ -16,7 +16,6 @@ interface UseComposerSubmitArgs {
   activeQueueSessionKeyRef: RefObject<string | null>
   attachments: ComposerAttachment[]
   busy: boolean
-  canSteer: boolean
   clearDraft: () => void
   disabled: boolean
   draftRef: RefObject<string>
@@ -51,7 +50,6 @@ export function useComposerSubmit({
   activeQueueSessionKeyRef,
   attachments,
   busy,
-  canSteer,
   clearDraft,
   disabled,
   draftRef,
@@ -169,12 +167,33 @@ export function useComposerSubmit({
   // Steer the live turn (nudge without interrupting). Clears the draft up front
   // for snappy feedback; if the gateway rejects (no live tool window) the words
   // are re-queued so nothing is lost — same safety net as a plain queue.
-  const steerDraft = () => {
-    if (!onSteer || !canSteer) {
+  //
+  // Steerability is judged here on live values, not a render-lagged prop: the
+  // keydown handler passes the DOM editor text (`liveText`), and the derived
+  // `isSteerableText`/`canSteer` state lags the final keystroke by a render —
+  // gating on it would silently drop a fast-typed steer. Attachments cannot
+  // ride a steer frame, so drafts with attachments no-op here and require the
+  // explicit queue chord; slash commands are controls, never steer nudges.
+  const steerDraft = (liveText?: string) => {
+    if (!onSteer) {
       return
     }
 
+    // Same DOM re-sync as submitDraft, so the steered text and the composer
+    // state agree even mid-IME/fast typing.
+    const editor = editorRef.current
+    const domText = liveText ?? (editor ? composerPlainText(editor) : draftRef.current)
+
+    if (domText !== draftRef.current) {
+      draftRef.current = domText
+      setComposerText(domText)
+    }
+
     const text = draftRef.current.trim()
+
+    if (!busy || attachments.length > 0 || !text || SLASH_COMMAND_RE.test(text)) {
+      return
+    }
 
     triggerHaptic('submit')
     clearDraft()

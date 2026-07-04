@@ -1833,8 +1833,9 @@ export const zh: Translations = {
       'composer.mention': '引用文件、文件夹、URL、git',
       'composer.slash': '斜杠命令面板',
       'composer.help': '此快速帮助 (删除以关闭)',
-      'composer.sendNewline': '发送 · Shift+Enter 换行',
-      'composer.sendQueued': '发送下一条排队的回合',
+      'composer.sendNewline': '空闲时发送 · Shift+Enter 换行',
+      'composer.steer': '引导正在运行的回合',
+      'composer.sendQueued': '排队当前草稿 · 发送下一条排队回合',
       'keybinds.openPanel': '所有键盘快捷键',
       'composer.cancel': '关闭弹窗 · 取消运行',
       'composer.history': '循环弹窗 / 历史'

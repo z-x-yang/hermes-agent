@@ -1632,8 +1632,9 @@ export const ja = defineLocale({
       'composer.mention': 'ファイル、フォルダー、URL、Git を参照',
       'composer.slash': 'スラッシュコマンドパレット',
       'composer.help': 'クイックヘルプ（削除で閉じる）',
-      'composer.sendNewline': '送信 · 改行は Shift+Enter',
-      'composer.sendQueued': '次のキュー済みターンを送信',
+      'composer.sendNewline': 'アイドル時に送信 · 改行は Shift+Enter',
+      'composer.steer': '実行中のターンをステア',
+      'composer.sendQueued': '現在の下書きをキュー · 次のキュー済みターンを送信',
       'keybinds.openPanel': 'すべてのキーボードショートカット',
       'composer.cancel': 'ポップオーバーを閉じる · 実行をキャンセル',
       'composer.history': 'ポップオーバー / 履歴を切り替え'
