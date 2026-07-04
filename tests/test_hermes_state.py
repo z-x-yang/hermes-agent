@@ -4881,3 +4881,25 @@ def test_refresh_compression_lock_requires_holder_and_preserves_reclaimability(d
 
     monkeypatch.setattr(hermes_state.time, "time", lambda: 1016.0)
     assert db.try_acquire_compression_lock("s1", "holder-b", ttl_seconds=10.0) is True
+
+
+def test_archive_and_compact_returning_ids_reports_fresh_active_rows(db):
+    db.create_session(session_id="s-rowids", source="cli")
+    db.append_message("s-rowids", role="user", content="old user")
+    db.append_message("s-rowids", role="assistant", content="old assistant")
+
+    row_ids = db.archive_and_compact_returning_ids(
+        "s-rowids",
+        [
+            {"role": "assistant", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "user", "content": "current user"},
+        ],
+    )
+
+    active = db.get_messages("s-rowids")
+    assert row_ids == [row["id"] for row in active]
+    assert [row["content"] for row in active] == [
+        "[CONTEXT COMPACTION] summary",
+        "current user",
+    ]
+    assert len(db.get_messages("s-rowids", include_inactive=True)) == 4

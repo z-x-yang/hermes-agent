@@ -3236,17 +3236,19 @@ class SessionDB:
 
         return self._execute_write(_do)
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int, list[int]]:
         """Insert *messages* as fresh active rows for *session_id*.
 
         Shared by :meth:`replace_messages` (delete-then-insert) and
         :meth:`archive_and_compact` (soft-archive-then-insert). Runs inside the
         caller's write transaction (takes the live ``conn``). Returns
-        ``(inserted_count, tool_call_count)``. Does NOT touch sessions.* counters
-        — the caller owns that, since the two flows reconcile counts differently.
+        ``(inserted_count, tool_call_count, inserted_row_ids)``. Does NOT touch
+        sessions.* counters — the caller owns that, since the two flows
+        reconcile counts differently.
         """
         now_ts = time.time()
         inserted = 0
+        inserted_row_ids: list[int] = []
         tool_calls_total = 0
         for msg in messages:
             role = msg.get("role", "unknown")
@@ -3284,7 +3286,7 @@ class SessionDB:
                 msg.get("platform_message_id") or msg.get("message_id")
             )
 
-            conn.execute(
+            cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
@@ -3310,12 +3312,14 @@ class SessionDB:
                 ),
             )
             inserted += 1
+            if cursor.lastrowid is not None:
+                inserted_row_ids.append(int(cursor.lastrowid))
             if tool_calls is not None:
                 tool_calls_total += (
                     len(tool_calls) if isinstance(tool_calls, list) else 1
                 )
             now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
-        return inserted, tool_calls_total
+        return inserted, tool_calls_total, inserted_row_ids
 
     def replace_messages(
         self,
@@ -3355,7 +3359,7 @@ class SessionDB:
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),
             )
-            total_messages, total_tool_calls = self._insert_message_rows(
+            total_messages, total_tool_calls, _row_ids = self._insert_message_rows(
                 conn, session_id, messages
             )
             conn.execute(
@@ -3378,6 +3382,34 @@ class SessionDB:
                 (session_id,),
             )
             return cursor.fetchone() is not None
+
+    def _archive_and_compact_write(
+        self,
+        conn,
+        session_id: str,
+        compacted_messages: List[Dict[str, Any]],
+    ) -> tuple[int, list[int]]:
+        # Soft-archive the live turns: active=0 hides them from the live
+        # context load, compacted=1 marks them as "summarized away" (vs
+        # rewind/undo's active=0+compacted=0, which means "user took it
+        # back"). search_messages includes compacted=1 rows by default so
+        # the pre-compaction transcript stays discoverable; live-context
+        # loads (active=1 only) still exclude them.
+        conn.execute(
+            "UPDATE messages SET active = 0, compacted = 1 "
+            "WHERE session_id = ? AND active = 1",
+            (session_id,),
+        )
+        inserted, tool_calls_total, inserted_row_ids = self._insert_message_rows(
+            conn, session_id, compacted_messages
+        )
+        # message_count / tool_call_count reflect the LIVE (active) set —
+        # the archived rows are still on disk but not part of the live count.
+        conn.execute(
+            "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+            (inserted, tool_calls_total, session_id),
+        )
+        return inserted, inserted_row_ids
 
     def archive_and_compact(
         self, session_id: str, compacted_messages: List[Dict[str, Any]]
@@ -3407,27 +3439,29 @@ class SessionDB:
         """
 
         def _do(conn):
-            # Soft-archive the live turns: active=0 hides them from the live
-            # context load, compacted=1 marks them as "summarized away" (vs
-            # rewind/undo's active=0+compacted=0, which means "user took it
-            # back"). search_messages includes compacted=1 rows by default so
-            # the pre-compaction transcript stays discoverable; live-context
-            # loads (active=1 only) still exclude them.
-            conn.execute(
-                "UPDATE messages SET active = 0, compacted = 1 "
-                "WHERE session_id = ? AND active = 1",
-                (session_id,),
-            )
-            inserted, tool_calls_total = self._insert_message_rows(
+            inserted, _row_ids = self._archive_and_compact_write(
                 conn, session_id, compacted_messages
             )
-            # message_count / tool_call_count reflect the LIVE (active) set —
-            # the archived rows are still on disk but not part of the live count.
-            conn.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                (inserted, tool_calls_total, session_id),
-            )
             return inserted
+
+        return self._execute_write(_do)
+
+    def archive_and_compact_returning_ids(
+        self, session_id: str, compacted_messages: List[Dict[str, Any]]
+    ) -> list[int]:
+        """Archive/compact like :meth:`archive_and_compact`, returning new row ids.
+
+        The exact active row ids are known inside the write transaction. Returning
+        them here lets compression audit emit a persist companion event without a
+        second post-archive read, so row-id audit does not disappear if that read
+        fails or sees transient lock contention.
+        """
+
+        def _do(conn):
+            _inserted, row_ids = self._archive_and_compact_write(
+                conn, session_id, compacted_messages
+            )
+            return row_ids
 
         return self._execute_write(_do)
 
