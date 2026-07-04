@@ -188,6 +188,10 @@ def verify_on_stop_enabled(
     return not _session_is_messaging_surface()
 
 
+def _session_id_is_cron(session_id: str | None) -> bool:
+    return str(session_id or "").strip().lower().startswith("cron_")
+
+
 def _candidate_cwds(paths: Iterable[str]) -> list[Path]:
     candidates: list[Path] = []
     seen: set[str] = set()
@@ -268,6 +272,8 @@ def build_verify_on_stop_nudge(
     max_attempts: int = 2,
 ) -> str | None:
     """Return a synthetic follow-up when edited code lacks fresh verification."""
+    if _session_id_is_cron(session_id):
+        return None
     # Drop documentation/prose paths (markdown, skills, README, LICENSE, ...) —
     # they carry no verifiable behavior, so a turn that touched only those has
     # nothing to verify and must not nudge.

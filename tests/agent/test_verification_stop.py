@@ -78,6 +78,20 @@ def test_verify_on_stop_is_off_for_cron_agent_platform(clear_verify_env):
     ) is False
 
 
+def test_cron_session_id_never_builds_verification_nudge(tmp_path, monkeypatch):
+    # A cron session's final assistant text is auto-delivered. Even if a caller
+    # forgets to pass platform="cron", the nudge builder itself must fail closed
+    # so internal verification receipts cannot replace the intended cron output.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    changed = str(tmp_path / "runs" / "decisions_reviewed.json")
+
+    assert build_verify_on_stop_nudge(
+        session_id="cron_5958dff23566_20260630_170039",
+        changed_paths=[changed],
+    ) is None
+
+
 def test_verify_on_stop_auto_sentinel_resolves_to_surface_default(clear_verify_env):
     # The legacy "auto" sentinel is still honored when set explicitly: it falls
     # through to the surface-aware default (ON interactive, OFF messaging).
