@@ -285,3 +285,58 @@ def test_review_fork_inherits_parent_toolset_config():
         f"disabled_toolsets mismatch: {captured.get('disabled_toolsets')!r} "
         f"vs expected {agent.disabled_toolsets!r}"
     )
+
+
+def test_review_fork_inherits_parent_fallback_chain():
+    """The fork must receive the parent's fallback chain via ``fallback_model``.
+
+    Without it the fork's ``_fallback_chain`` is empty, so a 429/overload on
+    the primary provider can never fail over: the review burns the full
+    retry budget (10 attempts, ~8 minutes) against a dead provider while the
+    foreground turn on the same session falls over on attempt 1.
+    """
+    import run_agent
+
+    agent = _make_agent_stub(run_agent.AIAgent)
+    agent._fallback_chain = [
+        {"provider": "gptcodex", "model": "gpt-5.5", "base_url": "https://gptcodex.top/v1/"},
+    ]
+
+    captured = {}
+
+    class _Recorder:
+        def __init__(self, *args, **kwargs):
+            captured["fallback_model"] = kwargs.get("fallback_model")
+            self._cached_system_prompt = None
+            self._memory_write_origin = None
+            self._memory_write_context = None
+            self._memory_store = None
+            self._memory_enabled = None
+            self._user_profile_enabled = None
+            self._memory_nudge_interval = None
+            self._skill_nudge_interval = None
+            self.suppress_status_output = None
+            self.session_start = None
+            self.session_id = None
+
+        def run_conversation(self, *args, **kwargs):
+            raise RuntimeError("stop after recording — don't actually call the API")
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    with patch.object(run_agent, "AIAgent", _Recorder), \
+         patch("threading.Thread", _SyncThread):
+        agent._spawn_background_review(
+            messages_snapshot=[],
+            review_memory=True,
+            review_skills=False,
+        )
+
+    assert captured.get("fallback_model") == agent._fallback_chain, (
+        f"fallback_model mismatch: {captured.get('fallback_model')!r} "
+        f"vs expected {agent._fallback_chain!r}"
+    )

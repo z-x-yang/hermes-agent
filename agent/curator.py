@@ -1857,10 +1857,17 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
     _reasoning_config = None
     _resolved_provider = None
     _model_name = ""
+    _fallback_chain = None
     try:
         from hermes_cli.config import load_config
         from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_cli.fallback_config import get_fallback_chain
         _cfg = load_config()
+        # Top-level fallback_providers chain — shared by the main model and
+        # every auxiliary task. Without it the curator fork has no failover:
+        # a 429/overload on its provider burns the full retry budget instead
+        # of switching (same gap as the background-review fork).
+        _fallback_chain = get_fallback_chain(_cfg) or None
         _binding = _resolve_review_runtime(_cfg)
         _provider, _model_name = _binding.provider, _binding.model
         _reasoning_config = _binding.reasoning_config
@@ -1888,6 +1895,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             api_key=_api_key,
             base_url=_base_url,
             api_mode=_api_mode,
+            fallback_model=_fallback_chain,
             reasoning_config=_reasoning_config,
             # Umbrella-building over a large skill collection is worth a
             # high iteration ceiling — the pass typically takes 50-100

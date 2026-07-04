@@ -705,6 +705,13 @@ def _run_review_in_thread(
                 api_mode=_rt.get("api_mode"),
                 base_url=_rt.get("base_url") or None,
                 api_key=_rt.get("api_key") or None,
+                # Inherit the parent's fallback chain (same as
+                # tools/delegate_tool.py subagents). Without it the fork's
+                # _fallback_chain is empty, so a 429/overload on the primary
+                # provider can never fail over — the review burns the full
+                # retry budget against a dead provider while the foreground
+                # turn on the same session falls over on attempt 1.
+                fallback_model=getattr(agent, "_fallback_chain", None) or None,
                 credential_pool=getattr(agent, "_credential_pool", None),
                 parent_session_id=agent.session_id,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
