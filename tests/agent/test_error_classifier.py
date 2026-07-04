@@ -336,6 +336,116 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.rate_limit
         assert result.should_fallback is True
 
+    # ── 429 quota wall (reset horizon beyond the retry window) ──
+
+    def test_429_quota_wall_days_level_reset_is_billing(self):
+        """ChatGPT Codex plan exhaustion: resets_in_seconds measured in days.
+
+        In-place retries can never outlast this — it must classify as
+        billing (retryable=False) so the loop rotates/falls back/aborts
+        instead of burning 10 retries against the wall.
+        """
+        e = MockAPIError(
+            "The usage limit has been reached",
+            status_code=429,
+            body={"error": {
+                "type": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+                "plan_type": "prolite",
+                "resets_at": 1783389315,
+                "resets_in_seconds": 373445,
+            }},
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+
+    def test_429_quota_wall_reset_only_in_message_text(self):
+        """Some SDK wrappers only carry the payload in the stringified error."""
+        e = MockAPIError(
+            "Error code: 429 - {'error': {'type': 'usage_limit_reached', "
+            "'message': 'The usage limit has been reached', "
+            "'resets_in_seconds': 373445}}",
+            status_code=429,
+            body=None,
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+
+    def test_429_short_reset_stays_rate_limit(self):
+        """A per-minute window reset is transient — normal retry applies."""
+        e = MockAPIError(
+            "The usage limit has been reached",
+            status_code=429,
+            body={"error": {
+                "type": "usage_limit_reached",
+                "resets_in_seconds": 42,
+            }},
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+
+    def test_429_no_reset_signal_stays_rate_limit(self):
+        e = MockAPIError(
+            "Too Many Requests, please slow down",
+            status_code=429,
+            body={"error": {"message": "Too Many Requests"}},
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+
+    def test_429_resets_at_epoch_beyond_window_is_billing(self):
+        import time as _time
+        e = MockAPIError(
+            "usage limit reached",
+            status_code=429,
+            body={"error": {"resets_at": _time.time() + 86400}},
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+
+    # ── reset horizon surfaced to consumers ──
+    # A 429 that carries a reset horizon must expose it on the classification
+    # so downstream code (e.g. the context compressor's summary-failure
+    # cooldown) can wait out exactly that long instead of re-slamming the wall
+    # on a fixed few-second timer.
+
+    def test_429_quota_wall_exposes_reset_horizon_seconds(self):
+        e = MockAPIError(
+            "The usage limit has been reached",
+            status_code=429,
+            body={"error": {"resets_in_seconds": 373445}},
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.billing
+        assert result.retry_after_seconds == 373445
+
+    def test_429_short_reset_exposes_reset_horizon_seconds(self):
+        e = MockAPIError(
+            "The usage limit has been reached",
+            status_code=429,
+            body={"error": {"resets_in_seconds": 42}},
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retry_after_seconds == 42
+
+    def test_429_no_reset_signal_leaves_retry_after_none(self):
+        e = MockAPIError(
+            "Too Many Requests, please slow down",
+            status_code=429,
+            body={"error": {"message": "Too Many Requests"}},
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retry_after_seconds is None
+
     def test_alibaba_rate_increased_too_quickly(self):
         """Alibaba/DashScope returns a unique throttling message.
 
@@ -843,6 +953,49 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.invalid_encrypted_content
         assert result.retryable is True
         assert result.should_fallback is False
+
+    def test_invalid_id_prefix_stream_error_is_non_retryable(self):
+        """Responses API rejects a replayed message item whose id doesn't
+        begin with `msg` (deterministic request-format error). Relays like
+        gptcodex surface it as an SSE `type=error` frame with NO HTTP status,
+        so it must not fall through to the retryable `unknown` bucket and spin
+        the full backoff budget (the "stuck session" symptom). Fail fast."""
+        message = (
+            "[ApiIdParam] [input[158].id] [invalid_id_prefix] Invalid "
+            "'input[158].id': 'item_5dae991a320545f883a7f608'. "
+            "Expected an ID that begins with 'msg'."
+        )
+        # status_code=None simulates the SSE error frame (_StreamErrorEvent).
+        e = MockAPIError(
+            message,
+            status_code=None,
+            body={"error": {"message": message, "code": "invalid_id_prefix",
+                            "param": "input[158].id", "type": "error"}},
+        )
+        result = classify_api_error(e, provider="gptcodex", model="gpt-5.5")
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_invalid_id_prefix_large_session_not_misrouted_to_overflow(self):
+        """Even on a large session, the invalid_id_prefix message must not be
+        misclassified as context_overflow (which would trigger compression on
+        a phantom error). Verify the deterministic-format classification wins."""
+        message = (
+            "invalid_id_prefix: Expected an ID that begins with 'msg'."
+        )
+        e = MockAPIError(
+            message,
+            status_code=None,
+            body={"error": {"message": message, "code": "invalid_id_prefix",
+                            "type": "error"}},
+        )
+        result = classify_api_error(
+            e, provider="gptcodex", model="gpt-5.5",
+            approx_tokens=180000, context_length=200000, num_messages=300,
+        )
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
 
     # ── Provider-specific: llama.cpp grammar-parse ──
 

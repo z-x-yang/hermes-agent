@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -86,6 +88,12 @@ class ClassifiedError:
     should_compress: bool = False
     should_rotate_credential: bool = False
     should_fallback: bool = False
+    # For rate-limit / quota errors that advertise a reset horizon (429 with
+    # ``resets_at`` / ``resets_in_seconds``): seconds-from-now until the limit
+    # lifts. None when no reset signal was present. Consumers size a cooldown
+    # from this instead of guessing a fixed delay (see the context compressor's
+    # summary-failure cooldown).
+    retry_after_seconds: Optional[float] = None
 
     @property
     def is_auth(self) -> bool:
@@ -297,6 +305,29 @@ _REQUEST_VALIDATION_PATTERNS = [
     "invalid_request_error",
     "unknown_parameter",
     "unsupported_parameter",
+]
+
+# OpenAI Responses API input-item id-prefix rejection.
+#
+# The Responses API requires each input item's ``id`` to match the prefix
+# for its type — message items must begin with ``msg`` (not the ``item_...``
+# generic-item ids some relays like gptcodex return, nor ``rs_``/``fc_``).
+# When a stored assistant message item is replayed with a non-``msg`` id the
+# request is rejected as:
+#   "Invalid 'input[N].id': 'item_...'. Expected an ID that begins with 'msg'."
+#
+# This is a deterministic request-format error: every retry replays the same
+# poisoned id and gets the identical rejection.  Crucially, gptcodex surfaces
+# it as an SSE ``type=error`` frame with NO HTTP status, so without an explicit
+# signal it falls through to the retryable ``unknown`` bucket and burns the
+# entire backoff budget — the observed "stuck session" symptom.  Classify as a
+# non-retryable format_error so the loop fails fast and falls back.  (The
+# root-cause fix strips these ids before they're sent — see
+# ``codex_responses_adapter._replayable_responses_message_id`` — so this is the
+# defense-in-depth net for any id-prefix rejection that still reaches the wire.)
+_INVALID_INPUT_ID_PREFIX_PATTERNS = [
+    "invalid_id_prefix",
+    "expected an id that begins with",
 ]
 
 # OpenRouter aggregator policy-block patterns.
@@ -582,6 +613,18 @@ def classify_api_error(
     if any(p in error_msg for p in _CONTENT_POLICY_BLOCKED_PATTERNS):
         return _result(
             FailoverReason.content_policy_blocked,
+            retryable=False,
+            should_fallback=True,
+        )
+
+    # Responses API input-item id-prefix rejection (deterministic). Must run
+    # before status-based classification so the status-less SSE ``type=error``
+    # variant (gptcodex) isn't left in the retryable ``unknown`` bucket, and a
+    # large-session 400 carrying this message isn't misrouted into the
+    # context-overflow compression path. See _INVALID_INPUT_ID_PREFIX_PATTERNS.
+    if any(p in error_msg for p in _INVALID_INPUT_ID_PREFIX_PATTERNS):
+        return _result(
+            FailoverReason.format_error,
             retryable=False,
             should_fallback=True,
         )
@@ -929,11 +972,29 @@ def _classify_by_status(
                 should_fallback=True,
                 error_context=ctx,
             )
+        # Disambiguate quota wall vs transient throttle: providers that meter
+        # plan usage (ChatGPT Codex backend ``usage_limit_reached``) attach the
+        # reset horizon to the 429 body, and it can be hours or days out.
+        # In-place backoff can only outlast a quota that resets within the
+        # retry window (~600s worst case), so a longer horizon means every
+        # retry is a guaranteed failure — classify as billing so recovery goes
+        # rotate credential → fallback chain → honest abort instead of
+        # burning the full retry budget against a wall.
+        reset_seconds = _extract_quota_reset_seconds(body, error_msg)
+        if reset_seconds is not None and reset_seconds > _QUOTA_WALL_MIN_RESET_SECONDS:
+            return result_fn(
+                FailoverReason.billing,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
+                retry_after_seconds=reset_seconds,
+            )
         return result_fn(
             FailoverReason.rate_limit,
             retryable=True,
             should_rotate_credential=True,
             should_fallback=True,
+            retry_after_seconds=reset_seconds,
         )
 
     if status_code == 400:
@@ -1397,6 +1458,41 @@ def _extract_status_code(error: Exception) -> Optional[int]:
         if cause is None or cause is current:
             break
         current = cause
+    return None
+
+
+# The retry loop makes at most 10 attempts with backoff capped at 60s
+# (jittered_backoff max_delay; Retry-After capped at 120s), so ~600s is the
+# longest quota outage in-place retries can ride out. A 429 whose reset
+# horizon exceeds this is a quota wall, not a transient throttle.
+_QUOTA_WALL_MIN_RESET_SECONDS = 600
+
+
+def _extract_quota_reset_seconds(body: dict, error_msg: str) -> Optional[float]:
+    """Extract the quota-reset horizon (seconds from now) from a 429 error.
+
+    Reads ``resets_in_seconds`` (relative) or ``resets_at`` (epoch) from the
+    error payload — top-level or nested under ``error``. Falls back to
+    scanning the message text because some SDK wrappers only carry the
+    payload in the stringified error. Returns None when no reset signal is
+    present (normal transient rate limits).
+    """
+    payloads = []
+    if isinstance(body, dict):
+        payloads.append(body)
+        nested = body.get("error")
+        if isinstance(nested, dict):
+            payloads.append(nested)
+    for payload in payloads:
+        val = payload.get("resets_in_seconds")
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return float(val)
+        val = payload.get("resets_at")
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return float(val) - time.time()
+    match = re.search(r"resets_in_seconds['\"]?\s*[:=]\s*(\d+)", error_msg)
+    if match:
+        return float(match.group(1))
     return None
 
 
