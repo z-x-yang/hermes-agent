@@ -216,10 +216,12 @@ class TestDefaultConfig:
         web = DEFAULT_CONFIG["web"]
         assert "backend" in web
         assert "search_backend" in web
+        assert "search_backends" in web
         assert "extract_backend" in web
-        # All empty string by default (no override)
+        # All defaults are empty (no override)
         assert web["backend"] == ""
         assert web["search_backend"] == ""
+        assert web["search_backends"] == []
         assert web["extract_backend"] == ""
 
 

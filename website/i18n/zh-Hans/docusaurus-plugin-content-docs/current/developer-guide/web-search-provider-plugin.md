@@ -30,6 +30,8 @@ Hermes 在三个位置扫描网页搜索后端：
 
 若两个键均未设置，Hermes 将根据环境中存在的 API key/URL 自动检测后端。`hermes tools` 会引导用户完成选择。
 
+如果需要有序回退链，`web.search_backends`（YAML 列表或逗号分隔字符串）会优先被 `web_search` 采用；若该键未设置，则继续沿用现有的 `web.search_backend` / `web.backend` 优先级。
+
 ## 目录结构
 
 ```

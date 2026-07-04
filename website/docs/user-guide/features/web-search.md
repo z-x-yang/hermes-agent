@@ -367,6 +367,21 @@ When per-capability keys are empty, both fall through to `web.backend`. When `we
 2. `web.backend` (shared fallback)
 3. Auto-detect from environment variables
 
+### Ordered search fallback
+
+If you want `web_search` to try a specific failover chain, set `web.search_backends` to an ordered list (YAML list or comma-separated string):
+
+```yaml
+# ~/.hermes/config.yaml
+web:
+  search_backends:
+    - brave-free
+    - tavily
+    - exa
+```
+
+Hermes will try each backend in order and stop at the first successful result. If this key is unset, the existing `web.search_backend` / `web.backend` precedence stays unchanged.
+
 ### Auto-detection
 
 If no backend is explicitly configured, Hermes picks the first available one based on which credentials are set:

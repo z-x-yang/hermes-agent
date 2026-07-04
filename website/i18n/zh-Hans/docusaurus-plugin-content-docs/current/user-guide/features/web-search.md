@@ -351,6 +351,21 @@ web:
 2. `web.backend`（共享回退）
 3. 从环境变量自动检测
 
+### 有序搜索回退
+
+如果你想让 `web_search` 按固定顺序尝试多个后端，可以把 `web.search_backends` 设成有序列表（YAML 列表或逗号分隔字符串）：
+
+```yaml
+# ~/.hermes/config.yaml
+web:
+  search_backends:
+    - brave-free
+    - tavily
+    - exa
+```
+
+Hermes 会按顺序依次尝试，直到某个后端成功返回。若不设置这个键，现有的 `web.search_backend` / `web.backend` 优先级保持不变。
+
 ### 自动检测
 
 如果未显式配置后端，Hermes 根据已设置的凭证选择第一个可用的后端：

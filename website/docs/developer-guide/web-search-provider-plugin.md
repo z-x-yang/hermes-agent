@@ -30,6 +30,8 @@ Each plugin's `register(ctx)` function calls `ctx.register_web_search_provider(.
 
 When neither key is set, Hermes auto-detects the backend from whichever API key/URL is present in the environment. `hermes tools` walks users through selection.
 
+For ordered failover chains, `web.search_backends` (YAML list or comma-separated string) is tried first by `web_search`; if that key is unset, the existing `web.search_backend` / `web.backend` precedence still applies.
+
 ## Directory structure
 
 ```

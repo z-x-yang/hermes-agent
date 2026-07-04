@@ -265,6 +265,34 @@ def _get_search_backend() -> str:
     return _get_capability_backend("search")
 
 
+def _normalize_backend_candidates(raw: Any) -> List[str]:
+    """Normalize a backend chain from config into a unique ordered list."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = re.split(r"[\n,;>]+", raw)
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        return []
+
+    normalized: List[str] = []
+    seen = set()
+    for value in values:
+        name = str(value).strip().lower()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        normalized.append(name)
+    return normalized
+
+
+def _get_search_backend_chain() -> List[str]:
+    """Return the explicit ordered fallback chain for web_search, if any."""
+    cfg = _load_web_config()
+    return _normalize_backend_candidates(cfg.get("search_backends"))
+
+
 def _get_extract_backend() -> str:
     """Determine which backend to use for web_extract specifically.
 
@@ -663,28 +691,78 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             get_provider as _wsp_get_provider,
         )
 
-        backend = _get_search_backend()
-        provider = _wsp_get_provider(backend) if backend else None
-        if provider is None or not provider.supports_search():
-            # Fall back to availability-walked active provider when the
-            # configured backend isn't a registered search provider (typo,
-            # uninstalled plugin, or capability mismatch).
-            provider = get_active_search_provider()
+        backend_chain = _get_search_backend_chain()
+        response_data = None
+        fallback_errors: List[str] = []
 
-        if provider is None:
-            response_data = {
-                "success": False,
-                "error": (
-                    "No web search provider configured. "
-                    "Run `hermes tools` to set one up."
-                ),
-            }
+        if backend_chain:
+            for backend in backend_chain:
+                provider = _wsp_get_provider(backend)
+                if provider is None:
+                    message = f"Configured web search backend '{backend}' is not registered"
+                    logger.warning(message)
+                    fallback_errors.append(message)
+                    continue
+                if not provider.supports_search():
+                    message = f"{provider.display_name} does not support web search"
+                    logger.warning(message)
+                    fallback_errors.append(message)
+                    continue
+
+                logger.info(
+                    "Web search via %s: '%s' (limit: %d)",
+                    provider.name, query, limit,
+                )
+                try:
+                    candidate = provider.search(query, limit)
+                except Exception as exc:  # noqa: BLE001
+                    message = f"{provider.name} raised {type(exc).__name__}: {exc}"
+                    logger.warning("Web search backend %s failed: %s", provider.name, exc)
+                    fallback_errors.append(message)
+                    continue
+
+                if isinstance(candidate, dict) and candidate.get("success") is True:
+                    response_data = candidate
+                    break
+
+                error_text = None
+                if isinstance(candidate, dict):
+                    error_text = candidate.get("error")
+                message = error_text or f"{provider.name} returned an unsuccessful response"
+                logger.warning("Web search backend %s failed: %s", provider.name, message)
+                fallback_errors.append(message)
+
+            if response_data is None:
+                error_message = "All configured web search backends failed."
+                if fallback_errors:
+                    error_message += " " + "; ".join(fallback_errors[:3])
+                response_data = {
+                    "success": False,
+                    "error": error_message,
+                }
         else:
-            logger.info(
-                "Web search via %s: '%s' (limit: %d)",
-                provider.name, query, limit,
-            )
-            response_data = provider.search(query, limit)
+            backend = _get_search_backend()
+            provider = _wsp_get_provider(backend) if backend else None
+            if provider is None or not provider.supports_search():
+                # Fall back to availability-walked active provider when the
+                # configured backend isn't a registered search provider (typo,
+                # uninstalled plugin, or capability mismatch).
+                provider = get_active_search_provider()
+
+            if provider is None:
+                response_data = {
+                    "success": False,
+                    "error": (
+                        "No web search provider configured. "
+                        "Run `hermes tools` to set one up."
+                    ),
+                }
+            else:
+                logger.info(
+                    "Web search via %s: '%s' (limit: %d)",
+                    provider.name, query, limit,
+                )
+                response_data = provider.search(query, limit)
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
@@ -954,7 +1032,7 @@ async def web_extract_tool(
         return tool_error(error_msg)
 
 
-# Convenience function to check Firecrawl credentials
+# Convenience function to check web backend availability
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available.
 
@@ -965,7 +1043,12 @@ def check_web_api_key() -> bool:
     :func:`_is_backend_available`, which delegates non-legacy names to the
     registry.
     """
-    configured = _load_web_config().get("backend", "").lower().strip()
+    cfg = _load_web_config()
+    search_chain = _normalize_backend_candidates(cfg.get("search_backends"))
+    if search_chain and any(_is_backend_available(backend) for backend in search_chain):
+        return True
+
+    configured = str(cfg.get("backend", "")).lower().strip()
     if configured and _is_backend_available(configured):
         return True
     # Any built-in backend with credentials present. This is a boolean OR, so
