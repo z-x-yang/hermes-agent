@@ -2533,6 +2533,11 @@ DEFAULT_CONFIG = {
             # Empty → the fire endpoint refuses all tokens (no unsigned decode).
             "nas_jwks_url": "",
         },
+        # Default reasoning effort for LLM-driven cron jobs that do not pin
+        # per-job `reasoning_effort`. Empty string preserves the legacy fallback
+        # to `agent.reasoning_effort`; valid explicit values are none, minimal,
+        # low, medium, high, and xhigh. Script-only no_agent jobs ignore this.
+        "reasoning_effort": "",
         # Wrap delivered cron responses with a header (task name) and footer
         # ("The agent cannot see this message").  Set to false for clean output.
         "wrap_response": True,

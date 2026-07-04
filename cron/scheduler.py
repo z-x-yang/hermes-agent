@@ -213,21 +213,33 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
 def _resolve_cron_reasoning_config(job: dict, cfg: Any) -> dict | None:
     """Resolve reasoning config for a cron-spawned agent.
 
-    Per-job ``reasoning_effort`` wins over global
-    ``config.yaml agent.reasoning_effort``. Existing jobs without the field keep
-    the old global behavior. Invalid persisted values fail closed so a hand-edited
-    jobs.json cannot silently downgrade to a different setting.
+    Precedence is per-job ``reasoning_effort`` > ``cron.reasoning_effort`` >
+    legacy ``agent.reasoning_effort``. Existing configs without the cron-specific
+    field keep the old global behavior. Explicit cron/job values fail closed when
+    invalid so hand-edited config cannot silently downgrade to a different setting.
     """
     from hermes_constants import parse_reasoning_effort
 
-    job_effort = str((job or {}).get("reasoning_effort") or "").strip()
-    if job_effort:
-        parsed = parse_reasoning_effort(job_effort)
+    def _parse_explicit_reasoning_effort(effort: str, *, label: str) -> dict | None:
+        parsed = parse_reasoning_effort(effort)
         if parsed is None:
+            context = f" {label}" if label else ""
             raise ValueError(
-                f"Invalid cron job reasoning_effort {job_effort!r}; expected one of: none, minimal, low, medium, high, xhigh"
+                f"Invalid cron{context} reasoning_effort {effort!r}; expected one of: none, minimal, low, medium, high, xhigh"
             )
         return parsed
+
+    job_effort = str((job or {}).get("reasoning_effort") or "").strip()
+    if job_effort:
+        return _parse_explicit_reasoning_effort(job_effort, label="job")
+
+    cron_cfg = (cfg or {}).get("cron") if isinstance(cfg, dict) else {}
+    if not isinstance(cron_cfg, dict):
+        cron_cfg = {}
+    cron_raw_effort = cron_cfg.get("reasoning_effort", "")
+    cron_effort = "" if cron_raw_effort is None else str(cron_raw_effort).strip()
+    if cron_effort:
+        return _parse_explicit_reasoning_effort(cron_effort, label="")
 
     agent_cfg = (cfg or {}).get("agent") if isinstance(cfg, dict) else {}
     if not isinstance(agent_cfg, dict):

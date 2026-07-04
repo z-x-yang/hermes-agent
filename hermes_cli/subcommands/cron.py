@@ -73,7 +73,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_create.add_argument(
         "--reasoning-effort",
         choices=["none", "minimal", "low", "medium", "high", "xhigh"],
-        help="Per-job reasoning effort override for LLM-driven jobs: none, minimal, low, medium, high, or xhigh. Omit to inherit the global agent.reasoning_effort.",
+        help="Per-job reasoning effort override for LLM-driven jobs: none, minimal, low, medium, high, or xhigh. Omit to inherit cron.reasoning_effort, then legacy agent.reasoning_effort.",
     )
 
     # cron edit
@@ -142,7 +142,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument(
         "--reasoning-effort",
         choices=["none", "minimal", "low", "medium", "high", "xhigh", ""],
-        help="Set per-job reasoning effort. Valid: none, minimal, low, medium, high, xhigh. Pass empty string to clear and inherit the global setting.",
+        help="Set per-job reasoning effort. Valid: none, minimal, low, medium, high, xhigh. Pass empty string to clear and inherit cron.reasoning_effort, then legacy agent.reasoning_effort.",
     )
 
     # lifecycle actions

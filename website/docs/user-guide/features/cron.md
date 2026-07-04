@@ -26,7 +26,7 @@ At creation, an unpinned job (one you don't give an explicit `provider`/`model`)
 :::
 
 :::tip
-LLM-driven cron jobs can also pin their own reasoning effort independently from the global `agent.reasoning_effort` setting. Use `reasoning_effort="high"` with the `cronjob` tool, or `--reasoning-effort high` in `hermes cron create/edit`. Valid values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`; pass an empty string on update to clear the per-job override. Script-only `no_agent` jobs ignore this field.
+LLM-driven cron jobs use `cron.reasoning_effort` as the cron-specific default when set; if it is empty or missing, Hermes preserves the legacy fallback to global `agent.reasoning_effort`. Individual jobs can still pin their own reasoning effort with `reasoning_effort="high"` in the `cronjob` tool, or `--reasoning-effort high` in `hermes cron create/edit`. Per-job values override `cron.reasoning_effort`. Valid values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`; pass an empty string on update to clear the per-job override. Script-only `no_agent` jobs ignore reasoning settings.
 :::
 
 :::warning
