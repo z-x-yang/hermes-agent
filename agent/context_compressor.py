@@ -961,29 +961,44 @@ class ContextCompressor(ContextEngine):
         Session end (CLI exit, gateway expiry, session-id rotation) goes
         through this method rather than ``on_session_reset()`` (/new, /reset).
         The original fix (#38788) only cleared ``_previous_summary``, but the
-        same cross-session contamination risk applies to per-session
-        variables that ``on_session_reset()`` clears: stale
+        same cross-session contamination risk applies to every per-session
+        variable that ``on_session_reset()`` clears: stale
         ``_ineffective_compression_count`` can suppress compression in a
         subsequent live session; ``_summary_failure_cooldown_until`` can block
         summary generation; ``_last_compress_aborted`` can make callers think
-        compression is still aborted.
+        compression is still aborted; ``_last_aux_model_failure_*`` can surface
+        stale error warnings; ``_last_summary_dropped_count`` /
+        ``_last_summary_fallback_used`` can produce misleading user warnings.
 
         ``compress()`` already guards ``_previous_summary`` leakage at the
         point of use; this is defense-in-depth that resets the per-session
-        surface the moment the owning session ends.
+        contamination surface the moment the owning session ends.
 
-        Deliberately NOT cleared here (content-free audit metadata):
-        ``_last_summary_error``, ``_last_summary_dropped_count``,
-        ``_last_summary_fallback_used``, ``_last_aux_model_failure_*``.
-        Gateway shutdown can call on_session_end while a slow compression is
-        still waiting on the summary model; clearing these fields mid-flight
-        produces successful audit rows with session_id=null and
-        summary_source={}. They are reset at the start of every compress()
-        call and overwritten before persist audit emission, so retaining them
-        across a real session end does not leak message content or
-        iterative-summary state.
+        Deliberately NOT cleared here (fork-only compression-audit sidecar):
+        ``_compression_audit_session_id``, ``_last_summary_source_audit``,
+        ``_last_compression_audit_record``,
+        ``_last_summary_user_message_ground_truth``,
+        ``_summary_failure_cooldown_error`` and ``_summary_skipped_for_cooldown``.
+        The gateway can fire ``on_session_end`` while ``compress()`` is still
+        waiting on the summary model (agent_close during a slow summary); the
+        final decision record still needs the session id and summary-source
+        metrics captured by that in-flight compression, so clearing them here
+        would emit a success audit row with session_id=null and
+        summary_source={} (see
+        ``test_compression_audit_survives_session_end_during_active_compression``).
+        They are re-initialised at the start of every ``compress()`` and
+        ``_compression_audit_session_id`` is re-bound from the live session id
+        before the next audit write, so retaining them across a real session
+        end never leaks message content or iterative-summary state. This is the
+        one intentional divergence from ``on_session_reset()``'s surface; every
+        contamination-relevant field below is cleared identically to it.
         """
         self._previous_summary = None
+        self._last_summary_error = None
+        self._last_summary_dropped_count = 0
+        self._last_summary_fallback_used = False
+        self._last_aux_model_failure_error = None
+        self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
         self._summary_failure_cooldown_until = 0.0
