@@ -108,10 +108,20 @@ def _session_is_messaging_surface() -> bool:
     (e.g. ``cli``, ``tui``) instead. Both are consulted via the session-context
     helper (with an ``os.environ`` fallback), alongside the ``HERMES_PLATFORM``
     override, matching the sibling platform resolution in
-    ``agent/skill_commands.py`` and ``agent/prompt_builder.py``. A turn is a
-    messaging surface when a resolved identity is present and is not a known
-    non-messaging surface.
+    ``agent/skill_commands.py`` and ``agent/prompt_builder.py``. Cron clears the
+    live session platform while running, but its final response is still
+    auto-delivered to a user-facing channel; treat ``HERMES_CRON_SESSION`` as a
+    delivery surface too so auto verify-on-stop does not replace the intended
+    cron payload with a verification receipt. A turn is a messaging surface when
+    a resolved identity is present and is not a known non-messaging surface.
     """
+    if os.environ.get("HERMES_CRON_SESSION", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return True
     try:
         from gateway.session_context import get_session_env
 

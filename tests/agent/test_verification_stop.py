@@ -39,6 +39,7 @@ def clear_verify_env(monkeypatch):
         "HERMES_PLATFORM",
         "HERMES_SESSION_PLATFORM",
         "HERMES_SESSION_SOURCE",
+        "HERMES_CRON_SESSION",
     ):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
@@ -58,6 +59,13 @@ def test_verify_on_stop_default_auto_off_on_messaging(clear_verify_env):
 
 def test_verify_on_stop_missing_agent_section_uses_auto(clear_verify_env):
     assert verify_on_stop_enabled({}) is True
+
+
+def test_verify_on_stop_auto_is_off_for_cron_sessions(clear_verify_env):
+    # Cron is a non-interactive delivery context: a verification-stop follow-up
+    # would replace the intended cron payload with a verification receipt.
+    clear_verify_env.setenv("HERMES_CRON_SESSION", "1")
+    assert verify_on_stop_enabled({"agent": {"verify_on_stop": "auto"}}) is False
 
 
 def test_verify_on_stop_auto_sentinel_resolves_to_surface_default(clear_verify_env):
