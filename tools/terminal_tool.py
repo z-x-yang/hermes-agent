@@ -1147,7 +1147,7 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     """
     _ISOLATION_KEYS = frozenset({
         "docker_image", "modal_image", "singularity_image",
-        "daytona_image", "env_type",
+        "daytona_image", "env_type", "_force_task_isolation",
     })
     if task_id and task_id in _task_env_overrides:
         overrides = _task_env_overrides[task_id]
@@ -1282,16 +1282,26 @@ def _get_env_config() -> Dict[str, Any]:
     else:
         default_cwd = "/root"
 
-    # Read TERMINAL_CWD but sanity-check it for container backends.
-    # If Docker cwd passthrough is explicitly enabled, remap the host path to
+    context_cwd = None
+    try:
+        from agent.runtime_cwd import resolve_context_cwd
+
+        context_cwd = resolve_context_cwd()
+    except Exception:
+        context_cwd = None
+
+    # Read the ContextVar-pinned session cwd first, then TERMINAL_CWD. Cron
+    # workdir jobs use the ContextVar path so parallel LLM jobs don't race on a
+    # process-global environment variable. Sanity-check for container backends:
+    # if Docker cwd passthrough is explicitly enabled, remap the host path to
     # /workspace and track the original host path separately. Otherwise keep the
     # normal sandbox behavior and discard host paths.
-    cwd = os.getenv("TERMINAL_CWD", default_cwd)
+    cwd = str(context_cwd) if context_cwd else os.getenv("TERMINAL_CWD", default_cwd)
     if cwd:
         cwd = os.path.expanduser(cwd)
     host_cwd = None
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
+        docker_cwd_source = str(context_cwd) if context_cwd else (os.getenv("TERMINAL_CWD") or _safe_getcwd())
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)

@@ -6,8 +6,8 @@ Covers:
   - jobs.update_job: set, clear, re-validate
   - tools.cronjob_tools.cronjob: create + update JSON round-trip, schema
     includes workdir, _format_job exposes it when set
-  - scheduler.tick(): partitions workdir jobs off the thread pool, restores
-    TERMINAL_CWD in finally, honours the env override during run_job
+  - scheduler.tick(): only serializes no_agent workdir jobs that still chdir;
+    LLM workdir jobs run through the parallel pool using ContextVar cwd
 """
 
 from __future__ import annotations
@@ -198,21 +198,22 @@ class TestCronjobToolWorkdir:
 
 class TestTickWorkdirPartition:
     """
-    tick() must run workdir jobs sequentially (outside the ThreadPoolExecutor)
-    because run_job mutates os.environ["TERMINAL_CWD"], which is process-global.
-    We verify the partition without booting the real scheduler by patching the
-    pieces tick() calls.
+    tick() must not serialize LLM workdir jobs. They use ContextVar cwd, so
+    long jobs in the same project should not head-of-line block other cron
+    jobs. Only no_agent workdir jobs remain sequential because run_job still
+    uses os.chdir() for those script-only jobs.
     """
 
-    def test_workdir_jobs_run_sequentially(self, tmp_path, monkeypatch):
+    def test_llm_workdir_jobs_use_parallel_pool_but_no_agent_workdir_is_sequential(self, tmp_path, monkeypatch):
         import cron.scheduler as sched
 
-        # Two workdir jobs (both sequential) + one parallel job.
+        # Two LLM workdir jobs + one no_agent workdir job + one plain job.
         workdir_a = {"id": "a", "name": "A", "workdir": str(tmp_path)}
         workdir_b = {"id": "b", "name": "B", "workdir": str(tmp_path)}
+        no_agent_workdir = {"id": "d", "name": "D", "workdir": str(tmp_path), "no_agent": True}
         parallel_job = {"id": "c", "name": "C", "workdir": None}
 
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: [workdir_a, workdir_b, parallel_job])
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: [workdir_a, workdir_b, no_agent_workdir, parallel_job])
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
 
         # Record call order / thread context.
@@ -234,22 +235,19 @@ class TestTickWorkdirPartition:
         )
 
         n = sched.tick(verbose=False)
-        assert n == 3
+        assert n == 4
 
-        ids = [c[0] for c in calls]
-        # Sequential workdir jobs preserve submission order relative to each
-        # other (single-thread pool).
-        assert ids.index("a") < ids.index("b")
+        # LLM workdir jobs now use the parallel pool, same as non-workdir jobs.
+        for jid in ("a", "b", "c"):
+            thread_name = next(t for j, t in calls if j == jid)
+            assert thread_name.startswith("cron-parallel"), thread_name
 
-        # Workdir jobs run on the persistent single-thread cron-seq pool —
-        # NOT the main thread — so a long workdir job never blocks the ticker.
+        # no_agent workdir jobs still run on the persistent single-thread
+        # cron-seq pool because run_job uses os.chdir() for script-only jobs.
         main_thread_name = threading.current_thread().name
-        for jid in ("a", "b"):
-            workdir_thread_name = next(t for j, t in calls if j == jid)
-            assert workdir_thread_name != main_thread_name
-            assert workdir_thread_name.startswith("cron-seq"), workdir_thread_name
-        par_thread_name = next(t for j, t in calls if j == "c")
-        assert par_thread_name.startswith("cron-parallel"), par_thread_name
+        no_agent_thread = next(t for j, t in calls if j == "d")
+        assert no_agent_thread != main_thread_name
+        assert no_agent_thread.startswith("cron-seq"), no_agent_thread
 
 
 # ---------------------------------------------------------------------------
@@ -258,8 +256,8 @@ class TestTickWorkdirPartition:
 
 class TestRunJobTerminalCwd:
     """
-    run_job sets TERMINAL_CWD + flips skip_context_files=False when workdir
-    is set, and restores the prior TERMINAL_CWD in finally — even on error.
+    run_job pins workdir in ContextVar cwd + flips skip_context_files=False,
+    without mutating process-global TERMINAL_CWD.
     We stub AIAgent so no real API call happens.
     """
 
@@ -272,15 +270,32 @@ class TestRunJobTerminalCwd:
 
         class FakeAgent:
             def __init__(self, **kwargs):
+                from agent.runtime_cwd import resolve_context_cwd
+
                 observed["skip_context_files"] = kwargs.get("skip_context_files")
                 observed["load_soul_identity"] = kwargs.get("load_soul_identity")
                 observed["terminal_cwd_during_init"] = os.environ.get(
                     "TERMINAL_CWD", "_UNSET_"
                 )
+                observed["context_cwd_during_init"] = str(resolve_context_cwd())
 
             def run_conversation(self, *_a, **_kw):
+                from agent.runtime_cwd import resolve_context_cwd
+                from tools.terminal_tool import (
+                    _resolve_container_task_id,
+                    resolve_task_overrides,
+                )
+
+                observed["run_task_id"] = _kw.get("task_id")
                 observed["terminal_cwd_during_run"] = os.environ.get(
                     "TERMINAL_CWD", "_UNSET_"
+                )
+                observed["context_cwd_during_run"] = str(resolve_context_cwd())
+                observed["task_overrides_during_run"] = resolve_task_overrides(
+                    _kw.get("task_id")
+                )
+                observed["container_task_id_during_run"] = _resolve_container_task_id(
+                    _kw.get("task_id")
                 )
                 return {"final_response": "done", "messages": []}
 
@@ -318,7 +333,7 @@ class TestRunJobTerminalCwd:
         import dotenv
         monkeypatch.setattr(dotenv, "load_dotenv", lambda *_a, **_kw: True)
 
-    def test_workdir_sets_and_restores_terminal_cwd(
+    def test_workdir_uses_context_cwd_and_terminal_task_override(
         self, tmp_path, monkeypatch
     ):
         import os
@@ -345,12 +360,76 @@ class TestRunJobTerminalCwd:
         # AIAgent was built with skip_context_files=False (feature ON).
         assert observed["skip_context_files"] is False
         assert observed["load_soul_identity"] is True
-        # TERMINAL_CWD was pointing at the job workdir while the agent ran.
-        assert observed["terminal_cwd_during_init"] == str(tmp_path.resolve())
-        assert observed["terminal_cwd_during_run"] == str(tmp_path.resolve())
+        # TERMINAL_CWD stays untouched; the job workdir is carried in ContextVar cwd.
+        assert observed["terminal_cwd_during_init"] == "/original/cwd"
+        assert observed["terminal_cwd_during_run"] == "/original/cwd"
+        assert observed["context_cwd_during_init"] == str(tmp_path.resolve())
+        assert observed["context_cwd_during_run"] == str(tmp_path.resolve())
+        assert observed["run_task_id"].startswith("cron_abc_")
+        assert observed["container_task_id_during_run"] == observed["run_task_id"]
+        assert observed["task_overrides_during_run"] == {
+            "cwd": str(tmp_path.resolve()),
+            "_force_task_isolation": True,
+        }
 
-        # And it was restored to the original value in finally.
+        # And it remains the original value in finally; terminal overrides are cleared too.
         assert os.environ["TERMINAL_CWD"] == "/original/cwd"
+        from tools.terminal_tool import resolve_task_overrides
+
+        assert resolve_task_overrides(observed["run_task_id"]) == {}
+
+    def test_workdir_terminal_override_failure_fails_job(self, tmp_path, monkeypatch):
+        """Cron must fail closed if it cannot isolate a workdir job's terminal env."""
+        import cron.scheduler as sched
+        import tools.terminal_tool as terminal_tool
+
+        observed: dict = {}
+        self._install_stubs(monkeypatch, observed)
+
+        def boom(*_a, **_kw):
+            raise RuntimeError("registry unavailable")
+
+        monkeypatch.setattr(terminal_tool, "register_task_env_overrides", boom)
+
+        job = {
+            "id": "abc",
+            "name": "wd-job",
+            "workdir": str(tmp_path),
+            "schedule_display": "manual",
+        }
+
+        success, _output, _response, error = sched.run_job(job)
+        assert success is False
+        assert "failed to isolate cron workdir terminal environment" in (error or "")
+        assert "run_task_id" not in observed
+
+    def test_tool_cwd_resolution_prefers_contextvar(self, tmp_path, monkeypatch):
+        """Tool cwd helpers must honor session ContextVar cwd before env cwd."""
+        env_cwd = tmp_path / "env"
+        ctx_cwd = tmp_path / "ctx"
+        staging = tmp_path / "stage"
+        env_cwd.mkdir()
+        ctx_cwd.mkdir()
+        staging.mkdir()
+        monkeypatch.setenv("TERMINAL_CWD", str(env_cwd))
+
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.terminal_tool import _get_env_config
+        from tools.file_tools import _configured_terminal_cwd
+        from tools.code_execution_tool import _resolve_child_cwd
+
+        tokens = set_session_vars(cwd=str(ctx_cwd))
+        try:
+            assert _get_env_config()["cwd"] == str(ctx_cwd)
+            assert _configured_terminal_cwd() == str(ctx_cwd)
+            assert _resolve_child_cwd("project", str(staging)) == str(ctx_cwd)
+            monkeypatch.setenv("TERMINAL_ENV", "docker")
+            monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
+            docker_cfg = _get_env_config()
+            assert docker_cfg["cwd"] == "/workspace"
+            assert docker_cfg["host_cwd"] == str(ctx_cwd)
+        finally:
+            clear_session_vars(tokens)
 
     def test_no_workdir_leaves_terminal_cwd_untouched(self, monkeypatch):
         """When workdir is absent, run_job must not touch TERMINAL_CWD at all —

@@ -1745,6 +1745,14 @@ def _resolve_child_cwd(mode: str, staging_dir: str) -> str:
     """
     if mode != "project":
         return staging_dir
+    try:
+        from agent.runtime_cwd import resolve_agent_cwd
+
+        p = resolve_agent_cwd()
+        if p.is_dir():
+            return str(p)
+    except Exception:
+        pass
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     if raw:
         expanded = os.path.expanduser(raw)

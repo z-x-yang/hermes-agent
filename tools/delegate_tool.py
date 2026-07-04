@@ -19,6 +19,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import contextvars
 
 logger = logging.getLogger(__name__)
 import os
@@ -39,6 +40,45 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+
+
+def _submit_with_context(executor: ThreadPoolExecutor, fn, *args, **kwargs):
+    """Submit *fn* to an executor with the caller's ContextVars preserved."""
+    ctx = contextvars.copy_context()
+
+    def _call():
+        return fn(*args, **kwargs)
+
+    return executor.submit(ctx.run, _call)
+
+
+def _explicit_session_cwd() -> Optional[str]:
+    """Return the explicitly ContextVar-pinned cwd, not the env fallback."""
+    try:
+        from agent.runtime_cwd import _session_cwd_override
+
+        raw = _session_cwd_override()
+        if raw:
+            path = os.path.abspath(os.path.expanduser(str(raw)))
+            if os.path.isdir(path):
+                return path
+    except Exception:
+        pass
+    return None
+
+
+def _register_context_cwd_terminal_override(task_id: str) -> bool:
+    """Force terminal env isolation for a task when a ContextVar cwd is pinned."""
+    cwd = _explicit_session_cwd()
+    if not cwd:
+        return False
+    from tools.terminal_tool import register_task_env_overrides
+
+    register_task_env_overrides(
+        task_id,
+        {"cwd": cwd, "_force_task_isolation": True},
+    )
+    return True
 
 
 # Tools that children must never have access to
@@ -743,7 +783,15 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     teaching subagents a fake container path while still helping them avoid
     guessing `/workspace/...` for local repo tasks.
     """
+    context_cwd = None
+    try:
+        from agent.runtime_cwd import resolve_context_cwd
+
+        context_cwd = resolve_context_cwd()
+    except Exception:
+        context_cwd = None
     candidates = [
+        str(context_cwd) if context_cwd else None,
         os.getenv("TERMINAL_CWD"),
         getattr(
             getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
@@ -1728,6 +1776,7 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    _child_terminal_override_task_id: Optional[str] = None
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -1878,6 +1927,24 @@ def _run_single_child(
         import uuid as _uuid
 
         child_task_id = _subagent_id or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
+        try:
+            if _register_context_cwd_terminal_override(child_task_id):
+                _child_terminal_override_task_id = child_task_id
+        except Exception as exc:
+            logger.exception(
+                "Failed to register subagent terminal cwd override for %s",
+                child_task_id,
+            )
+            return {
+                "task_index": task_index,
+                "status": "error",
+                "summary": None,
+                "error": f"Failed to isolate subagent terminal cwd: {exc}",
+                "exit_reason": "error",
+                "api_calls": 0,
+                "duration_seconds": round(time.monotonic() - child_start, 2),
+                "_child_role": getattr(child, "_delegate_role", None),
+            }
         parent_task_id = getattr(parent_agent, "_current_task_id", None)
         wall_start = time.time()
         parent_reads_snapshot = (
@@ -1924,7 +1991,7 @@ def _run_single_child(
                 stream_callback=_relay_child_text,
             )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        _child_future = _submit_with_context(_timeout_executor, _run_with_thread_capture)
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -2278,6 +2345,14 @@ def _run_single_child(
         if _subagent_id:
             _unregister_subagent(_subagent_id)
 
+        if _child_terminal_override_task_id:
+            try:
+                from tools.terminal_tool import clear_task_env_overrides
+
+                clear_task_env_overrides(_child_terminal_override_task_id)
+            except Exception:
+                pass
+
         if child_pool is not None and leased_cred_id is not None:
             try:
                 child_pool.release_lease(leased_cred_id)
@@ -2538,7 +2613,8 @@ def delegate_task(
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
                 for i, t, child in children:
-                    future = executor.submit(
+                    future = _submit_with_context(
+                        executor,
                         _run_single_child,
                         task_index=i,
                         goal=t["goal"],
@@ -2813,8 +2889,10 @@ def delegate_task(
                 except ValueError:
                     pass
 
+        _async_context = contextvars.copy_context()
+
         def _batch_runner():
-            return _execute_and_aggregate()
+            return _async_context.run(_execute_and_aggregate)
 
         def _batch_interrupt():
             for _c in _child_agents:

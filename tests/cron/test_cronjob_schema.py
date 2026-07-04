@@ -39,3 +39,13 @@ def test_cronjob_schema_required_array_unchanged():
     from tools.cronjob_tools import CRONJOB_SCHEMA
 
     assert CRONJOB_SCHEMA["parameters"]["required"] == ["action"]
+
+
+def test_cronjob_schema_workdir_description_matches_parallel_runtime_contract():
+    """`workdir` description must match scheduler partition semantics."""
+    from tools.cronjob_tools import CRONJOB_SCHEMA
+
+    desc = CRONJOB_SCHEMA["parameters"]["properties"]["workdir"]["description"]
+    assert "LLM-driven jobs with workdir run in the normal parallel pool" in desc
+    assert "no_agent script-only jobs with workdir remain sequential" in desc
+    assert "Jobs with workdir run sequentially" not in desc

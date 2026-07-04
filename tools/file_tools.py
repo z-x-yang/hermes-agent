@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import posixpath
+import tempfile
 import threading
 from pathlib import Path, PurePosixPath
 
@@ -195,13 +196,26 @@ def _sentinel_free_abs_cwd(raw: str | None) -> str | None:
 
 
 def _configured_terminal_cwd() -> str | None:
-    """Return ``$TERMINAL_CWD`` only when it names a real directory anchor.
+    """Return the configured cwd only when it names a real directory anchor.
 
-    Sentinel values (see ``_TERMINAL_CWD_SENTINELS``) and relative paths are
-    rejected — a relative anchor is meaningless without knowing which cwd it is
-    relative to, which is exactly the ambiguity that misroutes worktree edits.
-    Only an absolute, sentinel-free value is honored.
+    A session ContextVar cwd takes precedence over ``$TERMINAL_CWD`` so gateway,
+    delegate, and cron worker threads can carry isolated logical workdirs
+    without mutating process-global environment state. Sentinel values (see
+    ``_TERMINAL_CWD_SENTINELS``) and relative paths are rejected — a relative
+    anchor is meaningless without knowing which cwd it is relative to, which is
+    exactly the ambiguity that misroutes worktree edits. Only an absolute,
+    sentinel-free value is honored.
     """
+    try:
+        from agent.runtime_cwd import _session_cwd_override
+
+        raw_context_cwd = _session_cwd_override()
+        if raw_context_cwd:
+            resolved = _sentinel_free_abs_cwd(str(raw_context_cwd))
+            if resolved:
+                return resolved
+    except Exception:
+        pass
     return _sentinel_free_abs_cwd(os.environ.get("TERMINAL_CWD"))
 
 
@@ -565,6 +579,24 @@ _SENSITIVE_PATH_PREFIXES = (
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
+
+def _is_temp_path(path: str) -> bool:
+    """Return True when *path* is under the platform temp directory.
+
+    macOS resolves ``/tmp`` into ``/private/var/folders/...``. The broad
+    ``/private/var/`` system guard should still block system state such as
+    ``/private/var/db/...``, but must not make pytest/user temp workspaces
+    unwritable.
+    """
+    try:
+        p = Path(path).expanduser().resolve()
+        tmp = Path(tempfile.gettempdir()).expanduser().resolve()
+        p.relative_to(tmp)
+        return True
+    except Exception:
+        return False
+
+
 _hermes_config_resolved: str | None = None
 _hermes_config_resolved_loaded = False
 
@@ -598,7 +630,9 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         "Use the terminal tool with sudo if you need to modify system files."
     )
     for prefix in _SENSITIVE_PATH_PREFIXES:
-        if resolved.startswith(prefix) or normalized.startswith(prefix):
+        if resolved.startswith(prefix) and not _is_temp_path(resolved):
+            return _err
+        if normalized.startswith(prefix) and not _is_temp_path(normalized):
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err

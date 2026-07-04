@@ -205,6 +205,17 @@ def test_registering_cwd_override_noop_when_no_live_env(monkeypatch):
     assert terminal_tool._task_env_overrides["acp-session-pending"] == {"cwd": "/workspace/new"}
 
 
+def test_force_task_isolation_makes_cwd_only_override_use_task_container(monkeypatch):
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+
+    terminal_tool.register_task_env_overrides(
+        "cron-session",
+        {"cwd": "/workspace/cron", "_force_task_isolation": True},
+    )
+
+    assert terminal_tool._resolve_container_task_id("cron-session") == "cron-session"
+
+
 def test_registering_non_cwd_override_leaves_live_env_cwd_untouched(monkeypatch):
     """A non-cwd override (e.g. a per-task Modal image) must not disturb the
     live env's cwd."""
