@@ -2560,7 +2560,11 @@ def _get_provider_chain() -> List[tuple]:
 # process won't inherit the unhealthy mark — that's intentional, since
 # the user might be running two profiles with different OpenRouter keys.
 
-_AUX_UNHEALTHY_TTL_SECONDS = 600  # 10 minutes
+# Local retry preference: short provider hiccups should recover quickly.
+# Quota walls on relay/pooled providers are routinely cleared in seconds
+# (manual top-up, key rotation), and every aux call re-probes cheaply; a
+# 10-minute blacklist froze compression for far longer than the outage.
+_AUX_UNHEALTHY_TTL_SECONDS = 3
 _aux_unhealthy_until: Dict[str, float] = {}
 _aux_unhealthy_logged_at: Dict[str, float] = {}
 
@@ -3030,6 +3034,185 @@ def _is_auxiliary_fallback_error(exc: Exception) -> bool:
     )
 
 
+# Same-provider retry budget for empty-content HTTP 200s. Relay endpoints
+# (gptcodex.top) intermittently return a reasoning-only body with no message
+# item — observed flaky, not deterministic (4/7 compression fallback calls
+# succeeded on 2026-07-01 while 3 returned empty), so an immediate retry on
+# the SAME provider usually recovers. Short backoff between attempts gives
+# the relay a beat without holding the aux thread long; a provider that is
+# genuinely down keeps failing and escalates to fallback as before.
+_EMPTY_RESPONSE_RETRIES = 2
+_EMPTY_RESPONSE_RETRY_BACKOFF_SECONDS = (2.0, 5.0)
+
+# Same-provider retry budget for a quota/usage-limit ("payment") error from a
+# FALLBACK candidate. Relay endpoints (gptcodex.top) intermittently report a
+# spurious ``usage_limit_reached``/``no credits`` 429 even while the same API
+# key is actively serving other requests — observed 2026-07-03, when the relay
+# flaked mid-session while another agent was editing code through the very same
+# endpoint. Such a report is NOT trustworthy as terminal, so give the relay a
+# few exponential-backoff retries before advancing to the next candidate. This
+# is opt-in (``retry_payment``) and used ONLY for fallback candidates: a quota
+# error on the PRIMARY provider (e.g. the user's own OpenAI Codex plan) is real,
+# and should fail over to the relay immediately instead of burning seconds
+# retrying a genuinely exhausted plan — the next compaction turn re-probes the
+# primary once, which is enough to catch a manual top-up/reset.
+_PAYMENT_RETRIES = 2
+_PAYMENT_RETRY_BACKOFF_SECONDS = (1.0, 3.0)
+
+
+def _request_with_same_provider_retries(
+    request_fn,
+    task: Optional[str],
+    *,
+    label: str = "",
+    retry_payment: bool = False,
+    retry_transport: bool = False,
+):
+    """Run one auxiliary request with same-provider retries for flaky failures.
+
+    Complements the primary call's inline transient-transport loop in
+    ``call_llm`` (PR #16587); used for both the primary call (empty-200 only)
+    and each fallback-chain candidate:
+      - empty-content HTTP 200s (``_is_invalid_aux_response_error``): up to
+        ``_EMPTY_RESPONSE_RETRIES`` retries with short backoff — a flaky relay
+        that returns one reasoning-only body is usually fine on the immediate
+        retry, and abandoning it would burn the whole chain.
+      - quota/usage-limit ("payment") errors, ONLY when ``retry_payment`` is
+        set (fallback candidates): up to ``_PAYMENT_RETRIES`` retries with
+        exponential backoff, because a relay's ``usage_limit_reached`` report
+        is often spurious. Never enabled for the primary provider, whose quota
+        wall is real and should fail over at once.
+      - transient transport blips, ONLY when ``retry_transport`` is set
+        (fallback candidates — the primary call has its own inline loop):
+        up to ``_transient_retry_count()`` retries with the same backoff
+        formula, honoring the #54465 compression-timeout skip.
+    Auth failures (401/403) are terminal and never retried here. Anything else
+    propagates immediately to the caller's except-chain (provider fallback,
+    auth refresh, pool rotation).
+    """
+    transport_retries = _transient_retry_count() if retry_transport else 0
+    max_transport_retries = transport_retries
+    empty_retries = _EMPTY_RESPONSE_RETRIES
+    payment_retries = _PAYMENT_RETRIES if retry_payment else 0
+    while True:
+        try:
+            return request_fn()
+        except Exception as err:
+            if empty_retries > 0 and _is_invalid_aux_response_error(err):
+                delay = _EMPTY_RESPONSE_RETRY_BACKOFF_SECONDS[
+                    min(_EMPTY_RESPONSE_RETRIES - empty_retries,
+                        len(_EMPTY_RESPONSE_RETRY_BACKOFF_SECONDS) - 1)]
+                empty_retries -= 1
+                logger.info(
+                    "Auxiliary %s: empty/invalid response on %s; retrying same "
+                    "provider in %.0fs (%d retr%s left): %s",
+                    task or "call", label or "provider", delay, empty_retries,
+                    "y" if empty_retries == 1 else "ies", err,
+                )
+                time.sleep(delay)
+                continue
+            if (payment_retries > 0 and _is_payment_error(err)
+                    and not _is_auth_error(err)):
+                delay = _PAYMENT_RETRY_BACKOFF_SECONDS[
+                    min(_PAYMENT_RETRIES - payment_retries,
+                        len(_PAYMENT_RETRY_BACKOFF_SECONDS) - 1)]
+                payment_retries -= 1
+                logger.info(
+                    "Auxiliary %s: quota/usage-limit on fallback candidate %s "
+                    "(relay may be flaking); retrying same provider in %.1fs "
+                    "(%d retr%s left) before next candidate: %s",
+                    task or "call", label or "provider", delay, payment_retries,
+                    "y" if payment_retries == 1 else "ies", err,
+                )
+                time.sleep(delay)
+                continue
+            if transport_retries > 0 and _is_transient_transport_error(err):
+                # Compression timeouts skip same-target retries (#54465): a
+                # retry means another full timeout-long stall on the critical
+                # preflight path before the chain can advance.
+                if task == "compression" and _is_timeout_error(err):
+                    raise
+                attempt = max_transport_retries - transport_retries + 1
+                delay = min(
+                    _TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (attempt - 1)), 8.0)
+                transport_retries -= 1
+                logger.info(
+                    "Auxiliary %s: transient transport error on %s; retrying "
+                    "same provider in %.1fs (%d retr%s left) before fallback: %s",
+                    task or "call", label or "provider", delay, transport_retries,
+                    "y" if transport_retries == 1 else "ies", err,
+                )
+                time.sleep(delay)
+                continue
+            raise
+
+
+async def _request_with_same_provider_retries_async(
+    request_fn,
+    task: Optional[str],
+    *,
+    label: str = "",
+    retry_payment: bool = False,
+    retry_transport: bool = False,
+):
+    """Async twin of ``_request_with_same_provider_retries``."""
+    import asyncio
+
+    transport_retries = _transient_retry_count() if retry_transport else 0
+    max_transport_retries = transport_retries
+    empty_retries = _EMPTY_RESPONSE_RETRIES
+    payment_retries = _PAYMENT_RETRIES if retry_payment else 0
+    while True:
+        try:
+            return await request_fn()
+        except Exception as err:
+            if empty_retries > 0 and _is_invalid_aux_response_error(err):
+                delay = _EMPTY_RESPONSE_RETRY_BACKOFF_SECONDS[
+                    min(_EMPTY_RESPONSE_RETRIES - empty_retries,
+                        len(_EMPTY_RESPONSE_RETRY_BACKOFF_SECONDS) - 1)]
+                empty_retries -= 1
+                logger.info(
+                    "Auxiliary %s (async): empty/invalid response on %s; retrying "
+                    "same provider in %.0fs (%d retr%s left): %s",
+                    task or "call", label or "provider", delay, empty_retries,
+                    "y" if empty_retries == 1 else "ies", err,
+                )
+                await asyncio.sleep(delay)
+                continue
+            if (payment_retries > 0 and _is_payment_error(err)
+                    and not _is_auth_error(err)):
+                delay = _PAYMENT_RETRY_BACKOFF_SECONDS[
+                    min(_PAYMENT_RETRIES - payment_retries,
+                        len(_PAYMENT_RETRY_BACKOFF_SECONDS) - 1)]
+                payment_retries -= 1
+                logger.info(
+                    "Auxiliary %s (async): quota/usage-limit on fallback candidate "
+                    "%s (relay may be flaking); retrying same provider in %.1fs "
+                    "(%d retr%s left) before next candidate: %s",
+                    task or "call", label or "provider", delay, payment_retries,
+                    "y" if payment_retries == 1 else "ies", err,
+                )
+                await asyncio.sleep(delay)
+                continue
+            if transport_retries > 0 and _is_transient_transport_error(err):
+                if task == "compression" and _is_timeout_error(err):
+                    raise
+                attempt = max_transport_retries - transport_retries + 1
+                delay = min(
+                    _TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (attempt - 1)), 8.0)
+                transport_retries -= 1
+                logger.info(
+                    "Auxiliary %s (async): transient transport error on %s; "
+                    "retrying same provider in %.1fs (%d retr%s left) before "
+                    "fallback: %s",
+                    task or "call", label or "provider", delay, transport_retries,
+                    "y" if transport_retries == 1 else "ies", err,
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise
+
+
 def _fallback_failed_provider_label(
     provider_label: str,
     client: Any = None,
@@ -3048,6 +3231,42 @@ def _fallback_failed_provider_label(
     if label.endswith(")") and "(" in label:
         label = label.rsplit("(", 1)[1][:-1]
     return label.strip()
+
+
+_FALLBACK_CANDIDATE_SEP = "::"
+
+
+def _fallback_candidate_skip_key(provider_label: str, model: Optional[str] = None) -> str:
+    """Return a skip key for one fallback candidate, not an entire provider.
+
+    ``fallback_providers`` often contains multiple models behind the same relay
+    provider (for example ``gptcodex/gpt-5.5`` then ``gptcodex/gpt-5.4``).  A
+    transient empty response or model-specific quota from the first candidate
+    must not poison the second.  Provider-only labels remain supported for
+    callers that intentionally want to skip a whole backend.
+    """
+    provider = str(provider_label or "").strip().lower()
+    if provider.endswith(")") and "(" in provider:
+        provider = provider.rsplit("(", 1)[1][:-1].strip()
+    model_norm = str(model or "").strip().lower()
+    if provider and model_norm:
+        return f"{provider}{_FALLBACK_CANDIDATE_SEP}{model_norm}"
+    return provider
+
+
+def _split_fallback_skip_keys(skip_entries: Optional[set[str]]) -> tuple[set[str], set[str]]:
+    """Split provider-wide skips from provider::model candidate skips."""
+    provider_skips: set[str] = set()
+    candidate_skips: set[str] = set()
+    for entry in skip_entries or set():
+        value = str(entry or "").strip().lower()
+        if not value:
+            continue
+        if _FALLBACK_CANDIDATE_SEP in value:
+            candidate_skips.add(value)
+        else:
+            provider_skips.add(value)
+    return provider_skips, candidate_skips
 
 
 def _evict_cached_clients(provider: str) -> None:
@@ -3499,13 +3718,12 @@ def _try_main_agent_model_fallback(
         return None, None, ""
 
     skip = (failed_provider or "").lower().strip()
-    extra_skip = {
-        str(provider or "").strip().lower()
-        for provider in (skip_providers or set())
-        if str(provider or "").strip()
-    }
+    extra_skip, candidate_skips = _split_fallback_skip_keys(skip_providers)
+    main_candidate_key = _fallback_candidate_skip_key(main_provider, main_model)
     if main_provider.lower() == skip or main_provider.lower() in extra_skip:
         # The thing that failed IS the main model — nothing to fall back to.
+        return None, None, ""
+    if main_candidate_key in candidate_skips:
         return None, None, ""
     if _is_provider_unhealthy(main_provider):
         _log_skip_unhealthy(main_provider, task)
@@ -3634,12 +3852,8 @@ def _try_configured_fallback_chain(
     if not chain or not isinstance(chain, list):
         return None, None, ""
 
-    skip = {failed_provider.lower().strip()}
-    skip.update(
-        str(provider or "").strip().lower()
-        for provider in (skip_providers or set())
-        if str(provider or "").strip()
-    )
+    provider_skips, candidate_skips = _split_fallback_skip_keys(skip_providers)
+    skip = {failed_provider.lower().strip(), *provider_skips}
     tried = []
     min_ctx = _task_minimum_context_length(task)
 
@@ -3650,6 +3864,9 @@ def _try_configured_fallback_chain(
         if not fb_provider or fb_provider.lower() in skip:
             continue
         fb_model = str(entry.get("model", "")).strip() or None
+        candidate_key = _fallback_candidate_skip_key(fb_provider, fb_model)
+        if candidate_key in candidate_skips:
+            continue
 
         label = f"fallback_chain[{i}]({fb_provider})"
 
@@ -3767,12 +3984,9 @@ def _try_main_fallback_chain(
 
     failed_norm = (failed_provider or "").strip().lower()
     main_norm = (_read_main_provider() or "").strip().lower()
+    provider_skips, candidate_skips = _split_fallback_skip_keys(skip_providers)
     skip = {p for p in (failed_norm, main_norm, "auto") if p}
-    skip.update(
-        str(provider or "").strip().lower()
-        for provider in (skip_providers or set())
-        if str(provider or "").strip()
-    )
+    skip.update(provider_skips)
     tried: List[str] = []
     min_ctx = _task_minimum_context_length(task)
 
@@ -3785,8 +3999,12 @@ def _try_main_fallback_chain(
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
+        candidate_key = _fallback_candidate_skip_key(fb_provider, fb_model)
         if fb_norm in skip:
             tried.append(f"{label} (skipped)")
+            continue
+        if candidate_key in candidate_skips:
+            tried.append(f"{label}/{fb_model} (skipped)")
             continue
         if _is_provider_unhealthy(fb_norm):
             _log_skip_unhealthy(fb_norm, task)
@@ -6252,8 +6470,14 @@ def call_llm(
         # ``first_err`` and the existing fallback handling unchanged. Unified home
         # for the transient retry every auxiliary task shares. (PR #16587)
         try:
-            return _validate_llm_response(
-                client.chat.completions.create(**kwargs), task)
+            # Empty-content 200s from a flaky relay get their own bounded
+            # same-provider retries here, before the except-chain below treats
+            # them as a fallback signal (_is_invalid_aux_response_error) and
+            # abandons an otherwise-healthy provider.
+            return _request_with_same_provider_retries(
+                lambda: _validate_llm_response(
+                    client.chat.completions.create(**kwargs), task),
+                task, label=resolved_provider or "primary")
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
@@ -6609,28 +6833,28 @@ def call_llm(
             #   2. Top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
-            failed_fallback_providers: set[str] = set()
+            failed_fallback_candidates: set[str] = set()
 
             def _configured_layer():
-                kwargs = {"skip_providers": failed_fallback_providers} if failed_fallback_providers else {}
+                kwargs = {"skip_providers": failed_fallback_candidates} if failed_fallback_candidates else {}
                 return _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason, **kwargs)
 
             def _main_chain_layer():
-                kwargs = {"skip_providers": failed_fallback_providers} if failed_fallback_providers else {}
+                kwargs = {"skip_providers": failed_fallback_candidates} if failed_fallback_candidates else {}
                 return _try_main_fallback_chain(
                     task, resolved_provider or "auto", reason=reason, **kwargs)
 
             fallback_layers = [_configured_layer, _main_chain_layer]
             if is_auto:
                 def _builtin_layer():
-                    kwargs = {"skip_providers": failed_fallback_providers} if failed_fallback_providers else {}
+                    kwargs = {"skip_providers": failed_fallback_candidates} if failed_fallback_candidates else {}
                     return _try_payment_fallback(
                         resolved_provider, task, reason=reason, **kwargs)
                 fallback_layers.append(_builtin_layer)
             else:
                 def _main_agent_layer():
-                    kwargs = {"skip_providers": failed_fallback_providers} if failed_fallback_providers else {}
+                    kwargs = {"skip_providers": failed_fallback_candidates} if failed_fallback_candidates else {}
                     return _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason, **kwargs)
                 fallback_layers.append(_main_agent_layer)
@@ -6643,10 +6867,12 @@ def call_llm(
                     fb_failed_provider = _fallback_failed_provider_label(
                         fb_label, fb_client, main_runtime=main_runtime)
                     fb_failed_norm = fb_failed_provider.lower()
-                    if fb_failed_norm and fb_failed_norm in failed_fallback_providers:
+                    fb_failed_candidate = _fallback_candidate_skip_key(
+                        fb_failed_provider or fb_label, fb_model)
+                    if fb_failed_candidate and fb_failed_candidate in failed_fallback_candidates:
                         logger.debug(
-                            "Auxiliary %s: fallback layer returned already-failed provider %s; moving on",
-                            task or "call", fb_failed_provider,
+                            "Auxiliary %s: fallback layer returned already-failed candidate %s; moving on",
+                            task or "call", fb_failed_candidate,
                         )
                         break
                     fb_kwargs = _build_call_kwargs(
@@ -6656,15 +6882,28 @@ def call_llm(
                         extra_body=effective_extra_body,
                         base_url=str(getattr(fb_client, "base_url", "") or ""))
                     try:
-                        return _validate_llm_response(
-                            fb_client.chat.completions.create(**fb_kwargs), task)
+                        # Each fallback candidate gets its own same-provider
+                        # retries (transport, empty-200, spurious quota) — a
+                        # flaky relay that returns one empty body or a bogus
+                        # usage_limit_reached is usually fine on the immediate
+                        # retry, and abandoning it here would burn the whole
+                        # chain and resurface the original error. A payment
+                        # error on a fallback candidate deliberately does NOT
+                        # mark the provider unhealthy: a relay's spurious quota
+                        # report must not blacklist the site for every
+                        # subsequent aux call (the primary path still marks).
+                        return _request_with_same_provider_retries(
+                            lambda: _validate_llm_response(
+                                fb_client.chat.completions.create(**fb_kwargs), task),
+                            task, label=fb_failed_provider or fb_label,
+                            retry_payment=True, retry_transport=True)
                     except Exception as fallback_err:
                         if not _is_auxiliary_fallback_error(fallback_err):
                             raise
-                        if fb_failed_norm:
-                            failed_fallback_providers.add(fb_failed_norm)
-                        if _is_payment_error(fallback_err):
-                            _mark_provider_unhealthy(fb_failed_provider or fb_label)
+                        if fb_failed_candidate:
+                            failed_fallback_candidates.add(fb_failed_candidate)
+                        elif fb_failed_norm:
+                            failed_fallback_candidates.add(fb_failed_norm)
                         if _is_connection_error(fallback_err):
                             try:
                                 _evict_cached_client_instance(fb_client)
@@ -6868,8 +7107,14 @@ async def async_call_llm(
         # before the except-chain escalates to fallback — see call_llm()
         # for the rationale. (PR #16587)
         try:
-            return _validate_llm_response(
-                await client.chat.completions.create(**kwargs), task)
+            # Empty-content 200s get bounded same-provider retries before the
+            # except-chain treats them as a fallback signal — see call_llm().
+            async def _primary_call_async():
+                return _validate_llm_response(
+                    await client.chat.completions.create(**kwargs), task)
+            return await _request_with_same_provider_retries_async(
+                _primary_call_async,
+                task, label=resolved_provider or "primary")
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
@@ -7161,28 +7406,28 @@ async def async_call_llm(
             #   2. Top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
-            failed_fallback_providers: set[str] = set()
+            failed_fallback_candidates: set[str] = set()
 
             def _configured_layer():
-                kwargs = {"skip_providers": failed_fallback_providers} if failed_fallback_providers else {}
+                kwargs = {"skip_providers": failed_fallback_candidates} if failed_fallback_candidates else {}
                 return _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason, **kwargs)
 
             def _main_chain_layer():
-                kwargs = {"skip_providers": failed_fallback_providers} if failed_fallback_providers else {}
+                kwargs = {"skip_providers": failed_fallback_candidates} if failed_fallback_candidates else {}
                 return _try_main_fallback_chain(
                     task, resolved_provider or "auto", reason=reason, **kwargs)
 
             fallback_layers = [_configured_layer, _main_chain_layer]
             if is_auto:
                 def _builtin_layer():
-                    kwargs = {"skip_providers": failed_fallback_providers} if failed_fallback_providers else {}
+                    kwargs = {"skip_providers": failed_fallback_candidates} if failed_fallback_candidates else {}
                     return _try_payment_fallback(
                         resolved_provider, task, reason=reason, **kwargs)
                 fallback_layers.append(_builtin_layer)
             else:
                 def _main_agent_layer():
-                    kwargs = {"skip_providers": failed_fallback_providers} if failed_fallback_providers else {}
+                    kwargs = {"skip_providers": failed_fallback_candidates} if failed_fallback_candidates else {}
                     return _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason, **kwargs)
                 fallback_layers.append(_main_agent_layer)
@@ -7194,10 +7439,12 @@ async def async_call_llm(
                         break
                     fb_failed_provider = _fallback_failed_provider_label(fb_label, fb_client)
                     fb_failed_norm = fb_failed_provider.lower()
-                    if fb_failed_norm and fb_failed_norm in failed_fallback_providers:
+                    fb_failed_candidate = _fallback_candidate_skip_key(
+                        fb_failed_provider or fb_label, fb_model)
+                    if fb_failed_candidate and fb_failed_candidate in failed_fallback_candidates:
                         logger.debug(
-                            "Auxiliary %s (async): fallback layer returned already-failed provider %s; moving on",
-                            task or "call", fb_failed_provider,
+                            "Auxiliary %s (async): fallback layer returned already-failed candidate %s; moving on",
+                            task or "call", fb_failed_candidate,
                         )
                         break
                     fb_kwargs = _build_call_kwargs(
@@ -7213,15 +7460,24 @@ async def async_call_llm(
                     if async_fb_model and async_fb_model != fb_kwargs.get("model"):
                         fb_kwargs["model"] = async_fb_model
                     try:
-                        return _validate_llm_response(
-                            await async_fb.chat.completions.create(**fb_kwargs), task)
+                        # Same-provider retries per fallback candidate
+                        # (transport, empty-200, spurious quota) — see the
+                        # sync loop for the rationale; payment errors here
+                        # deliberately do not mark the provider unhealthy.
+                        async def _fb_request(_fb=async_fb, _kw=fb_kwargs):
+                            return _validate_llm_response(
+                                await _fb.chat.completions.create(**_kw), task)
+
+                        return await _request_with_same_provider_retries_async(
+                            _fb_request, task, label=fb_failed_provider or fb_label,
+                            retry_payment=True, retry_transport=True)
                     except Exception as fallback_err:
                         if not _is_auxiliary_fallback_error(fallback_err):
                             raise
-                        if fb_failed_norm:
-                            failed_fallback_providers.add(fb_failed_norm)
-                        if _is_payment_error(fallback_err):
-                            _mark_provider_unhealthy(fb_failed_provider or fb_label)
+                        if fb_failed_candidate:
+                            failed_fallback_candidates.add(fb_failed_candidate)
+                        elif fb_failed_norm:
+                            failed_fallback_candidates.add(fb_failed_norm)
                         if _is_connection_error(fallback_err):
                             try:
                                 _evict_cached_client_instance(async_fb)

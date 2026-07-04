@@ -35,6 +35,11 @@ from agent.auxiliary_client import (
     _resolve_xai_oauth_for_aux,
     _CodexCompletionsAdapter,
     _pool_runtime_base_url,
+    _request_with_same_provider_retries,
+    _EMPTY_RESPONSE_RETRIES,
+    _PAYMENT_RETRIES,
+    _PAYMENT_RETRY_BACKOFF_SECONDS,
+    _DEFAULT_TRANSIENT_RETRIES,
 )
 
 
@@ -2560,7 +2565,8 @@ class TestAuxiliaryFallbackLayering:
              patch("agent.auxiliary_client._try_main_fallback_chain",
                    return_value=(main_chain_client, "gpt-5.5", "gptcodex")) as mock_main_chain, \
              patch("agent.auxiliary_client._try_main_agent_model_fallback",
-                   return_value=(main_agent_client, "gpt-5.5", "main-agent(openai-codex)")) as mock_main_agent:
+                   return_value=(main_agent_client, "gpt-5.5", "main-agent(openai-codex)")) as mock_main_agent, \
+             patch("agent.auxiliary_client.time.sleep"):
             result = call_llm(
                 task="compression",
                 messages=[{"role": "user", "content": "summarize"}],
@@ -2573,12 +2579,12 @@ class TestAuxiliaryFallbackLayering:
             call("compression", "openai-codex", reason="payment error"),
             call(
                 "compression", "openai-codex",
-                reason="payment error", skip_providers={"gptcodex"},
+                reason="payment error", skip_providers={"gptcodex::gpt-5.5"},
             ),
         ]
         mock_main_agent.assert_called_once_with(
             "openai-codex", "compression",
-            reason="payment error", skip_providers={"gptcodex"},
+            reason="payment error", skip_providers={"gptcodex::gpt-5.5"},
         )
 
     @pytest.mark.asyncio
@@ -2612,6 +2618,7 @@ class TestAuxiliaryFallbackLayering:
                    return_value=(sync_main_chain_client, "gpt-5.5", "gptcodex")) as mock_main_chain, \
              patch("agent.auxiliary_client._try_main_agent_model_fallback",
                    return_value=(sync_main_agent_client, "gpt-5.5", "main-agent(openai-codex)")) as mock_main_agent, \
+             patch("asyncio.sleep", new=AsyncMock()), \
              patch("agent.auxiliary_client._to_async_client",
                    side_effect=async_clients):
             result = await async_call_llm(
@@ -2620,18 +2627,20 @@ class TestAuxiliaryFallbackLayering:
             )
 
         assert result.choices[0].message.content == "from async main agent safety net"
-        assert async_main_chain_client.chat.completions.create.await_count == 1
+        # Flaky-relay payment retry: the candidate is tried initial + _PAYMENT_RETRIES
+        # times before advancing to the main-agent safety net.
+        assert async_main_chain_client.chat.completions.create.await_count == _PAYMENT_RETRIES + 1
         assert async_main_agent_client.chat.completions.create.await_count == 1
         assert mock_main_chain.call_args_list == [
             call("compression", "openai-codex", reason="payment error"),
             call(
                 "compression", "openai-codex",
-                reason="payment error", skip_providers={"gptcodex"},
+                reason="payment error", skip_providers={"gptcodex::gpt-5.5"},
             ),
         ]
         mock_main_agent.assert_called_once_with(
             "openai-codex", "compression",
-            reason="payment error", skip_providers={"gptcodex"},
+            reason="payment error", skip_providers={"gptcodex::gpt-5.5"},
         )
 
     def test_explicit_provider_exhausts_top_level_chain_entries_before_main_agent(self, monkeypatch):
@@ -2658,7 +2667,8 @@ class TestAuxiliaryFallbackLayering:
                        (depleted_fallback_client, "gpt-5.4", "openrouter"),
                        (healthy_fallback_client, "gpt-5.5", "gptcodex"),
                    ]) as mock_main_chain, \
-             patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main_agent:
+             patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main_agent, \
+             patch("agent.auxiliary_client.time.sleep"):
             result = call_llm(
                 task="compression",
                 messages=[{"role": "user", "content": "summarize"}],
@@ -2671,9 +2681,62 @@ class TestAuxiliaryFallbackLayering:
             call("compression", "openai-codex", reason="payment error"),
             call(
                 "compression", "openai-codex",
-                reason="payment error", skip_providers={"openrouter"},
+                reason="payment error", skip_providers={"openrouter::gpt-5.4"},
             ),
         ]
+        mock_main_agent.assert_not_called()
+
+    def test_same_provider_fallback_models_are_distinct_after_invalid_response(self, monkeypatch):
+        """A flaky relay model should not poison every later model on that relay."""
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_payment_err()
+
+        flaky_relay_client = MagicMock()
+        flaky_relay_client.chat.completions.create.return_value = MagicMock(choices=[])
+
+        healthy_relay_client = MagicMock()
+        healthy_relay_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from gptcodex gpt-5.4"))
+        ])
+
+        fallback_chain = [
+            {"provider": "gptcodex", "model": "gpt-5.5"},
+            {"provider": "gptcodex", "model": "gpt-5.4"},
+        ]
+
+        def resolve_entry(entry):
+            if entry["model"] == "gpt-5.5":
+                return flaky_relay_client, "gpt-5.5"
+            if entry["model"] == "gpt-5.4":
+                return healthy_relay_client, "gpt-5.4"
+            raise AssertionError(entry)
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("openai-codex", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("hermes_cli.config.load_config", return_value={}), \
+             patch("hermes_cli.fallback_config.get_fallback_chain",
+                   return_value=fallback_chain), \
+             patch("agent.auxiliary_client._read_main_provider",
+                   return_value="openai-codex"), \
+             patch("agent.auxiliary_client._task_minimum_context_length",
+                   return_value=None), \
+             patch("agent.auxiliary_client._resolve_fallback_entry",
+                   side_effect=resolve_entry), \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                   return_value=(None, None, "")) as mock_main_agent, \
+             patch("agent.auxiliary_client.time.sleep"):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from gptcodex gpt-5.4"
+        assert flaky_relay_client.chat.completions.create.call_count == 3
+        assert healthy_relay_client.chat.completions.create.call_count == 1
         mock_main_agent.assert_not_called()
 
     @pytest.mark.asyncio
@@ -2703,6 +2766,7 @@ class TestAuxiliaryFallbackLayering:
                        (sync_healthy_client, "gpt-5.5", "gptcodex"),
                    ]) as mock_main_chain, \
              patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main_agent, \
+             patch("asyncio.sleep", new=AsyncMock()), \
              patch("agent.auxiliary_client._to_async_client",
                    side_effect=[
                        (async_depleted_client, "gpt-5.4"),
@@ -2714,13 +2778,15 @@ class TestAuxiliaryFallbackLayering:
             )
 
         assert result.choices[0].message.content == "from async second top-level fallback"
-        assert async_depleted_client.chat.completions.create.await_count == 1
+        # Fallback candidates retry usage-limit/quota errors (relay may be flaking)
+        # before moving on to the next top-level entry.
+        assert async_depleted_client.chat.completions.create.await_count == _PAYMENT_RETRIES + 1
         assert async_healthy_client.chat.completions.create.await_count == 1
         assert mock_main_chain.call_args_list == [
             call("compression", "openai-codex", reason="payment error"),
             call(
                 "compression", "openai-codex",
-                reason="payment error", skip_providers={"openrouter"},
+                reason="payment error", skip_providers={"openrouter::gpt-5.4"},
             ),
         ]
         mock_main_agent.assert_not_called()
@@ -3165,6 +3231,378 @@ class TestIsTimeoutError:
             status_code = 503
 
         assert _is_timeout_error(_Err503("upstream")) is False
+
+
+class TestEmptyResponseSameProviderRetry:
+    """Empty-content HTTP 200s get same-provider retries before fallback.
+
+    Relay endpoints (gptcodex.top) intermittently return HTTP 200 with a
+    reasoning-only body — no message item, so ``content`` is empty. Observed
+    flaky, NOT deterministic (4/7 compression fallback calls succeeded on
+    2026-07-01 while 3 returned empty). Treating the first empty body as a
+    hard fallback signal abandons a working provider; with the fallback
+    chain exhausted the original 429 resurfaces and compression aborts.
+
+    Same-provider retry budget: ``_EMPTY_RESPONSE_RETRIES`` (2) with short
+    backoff, on BOTH the primary call and each fallback-chain candidate.
+    """
+
+    def _empty_resp(self):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=None, tool_calls=None),
+                finish_reason="stop")],
+            model="gpt-5.5", usage=None)
+
+    def _ok_resp(self, text="summary text"):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=text, tool_calls=None),
+                finish_reason="stop")],
+            model="gpt-5.5", usage=None)
+
+    def _patches(self, client):
+        # NOTE: _validate_llm_response is NOT patched — the empty-content
+        # RuntimeError it raises is exactly the signal under test.
+        return (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("openrouter", "some-model", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(client, "some-model"),
+            ),
+            patch("agent.auxiliary_client.time.sleep"),
+        )
+
+    def test_empty_200_retried_on_same_provider(self):
+        """Two empty bodies then success: stays on the same provider."""
+        client = MagicMock()
+        client.base_url = "https://gptcodex.top/v1"
+        client.chat.completions.create.side_effect = [
+            self._empty_resp(), self._empty_resp(), self._ok_resp()]
+        p1, p2, p3 = self._patches(client)
+        with p1, p2, p3:
+            result = call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
+        assert result.choices[0].message.content == "summary text"
+        assert client.chat.completions.create.call_count == 3
+
+    def test_empty_200_exhausts_retries_then_falls_back(self):
+        """Three consecutive empty bodies exhaust the same-provider budget
+        and escalate to the provider fallback chain."""
+        primary = MagicMock()
+        primary.base_url = "https://gptcodex.top/v1"
+        primary.chat.completions.create.return_value = self._empty_resp()
+
+        fb_client = MagicMock()
+        fb_client.base_url = "https://api.openai.com/v1"
+        fb_client.chat.completions.create.return_value = self._ok_resp("fb summary")
+
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch("agent.auxiliary_client._try_configured_fallback_chain",
+                  return_value=(None, None, "")),
+            patch("agent.auxiliary_client._try_main_fallback_chain",
+                  return_value=(None, None, "")),
+            patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                  return_value=(fb_client, "fb-model", "openai")),
+        ):
+            result = call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
+        assert result.choices[0].message.content == "fb summary"
+        # Primary: initial + 2 same-provider retries = 3 attempts.
+        assert primary.chat.completions.create.call_count == 3
+        assert fb_client.chat.completions.create.call_count == 1
+
+    def test_fallback_provider_empty_200_retried(self):
+        """The 2026-07-01 incident shape: primary hard-429s, the fallback
+        relay returns one empty 200 then succeeds. The fallback candidate
+        must get its own same-provider retries instead of being abandoned."""
+        primary = MagicMock()
+        primary.base_url = "https://chatgpt.com/backend-api/codex"
+        err_429 = Exception(
+            "Error code: 429 - {'error': {'type': 'usage_limit_reached', "
+            "'message': 'The usage limit has been reached'}}")
+        err_429.status_code = 429
+        primary.chat.completions.create.side_effect = err_429
+
+        fb_client = MagicMock()
+        fb_client.base_url = "https://gptcodex.top/v1"
+        fb_client.chat.completions.create.side_effect = [
+            self._empty_resp(), self._ok_resp("relay summary")]
+
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch("agent.auxiliary_client._try_configured_fallback_chain",
+                  return_value=(None, None, "")),
+            patch("agent.auxiliary_client._try_main_fallback_chain",
+                  return_value=(fb_client, "gpt-5.5", "gptcodex")),
+            patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                  return_value=(None, None, "")),
+        ):
+            result = call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
+        assert result.choices[0].message.content == "relay summary"
+        # Fallback candidate: initial empty + 1 same-provider retry = 2 calls.
+        assert fb_client.chat.completions.create.call_count == 2
+
+    def test_non_empty_error_not_retried_as_empty(self):
+        """A non-transient, non-empty error (400) gets no same-provider
+        retry — single attempt, propagates immediately."""
+        class _Err400(Exception):
+            status_code = 400
+
+        client = MagicMock()
+        client.base_url = "https://gptcodex.top/v1"
+        client.chat.completions.create.side_effect = _Err400("bad request")
+        p1, p2, p3 = self._patches(client)
+        with p1, p2, p3, pytest.raises(_Err400):
+            call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
+        assert client.chat.completions.create.call_count == 1
+
+    def test_async_helper_retries_empty_then_succeeds(self):
+        """Async twin: same retry semantics, driven via asyncio.run so it
+        runs even without pytest-asyncio installed."""
+        import asyncio
+        from agent.auxiliary_client import (
+            _request_with_same_provider_retries_async,
+        )
+
+        empty_err = RuntimeError(
+            "Auxiliary compression: LLM returned invalid response "
+            "(type=SimpleNamespace): empty message content. "
+            "Expected non-empty .choices[0].message content")
+        attempts = []
+
+        async def _request():
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise empty_err
+            return {"ok": True}
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            result = asyncio.run(_request_with_same_provider_retries_async(
+                _request, "compression", label="gptcodex"))
+        assert result == {"ok": True}
+        assert len(attempts) == 3
+
+    def test_async_helper_exhausts_empty_budget(self):
+        """Async twin: budget exhausted (initial + 2 retries) re-raises."""
+        import asyncio
+        from agent.auxiliary_client import (
+            _request_with_same_provider_retries_async,
+        )
+
+        empty_err = RuntimeError(
+            "Auxiliary compression: LLM returned invalid response "
+            "(type=SimpleNamespace): empty message content. "
+            "Expected non-empty .choices[0].message content")
+        attempts = []
+
+        async def _request():
+            attempts.append(1)
+            raise empty_err
+
+        with patch("asyncio.sleep", new=AsyncMock()), \
+             pytest.raises(RuntimeError, match="empty message content"):
+            asyncio.run(_request_with_same_provider_retries_async(
+                _request, "compression", label="gptcodex"))
+        assert len(attempts) == 3
+
+    def test_async_helper_retries_transport_up_to_budget(self):
+        """Async twin (fallback-candidate mode, retry_transport=True): a run
+        of transient blips shorter than the budget recovers on the same
+        provider with escalating backoff."""
+        import asyncio
+        from agent.auxiliary_client import (
+            _request_with_same_provider_retries_async,
+        )
+
+        transport_err = ConnectionError(
+            "peer closed connection without sending complete message body")
+        attempts = []
+
+        async def _request():
+            attempts.append(1)
+            if len(attempts) <= _DEFAULT_TRANSIENT_RETRIES:
+                raise transport_err
+            return {"ok": True}
+
+        sleep_mock = AsyncMock()
+        with patch("asyncio.sleep", new=sleep_mock):
+            result = asyncio.run(_request_with_same_provider_retries_async(
+                _request, "compression", label="openrouter",
+                retry_transport=True))
+        assert result == {"ok": True}
+        assert len(attempts) == _DEFAULT_TRANSIENT_RETRIES + 1
+        assert sleep_mock.await_count == _DEFAULT_TRANSIENT_RETRIES
+        delays = [c.args[0] for c in sleep_mock.await_args_list]
+        assert all(d > 0 for d in delays)
+        assert delays == sorted(delays)
+
+    def test_async_helper_exhausts_transport_budget(self):
+        """Async twin: transient blips beyond the budget re-raise after
+        initial + budget attempts (fallback-candidate mode)."""
+        import asyncio
+        from agent.auxiliary_client import (
+            _request_with_same_provider_retries_async,
+        )
+
+        transport_err = ConnectionError(
+            "peer closed connection without sending complete message body")
+        attempts = []
+
+        async def _request():
+            attempts.append(1)
+            raise transport_err
+
+        with patch("asyncio.sleep", new=AsyncMock()), \
+             pytest.raises(ConnectionError):
+            asyncio.run(_request_with_same_provider_retries_async(
+                _request, "compression", label="openrouter",
+                retry_transport=True))
+        assert len(attempts) == _DEFAULT_TRANSIENT_RETRIES + 1
+
+
+class TestFlakyRelayPaymentRetry:
+    """A quota/usage-limit ("payment") error from a FALLBACK candidate is not
+    trustworthy as terminal. Relay endpoints (gptcodex.top) intermittently
+    report a spurious ``usage_limit_reached`` even while the same key is
+    actively serving other requests — observed 2026-07-03, the relay flaked
+    mid-session while another agent was editing code through the same endpoint.
+    So a fallback candidate retries payment errors with exponential backoff
+    before moving on; the PRIMARY provider does NOT — a real quota wall on the
+    user's own plan (e.g. OpenAI Codex) should fail over to the relay at once.
+    Auth failures are terminal and never retried, even for a fallback candidate.
+    """
+
+    def _payment_err(self, status=429):
+        e = Exception(
+            "Error code: 429 - {'error': {'type': 'usage_limit_reached', "
+            "'message': 'The usage limit has been reached'}}")
+        e.status_code = status
+        return e
+
+    # ── helper-level: the retry gate ──
+
+    def test_payment_retried_when_enabled_then_succeeds(self):
+        attempts = []
+
+        def _request():
+            attempts.append(1)
+            if len(attempts) <= _PAYMENT_RETRIES:
+                raise self._payment_err()
+            return {"ok": True}
+
+        with patch("agent.auxiliary_client.time.sleep") as mock_sleep:
+            result = _request_with_same_provider_retries(
+                _request, "compression", label="gptcodex", retry_payment=True)
+        assert result == {"ok": True}
+        assert len(attempts) == _PAYMENT_RETRIES + 1
+        assert mock_sleep.call_count == _PAYMENT_RETRIES
+        delays = [c.args[0] for c in mock_sleep.call_args_list]
+        assert all(d > 0 for d in delays)
+        assert delays == sorted(delays)  # escalating backoff
+
+    def test_payment_not_retried_by_default(self):
+        """Primary provider (retry_payment defaults False): a real quota wall
+        fails over immediately — a single attempt, no in-place retry."""
+        attempts = []
+
+        def _request():
+            attempts.append(1)
+            raise self._payment_err()
+
+        with patch("agent.auxiliary_client.time.sleep"), \
+                pytest.raises(Exception):
+            _request_with_same_provider_retries(
+                _request, "compression", label="openai-codex")
+        assert len(attempts) == 1
+
+    def test_payment_retry_exhausts_then_raises(self):
+        attempts = []
+
+        def _request():
+            attempts.append(1)
+            raise self._payment_err()
+
+        with patch("agent.auxiliary_client.time.sleep"), \
+                pytest.raises(Exception):
+            _request_with_same_provider_retries(
+                _request, "compression", label="gptcodex", retry_payment=True)
+        assert len(attempts) == _PAYMENT_RETRIES + 1
+
+    def test_auth_not_retried_even_with_payment_retry(self):
+        auth_err = Exception("Error code: 401 - invalid api key")
+        auth_err.status_code = 401
+        attempts = []
+
+        def _request():
+            attempts.append(1)
+            raise auth_err
+
+        with patch("agent.auxiliary_client.time.sleep"), \
+                pytest.raises(Exception):
+            _request_with_same_provider_retries(
+                _request, "compression", label="gptcodex", retry_payment=True)
+        assert len(attempts) == 1
+
+    def test_async_payment_retried_then_succeeds(self):
+        import asyncio
+        from agent.auxiliary_client import (
+            _request_with_same_provider_retries_async,
+        )
+
+        attempts = []
+
+        async def _request():
+            attempts.append(1)
+            if len(attempts) <= _PAYMENT_RETRIES:
+                raise self._payment_err()
+            return {"ok": True}
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            result = asyncio.run(_request_with_same_provider_retries_async(
+                _request, "compression", label="gptcodex", retry_payment=True))
+        assert result == {"ok": True}
+        assert len(attempts) == _PAYMENT_RETRIES + 1
+
+    # ── integration: primary switches at once, relay's flaky quota retried ──
+
+    def test_primary_quota_switches_immediately_relay_payment_retried(self):
+        primary = MagicMock()
+        primary.base_url = "https://chatgpt.com/backend-api/codex"
+        primary.chat.completions.create.side_effect = self._payment_err()
+
+        fb_client = MagicMock()
+        fb_client.base_url = "https://gptcodex.top/v1"
+        ok = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="relay summary", tool_calls=None),
+                finish_reason="stop")],
+            model="gpt-5.5", usage=None)
+        fb_client.chat.completions.create.side_effect = [self._payment_err(), ok]
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model",
+                  return_value=("openai-codex", "gpt-5.5", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client",
+                  return_value=(primary, "gpt-5.5")),
+            patch("agent.auxiliary_client.time.sleep"),
+            patch("agent.auxiliary_client._try_configured_fallback_chain",
+                  return_value=(None, None, "")),
+            patch("agent.auxiliary_client._try_main_fallback_chain",
+                  return_value=(fb_client, "gpt-5.5", "gptcodex")),
+            patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                  return_value=(None, None, "")),
+        ):
+            result = call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
+        assert result.choices[0].message.content == "relay summary"
+        # Primary: one attempt, no payment retry — immediate failover.
+        assert primary.chat.completions.create.call_count == 1
+        # Relay: spurious quota then success — retried on the same candidate.
+        assert fb_client.chat.completions.create.call_count == 2
 
 
 class TestIsConnectionError:
@@ -5127,6 +5565,14 @@ class TestAuxUnhealthyCache:
         assert _is_provider_unhealthy("openrouter") is False
         _mark_provider_unhealthy("openrouter")
         assert _is_provider_unhealthy("openrouter") is True
+
+    def test_default_unhealthy_ttl_is_short_local_retry(self, monkeypatch):
+        import agent.auxiliary_client as aux
+
+        monkeypatch.setattr(aux.time, "time", lambda: 1000.0)
+        aux._mark_provider_unhealthy("openrouter")
+
+        assert aux._aux_unhealthy_until["openrouter"] == 1003.0
 
     def test_ttl_expiry_evicts(self):
         from agent.auxiliary_client import (
