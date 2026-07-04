@@ -1,7 +1,7 @@
 # 设计:持续 origin 502 → 自动压缩自愈
 
 - 日期:2026-06-22
-- 状态:已设计,待实现(brainstorming → 本 spec → writing-plans)
+- 状态:已实现(brainstorming → 本 spec → TDD port)
 - 关联代码锚点基于 HEAD `c09ead9`
 - 相关记忆:`hermes-gptcodex-502-intermittent`、`hermes-gptcodex-credential-pool`
 
@@ -88,7 +88,7 @@ if (classified.reason in {server_error, overloaded}
 - 压缩计入 `max_compression_attempts = 3`(`:912`)。
 - 压缩重启经 `:3489-3497` 时 `retry_count += 1`(现有注释明说"压缩重启计入重试上限以防无限循环")——总预算 `max_retries = 10` 始终是硬上限。
 
-**参数交互的诚实预期**:门槛 5 + 总预算 10 ⇒ **一轮里压缩自愈预计触发约 1 次**(第 5 次 502 压一次,重启计入 `retry_count`;若压缩后的轻请求仍持续 502,总预算很快耗尽走诚实失败)。这没问题:压缩后请求大幅变轻(类比 105→11),坏窗通过率高,1 次大概率够;真不够即极坏窗,诚实失败是对的归宿。精确触发次数取决于通用退避路径 `retry_count` 的自增时机,实现时验证;无论如何 `compression_attempts ≤ 3` 与 `retry_count ≤ 10` 双护栏保证有界。
+**参数交互的诚实预期(已验证 + 对抗式 review 修正)**:压缩重启走**外层循环**的 `continue`,会重新执行每轮初始化(`retry_count=0`、`consecutive_overload_errors=0`),所以 **`retry_count` 不是"压缩次数"的护栏**——真护栏是对话级的 `compression_attempts ≤ 3`(在 run 函数开头初始化、跨重启累加,不被外层循环重置)。因此持续坏窗下**最多自动压缩 3 次**,而非早先误写的"约 1 次";每次压缩后的轻请求都获得完整重试预算去碰坏窗的放行间隙,3 次仍救不了即极坏窗,诚实失败是对的归宿。压缩后请求大幅变轻(类比 105→11),坏窗通过率高,通常前 1-2 次就恢复。`consecutive_overload_errors` **按 origin 计数**(`base_url` 变化即重新数),避免 fallback 换 origin 时旧 origin 的 streak 泄漏到新 origin 误触发。有界性由 `compression_attempts ≤ 3` 单独保证(与 restart 是否重置 `retry_count` 无关)。
 
 ### 节 3 — 诚实失败 + 自死锁防护 + 可观测
 - **诚实失败**:所有终止都归到**现有 `max_retries` 耗尽路径**(约 `:3406-3432`),不另开 return 分支(改动最小)。仅**增强错误信息**:若本轮 `compression_attempts > 0` 且 `classified.reason` 为 `server_error`/`overloaded`,终端错误改为
@@ -132,6 +132,8 @@ compression:
 
 1. **概率性,非根治**:本质是 origin 级故障,真正根治需异地 fallback(不同 base_url 的中转站)。单 origin 下自愈是"提高坏窗通过率",极坏窗仍诚实失败。
 2. **压缩 aux timeout = 600s 未加固**(用户选保持最小):坏窗里若压缩调用是 524 类挂起(而非秒级 502),会话可能冻结至多 ~10 分钟才超时返回。后续可补:自愈路径给压缩传更短 timeout(如 120s)。秒级 502 不受影响(优雅 abort 秒级返回)。
+3. **`len(messages)` 是"压缩是否生效"的粗代理**(对抗式 review 指出):正常多轮历史压缩会显著减少条目数,该检测可靠;但理论上若单条巨大消息被一条等长 summary 替换(压缩生效但条数不变),会被误判为 no-op 而不重启。本场景(重的是 structured 历史项数,非单条巨大消息)不触发此边界。
+4. **仅覆盖以 HTTP 异常抛出的 502/503**(对抗式 review 指出):`codex_responses` transport 若把过载表达成 `status="failed"` 的响应对象而非抛 HTTP 异常,会走 invalid-response 重试路径、不进本自愈。实测 gptcodex 的 502 是 HTTP 异常(被 `classify_api_error` 归为 `server_error`),故当前覆盖;若未来 transport 行为变化需另行处理。
 
 ## 8. 验证计划(writing-plans 阶段细化)
 

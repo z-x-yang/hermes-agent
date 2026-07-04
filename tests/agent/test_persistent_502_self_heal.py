@@ -52,3 +52,36 @@ def test_compression_budget_exhausted_does_not_trigger():
 
 def test_just_under_budget_triggers():
     assert _call(compression_attempts=2) is True
+
+
+def _make_agent_with_config(cfg):
+    from unittest.mock import patch
+    from run_agent import AIAgent
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch("hermes_cli.config.load_config", return_value=cfg),
+    ):
+        return AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://gptcodex.top/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+
+def test_agent_reads_persistent_overload_threshold_default():
+    """A freshly built AIAgent exposes the threshold attr, default 5."""
+    agent = _make_agent_with_config({})
+    assert getattr(agent, "_persistent_overload_threshold", None) == 5
+
+
+def test_agent_reads_persistent_overload_threshold_override():
+    """compression.persistent_overload_threshold propagates into AIAgent."""
+    agent = _make_agent_with_config(
+        {"compression": {"persistent_overload_threshold": 2}}
+    )
+    assert agent._persistent_overload_threshold == 2

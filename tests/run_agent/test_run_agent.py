@@ -5481,6 +5481,32 @@ class TestRetryExhaustion:
         assert "error" in result
         assert "rate limited" in result["error"]
 
+    def test_api_error_retry_backoff_starts_at_five_seconds(self, agent):
+        """Transient API errors should not retry after only ~2 seconds."""
+        self._setup_agent(agent)
+        agent._api_max_retries = 2
+        agent.client.chat.completions.create.side_effect = RuntimeError("server overloaded")
+        from agent import conversation_loop as _conv_loop
+        backoff_calls = []
+
+        def _record_backoff(attempt, **kwargs):
+            backoff_calls.append((attempt, kwargs))
+            return 0.0
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "jittered_backoff", _record_backoff),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result.get("completed") is False
+        assert backoff_calls, "expected at least one retry backoff"
+        assert backoff_calls[0] == (1, {"base_delay": 5.0, "max_delay": 60.0})
+
     def test_build_api_kwargs_error_no_unbound_local(self, agent):
         """When _build_api_kwargs raises, except handler must not crash with UnboundLocalError.
 
@@ -5707,7 +5733,7 @@ class TestCredentialPoolRecovery:
         refreshed_entry = SimpleNamespace(label="primary", id="abc")
 
         class _Pool:
-            def try_refresh_current(self):
+            def try_refresh_current(self, api_key_hint=None):
                 return refreshed_entry
 
         agent._credential_pool = _Pool()
@@ -5731,7 +5757,7 @@ class TestCredentialPoolRecovery:
         sequence = [entry_a, entry_a, entry_b, entry_b]
 
         class _Pool:
-            def try_refresh_current(self):
+            def try_refresh_current(self, api_key_hint=None):
                 return sequence.pop(0)
 
         agent._credential_pool = _Pool()

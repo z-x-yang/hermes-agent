@@ -637,6 +637,11 @@ def run_conversation(
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
+    # Only set True when persistent-overload self-heal actually compresses, so
+    # the terminal error message distinguishes a 502 self-heal exhaustion from
+    # an unrelated compression (413 / context-overflow) that merely shares the
+    # conversation-level compression_attempts counter.
+    persistent_overload_self_heal_attempted = False
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
@@ -1033,6 +1038,16 @@ def run_conversation(
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
         max_compression_attempts = 3
+        # Consecutive origin-overload (502/503/524/529) errors on THIS request.
+        # Re-initialised per api-call attempt (this block runs once per attempt
+        # before the `while retry_count < max_retries` loop). Drives the
+        # persistent-overload self-heal below; only a *streak* of overloads
+        # (not a single transient blip) reaches the threshold.
+        consecutive_overload_errors = 0
+        # The streak belongs to a specific origin. A fallback that switches
+        # base_url must start a fresh streak (the new origin's 1st overload is
+        # not the old origin's 5th); track which origin the streak is counting.
+        _overload_streak_origin = getattr(agent, "base_url", "") or ""
 
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
@@ -2525,6 +2540,20 @@ def run_conversation(
                     reason=classified.reason.value,
                 )
 
+                # Bump the consecutive origin-overload streak. Only overload
+                # reasons bump it; other error types neither bump nor clear it,
+                # so a 429 interleaved in a bad window won't reset the streak.
+                # A fallback that changes base_url starts a fresh streak.
+                if classified.reason in (
+                    FailoverReason.server_error,
+                    FailoverReason.overloaded,
+                ):
+                    _cur_origin = getattr(agent, "base_url", "") or ""
+                    if _cur_origin != _overload_streak_origin:
+                        consecutive_overload_errors = 0
+                        _overload_streak_origin = _cur_origin
+                    consecutive_overload_errors += 1
+
                 if (
                     classified.reason == FailoverReason.billing
                     and _is_nous_inference_route(
@@ -3059,6 +3088,50 @@ def run_conversation(
                             break
                     # Fall through to normal error handling if compression
                     # is exhausted or didn't help.
+
+                # ── Persistent origin-overload self-heal (502/503/524/529) ──
+                # Origin-level intermittent overload can last longer than the
+                # same-origin retry budget. After `threshold` consecutive
+                # overload/server errors from the same origin, compress history
+                # into a lighter request and restart, mirroring manual /compress.
+                # Bounded by max_compression_attempts; if the bad window also
+                # breaks the auxiliary compression call and compression returns
+                # messages unchanged, don't restart — fall through to normal
+                # backoff/exhaustion for an honest failure.
+                if _should_self_heal_persistent_overload(
+                    reason=classified.reason,
+                    consecutive_overload_errors=consecutive_overload_errors,
+                    threshold=getattr(agent, "_persistent_overload_threshold", 5),
+                    compression_enabled=getattr(agent, "compression_enabled", True),
+                    compression_attempts=compression_attempts,
+                    max_compression_attempts=max_compression_attempts,
+                ):
+                    compression_attempts += 1
+                    persistent_overload_self_heal_attempted = True
+                    agent._buffer_status(
+                        f"⚠️ 检测到中转站持续过载(HTTP {status_code}×{consecutive_overload_errors})"
+                        f" → 自动压缩上下文后重试 ({compression_attempts}/{max_compression_attempts})…"
+                    )
+                    original_len = len(messages)
+                    messages, active_system_prompt = agent._compress_context(
+                        messages, system_message,
+                        approx_tokens=approx_tokens,
+                        task_id=effective_task_id,
+                    )
+                    # Compression created a new session — clear history so
+                    # _flush_messages_to_session_db writes compressed messages
+                    # to the new session (same as the long_context_tier path).
+                    conversation_history = None
+                    if len(messages) < original_len:
+                        # Real reduction → retry with the lighter request.
+                        consecutive_overload_errors = 0
+                        _overload_streak_origin = getattr(agent, "base_url", "") or ""
+                        _retry.restart_with_compressed_messages = True
+                        break
+                    # else: compression no-op (aux call also failed in the bad
+                    # window → graceful abort returned messages unchanged).
+                    # Don't restart; fall through to normal backoff, bounded by
+                    # max_retries → honest failure.
 
                 # Eager fallback for rate-limit errors (429 or quota exhaustion)
                 # and transport errors (connection failure / timeout / provider
@@ -3927,6 +4000,23 @@ def run_conversation(
                             _final_response += f"\n\n{_billing_guidance}"
                     else:
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
+                        # Persistent origin-overload self-heal exhausted: only
+                        # use this label if that self-heal actually attempted
+                        # compression, not if some unrelated compression path
+                        # happened earlier in the turn.
+                        if (
+                            persistent_overload_self_heal_attempted
+                            and classified.reason in (
+                                FailoverReason.server_error,
+                                FailoverReason.overloaded,
+                            )
+                        ):
+                            _final_response = (
+                                f"中转站持续过载(HTTP {classified.status_code}):"
+                                f"已自动压缩 {compression_attempts} 次尝试绕过仍失败,"
+                                f"可能 origin 持续抖动,请稍后重试或检查中转站。"
+                                f"原始错误:{_final_summary}"
+                            )
                     if _is_thinking_timeout:
                         # Thinking-timeout guidance overrides the generic
                         # stream-drop guidance — the latter is wrong for
@@ -3982,7 +4072,7 @@ def run_conversation(
                                 _retry_after = min(float(_ra_raw), 600)
                             except (TypeError, ValueError):
                                 pass
-                wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=5.0, max_delay=60.0)
                 _backoff_policy = None
                 if is_rate_limited and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
