@@ -15,7 +15,11 @@ from unittest.mock import patch
 
 import pytest
 
-from tools.skill_manager_tool import _create_skill, _edit_skill
+from tools.skill_manager_tool import (
+    _create_skill,
+    _edit_skill,
+    mark_background_review_skill_read,
+)
 
 
 @contextmanager
@@ -49,7 +53,12 @@ def _content(version):
 def test_background_rewrite_backs_up_previous_content(tmp_path):
     with _skill_dir(tmp_path):
         assert _create_skill("test-skill", _content(1))["success"]
+        skill_md = tmp_path / "test-skill" / "SKILL.md"
         with _as_background_review():
+            # A review fork must load the target before it may rewrite it
+            # (skill_view does this in production). Mark it read so the test
+            # exercises the .history backup path, not the read-before-write guard.
+            mark_background_review_skill_read(skill_md)
             assert _edit_skill("test-skill", _content(2))["success"]
         backups = sorted((tmp_path / "test-skill" / ".history").glob("SKILL-*.md"))
         assert len(backups) == 1
@@ -60,7 +69,11 @@ def test_background_rewrite_backs_up_previous_content(tmp_path):
 def test_history_keeps_only_last_five(tmp_path):
     with _skill_dir(tmp_path):
         assert _create_skill("test-skill", _content(0))["success"]
+        skill_md = tmp_path / "test-skill" / "SKILL.md"
         with _as_background_review():
+            # Read-mark persists in the context, so one mark covers the whole
+            # rewrite loop (the path never changes across edits).
+            mark_background_review_skill_read(skill_md)
             for v in range(1, 8):
                 assert _edit_skill("test-skill", _content(v))["success"]
         backups = sorted((tmp_path / "test-skill" / ".history").glob("SKILL-*.md"))
@@ -85,7 +98,10 @@ def test_backup_failure_refuses_the_rewrite(tmp_path, monkeypatch):
             raise OSError("disk full")
 
         monkeypatch.setattr(smt, "_backup_skill_history", _boom)
+        skill_md = tmp_path / "test-skill" / "SKILL.md"
         with _as_background_review():
+            # Clear the read guard so we reach the backup step it protects.
+            mark_background_review_skill_read(skill_md)
             result = _edit_skill("test-skill", _content(2))
         assert not result["success"]
         assert "backup" in result["error"].lower()
