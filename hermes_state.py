@@ -737,6 +737,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_error TEXT,
     compression_failure_cooldown_until REAL,
     compression_failure_error TEXT,
+    compression_count INTEGER NOT NULL DEFAULT 0,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
@@ -1799,6 +1800,84 @@ class SessionDB:
             conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?", params)
 
         self._execute_write(_do)
+
+    def set_session_compression_count(self, session_id: str, count: int) -> None:
+        """Persist the cumulative successful compression count for a session.
+
+        This lives in ``sessions`` so gateway /status survives process restarts.
+        The caller passes the compressor's authoritative count after a successful
+        compaction; the database keeps the maximum value so stale writers cannot
+        accidentally decrease the durable count.
+        """
+        if not session_id:
+            return
+        try:
+            safe_count = max(0, int(count))
+        except (TypeError, ValueError):
+            safe_count = 0
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET compression_count = MAX(COALESCE(compression_count, 0), ?) "
+                "WHERE id = ?",
+                (safe_count, session_id),
+            )
+
+        self._execute_write(_do)
+
+    def get_session_compression_count(self, session_id: str) -> int:
+        """Return the best-known cumulative compression count for a session.
+
+        New rows use ``sessions.compression_count``. Older rows created before
+        that column existed are recovered from durable evidence already in
+        ``state.db``: rotation-mode compression parent chains and in-place
+        compaction summary rows with the stable ``[CONTEXT COMPACTION]`` prefix.
+        """
+        if not session_id:
+            return 0
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return 0
+            row = conn.execute(
+                "SELECT id, parent_session_id, end_reason, compression_count "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return 0
+            try:
+                persisted = max(0, int(row["compression_count"] or 0))
+            except (TypeError, ValueError, KeyError):
+                persisted = 0
+
+            lineage_count = 0
+            parent_id = row["parent_session_id"]
+            seen: set[str] = {session_id}
+            while parent_id and parent_id not in seen:
+                seen.add(parent_id)
+                parent = conn.execute(
+                    "SELECT id, parent_session_id, end_reason FROM sessions WHERE id = ?",
+                    (parent_id,),
+                ).fetchone()
+                if parent is None:
+                    break
+                if parent["end_reason"] != "compression":
+                    break
+                lineage_count += 1
+                parent_id = parent["parent_session_id"]
+
+            summary_row = conn.execute(
+                "SELECT COUNT(*) AS n FROM messages "
+                "WHERE session_id = ? AND content LIKE '[CONTEXT COMPACTION]%'",
+                (session_id,),
+            ).fetchone()
+            try:
+                summary_count = max(0, int(summary_row["n"] if summary_row else 0))
+            except (TypeError, ValueError, KeyError):
+                summary_count = 0
+
+        return max(persisted, lineage_count, summary_count)
 
     def backfill_repo_roots(self, cwd_to_root: Dict[str, str]) -> None:
         """Persist resolved git repo roots for cwds that don't have one yet.
