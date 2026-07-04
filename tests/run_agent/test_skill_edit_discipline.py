@@ -16,6 +16,7 @@ Design under test (user requirements, 2026-07-03):
 """
 
 import json
+import logging
 
 import pytest
 
@@ -45,6 +46,12 @@ def test_prompts_carry_edit_discipline(prompt):
     # frequency-based placement with trigger-condition pointers
     assert "PLACE BY FREQUENCY" in prompt
     assert "trigger condition" in prompt
+    # preserve concrete substance — anti-genericization + working-language
+    assert "PRESERVE SUBSTANCE" in prompt
+    assert "generic paraphrase" in prompt
+    assert "working language" in prompt
+    # quality-critical every-run content must stay always-loaded, not behind a pointer
+    assert "quality-critical every-run content" in prompt
 
 
 @pytest.mark.parametrize("prompt", [_SKILL_REVIEW_PROMPT, _COMBINED_REVIEW_PROMPT])
@@ -234,21 +241,25 @@ def _edit_messages(skill_name, success=True):
     ]
 
 
-def test_compaction_outcome_rewrite_resets_baseline_and_accounts(skills_on_disk, monkeypatch):
+def test_compaction_outcome_rewrite_resets_baseline_and_accounts(skills_on_disk, monkeypatch, caplog):
     monkeypatch.setattr(er, "_compaction_shrink_pct", lambda name: None)
     _seed_usage({"a": _rec(patch_count=42)})
     actions = []
-    er.apply_compaction_outcome(
-        {"name": "a", "overdue": 42}, _edit_messages("a"), prior_snapshot=[], actions=actions
-    )
+    with caplog.at_level(logging.INFO, logger="agent.efficiency_review"):
+        er.apply_compaction_outcome(
+            {"name": "a", "overdue": 42}, _edit_messages("a"), prior_snapshot=[], actions=actions
+        )
     assert skill_usage.get_record("a")["compacted_patch_count"] == 42
     # honest accounting: says a rewrite happened + how many patches were
     # pending — never a false "folded N patches" claim
     assert any("rewrote skill 'a'" in a and "42 patches since last check" in a for a in actions)
     assert not any("folded" in a for a in actions)
+    # durable sink: the accounting also reaches gateway.log via logger, not
+    # only the _safe_print/Discord-gated actions[] path
+    assert any("rewrote skill 'a'" in r.message for r in caplog.records)
 
 
-def test_compaction_outcome_clean_verdict_resets_baseline(skills_on_disk):
+def test_compaction_outcome_clean_verdict_resets_baseline(skills_on_disk, caplog):
     """Model reads the skill, judges it clean, states the sentinel instead of
     editing — that closes the loop too (earn-the-rewrite)."""
     _seed_usage({"a": _rec(patch_count=42)})
@@ -257,11 +268,14 @@ def test_compaction_outcome_clean_verdict_resets_baseline(skills_on_disk):
         {"role": "assistant",
          "content": f"Reviewed the skill in full. {er.COMPACTION_CLEAN_SENTINEL}"},
     ]
-    er.apply_compaction_outcome(
-        {"name": "a", "overdue": 42}, verdict_messages, prior_snapshot=[], actions=actions
-    )
+    with caplog.at_level(logging.INFO, logger="agent.efficiency_review"):
+        er.apply_compaction_outcome(
+            {"name": "a", "overdue": 42}, verdict_messages, prior_snapshot=[], actions=actions
+        )
     assert skill_usage.get_record("a")["compacted_patch_count"] == 42
     assert any("judged clean" in a and "no rewrite needed" in a for a in actions)
+    # durable sink: clean verdict is also logged, not only in actions[]
+    assert any("judged clean" in r.message for r in caplog.records)
 
 
 def test_compaction_outcome_clean_verdict_in_prior_snapshot_ignored(skills_on_disk):

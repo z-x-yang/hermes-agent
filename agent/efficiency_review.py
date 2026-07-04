@@ -656,15 +656,22 @@ def apply_compaction_outcome(
                 f" · ⚠️ body shrank {shrink}% — compaction should dedupe, not "
                 "shorten; diff .history/ if unexpected"
             )
+        # Durable sink: actions[] only reaches _safe_print (swallowed by the
+        # review thread's stdout silence) and the headless-gated Discord
+        # callback, so compaction accounting would otherwise vanish for cron
+        # runs. Log it so it survives in gateway.log regardless of delivery.
+        logger.info("%s", line)
         actions.append(line)
         return
     if _stated_clean_verdict(review_messages, prior_snapshot):
         from tools import skill_usage
         skill_usage.set_compaction_baseline(name)
-        actions.append(
+        clean_line = (
             f"🧹 Compaction check: skill '{name}' judged clean — no rewrite "
             f"needed ({overdue} patches since last check)"
         )
+        logger.info("%s", clean_line)
+        actions.append(clean_line)
 
 
 __all__ = [
