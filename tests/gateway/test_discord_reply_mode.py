@@ -259,6 +259,19 @@ class TestEnvVarOverride:
             _apply_env_overrides(config)
         assert config.platforms[Platform.DISCORD].reply_to_mode == "all"
 
+    def test_env_var_sets_final_mode(self):
+        # Regression: the 0.18 3-way port reverted the env→config allow-set to
+        # upstream's {off,first,all}, silently dropping the fork's "final" mode.
+        # config.yaml stayed reply_to_mode=final, but the value never reached the
+        # PlatformConfig — it fell back to "first", which re-pings the user on
+        # every intermediate/preview message instead of only the turn-final one.
+        # This bridge is the exact path production uses; the adapter-level tests
+        # construct PlatformConfig directly and never exercise it.
+        config = self._make_config()
+        with patch.dict(os.environ, {"DISCORD_REPLY_TO_MODE": "final"}, clear=False):
+            _apply_env_overrides(config)
+        assert config.platforms[Platform.DISCORD].reply_to_mode == "final"
+
     def test_env_var_case_insensitive(self):
         config = self._make_config()
         with patch.dict(os.environ, {"DISCORD_REPLY_TO_MODE": "ALL"}, clear=False):

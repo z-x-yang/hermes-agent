@@ -1373,12 +1373,27 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             thread_id=os.getenv("DISCORD_HOME_CHANNEL_THREAD_ID") or None,
         )
     
-    # Reply threading mode for Discord (off/first/all)
+    # Reply threading mode for Discord (off/first/final/all). "final" is a
+    # fork addition: only the turn-final reply carries the reply reference
+    # (and thus the @mention) — intermediate/preview messages stay quiet.
+    # Keep this set in sync with the modes the Discord adapter recognises;
+    # dropping "final" here silently downgrades the config to "first", which
+    # re-pings the user on every intermediate message (regressed by the 0.18
+    # 3-way port that reverted this line to upstream's {off,first,all}).
     discord_reply_mode = os.getenv("DISCORD_REPLY_TO_MODE", "").lower()
-    if discord_reply_mode in {"off", "first", "all"}:
+    if discord_reply_mode in {"off", "first", "final", "all"}:
         if Platform.DISCORD not in config.platforms:
             config.platforms[Platform.DISCORD] = PlatformConfig()
         config.platforms[Platform.DISCORD].reply_to_mode = discord_reply_mode
+    elif discord_reply_mode:
+        # fail loud instead of silently falling back to the default "first" —
+        # an unrecognised value here is almost always a typo or a lost fork
+        # customisation, not something to swallow.
+        logger.warning(
+            "Ignoring unrecognised DISCORD_REPLY_TO_MODE=%r "
+            "(expected one of off/first/final/all); leaving reply_to_mode unchanged",
+            discord_reply_mode,
+        )
     
     # WhatsApp (typically uses different auth mechanism)
     whatsapp_enabled = env_var_enabled("WHATSAPP_ENABLED")
