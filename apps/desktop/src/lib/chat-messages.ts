@@ -56,10 +56,12 @@ export type GatewayEventPayload = {
   // agent.terminal.output — live chunk for a read-only agent terminal tab
   process_id?: string
   chunk?: string
-  // clarify.request
+  // clarify.request — backgrounded by the shared `context` field above;
+  // `choices` are {label, description} dicts (see the Python contract in
+  // tools/clarify_tool.py). Read structurally via normalizeClarifyChoices.
   request_id?: string
   question?: string
-  choices?: string[] | null
+  choices?: Array<{ label: string; description: string }> | null
   // approval.request (dangerous command / execute_code) — session-keyed
   command?: string
   description?: string

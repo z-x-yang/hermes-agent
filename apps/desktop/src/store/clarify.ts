@@ -2,11 +2,55 @@ import { atom, computed } from 'nanostores'
 
 import { $activeSessionId } from './session'
 
+// A single clarify option. Mirrors the Python-side contract
+// (tools/clarify_tool._normalize_choice): `label` is a non-empty string,
+// `description` is a string that may be empty but is never null. The gateway
+// normalizes every choice before it reaches the wire, so this end trusts the
+// shape and reads `choice.label` / `choice.description` directly.
+export interface ClarifyChoice {
+  label: string
+  description: string
+}
+
 export interface ClarifyRequest {
   requestId: string
   question: string
-  choices: string[] | null
+  context: string | null
+  choices: ClarifyChoice[] | null
   sessionId: string | null
+}
+
+// Parse a wire/args `choices` value into the typed contract. The Python side is
+// authoritative and only ever emits well-formed `{label, description}` dicts,
+// so under normal operation this drops nothing — it is the same defensive
+// filter the old code applied to bare strings, re-pointed at the dict shape.
+// It deliberately does NOT accept a bare string as a label: there is no
+// backward-compat path for the pre-redesign format (see the Python contract).
+export function normalizeClarifyChoices(raw: unknown): ClarifyChoice[] | null {
+  if (!Array.isArray(raw)) {
+    return null
+  }
+
+  const choices: ClarifyChoice[] = []
+
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') {
+      continue
+    }
+
+    const row = item as Record<string, unknown>
+
+    if (typeof row.label !== 'string' || !row.label) {
+      continue
+    }
+
+    choices.push({
+      label: row.label,
+      description: typeof row.description === 'string' ? row.description : ''
+    })
+  }
+
+  return choices.length > 0 ? choices : null
 }
 
 // Pending clarify requests keyed by the runtime session id that raised them.

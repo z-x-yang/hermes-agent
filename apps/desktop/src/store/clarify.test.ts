@@ -5,6 +5,7 @@ import {
   $clarifyRequests,
   type ClarifyRequest,
   clearClarifyRequest,
+  normalizeClarifyChoices,
   setClarifyRequest
 } from './clarify'
 import { $activeSessionId } from './session'
@@ -13,6 +14,7 @@ function clarify(sessionId: string | null, requestId: string): ClarifyRequest {
   return {
     requestId,
     question: `question-${requestId}`,
+    context: null,
     choices: null,
     sessionId
   }
@@ -77,5 +79,61 @@ describe('clarify store', () => {
 
     expect($clarifyRequests.get()['session-a']).toBeUndefined()
     expect($clarifyRequests.get()['session-b']?.requestId).toBe('other')
+  })
+
+  it('round-trips structured choices and context through the store', () => {
+    setClarifyRequest({
+      requestId: 'req',
+      question: 'Which?',
+      context: 'Some background the question hangs on.',
+      choices: [
+        { label: 'Ship it', description: 'Merge and deploy now' },
+        { label: 'Wait', description: '' }
+      ],
+      sessionId: 'session-a'
+    })
+
+    const stored = $clarifyRequests.get()['session-a']
+    expect(stored?.context).toBe('Some background the question hangs on.')
+    expect(stored?.choices).toEqual([
+      { label: 'Ship it', description: 'Merge and deploy now' },
+      { label: 'Wait', description: '' }
+    ])
+  })
+})
+
+describe('normalizeClarifyChoices', () => {
+  it('reads {label, description} dicts through unchanged', () => {
+    expect(
+      normalizeClarifyChoices([
+        { label: 'A', description: 'first' },
+        { label: 'B', description: 'second' }
+      ])
+    ).toEqual([
+      { label: 'A', description: 'first' },
+      { label: 'B', description: 'second' }
+    ])
+  })
+
+  it('defaults a missing or non-string description to an empty string', () => {
+    expect(normalizeClarifyChoices([{ label: 'A' }, { label: 'B', description: 42 }])).toEqual([
+      { label: 'A', description: '' },
+      { label: 'B', description: '' }
+    ])
+  })
+
+  it('returns null for a non-array', () => {
+    expect(normalizeClarifyChoices(null)).toBeNull()
+    expect(normalizeClarifyChoices('nope')).toBeNull()
+    expect(normalizeClarifyChoices(undefined)).toBeNull()
+  })
+
+  it('drops malformed elements and does NOT accept a bare string as a label', () => {
+    // A bare string is the pre-redesign format — there is no backward-compat
+    // path, so it is dropped rather than coerced into a label.
+    expect(normalizeClarifyChoices(['just a string', { label: '' }, { description: 'no label' }, 7, null])).toBeNull()
+    expect(normalizeClarifyChoices([{ label: 'keep', description: 'me' }, 'drop', { label: '' }])).toEqual([
+      { label: 'keep', description: 'me' }
+    ])
   })
 })

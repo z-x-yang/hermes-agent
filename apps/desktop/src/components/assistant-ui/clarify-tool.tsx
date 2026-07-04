@@ -21,7 +21,7 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { Loader2, MessageQuestion } from '@/lib/icons'
 import { cn } from '@/lib/utils'
-import { $clarifyRequest, clearClarifyRequest } from '@/store/clarify'
+import { $clarifyRequest, type ClarifyChoice, clearClarifyRequest, normalizeClarifyChoices } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
 
@@ -29,7 +29,8 @@ import { selectMessageRunning } from './tool/fallback-model'
 
 interface ClarifyArgs {
   question?: string
-  choices?: string[] | null
+  context?: string | null
+  choices?: ClarifyChoice[] | null
 }
 
 function readClarifyArgs(args: unknown): ClarifyArgs {
@@ -38,11 +39,11 @@ function readClarifyArgs(args: unknown): ClarifyArgs {
   }
 
   const row = args as Record<string, unknown>
-  const choices = Array.isArray(row.choices) ? row.choices.filter((c): c is string => typeof c === 'string') : null
 
   return {
     question: typeof row.question === 'string' ? row.question : undefined,
-    choices: choices && choices.length > 0 ? choices : null
+    context: typeof row.context === 'string' ? row.context : null,
+    choices: normalizeClarifyChoices(row.choices)
   }
 }
 
@@ -131,6 +132,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
   }, [fromArgs.question, request])
 
   const question = fromArgs.question || matchingRequest?.question || ''
+  const context = fromArgs.context ?? matchingRequest?.context ?? null
 
   const choices = useMemo(
     () => fromArgs.choices ?? matchingRequest?.choices ?? [],
@@ -258,7 +260,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
 
         if (index < choices.length) {
           event.preventDefault()
-          selectChoice(choices[index])
+          selectChoice(choices[index].label)
         } else if (index === choices.length) {
           event.preventDefault()
           textareaRef.current?.focus()
@@ -302,6 +304,14 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
 
   return (
     <ClarifyShell className="grid gap-2 px-2.5 py-2">
+      {/* Background the question hangs on, rendered above it in a quieter tone —
+          mirrors the `context` field the Python side sends (clarify_tool.py). */}
+      {context ? (
+        <span className="whitespace-pre-wrap leading-(--conversation-line-height) text-(--ui-text-tertiary)">
+          {context}
+        </span>
+      ) : null}
+
       <div className="flex items-start gap-2">
         <span className="flex-1 whitespace-pre-wrap font-medium leading-(--conversation-line-height)">{question}</span>
         <MessageQuestion aria-hidden className="mt-px size-4 shrink-0 text-(--ui-text-tertiary)" />
@@ -315,16 +325,23 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
                 className={cn(
                   OPTION_ROW_CLASS,
                   'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
-                  selectedChoice === choice && 'text-(--ui-text-primary)'
+                  selectedChoice === choice.label && 'text-(--ui-text-primary)'
                 )}
                 data-choice
                 disabled={submitting}
-                key={`${index}-${choice}`}
-                onClick={() => selectChoice(choice)}
+                key={`${index}-${choice.label}`}
+                onClick={() => selectChoice(choice.label)}
                 type="button"
               >
-                <KeyBadge char={letterFor(index)} selected={selectedChoice === choice} />
-                <span className="flex-1 wrap-anywhere">{choice}</span>
+                <KeyBadge char={letterFor(index)} selected={selectedChoice === choice.label} />
+                <span className="flex-1 wrap-anywhere">
+                  <span className="block">{choice.label}</span>
+                  {/* Description is the "why this option" line — the whole point of
+                      the redesign. Empty string ("" never null) renders nothing. */}
+                  {choice.description ? (
+                    <span className="mt-0.5 block text-(--ui-text-tertiary)">{choice.description}</span>
+                  ) : null}
+                </span>
               </button>
             ))}
             {/* "Other" is an inline content-sizing field, not a separate view. */}
