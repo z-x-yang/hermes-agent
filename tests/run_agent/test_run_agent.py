@@ -24,6 +24,7 @@ import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.memory_manager import MemoryManager
+from agent.memory_provider import MemoryProvider
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
 
@@ -2231,6 +2232,36 @@ class TestFormatToolsForSystemMessage:
 
 
 class TestExecuteToolCalls:
+    @staticmethod
+    def _install_agent_local_fact_store(agent, *, properties=None):
+        agent.valid_tool_names.update({"tool_search", "tool_describe", "tool_call"})
+        schema_properties = properties or {"query": {"type": "string"}}
+
+        class FakeMemoryProvider(MemoryProvider):
+            @property
+            def name(self):
+                return "ext"
+
+            def is_available(self):
+                return True
+
+            def initialize(self, session_id, **kwargs):
+                return None
+
+            def get_tool_schemas(self):
+                return [{
+                    "name": "fact_store",
+                    "description": "Search and manage Holographic Memory facts.",
+                    "parameters": {"type": "object", "properties": schema_properties},
+                }]
+
+            def handle_tool_call(self, tool_name, args, **kwargs):
+                return json.dumps({"handled": tool_name, "args": args})
+
+        mgr = MemoryManager()
+        mgr.add_provider(FakeMemoryProvider())
+        agent._memory_manager = mgr
+
     def test_single_tool_executed(self, agent):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
@@ -2281,6 +2312,67 @@ class TestExecuteToolCalls:
         assert metadata["old_text"] == old_text
         assert metadata["tool_call_id"] == "mem-1"
         assert messages[-1]["tool_call_id"] == "mem-1"
+
+    def test_sequential_tool_search_finds_agent_local_memory_provider_tool(self, agent):
+        """tool_search must search the agent's live memory-provider tools."""
+        self._install_agent_local_fact_store(agent)
+
+        tc = _mock_tool_call(
+            name="tool_search",
+            arguments=json.dumps({"query": "holographic fact store"}),
+            call_id="bridge-search-1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+
+        with patch("run_agent.handle_function_call", side_effect=AssertionError("registry bridge missed agent-local tools")):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        parsed = json.loads(messages[-1]["content"])
+        assert any(match["name"] == "fact_store" for match in parsed["matches"])
+
+    def test_invoke_tool_search_finds_agent_local_memory_provider_tool(self, agent):
+        """Concurrent-path _invoke_tool must use the same agent-local bridge."""
+        self._install_agent_local_fact_store(agent)
+
+        with patch("run_agent.handle_function_call", side_effect=AssertionError("registry bridge missed agent-local tools")):
+            result = agent._invoke_tool(
+                "tool_search",
+                {"query": "holographic fact store"},
+                "task-1",
+                tool_call_id="bridge-search-2",
+                pre_tool_block_checked=True,
+            )
+
+        parsed = json.loads(result)
+        assert any(match["name"] == "fact_store" for match in parsed["matches"])
+
+    def test_sequential_tool_call_invokes_agent_local_memory_provider_tool(self, agent):
+        """tool_call must unwrap agent-local memory tools to MemoryManager."""
+        self._install_agent_local_fact_store(
+            agent,
+            properties={"action": {"type": "string"}},
+        )
+
+        tc = _mock_tool_call(
+            name="tool_call",
+            arguments=json.dumps({
+                "name": "fact_store",
+                "arguments": {"action": "search", "query": "commit"},
+            }),
+            call_id="bridge-call-1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+
+        with patch("run_agent.handle_function_call", side_effect=AssertionError("registry bridge missed agent-local tools")):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        parsed = json.loads(messages[-1]["content"])
+        assert parsed == {
+            "handled": "fact_store",
+            "args": {"action": "search", "query": "commit"},
+        }
 
     def test_keyboard_interrupt_emits_cancelled_post_tool_hook(self, agent, monkeypatch):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")

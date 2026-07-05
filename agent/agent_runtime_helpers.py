@@ -2200,7 +2200,21 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             pass
         return result
 
-    if function_name == "todo":
+    try:
+        from agent.tool_executor import _is_agent_tool_search_bridge_name
+    except Exception:
+        _is_tool_search_bridge = False
+    else:
+        _is_tool_search_bridge = _is_agent_tool_search_bridge_name(function_name)
+
+    if _is_tool_search_bridge:
+        def _execute(next_args: dict) -> Any:
+            from agent.tool_executor import _dispatch_agent_tool_search_bridge
+            bridge_result = _dispatch_agent_tool_search_bridge(agent, function_name, next_args)
+            if bridge_result is None:
+                return json.dumps({"error": f"Tool Search bridge '{function_name}' is unavailable"}, ensure_ascii=False)
+            return _finish_agent_tool(bridge_result, next_args)
+    elif function_name == "todo":
         def _execute(next_args: dict) -> Any:
             from tools.todo_tool import todo_tool as _todo_tool
             return _finish_agent_tool(

@@ -1400,6 +1400,150 @@ class TestMemoryToolToolsetGate:
         assert names == {"fact_store", "memory_search", "memory_add"}
 
 
+class TestMemoryProviderToolSearchBridge:
+    """Memory-provider tools must remain reachable through the bridge surface.
+
+    Regression: Holographic prefetch can be active while the current session's
+    exposed tool bridge cannot find/call `fact_store`, because the bridge
+    rebuilds its catalog from the global registry and misses agent-local memory
+    provider schemas.
+    """
+
+    class _FakeCompressor:
+        def __init__(self, schemas):
+            self._schemas = schemas
+
+        def get_tool_schemas(self):
+            return list(self._schemas)
+
+    def _agent(self, enabled_toolsets=None, context_schemas=None, context_tool_names=None):
+        mgr = MemoryManager()
+        mgr.add_provider(FakeMemoryProvider(
+            "ext",
+            tools=[{
+                "name": "fact_store",
+                "description": "Search and manage Holographic Memory facts.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string"},
+                        "query": {"type": "string"},
+                    },
+                },
+            }],
+        ))
+        return SimpleNamespace(
+            _memory_manager=mgr,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=None,
+            tools=[],
+            valid_tool_names=set(),
+            context_compressor=(
+                self._FakeCompressor(context_schemas)
+                if context_schemas is not None
+                else None
+            ),
+            _context_engine_tool_names=set(context_tool_names or set()),
+        )
+
+    def test_tool_search_finds_agent_local_memory_provider_tool(self):
+        from agent.tool_executor import _dispatch_agent_tool_search_bridge
+
+        result = _dispatch_agent_tool_search_bridge(
+            self._agent(),
+            "tool_search",
+            {"query": "holographic fact store"},
+        )
+
+        assert result is not None
+        parsed = json.loads(result)
+        assert any(match["name"] == "fact_store" for match in parsed["matches"])
+
+    def test_tool_describe_describes_agent_local_memory_provider_tool(self):
+        from agent.tool_executor import _dispatch_agent_tool_search_bridge
+
+        result = _dispatch_agent_tool_search_bridge(
+            self._agent(),
+            "tool_describe",
+            {"name": "fact_store"},
+        )
+
+        assert result is not None
+        parsed = json.loads(result)
+        assert parsed["name"] == "fact_store"
+        assert "action" in parsed["parameters"]["properties"]
+
+    def test_tool_call_unwrap_allows_agent_local_memory_provider_tool(self):
+        from agent.tool_executor import _resolve_agent_tool_call_bridge
+
+        name, args, err = _resolve_agent_tool_call_bridge(
+            self._agent(),
+            {"name": "fact_store", "arguments": {"action": "search", "query": "commit"}},
+        )
+
+        assert err is None
+        assert name == "fact_store"
+        assert args == {"action": "search", "query": "commit"}
+
+    def test_tool_search_skips_unrouted_context_engine_schema(self):
+        """Only context-engine names that the executor will route may be bridged."""
+        from agent.tool_executor import _dispatch_agent_tool_search_bridge, _resolve_agent_tool_call_bridge
+
+        agent = self._agent(
+            context_schemas=[{
+                "name": "read_file",
+                "description": "context engine shadow should not be bridged",
+                "parameters": {"type": "object", "properties": {}},
+            }],
+            context_tool_names=set(),
+        )
+
+        result = _dispatch_agent_tool_search_bridge(
+            agent,
+            "tool_search",
+            {"query": "context engine shadow"},
+        )
+        assert result is not None
+        parsed = json.loads(result)
+        assert not any(match["name"] == "read_file" for match in parsed["matches"])
+
+        name, args, err = _resolve_agent_tool_call_bridge(
+            agent,
+            {"name": "read_file", "arguments": {}},
+        )
+        assert name is None
+        assert err is not None
+
+    def test_tool_search_includes_routed_context_engine_schema(self):
+        from agent.tool_executor import _dispatch_agent_tool_search_bridge, _resolve_agent_tool_call_bridge
+
+        agent = self._agent(
+            context_schemas=[{
+                "name": "lcm_grep",
+                "description": "Search compressed context slices.",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            }],
+            context_tool_names={"lcm_grep"},
+        )
+
+        result = _dispatch_agent_tool_search_bridge(
+            agent,
+            "tool_search",
+            {"query": "compressed context slices"},
+        )
+        assert result is not None
+        parsed = json.loads(result)
+        assert any(match["name"] == "lcm_grep" for match in parsed["matches"])
+
+        name, args, err = _resolve_agent_tool_call_bridge(
+            agent,
+            {"name": "lcm_grep", "arguments": {"query": "facts"}},
+        )
+        assert err is None
+        assert name == "lcm_grep"
+        assert args == {"query": "facts"}
+
+
 class TestContextEngineToolsetGate:
     """Issue #5544 (sibling): context engine tools follow the same gate.
 

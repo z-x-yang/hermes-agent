@@ -244,6 +244,186 @@ def _tool_search_scoped_names(agent) -> frozenset:
     return names
 
 
+def _wrap_tool_schema(schema: dict) -> dict:
+    return {"type": "function", "function": schema}
+
+
+def _agent_local_bridge_tool_defs(agent) -> list[dict]:
+    """Return agent-local dynamic tools that are not in the global registry.
+
+    Memory-provider and context-engine tools are attached to an AIAgent after
+    ``model_tools.get_tool_definitions()`` runs, so the global Tool Search
+    bridge cannot reconstruct them from the registry. Include them explicitly
+    for agent-owned bridge calls.
+    """
+    defs: list[dict] = []
+    seen: set[str] = set()
+
+    def add_schema(raw_schema) -> None:
+        try:
+            from agent.memory_manager import normalize_tool_schema
+            schema = normalize_tool_schema(raw_schema)
+        except Exception:
+            schema = None
+        if schema is None:
+            return
+        name = schema.get("name")
+        if not name or name in seen:
+            return
+        defs.append(_wrap_tool_schema(schema))
+        seen.add(name)
+
+    enabled = getattr(agent, "enabled_toolsets", None)
+    try:
+        from agent.memory_manager import memory_provider_tools_enabled
+        mm = getattr(agent, "_memory_manager", None)
+        if mm is not None and memory_provider_tools_enabled(enabled):
+            for raw_schema in mm.get_all_tool_schemas():
+                add_schema(raw_schema)
+    except Exception:
+        logger.debug("Failed to collect agent-local memory provider tools", exc_info=True)
+
+    try:
+        compressor = getattr(agent, "context_compressor", None)
+        routed_engine_names = set(getattr(agent, "_context_engine_tool_names", set()) or set())
+        if (
+            compressor is not None
+            and routed_engine_names
+            and (enabled is None or "context_engine" in enabled)
+        ):
+            get_schemas = getattr(compressor, "get_tool_schemas", None)
+            if callable(get_schemas):
+                for raw_schema in get_schemas():
+                    try:
+                        from agent.memory_manager import normalize_tool_schema
+                        schema = normalize_tool_schema(raw_schema)
+                    except Exception:
+                        schema = None
+                    if schema is not None and schema.get("name") in routed_engine_names:
+                        add_schema(schema)
+    except Exception:
+        logger.debug("Failed to collect agent-local context engine tools", exc_info=True)
+
+    return defs
+
+
+def _agent_local_bridge_tool_names(agent) -> frozenset[str]:
+    return frozenset(
+        (td.get("function") or {}).get("name", "")
+        for td in _agent_local_bridge_tool_defs(agent)
+        if (td.get("function") or {}).get("name")
+    )
+
+
+def _agent_bridge_allowed_tool_names(agent) -> frozenset[str]:
+    """Return every underlying tool the agent-owned bridge may invoke."""
+    return _tool_search_scoped_names(agent) | _agent_local_bridge_tool_names(agent)
+
+
+def _is_agent_tool_search_bridge_name(function_name: str) -> bool:
+    try:
+        from tools import tool_search as _ts
+        return function_name in {_ts.TOOL_SEARCH_NAME, _ts.TOOL_DESCRIBE_NAME}
+    except Exception:
+        return False
+
+
+def _agent_bridge_deferrable_tool_defs(agent) -> list[dict]:
+    """Catalog the tools reachable via the agent-owned Tool Search bridge."""
+    try:
+        import model_tools
+        from tools import tool_search as _ts
+
+        scoped_defs = model_tools.get_tool_definitions(
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        ) or []
+        _, registry_deferrable = _ts.classify_tools(scoped_defs)
+    except Exception:
+        registry_deferrable = []
+
+    combined: list[dict] = []
+    seen: set[str] = set()
+    for td in list(registry_deferrable) + _agent_local_bridge_tool_defs(agent):
+        name = (td.get("function") or {}).get("name", "")
+        if not name or name in seen:
+            continue
+        combined.append(td)
+        seen.add(name)
+    return combined
+
+
+def _dispatch_agent_tool_search_bridge(agent, function_name: str, function_args: dict) -> str | None:
+    """Dispatch tool_search/tool_describe against the agent's actual tool surface."""
+    try:
+        from tools import tool_search as _ts
+    except Exception:
+        return None
+
+    if function_name == _ts.TOOL_SEARCH_NAME:
+        query = str((function_args or {}).get("query") or "").strip()
+        if not query:
+            return json.dumps({"error": "query is required"}, ensure_ascii=False)
+        cfg = _ts.load_config()
+        raw_limit = (function_args or {}).get("limit")
+        try:
+            requested_limit = int(raw_limit) if raw_limit is not None else cfg.search_default_limit
+        except (TypeError, ValueError):
+            requested_limit = cfg.search_default_limit
+        limit = max(1, min(cfg.max_search_limit, requested_limit))
+        catalog = _ts.build_catalog(_agent_bridge_deferrable_tool_defs(agent))
+        hits = _ts.search_catalog(catalog, query, limit=limit)
+        return json.dumps({
+            "query": query,
+            "total_available": len(catalog),
+            "matches": [_ts._format_search_hit(hit) for hit in hits],
+        }, ensure_ascii=False)
+
+    if function_name == _ts.TOOL_DESCRIBE_NAME:
+        name = str((function_args or {}).get("name") or "").strip()
+        if not name:
+            return json.dumps({"error": "name is required"}, ensure_ascii=False)
+        for td in _agent_bridge_deferrable_tool_defs(agent):
+            fn = td.get("function") or {}
+            if fn.get("name") == name:
+                return json.dumps({
+                    "name": name,
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                }, ensure_ascii=False)
+        return json.dumps({
+            "error": f"'{name}' is not currently available. Re-run tool_search to refresh.",
+        }, ensure_ascii=False)
+
+    return None
+
+
+def _resolve_agent_tool_call_bridge(agent, function_args: dict) -> tuple[str | None, dict, str | None]:
+    """Resolve tool_call for registry deferrables plus agent-local dynamic tools."""
+    try:
+        from tools import tool_search as _ts
+    except Exception:
+        return None, {}, "tool_call bridge is unavailable"
+
+    name = str((function_args or {}).get("name") or "").strip()
+    if name in _agent_local_bridge_tool_names(agent):
+        raw_args = (function_args or {}).get("arguments")
+        if raw_args is None:
+            raw_args = {}
+        if isinstance(raw_args, str):
+            try:
+                raw_args = json.loads(raw_args)
+            except json.JSONDecodeError as e:
+                return None, {}, f"tool_call 'arguments' is not valid JSON: {e}"
+        if not isinstance(raw_args, dict):
+            return None, {}, "tool_call 'arguments' must be an object"
+        return name, raw_args, None
+
+    return _ts.resolve_underlying_call(function_args or {})
+
+
 def _apply_tool_request_middleware_for_agent(
     agent,
     *,
@@ -370,9 +550,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
+                _underlying, _underlying_args, _err = _resolve_agent_tool_call_bridge(agent, function_args)
                 if not _err and _underlying:
-                    if _underlying in _tool_search_scoped_names(agent):
+                    if _underlying in _agent_bridge_allowed_tool_names(agent):
                         function_name = _underlying
                         function_args = _underlying_args
                     else:
@@ -1005,9 +1185,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
+                _underlying, _underlying_args, _err = _resolve_agent_tool_call_bridge(agent, function_args)
                 if not _err and _underlying:
-                    if _underlying in _tool_search_scoped_names(agent):
+                    if _underlying in _agent_bridge_allowed_tool_names(agent):
                         function_name = _underlying
                         function_args = _underlying_args
                     else:
@@ -1162,6 +1342,31 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 status="blocked",
                 error_type="guardrail_block",
                 error_message=getattr(_guardrail_block_decision, "message", None) or "Tool blocked by guardrail policy",
+                middleware_trace=list(middleware_trace),
+            )
+        elif _is_agent_tool_search_bridge_name(function_name):
+            def _execute(next_args: dict) -> Any:
+                bridge_result = _dispatch_agent_tool_search_bridge(agent, function_name, next_args)
+                if bridge_result is None:
+                    return json.dumps({"error": f"Tool Search bridge '{function_name}' is unavailable"}, ensure_ascii=False)
+                return bridge_result
+            function_result, function_args = _run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+            )
+            tool_duration = time.time() - tool_start_time
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=function_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                duration_ms=int(tool_duration * 1000),
                 middleware_trace=list(middleware_trace),
             )
         elif function_name == "todo":
