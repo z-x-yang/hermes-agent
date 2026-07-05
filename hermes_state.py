@@ -782,6 +782,12 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+-- Covering index for analytics/insights aggregations (tool counts, message
+-- role stats): answers them from the index instead of scanning the messages
+-- table, whose rows carry large content blobs. First build on a large
+-- existing DB is a one-time ~10s cost.
+CREATE INDEX IF NOT EXISTS idx_messages_session_role_tool
+    ON messages(session_id, role, tool_name);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 """
 

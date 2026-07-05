@@ -730,3 +730,67 @@ class TestEdgeCases:
         # Depending on timing, might catch the session if created <1s ago
         # Just verify it doesn't crash
         assert "empty" in report
+    def test_malformed_tool_calls_function_does_not_crash(self):
+        # Regression: a tool_calls entry whose "function" is not a dict used to
+        # raise AttributeError and 500 the entire usage report. It must now be
+        # skipped (with a warning) while valid calls are still counted.
+        import json, logging, tempfile
+        from pathlib import Path
+        from hermes_state import SessionDB
+        from agent.insights import InsightsEngine
+
+        db = SessionDB(db_path=Path(tempfile.mkdtemp()) / "state.db")
+        conn = db._conn
+        m_info = conn.execute("PRAGMA table_info(messages)").fetchall()
+        s_info = conn.execute("PRAGMA table_info(sessions)").fetchall()
+
+        def _req(info, keep):
+            out = {}
+            for cid, name, ctype, notnull, dflt, pk in info:
+                if name in keep or pk:
+                    continue
+                if notnull and dflt is None:
+                    t = (ctype or "").upper()
+                    out[name] = 0 if ("INT" in t or "REAL" in t or "NUM" in t) else ""
+            return out
+
+        s_req = _req(s_info, {"id", "started_at", "source"})
+        m_req = _req(m_info, {"session_id", "role", "timestamp", "tool_calls"})
+        has_source = "source" in {r[1] for r in s_info}
+
+        scol = ["id", "started_at"] + (["source"] if has_source else []) + list(s_req)
+        sval = ["s1", 999900.0] + (["discord"] if has_source else []) + list(s_req.values())
+        conn.execute(
+            f"INSERT INTO sessions ({','.join(scol)}) VALUES ({','.join('?' * len(scol))})",
+            sval,
+        )
+
+        def _msg(tc):
+            col = ["session_id", "role", "timestamp", "tool_calls"] + list(m_req)
+            val = ["s1", "assistant", 1.0, tc] + list(m_req.values())
+            conn.execute(
+                f"INSERT INTO messages ({','.join(col)}) VALUES ({','.join('?' * len(col))})",
+                val,
+            )
+
+        _msg(json.dumps([{"function": None}, {"function": {"name": "ReadFile"}}]))
+        conn.commit()
+
+        captured = []
+
+        class _H(logging.Handler):
+            def emit(self, record):
+                captured.append(record.getMessage())
+
+        root = logging.getLogger()
+        handler = _H()
+        root.addHandler(handler)
+        try:
+            tools, skills = InsightsEngine(db)._get_tool_and_skill_usage(0.0)
+        finally:
+            root.removeHandler(handler)
+
+        names = {t["tool_name"] for t in tools}
+        assert "ReadFile" in names
+        assert any("malformed tool_calls" in m for m in captured)
+

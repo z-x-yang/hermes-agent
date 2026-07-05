@@ -4126,6 +4126,42 @@ class TestNewEndpoints:
             "top_skills": [],
         }
 
+    def test_analytics_usage_does_not_block_event_loop(self, monkeypatch):
+        """The usage report must run in a worker thread, not on the loop.
+
+        The report takes seconds on a large DB; computed on the event loop it
+        stalls every concurrent API call past the desktop client's timeout
+        (the '工具配置加载失败' failure mode). Deadlock-style check: the fake
+        compute blocks until the loop proves it is still running by setting
+        the release event from a timer scheduled on the loop itself.
+        """
+        import threading
+
+        from hermes_cli import web_server as ws
+
+        release = threading.Event()
+        computed = {}
+
+        def fake_compute(days, profile):
+            # Only returns if the event loop stays free to run the timer below.
+            if not release.wait(timeout=5):
+                raise AssertionError("event loop blocked while report computed")
+            computed["days"] = days
+            return {"ok": True}
+
+        monkeypatch.setattr(ws, "_compute_usage_analytics", fake_compute)
+
+        async def _run():
+            loop = asyncio.get_running_loop()
+            loop.call_later(0.05, release.set)
+            return await asyncio.wait_for(
+                ws.get_usage_analytics(days=3), timeout=5
+            )
+
+        result = asyncio.run(_run())
+        assert result == {"ok": True}
+        assert computed["days"] == 3
+
     def test_models_analytics_merges_session_only_duplicate_into_accounted_provider(self):
         """Session-only model rows should not render as duplicate zero-token cards.
 
@@ -6592,3 +6628,39 @@ class TestDesktopCronTicker:
 
         with self._client():
             assert not called.wait(0.5), "ticker must not run outside the desktop app"
+class TestAnalyticsUsageOffLoop:
+    """Guard: the entire usage computation, including opening the SessionDB,
+    must run off the event loop (inside asyncio.to_thread). A regression that
+    pulled _open_session_db_for_profile back onto the async handler would run it
+    on the main thread, and this test would fail."""
+
+    def test_db_open_runs_off_the_event_loop(self, monkeypatch):
+        import asyncio
+        import tempfile
+        import threading
+        from pathlib import Path
+        import hermes_cli.web_server as ws
+        from hermes_state import SessionDB
+
+        seen = {}
+
+        def spy(profile):
+            seen["off_main_thread"] = (
+                threading.current_thread() is not threading.main_thread()
+            )
+            # Empty temp DB so the report short-circuits fast (no prod I/O).
+            return SessionDB(db_path=Path(tempfile.mkdtemp()) / "state.db")
+
+        monkeypatch.setattr(ws, "_open_session_db_for_profile", spy)
+
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                ws.get_usage_analytics(days=1, profile=None)
+            )
+        finally:
+            loop.close()
+
+        assert seen.get("off_main_thread") is True
+        assert isinstance(result, dict)
+

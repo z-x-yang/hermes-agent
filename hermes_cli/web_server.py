@@ -12090,6 +12090,14 @@ async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None
 
 @app.get("/api/analytics/usage")
 async def get_usage_analytics(days: int = 30, profile: Optional[str] = None):
+    # The insights report scans assistant tool_calls blobs and takes seconds
+    # on a large DB. Run it in a worker thread (DB opened inside the thread):
+    # computing it on the event loop used to stall every concurrent API call
+    # past the desktop client's 15s timeout.
+    return await asyncio.to_thread(_compute_usage_analytics, days, profile)
+
+
+def _compute_usage_analytics(days: int, profile: Optional[str]) -> Dict[str, Any]:
     from agent.insights import InsightsEngine
 
     db = _open_session_db_for_profile(profile)

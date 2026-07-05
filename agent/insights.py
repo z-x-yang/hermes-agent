@@ -16,6 +16,7 @@ Usage:
     print(engine.format_terminal(report))
 """
 
+import logging
 import json
 import time
 from collections import Counter, defaultdict
@@ -114,8 +115,7 @@ class InsightsEngine:
 
         # Gather raw data
         sessions = self._get_sessions(cutoff, source)
-        tool_usage = self._get_tool_usage(cutoff, source)
-        skill_usage = self._get_skill_usage(cutoff, source)
+        tool_usage, skill_usage = self._get_tool_and_skill_usage(cutoff, source)
         message_stats = self._get_message_stats(cutoff, source)
 
         if not sessions:
@@ -187,6 +187,22 @@ class InsightsEngine:
         " ORDER BY started_at DESC"
     )
 
+    # Messages queries filter through the window's session ids with an IN
+    # subquery instead of a JOIN: the join form makes SQLite scan the whole
+    # messages table (rows carry multi-KB content blobs — tens of seconds on
+    # a multi-GB DB), while the subquery form drives idx_sessions_started +
+    # idx_messages_session_role_tool and only touches rows in the window.
+    _WINDOW_IDS_ALL = "SELECT id FROM sessions WHERE started_at >= ?"
+    _WINDOW_IDS_WITH_SOURCE = (
+        "SELECT id FROM sessions WHERE started_at >= ? AND source = ?"
+    )
+
+    def _window_params(self, cutoff: float, source: str = None) -> tuple:
+        """(session-id subquery, bind params) for the report window."""
+        if source:
+            return self._WINDOW_IDS_WITH_SOURCE, (cutoff, source)
+        return self._WINDOW_IDS_ALL, (cutoff,)
+
     def _get_sessions(self, cutoff: float, source: str = None) -> List[Dict]:
         """Fetch sessions within the time window."""
         if source:
@@ -195,122 +211,48 @@ class InsightsEngine:
             cursor = self._conn.execute(self._GET_SESSIONS_ALL, (cutoff,))
         return [dict(row) for row in cursor.fetchall()]
 
-    def _get_tool_usage(self, cutoff: float, source: str = None) -> List[Dict]:
-        """Get tool call counts from messages.
+    def _get_tool_and_skill_usage(
+        self, cutoff: float, source: str = None
+    ) -> tuple[List[Dict], List[Dict]]:
+        """Compute tool call counts and per-skill usage in one pass.
 
-        Uses two sources:
-        1. tool_name column on 'tool' role messages (set by gateway)
+        Tool counts merge two sources:
+        1. tool_name column on 'tool' role messages (set by gateway) —
+           answered entirely from idx_messages_session_role_tool.
         2. tool_calls JSON on 'assistant' role messages (covers CLI where
-           tool_name is not populated on tool responses)
+           tool_name is not populated on tool responses).
+
+        Skill usage comes from the same assistant tool_calls blobs, so both
+        are extracted from a single scan — fetching those blobs dominates the
+        report cost and used to happen twice.
         """
-        tool_counts = Counter()
+        ids_sql, params = self._window_params(cutoff, source)
 
         # Source 1: explicit tool_name on tool response messages
-        if source:
-            cursor = self._conn.execute(
-                """SELECT m.tool_name, COUNT(*) as count
-                   FROM messages m
-                   JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ? AND s.source = ?
-                     AND m.role = 'tool' AND m.tool_name IS NOT NULL
-                   GROUP BY m.tool_name
-                   ORDER BY count DESC""",
-                (cutoff, source),
-            )
-        else:
-            cursor = self._conn.execute(
-                """SELECT m.tool_name, COUNT(*) as count
-                   FROM messages m
-                   JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ?
-                     AND m.role = 'tool' AND m.tool_name IS NOT NULL
-                   GROUP BY m.tool_name
-                   ORDER BY count DESC""",
-                (cutoff,),
-            )
+        tool_counts = Counter()
+        cursor = self._conn.execute(
+            f"""SELECT m.tool_name, COUNT(*) as count
+                FROM messages m
+                WHERE m.session_id IN ({ids_sql})
+                  AND m.role = 'tool' AND m.tool_name IS NOT NULL
+                GROUP BY m.tool_name""",
+            params,
+        )
         for row in cursor.fetchall():
             tool_counts[row["tool_name"]] += row["count"]
 
-        # Source 2: extract from tool_calls JSON on assistant messages
-        # (covers CLI sessions where tool_name is NULL on tool responses)
-        if source:
-            cursor2 = self._conn.execute(
-                """SELECT m.tool_calls
-                   FROM messages m
-                   JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ? AND s.source = ?
-                     AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
-                (cutoff, source),
-            )
-        else:
-            cursor2 = self._conn.execute(
-                """SELECT m.tool_calls
-                   FROM messages m
-                   JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ?
-                     AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
-                (cutoff,),
-            )
+        # Source 2 + skills: single pass over assistant tool_calls JSON
+        cursor = self._conn.execute(
+            f"""SELECT m.tool_calls, m.timestamp
+                FROM messages m
+                WHERE m.session_id IN ({ids_sql})
+                  AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
+            params,
+        )
 
         tool_calls_counts = Counter()
-        for row in cursor2.fetchall():
-            try:
-                calls = row["tool_calls"]
-                if isinstance(calls, str):
-                    calls = json.loads(calls)
-                if isinstance(calls, list):
-                    for call in calls:
-                        func = call.get("function", {}) if isinstance(call, dict) else {}
-                        name = func.get("name")
-                        if name:
-                            tool_calls_counts[name] += 1
-            except (json.JSONDecodeError, TypeError, AttributeError):
-                continue
-
-        # Merge: prefer tool_name source, supplement with tool_calls source
-        # for tools not already counted
-        if not tool_counts and tool_calls_counts:
-            # No tool_name data at all — use tool_calls exclusively
-            tool_counts = tool_calls_counts
-        elif tool_counts and tool_calls_counts:
-            # Both sources have data — use whichever has the higher count per tool
-            # (they may overlap, so take the max to avoid double-counting)
-            all_tools = set(tool_counts) | set(tool_calls_counts)
-            merged = Counter()
-            for tool in all_tools:
-                merged[tool] = max(tool_counts.get(tool, 0), tool_calls_counts.get(tool, 0))
-            tool_counts = merged
-
-        # Convert to the expected format
-        return [
-            {"tool_name": name, "count": count}
-            for name, count in tool_counts.most_common()
-        ]
-
-    def _get_skill_usage(self, cutoff: float, source: str = None) -> List[Dict]:
-        """Extract per-skill usage from assistant tool calls."""
         skill_counts: Dict[str, Dict[str, Any]] = {}
-
-        if source:
-            cursor = self._conn.execute(
-                """SELECT m.tool_calls, m.timestamp
-                   FROM messages m
-                   JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ? AND s.source = ?
-                     AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
-                (cutoff, source),
-            )
-        else:
-            cursor = self._conn.execute(
-                """SELECT m.tool_calls, m.timestamp
-                   FROM messages m
-                   JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ?
-                     AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
-                (cutoff,),
-            )
-
-        for row in cursor.fetchall():
+        for row in cursor:
             try:
                 calls = row["tool_calls"]
                 if isinstance(calls, str):
@@ -325,7 +267,14 @@ class InsightsEngine:
                 if not isinstance(call, dict):
                     continue
                 func = call.get("function", {})
+                if not isinstance(func, dict):
+                    logging.getLogger(__name__).warning("insights: skipping malformed tool_calls entry (function type=%s)", type(func).__name__)
+                    continue
                 tool_name = func.get("name")
+                if not tool_name:
+                    continue
+                tool_calls_counts[tool_name] += 1
+
                 if tool_name not in {"skill_view", "skill_manage"}:
                     continue
 
@@ -361,34 +310,39 @@ class InsightsEngine:
                 ):
                     entry["last_used_at"] = timestamp
 
-        return list(skill_counts.values())
+        # Merge: prefer tool_name source, supplement with tool_calls source
+        # for tools not already counted
+        if not tool_counts and tool_calls_counts:
+            # No tool_name data at all — use tool_calls exclusively
+            tool_counts = tool_calls_counts
+        elif tool_counts and tool_calls_counts:
+            # Both sources have data — use whichever has the higher count per tool
+            # (they may overlap, so take the max to avoid double-counting)
+            all_tools = set(tool_counts) | set(tool_calls_counts)
+            merged = Counter()
+            for tool in all_tools:
+                merged[tool] = max(tool_counts.get(tool, 0), tool_calls_counts.get(tool, 0))
+            tool_counts = merged
+
+        tool_usage = [
+            {"tool_name": name, "count": count}
+            for name, count in tool_counts.most_common()
+        ]
+        return tool_usage, list(skill_counts.values())
 
     def _get_message_stats(self, cutoff: float, source: str = None) -> Dict:
         """Get aggregate message statistics."""
-        if source:
-            cursor = self._conn.execute(
-                """SELECT
-                     COUNT(*) as total_messages,
-                     SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) as user_messages,
-                     SUM(CASE WHEN m.role = 'assistant' THEN 1 ELSE 0 END) as assistant_messages,
-                     SUM(CASE WHEN m.role = 'tool' THEN 1 ELSE 0 END) as tool_messages
-                   FROM messages m
-                   JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ? AND s.source = ?""",
-                (cutoff, source),
-            )
-        else:
-            cursor = self._conn.execute(
-                """SELECT
-                     COUNT(*) as total_messages,
-                     SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) as user_messages,
-                     SUM(CASE WHEN m.role = 'assistant' THEN 1 ELSE 0 END) as assistant_messages,
-                     SUM(CASE WHEN m.role = 'tool' THEN 1 ELSE 0 END) as tool_messages
-                   FROM messages m
-                   JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ?""",
-                (cutoff,),
-            )
+        ids_sql, params = self._window_params(cutoff, source)
+        cursor = self._conn.execute(
+            f"""SELECT
+                  COUNT(*) as total_messages,
+                  SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) as user_messages,
+                  SUM(CASE WHEN m.role = 'assistant' THEN 1 ELSE 0 END) as assistant_messages,
+                  SUM(CASE WHEN m.role = 'tool' THEN 1 ELSE 0 END) as tool_messages
+                FROM messages m
+                WHERE m.session_id IN ({ids_sql})""",
+            params,
+        )
         row = cursor.fetchone()
         return dict(row) if row else {
             "total_messages": 0, "user_messages": 0,
