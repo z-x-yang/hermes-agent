@@ -3,6 +3,7 @@
 import json
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -1950,6 +1951,63 @@ class TestCompressionAuditLog:
         assert 0 < tail["token_share_of_after"] < 1
         assert tail["tail_budget_tokens"] == c.tail_token_budget
         assert 0 < tail["token_share_of_tail_budget"]
+
+    def test_tail_compaction_preserves_at_least_80pct_budget_floor(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "agent.context_compressor.get_hermes_home",
+            lambda: tmp_path,
+            raising=False,
+        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=10,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 10_000
+
+        msgs: list[dict[str, Any]] = [{"role": "system", "content": "System prompt"}]
+        for i in range(100):
+            msgs.append({
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"middle {i} " + ("x" * 100),
+            })
+        for i in range(10):
+            call_id = f"call_tail_{i}"
+            msgs.extend([
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "tool_name": "terminal",
+                    "content": "X" * 5_000,
+                },
+                {"role": "assistant", "content": f"after tool {i} " + ("y" * 100)},
+            ])
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
+        ):
+            c.compress(msgs, current_tokens=90_000, force=True)
+
+        [record] = _read_compression_audit_records(tmp_path)
+        tail = record["message_accounting"]["retained_tail"]
+        assert tail["tail_budget_tokens"] == c.tail_token_budget
+        assert tail["token_share_of_tail_budget"] >= 0.8
+        assert tail["tokens_estimate"] >= int(c.tail_token_budget * 0.8)
 
     def test_message_accounting_does_not_count_user_role_summary_as_real_user(
         self, tmp_path, monkeypatch

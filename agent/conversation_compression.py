@@ -648,9 +648,12 @@ def compress_context(
                         "check auxiliary.compression.model in config.yaml."
                     )
 
+        post_compression_injected_count = 0
+        pre_injection_output_count = len(compressed)
         todo_snapshot = agent._todo_store.format_for_injection()
         if todo_snapshot:
             compressed.append({"role": "user", "content": todo_snapshot})
+            post_compression_injected_count = len(compressed) - pre_injection_output_count
 
         agent._invalidate_system_prompt()
         new_system_prompt = agent._build_system_prompt(system_message)
@@ -710,9 +713,20 @@ def compress_context(
                             )
                     try:
                         if hasattr(agent.context_compressor, "write_compression_persist_audit"):
+                            injected_row_ids = []
+                            if post_compression_injected_count and output_row_ids:
+                                injected_row_ids = output_row_ids[-post_compression_injected_count:]
+                            persist_audit_kwargs = {
+                                "output_row_ids": output_row_ids,
+                                "retained_tail_output_count": retained_tail_output_count,
+                            }
+                            if post_compression_injected_count:
+                                persist_audit_kwargs.update({
+                                    "post_compression_injected_count": post_compression_injected_count,
+                                    "post_compression_injected_row_ids": injected_row_ids,
+                                })
                             agent.context_compressor.write_compression_persist_audit(
-                                output_row_ids=output_row_ids,
-                                retained_tail_output_count=retained_tail_output_count,
+                                **persist_audit_kwargs
                             )
                     except Exception as _audit_err:
                         logger.warning("compression persist audit enrichment failed: %s", _audit_err)

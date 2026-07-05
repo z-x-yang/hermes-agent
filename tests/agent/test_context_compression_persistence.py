@@ -33,8 +33,11 @@ class _FakeCompressor:
 
 
 class _FakeTodoStore:
+    def __init__(self, snapshot: str = ""):
+        self.snapshot = snapshot
+
     def format_for_injection(self):
-        return ""
+        return self.snapshot
 
 
 class _FakeSessionDB:
@@ -71,7 +74,7 @@ class _FakeSessionDB:
         self.appended.append(kwargs)
 
 
-def _make_agent(compressed) -> Any:
+def _make_agent(compressed, *, todo_snapshot: str = "") -> Any:
     agent = cast(Any, object.__new__(AIAgent))
     agent.session_id = "session-1"
     agent.model = "test-model"
@@ -84,7 +87,7 @@ def _make_agent(compressed) -> Any:
     agent._session_init_model_config = {}
     agent._compression_feasibility_checked = True
     agent._memory_manager = None
-    agent._todo_store = _FakeTodoStore()
+    agent._todo_store = _FakeTodoStore(todo_snapshot)
     agent._cached_system_prompt = "system-old"
     agent._last_flushed_db_idx = 0
     agent._flushed_db_message_ids = set()
@@ -152,6 +155,45 @@ def test_in_place_compression_writes_persist_audit_with_output_row_ids():
         {
             "output_row_ids": [101, 102],
             "retained_tail_output_count": 2,
+        }
+    ]
+
+
+def test_in_place_persist_audit_marks_post_compression_todo_injection():
+    """Todo snapshot injection happens after compressor accounting.
+
+    The companion audit must make that extra synthetic row explicit so the
+    content-free compression record is not mistaken for the exact persisted
+    after/tail shape.
+    """
+    original = [
+        {"role": "user", "content": "old user"},
+        {"role": "assistant", "content": "old assistant"},
+        {"role": "user", "content": "current user"},
+    ]
+    compressed = [
+        {"role": "assistant", "content": "[CONTEXT COMPACTION] compacted summary"},
+        {"role": "user", "content": "current user"},
+    ]
+    todo_snapshot = "[Your active task list was preserved across context compression]\n- [>] fix.tail (in_progress)"
+    agent = _make_agent(
+        compressed,
+        todo_snapshot=todo_snapshot,
+    )
+    agent._session_db.row_ids = [101, 102, 103]
+
+    compress_context(agent, original, "system")
+
+    assert agent._session_db.archived[-1] == {
+        "role": "user",
+        "content": todo_snapshot,
+    }
+    assert agent.context_compressor.persist_audit_calls == [
+        {
+            "output_row_ids": [101, 102, 103],
+            "retained_tail_output_count": 2,
+            "post_compression_injected_count": 1,
+            "post_compression_injected_row_ids": [103],
         }
     ]
 

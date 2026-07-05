@@ -266,7 +266,7 @@ _GATEWAY_TRIGGERING_MESSAGE_RE = re.compile(
 )
 _GATEWAY_INTERRUPTION_SYSTEM_NOTE_RE = re.compile(
     r"(?ms)^\s*\[System note: The previous turn was interrupted by a gateway "
-    r"shutdown;.*?\]\s*"
+    r"(?:shutdown|restart);.*?\]\s*"
 )
 
 # Placeholder used when pruning old tool results
@@ -316,6 +316,11 @@ _TAIL_TOOL_TRUNCATED_TAIL_CHARS = 1_500
 # 10% tail-token budget; the cap prevents preserving arbitrarily many bulky
 # tool-output rows, but must not undercut that configured 10-message floor.
 _MAX_TAIL_MESSAGE_FLOOR = 10
+# Try to use a meaningful fraction of the configured tail token budget before
+# relying on the handoff summary alone. This is a target floor when the suffix
+# contains enough safe raw context; source-fidelity/tool-boundary constraints may
+# still force a larger or smaller effective tail in pathological cases.
+_TAIL_BUDGET_MIN_UTILIZATION = 0.80
 
 # Non-visible assistant provider metadata that the compressor copies into the
 # retained head/tail verbatim. None of it is user-visible: it is per-turn
@@ -2068,6 +2073,11 @@ class ContextCompressor(ContextEngine):
                 tail["tokens_estimate"], after["tokens_estimate"]
             ),
             "tail_budget_tokens": int(tail_budget_tokens) if tail_budget_tokens else None,
+            "tail_budget_min_utilization": _TAIL_BUDGET_MIN_UTILIZATION,
+            "tail_budget_target_tokens": (
+                int(int(tail_budget_tokens) * _TAIL_BUDGET_MIN_UTILIZATION)
+                if tail_budget_tokens else None
+            ),
             "token_share_of_tail_budget": cls._audit_share(
                 tail["tokens_estimate"], int(tail_budget_tokens) if tail_budget_tokens else None
             ),
@@ -2101,6 +2111,8 @@ class ContextCompressor(ContextEngine):
         *,
         output_row_ids: list[int] | None,
         retained_tail_output_count: int | None = None,
+        post_compression_injected_count: int | None = None,
+        post_compression_injected_row_ids: list[int] | None = None,
     ) -> None:
         """Append post-persistence row-id metadata for the latest compression.
 
@@ -2113,6 +2125,7 @@ class ContextCompressor(ContextEngine):
         if not compression_id:
             return
         safe_ids = [int(v) for v in (output_row_ids or [])]
+        safe_injected_ids = [int(v) for v in (post_compression_injected_row_ids or [])]
         record = {
             "event": "context_compression_persist",
             "schema_version": 1,
@@ -2123,6 +2136,9 @@ class ContextCompressor(ContextEngine):
                 int(retained_tail_output_count) if retained_tail_output_count is not None else None
             ),
         }
+        if post_compression_injected_count:
+            record["post_compression_injected_count"] = int(post_compression_injected_count)
+            record["post_compression_injected_row_ids"] = safe_injected_ids
         self._write_compression_audit_record(record, remember=False)
 
     def _write_user_message_ground_truth_audit(self) -> None:
@@ -3965,6 +3981,54 @@ This compaction should PRIORITISE preserving all information related to the focu
             if available_tail > 1 else 0
         )
 
+    def _tail_budget_floor_start(
+        self,
+        messages: List[Dict[str, Any]],
+        head_end: int,
+        token_budget: int | None = None,
+    ) -> int:
+        """Return earliest suffix start needed for the configured 80% tail floor.
+
+        If the available suffix cannot reach the target while still leaving a
+        useful summary window, fall back to the message-count floor. The returned
+        index is a *floor boundary*: tail compaction/promotion must not move the
+        final live tail to the right of it.
+        """
+        n = len(messages)
+        min_tail = self._minimum_tail_message_count(messages, head_end)
+        message_floor_start = n - min_tail if min_tail else n
+        if token_budget is None:
+            token_budget = self.tail_token_budget
+        if not token_budget or token_budget <= 0:
+            return message_floor_start
+
+        target_tokens = max(1, int(int(token_budget) * _TAIL_BUDGET_MIN_UTILIZATION))
+        accumulated = 0
+        target_start = n
+        for i in range(n - 1, head_end, -1):
+            msg_tokens = _estimate_msg_budget_tokens(messages[i])
+            next_accumulated = accumulated + msg_tokens
+            if accumulated < target_tokens <= next_accumulated and next_accumulated > token_budget:
+                # Reaching 80% would require pulling in a discrete oversized
+                # message/tool group that blows past the configured budget. In
+                # that shape, keep the old message-count floor and let the tail
+                # tool compaction/source-fidelity path decide what can stay raw.
+                return message_floor_start
+            accumulated = next_accumulated
+            target_start = i
+            if accumulated >= target_tokens:
+                break
+
+        if accumulated < target_tokens:
+            return message_floor_start
+
+        target_start = self._align_boundary_backward(messages, target_start)
+        # Keep at least one message in the summary window; tiny transcripts that
+        # cannot satisfy both constraints use the bounded message floor instead.
+        if target_start <= head_end + 1:
+            return message_floor_start
+        return min(message_floor_start, target_start)
+
     def _find_tail_cut_by_tokens(
         self, messages: List[Dict[str, Any]], head_end: int,
         token_budget: int | None = None,
@@ -4163,8 +4227,22 @@ This compaction should PRIORITISE preserving all information related to the focu
         compress_start = self._protect_head_size(messages)
         compress_start = self._align_boundary_forward(messages, compress_start)
 
-        # Use token-budget tail protection instead of fixed message count
+        # Use token-budget tail protection instead of fixed message count. The
+        # budget floor asks for at least 80% of the configured tail budget when
+        # enough suffix context exists, while still keeping the bounded message
+        # floor as a fallback for small transcripts.
+        minimum_tail_messages = self._minimum_tail_message_count(messages, compress_start)
+        message_floor_start = n_messages - minimum_tail_messages if minimum_tail_messages else n_messages
+        hard_tail_start = self._tail_budget_floor_start(
+            messages,
+            compress_start,
+            self.tail_token_budget,
+        )
+        hard_tail_start = min(message_floor_start, hard_tail_start)
+        tail_budget_floor_active = hard_tail_start < message_floor_start
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+        if tail_budget_floor_active and compress_end > hard_tail_start:
+            compress_end = hard_tail_start
 
         # Codex-style narrow tail cleanup: if the selected protected tail is
         # still too large because it contains bulky tool outputs, shrink older
@@ -4174,8 +4252,6 @@ This compaction should PRIORITISE preserving all information related to the focu
         # are not pinned into the protected tail; continuation is summarized.
         initial_tail_start = compress_end
         tail_boundary_promoted = False
-        minimum_tail_messages = self._minimum_tail_message_count(messages, compress_start)
-        hard_tail_start = n_messages - minimum_tail_messages if minimum_tail_messages else n_messages
         compacted_tail_tool_indices: list[int] = []
         pre_tail_compaction_messages = messages
         messages, tail_tool_compacted = self._compact_tool_outputs_in_tail(
@@ -4198,6 +4274,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                     tail_tool_compacted,
                 )
             compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+            if tail_budget_floor_active and compress_end > hard_tail_start:
+                compress_end = hard_tail_start
 
         if compress_start >= compress_end:
             # No compressable window — the entire transcript fits within

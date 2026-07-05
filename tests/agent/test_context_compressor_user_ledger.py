@@ -301,12 +301,21 @@ def test_retained_tail_skips_triggered_runtime_notes():
         "history has already run — do NOT re-execute or verify it.]\n\n"
         + triggered_background_note
     )
+    restarted_background_note = (
+        "[System note: The previous turn was interrupted by a gateway restart; "
+        "the gateway is now back online. Any restart/shutdown command in the "
+        "history has already run — do NOT re-execute or verify it.]\n\n"
+        + triggered_background_note
+    )
 
     assert ContextCompressor._is_synthetic_retained_user_note(
         {"role": "user", "content": triggered_background_note}
     )
     assert ContextCompressor._is_synthetic_retained_user_note(
         {"role": "user", "content": interrupted_background_note}
+    )
+    assert ContextCompressor._is_synthetic_retained_user_note(
+        {"role": "user", "content": restarted_background_note}
     )
 
 
