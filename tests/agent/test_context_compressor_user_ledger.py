@@ -257,6 +257,75 @@ def test_extract_current_user_ledger_entries_skips_synthetic_notes():
     assert entries[0]["is_latest"] is False
 
 
+def test_user_ledger_strips_trigger_metadata_and_skips_triggered_runtime_notes():
+    trigger_only = (
+        "[Triggering message id: `1523072422226428076` — use as `message_id` "
+        "for reply/react/pin via the discord tools.]"
+    )
+    triggered_background_note = (
+        trigger_only
+        + "\n\n[IMPORTANT: Background process proc_3c2c2ab1a7fd matched watch pattern "
+        "\"Uvicorn running on\".\n"
+        "Command: ./scripts/run-noema.sh\n"
+        "Matched output:\n"
+        "INFO:     Uvicorn running on http://127.0.0.1:8790\n]"
+    )
+    triggered_real_message = trigger_only + "\n\n继续修这个压缩摘要问题。"
+
+    entries = ContextCompressor._extract_current_user_ledger_entries(
+        [
+            {"role": "user", "content": trigger_only},
+            {"role": "user", "content": triggered_background_note},
+            {"role": "assistant", "content": "ack"},
+            {"role": "user", "content": triggered_real_message},
+        ]
+    )
+
+    assert [e["text"] for e in entries] == ["继续修这个压缩摘要问题。"]
+    assert entries[-1]["is_latest"] is True
+
+
+def test_retained_tail_skips_triggered_runtime_notes():
+    triggered_background_note = (
+        "[Triggering message id: `1523072422226428076` — use as `message_id` "
+        "for reply/react/pin via the discord tools.]\n\n"
+        "[IMPORTANT: Background process proc_3c2c2ab1a7fd matched watch pattern "
+        "\"Uvicorn running on\".\n"
+        "Command: ./scripts/run-noema.sh\n"
+        "Matched output:\n"
+        "INFO:     Uvicorn running on http://127.0.0.1:8790\n]"
+    )
+    interrupted_background_note = (
+        "[System note: The previous turn was interrupted by a gateway shutdown; "
+        "the gateway is now back online. Any restart/shutdown command in the "
+        "history has already run — do NOT re-execute or verify it.]\n\n"
+        + triggered_background_note
+    )
+
+    assert ContextCompressor._is_synthetic_retained_user_note(
+        {"role": "user", "content": triggered_background_note}
+    )
+    assert ContextCompressor._is_synthetic_retained_user_note(
+        {"role": "user", "content": interrupted_background_note}
+    )
+
+
+def test_retained_tail_keeps_real_user_text_without_trigger_metadata():
+    msg = {
+        "role": "user",
+        "content": (
+            "[Triggering message id: `1523082458323619862` — use as `message_id` "
+            "for reply/react/pin via the discord tools.]\n\n"
+            "noema-router实现好了？"
+        ),
+    }
+
+    cleaned = ContextCompressor._sanitize_retained_user_tail_message(dict(msg))
+
+    assert cleaned is not None
+    assert cleaned["content"] == "noema-router实现好了？"
+
+
 def test_generate_summary_records_user_message_ground_truth():
     compressor = _make_compressor()
     synthetic_todo_note = (

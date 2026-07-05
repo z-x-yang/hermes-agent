@@ -256,6 +256,18 @@ _ASYNC_DELEGATION_COMPLETION_PREFIXES = (
 _BACKGROUND_PROCESS_NOTIFICATION_PREFIXES = (
     "[IMPORTANT: Background process ",
 )
+_SYNTHETIC_USER_NOTE_PREFIXES = (
+    _ACTIVE_TASK_LIST_PRESERVATION_PREFIX,
+    *_ASYNC_DELEGATION_COMPLETION_PREFIXES,
+    *_BACKGROUND_PROCESS_NOTIFICATION_PREFIXES,
+)
+_GATEWAY_TRIGGERING_MESSAGE_RE = re.compile(
+    r"(?ms)^\s*\[Triggering message id:[^\]\n]*\]\s*"
+)
+_GATEWAY_INTERRUPTION_SYSTEM_NOTE_RE = re.compile(
+    r"(?ms)^\s*\[System note: The previous turn was interrupted by a gateway "
+    r"shutdown;.*?\]\s*"
+)
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
@@ -2069,18 +2081,29 @@ class ContextCompressor(ContextEngine):
         """Remove runtime notes that are stored as user-role rows but are not user asks."""
         if not text:
             return ""
+        prefix_pattern = "|".join(re.escape(p) for p in _SYNTHETIC_USER_NOTE_PREFIXES)
         text = re.sub(
-            rf"(?ms)(?:^|\n)\s*{re.escape(_ACTIVE_TASK_LIST_PRESERVATION_PREFIX)}\n.*?(?=\n\s*\n|\Z)",
+            rf"(?ms)(?:^|\n)\s*(?:{prefix_pattern}).*?(?=\n\s*\n|\Z)",
             "\n",
             text,
         )
         return text.strip()
+
+    @staticmethod
+    def _strip_gateway_triggering_message_metadata(text: str) -> str:
+        """Drop Discord/Gateway delivery metadata that precedes the real user text."""
+        if not text:
+            return ""
+        text = _GATEWAY_INTERRUPTION_SYSTEM_NOTE_RE.sub("", text, count=1)
+        return _GATEWAY_TRIGGERING_MESSAGE_RE.sub("", text, count=1).strip()
 
     @classmethod
     def _strip_gateway_user_context_wrappers(cls, text: str) -> str:
         """Keep the trigger message, not gateway reply/history scaffolding."""
         if not text:
             return ""
+
+        text = cls._strip_gateway_triggering_message_metadata(text)
 
         # Group-chat backfill/reply context is serialized before a hard marker;
         # the actual triggering user text follows it. Use the last marker so
@@ -2115,14 +2138,13 @@ class ContextCompressor(ContextEngine):
     @classmethod
     def _is_synthetic_user_ledger_note(cls, text: str) -> bool:
         """Return true for system-injected user-role notes, not human asks."""
+        text = cls._strip_gateway_triggering_message_metadata(text or "")
         candidates = [text]
         sender_stripped = re.sub(r"^\[[^\]\n]{1,80}\]\s+", "", text or "", count=1)
         if sender_stripped != text:
             candidates.append(sender_stripped)
         return any(
-            candidate.startswith(_ACTIVE_TASK_LIST_PRESERVATION_PREFIX)
-            or candidate.startswith(_ASYNC_DELEGATION_COMPLETION_PREFIXES)
-            or candidate.startswith(_BACKGROUND_PROCESS_NOTIFICATION_PREFIXES)
+            any(candidate.startswith(prefix) for prefix in _SYNTHETIC_USER_NOTE_PREFIXES)
             for candidate in candidates
         )
 
@@ -2131,8 +2153,26 @@ class ContextCompressor(ContextEngine):
         """Return true for pure synthetic user-role notes in retained live tail."""
         if msg.get("role") != "user":
             return False
-        text = _content_text_for_contains(msg.get("content")).strip()
-        return bool(text and cls._is_synthetic_user_ledger_note(text))
+        original_text = _content_text_for_contains(msg.get("content")).strip()
+        text = cls._strip_gateway_user_context_wrappers(original_text)
+        return bool(original_text and (not text or cls._is_synthetic_user_ledger_note(text)))
+
+    @classmethod
+    def _sanitize_retained_user_tail_message(
+        cls, msg: Dict[str, Any]
+    ) -> Dict[str, Any] | None:
+        """Return retained user tail with gateway/runtime scaffolding removed."""
+        if msg.get("role") != "user":
+            return msg
+        content = msg.get("content")
+        if not isinstance(content, str):
+            return None if cls._is_synthetic_retained_user_note(msg) else msg
+        cleaned = cls._strip_gateway_user_context_wrappers(content)
+        if not cleaned:
+            return None
+        if cleaned != content.strip():
+            msg["content"] = cleaned
+        return msg
 
     @staticmethod
     def _markdown_fence_for(text: str) -> str:
@@ -4250,7 +4290,8 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         for i in range(compress_end, n_messages):
             msg = _fresh_compaction_message_copy(messages[i])
-            if self._is_synthetic_retained_user_note(msg):
+            msg = self._sanitize_retained_user_tail_message(msg)
+            if msg is None:
                 continue
             if _merge_summary_into_tail:
                 # Merge the summary into the first (non-synthetic) tail
