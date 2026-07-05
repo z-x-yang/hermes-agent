@@ -1879,6 +1879,42 @@ class ContextCompressor(ContextEngine):
         chars = sum(len(str(tool_call)) for tool_call in tool_calls)
         return (chars + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN if chars else 0
 
+    @staticmethod
+    def _audit_content_has_payload(content: Any) -> bool:
+        if content in (None, "", []):
+            return False
+        if isinstance(content, list):
+            return bool(content)
+        return True
+
+    @classmethod
+    def _audit_retained_tail_content_from_summary_envelope(cls, content: Any) -> Any:
+        """Return retained user content after a merged compaction summary."""
+        if isinstance(content, list):
+            parts = list(content)
+            if not parts:
+                return []
+            first = parts[0]
+            first_text = ""
+            if isinstance(first, str):
+                first_text = first
+            elif isinstance(first, dict) and isinstance(first.get("text"), str):
+                first_text = first["text"]
+            if not first_text or not cls._is_context_summary_content(first_text):
+                return content
+
+            _summary_body, first_retained_text = cls._split_context_summary_content(first_text)
+            if first_retained_text:
+                if isinstance(first, str):
+                    return [first_retained_text, *parts[1:]]
+                first_tail = dict(first)
+                first_tail["text"] = first_retained_text
+                return [first_tail, *parts[1:]]
+            return parts[1:]
+
+        _summary_body, retained_tail_text = cls._split_context_summary_content(content)
+        return retained_tail_text.strip()
+
     @classmethod
     def _audit_message_stats(
         cls,
@@ -1912,13 +1948,50 @@ class ContextCompressor(ContextEngine):
             content = msg.get("content")
             original_text = _content_text_for_contains(content).strip()
             if original_text:
+                force_real_user_token_content = False
+                synthetic_prefix_tokens = 0
+                real_user_content_override = None
+                if cls._has_compressed_summary_metadata(msg) or cls._is_context_summary_content(original_text):
+                    _summary_body, _retained_tail_text = cls._split_context_summary_content(original_text)
+                    if _summary_body:
+                        retained_content = cls._audit_retained_tail_content_from_summary_envelope(content)
+                        if cls._audit_content_has_payload(retained_content):
+                            # A merged summary/user-tail envelope is one provider row
+                            # but only the retained tail text is user-authored.
+                            real_user_content_override = retained_content
+                            original_text = _content_text_for_contains(retained_content).strip()
+                            force_real_user_token_content = True
+                        else:
+                            synthetic_user_messages += 1
+                            synthetic_user_tokens += msg_tokens
+                            continue
+                if not original_text and real_user_content_override is not None:
+                    # Image-only retained user tails have no text to clean, but
+                    # they are still user-authored content and should keep their
+                    # image token estimate in the real-user bucket.
+                    real_user_messages += 1
+                    real_msg = msg.copy()
+                    real_msg["content"] = real_user_content_override
+                    real_msg.pop(COMPRESSED_SUMMARY_METADATA_KEY, None)
+                    real_msg_tokens = int(estimate_messages_tokens_rough([real_msg]) or 0)
+                    real_user_tokens += real_msg_tokens
+                    synthetic_user_tokens += max(0, msg_tokens - real_msg_tokens)
+                    continue
                 cleaned_text = cls._strip_gateway_user_context_wrappers(original_text)
                 if cleaned_text and not cls._is_synthetic_user_ledger_note(cleaned_text):
                     real_user_messages += 1
                     real_msg = msg.copy()
-                    if cleaned_text != original_text:
+                    if real_user_content_override is not None and cleaned_text == original_text:
+                        real_msg["content"] = real_user_content_override
+                        real_msg.pop(COMPRESSED_SUMMARY_METADATA_KEY, None)
+                    elif force_real_user_token_content or cleaned_text != original_text:
                         real_msg["content"] = cleaned_text
-                    real_user_tokens += int(estimate_messages_tokens_rough([real_msg]) or 0)
+                        real_msg.pop(COMPRESSED_SUMMARY_METADATA_KEY, None)
+                    real_msg_tokens = int(estimate_messages_tokens_rough([real_msg]) or 0)
+                    real_user_tokens += real_msg_tokens
+                    if force_real_user_token_content:
+                        synthetic_prefix_tokens = max(0, msg_tokens - real_msg_tokens)
+                    synthetic_user_tokens += synthetic_prefix_tokens
                 else:
                     synthetic_user_messages += 1
                     synthetic_user_tokens += msg_tokens

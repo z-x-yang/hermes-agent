@@ -12,6 +12,7 @@ from agent.context_compressor import (
     SUMMARY_PREFIX,
     COMPRESSED_SUMMARY_METADATA_KEY,
     _SUMMARY_END_MARKER,
+    _MERGED_USER_TAIL_MARKER,
     _SUMMARY_TRANSIENT_FAILURE_COOLDOWN_SECONDS,
     _SUMMARY_QUOTA_COOLDOWN_MAX_SECONDS,
     _USER_LEDGER_MAX_CHARS,
@@ -1949,6 +1950,101 @@ class TestCompressionAuditLog:
         assert 0 < tail["token_share_of_after"] < 1
         assert tail["tail_budget_tokens"] == c.tail_token_budget
         assert 0 < tail["token_share_of_tail_budget"]
+
+    def test_message_accounting_does_not_count_user_role_summary_as_real_user(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "agent.context_compressor.get_hermes_home",
+            lambda: tmp_path,
+            raising=False,
+        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=0,
+                protect_last_n=2,
+                quiet_mode=True,
+            )
+
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "middle user"},
+            {"role": "assistant", "content": "middle assistant"},
+            {"role": "user", "content": "middle user 2"},
+            {"role": "assistant", "content": "middle assistant 2"},
+            {"role": "assistant", "content": "retained assistant"},
+            {"role": "user", "content": "retained real user"},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
+            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
+        ):
+            c.compress(msgs, current_tokens=90_000, force=True)
+
+        [record] = _read_compression_audit_records(tmp_path)
+        after = record["message_accounting"]["after"]
+        # With a system-only protected head, the standalone compaction summary is
+        # intentionally emitted as role=user for provider alternation. It is not
+        # a real user message and must not inflate user-loss accounting.
+        assert after["role_counts"]["user"] == 2
+        assert after["user_messages"] == 2
+        assert after["real_user_messages"] == 1
+        assert after["synthetic_user_messages"] == 1
+        assert after["real_user_tokens_estimate"] < after["token_estimates_by_role"]["user"]
+
+    def test_message_accounting_splits_merged_user_summary_tokens(self):
+        summary_body = " ".join(["summary"] * 200)
+        tail_text = "retained real user ask"
+        merged = {
+            "role": "user",
+            "content": (
+                f"{SUMMARY_PREFIX}\n{summary_body}\n\n{_SUMMARY_END_MARKER}\n\n"
+                f"{_MERGED_USER_TAIL_MARKER}\n{tail_text}"
+            ),
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+        }
+
+        stats = ContextCompressor._audit_message_stats([merged])
+        tail_only = ContextCompressor._audit_message_stats([
+            {"role": "user", "content": tail_text}
+        ])
+
+        assert stats["user_messages"] == 1
+        assert stats["real_user_messages"] == 1
+        assert stats["synthetic_user_messages"] == 0
+        assert stats["real_user_tokens_estimate"] == tail_only["real_user_tokens_estimate"]
+        assert stats["synthetic_user_tokens_estimate"] > 0
+
+    def test_message_accounting_keeps_multimodal_merged_user_tail_real(self):
+        summary_prefix = (
+            f"{SUMMARY_PREFIX}\nsummary\n\n{_SUMMARY_END_MARKER}\n\n"
+            f"{_MERGED_USER_TAIL_MARKER}\n"
+        )
+        image_part = {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,abc"},
+        }
+        merged = {
+            "role": "user",
+            "content": [{"type": "text", "text": summary_prefix}, image_part],
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+        }
+
+        stats = ContextCompressor._audit_message_stats([merged])
+        image_tail_only = ContextCompressor._audit_message_stats([
+            {"role": "user", "content": [image_part]}
+        ])
+
+        assert stats["user_messages"] == 1
+        assert stats["real_user_messages"] == 1
+        assert stats["synthetic_user_messages"] == 0
+        assert stats["real_user_tokens_estimate"] == image_tail_only["real_user_tokens_estimate"]
+        assert stats["real_user_tokens_estimate"] >= 1500
+        assert stats["synthetic_user_tokens_estimate"] > 0
 
     def test_compression_audit_survives_session_end_during_active_compression(self):
         """agent_close during a slow summary must not erase the active audit.
