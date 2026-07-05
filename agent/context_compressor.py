@@ -1855,6 +1855,157 @@ class ContextCompressor(ContextEngine):
             "message_count": max(0, end_i - start_i),
         }
 
+    @staticmethod
+    def _audit_share(numerator: int | None, denominator: int | None) -> float | None:
+        if not numerator or not denominator:
+            return None
+        return round(float(numerator) / float(denominator), 6)
+
+    @staticmethod
+    def _audit_role_key(role: Any) -> str:
+        role_text = str(role or "other")
+        return role_text if role_text in {"system", "user", "assistant", "tool"} else "other"
+
+    @staticmethod
+    def _audit_tool_call_count(msg: Dict[str, Any]) -> int:
+        tool_calls = msg.get("tool_calls") or []
+        return len(tool_calls) if isinstance(tool_calls, list) else 0
+
+    @staticmethod
+    def _audit_tool_call_tokens(msg: Dict[str, Any]) -> int:
+        tool_calls = msg.get("tool_calls") or []
+        if not isinstance(tool_calls, list):
+            return 0
+        chars = sum(len(str(tool_call)) for tool_call in tool_calls)
+        return (chars + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN if chars else 0
+
+    @classmethod
+    def _audit_message_stats(
+        cls,
+        messages: list[Dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        """Return content-free message/token/role accounting for audit logs."""
+        safe_messages = [msg for msg in (messages or []) if isinstance(msg, dict)]
+        role_keys = ("system", "user", "assistant", "tool", "other")
+        role_counts = {role: 0 for role in role_keys}
+        token_estimates_by_role = {role: 0 for role in role_keys}
+        total_tokens = 0
+        tool_call_count = 0
+        tool_call_tokens = 0
+        real_user_messages = 0
+        synthetic_user_messages = 0
+        real_user_tokens = 0
+        synthetic_user_tokens = 0
+
+        for msg in safe_messages:
+            role = cls._audit_role_key(msg.get("role"))
+            role_counts[role] += 1
+            msg_tokens = int(estimate_messages_tokens_rough([msg]) or 0)
+            total_tokens += msg_tokens
+            token_estimates_by_role[role] += msg_tokens
+            tool_call_count += cls._audit_tool_call_count(msg)
+            tool_call_tokens += cls._audit_tool_call_tokens(msg)
+
+            if role != "user":
+                continue
+
+            content = msg.get("content")
+            original_text = _content_text_for_contains(content).strip()
+            if original_text:
+                cleaned_text = cls._strip_gateway_user_context_wrappers(original_text)
+                if cleaned_text and not cls._is_synthetic_user_ledger_note(cleaned_text):
+                    real_user_messages += 1
+                    real_msg = msg.copy()
+                    if cleaned_text != original_text:
+                        real_msg["content"] = cleaned_text
+                    real_user_tokens += int(estimate_messages_tokens_rough([real_msg]) or 0)
+                else:
+                    synthetic_user_messages += 1
+                    synthetic_user_tokens += msg_tokens
+            elif content not in (None, "", []):
+                # Image-only or otherwise non-text user turns are still real
+                # user messages, even though the text extractor has no body.
+                real_user_messages += 1
+                real_user_tokens += msg_tokens
+
+        return {
+            "message_count": len(safe_messages),
+            "tokens_estimate": total_tokens,
+            "role_counts": role_counts,
+            "token_estimates_by_role": token_estimates_by_role,
+            "token_shares_by_role": {
+                role: cls._audit_share(tokens, total_tokens)
+                for role, tokens in token_estimates_by_role.items()
+            },
+            "user_messages": role_counts["user"],
+            "real_user_messages": real_user_messages,
+            "synthetic_user_messages": synthetic_user_messages,
+            "assistant_messages": role_counts["assistant"],
+            "tool_messages": role_counts["tool"],
+            "tool_call_count": tool_call_count,
+            "tool_call_tokens_estimate": tool_call_tokens,
+            "tool_call_token_share": cls._audit_share(tool_call_tokens, total_tokens),
+            "real_user_tokens_estimate": real_user_tokens,
+            "synthetic_user_tokens_estimate": synthetic_user_tokens,
+        }
+
+    @classmethod
+    def _build_message_accounting(
+        cls,
+        *,
+        before_messages: list[Dict[str, Any]] | None = None,
+        after_messages: list[Dict[str, Any]] | None = None,
+        retained_tail_messages: list[Dict[str, Any]] | None = None,
+        retained_tail_raw_messages: list[Dict[str, Any]] | None = None,
+        tail_budget_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """Build detailed before/after/tail audit accounting without content."""
+        before = cls._audit_message_stats(before_messages)
+        after = cls._audit_message_stats(after_messages)
+        tail_output = cls._audit_message_stats(retained_tail_messages)
+        tail = dict(tail_output)
+        raw_tail = cls._audit_message_stats(
+            retained_tail_raw_messages
+            if retained_tail_raw_messages is not None else retained_tail_messages
+        )
+
+        tail.update({
+            "raw_message_count": raw_tail["message_count"],
+            "raw_tokens_estimate": raw_tail["tokens_estimate"],
+            "raw_role_counts": raw_tail["role_counts"],
+            "raw_token_estimates_by_role": raw_tail["token_estimates_by_role"],
+            "raw_tool_call_count": raw_tail["tool_call_count"],
+            # `user_messages` is the raw user-role row count before retained-tail
+            # sanitizer drops gateway/runtime scaffolding. `retained_user_messages`
+            # is what remains in the actual post-compression tail.
+            "user_messages": raw_tail["user_messages"],
+            "retained_user_messages": tail_output["user_messages"],
+            "real_user_messages": raw_tail["real_user_messages"],
+            "synthetic_user_messages": raw_tail["synthetic_user_messages"],
+            "retained_real_user_messages": tail_output["real_user_messages"],
+            "retained_synthetic_user_messages": tail_output["synthetic_user_messages"],
+            "real_user_tokens_estimate": raw_tail["real_user_tokens_estimate"],
+            "synthetic_user_tokens_estimate": raw_tail["synthetic_user_tokens_estimate"],
+            "retained_real_user_tokens_estimate": tail_output["real_user_tokens_estimate"],
+            "retained_synthetic_user_tokens_estimate": tail_output["synthetic_user_tokens_estimate"],
+            "token_share_of_before": cls._audit_share(
+                tail["tokens_estimate"], before["tokens_estimate"]
+            ),
+            "token_share_of_after": cls._audit_share(
+                tail["tokens_estimate"], after["tokens_estimate"]
+            ),
+            "tail_budget_tokens": int(tail_budget_tokens) if tail_budget_tokens else None,
+            "token_share_of_tail_budget": cls._audit_share(
+                tail["tokens_estimate"], int(tail_budget_tokens) if tail_budget_tokens else None
+            ),
+        })
+
+        return {
+            "before": before,
+            "after": after,
+            "retained_tail": tail,
+        }
+
     def _write_compression_audit_record(self, record: dict[str, Any], *, remember: bool = True) -> None:
         """Append one structured compression audit record.
 
@@ -1959,6 +2110,10 @@ class ContextCompressor(ContextEngine):
         new_summary_text: str | None = None,
         retained_tail_output_count: int | None = None,
         output_row_ids: list[int] | None = None,
+        before_messages: list[Dict[str, Any]] | None = None,
+        after_messages: list[Dict[str, Any]] | None = None,
+        retained_tail_messages: list[Dict[str, Any]] | None = None,
+        retained_tail_raw_messages: list[Dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Build one content-free compression audit record."""
         saved_estimate = None
@@ -1995,6 +2150,19 @@ class ContextCompressor(ContextEngine):
         _user_ground_truth = getattr(
             self, "_last_summary_user_message_ground_truth", None
         )
+        message_accounting = self._build_message_accounting(
+            before_messages=before_messages,
+            after_messages=after_messages,
+            retained_tail_messages=retained_tail_messages,
+            retained_tail_raw_messages=retained_tail_raw_messages,
+            tail_budget_tokens=getattr(self, "tail_token_budget", None),
+        )
+        if before_messages is None:
+            message_accounting["before"]["message_count"] = int(input_messages)
+            message_accounting["before"]["tokens_estimate"] = before_estimate
+        if after_messages is None:
+            message_accounting["after"]["message_count"] = int(output_messages)
+            message_accounting["after"]["tokens_estimate"] = after_estimate
         return {
             "event": "context_compression",
             "schema_version": 1,
@@ -2010,6 +2178,7 @@ class ContextCompressor(ContextEngine):
                 int(retained_tail_output_count) if retained_tail_output_count is not None else None
             ),
             "output_row_ids": output_row_ids,
+            "message_accounting": message_accounting,
             "previous_summary_chars": previous_summary_chars,
             "previous_summary_tokens": previous_summary_tokens,
             "new_summary_chars": new_summary_chars,
@@ -2032,6 +2201,11 @@ class ContextCompressor(ContextEngine):
                 "before_estimate": before_estimate,
                 "after_estimate": after_estimate,
                 "saved_estimate": saved_estimate,
+                "message_before_estimate": message_accounting["before"].get("tokens_estimate"),
+                "message_after_estimate": message_accounting["after"].get("tokens_estimate"),
+                "retained_tail_estimate": message_accounting["retained_tail"].get("tokens_estimate"),
+                "retained_tail_raw_estimate": message_accounting["retained_tail"].get("raw_tokens_estimate"),
+                "tail_budget_tokens": message_accounting["retained_tail"].get("tail_budget_tokens"),
             },
         }
 
@@ -3899,6 +4073,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 abort_reason="too_few_messages",
                 before_estimate=display_tokens,
                 after_estimate=display_tokens,
+                before_messages=original_messages,
+                after_messages=messages,
             ))
             return messages
 
@@ -3980,6 +4156,10 @@ This compaction should PRIORITISE preserving all information related to the focu
                 abort_reason="empty_summary_window",
                 before_estimate=display_tokens,
                 after_estimate=estimate_messages_tokens_rough(messages),
+                before_messages=original_messages,
+                after_messages=messages,
+                retained_tail_messages=messages[compress_end:],
+                retained_tail_raw_messages=messages[compress_end:],
             ))
             return messages
 
@@ -4199,6 +4379,10 @@ This compaction should PRIORITISE preserving all information related to the focu
                 before_estimate=display_tokens,
                 after_estimate=estimate_messages_tokens_rough(output_messages),
                 previous_summary_text=previous_summary_for_audit,
+                before_messages=original_messages,
+                after_messages=output_messages,
+                retained_tail_messages=output_messages[compress_end:],
+                retained_tail_raw_messages=messages[compress_end:],
             ))
             return output_messages
 
@@ -4359,6 +4543,24 @@ This compaction should PRIORITISE preserving all information related to the focu
             0,
             len(compressed) - compress_start - (0 if summary_was_merged_into_tail else 1),
         )
+        tail_output_start = max(0, len(compressed) - retained_tail_output_count)
+        retained_tail_messages_for_audit = [
+            _fresh_compaction_message_copy(msg)
+            for msg in compressed[tail_output_start:]
+            if isinstance(msg, dict)
+        ]
+        if summary_was_merged_into_tail and retained_tail_messages_for_audit:
+            # The provider-visible first tail row may carry a prepended summary
+            # prefix purely to preserve role alternation. Tail accounting should
+            # measure the retained live message itself, not the synthetic summary.
+            first_tail = retained_tail_messages_for_audit[0].copy()
+            summary_body, retained_tail_text = self._split_context_summary_content(
+                first_tail.get("content")
+            )
+            if summary_body:
+                first_tail["content"] = retained_tail_text
+                first_tail.pop(COMPRESSED_SUMMARY_METADATA_KEY, None)
+                retained_tail_messages_for_audit[0] = first_tail
 
         new_estimate = estimate_messages_tokens_rough(compressed)
         saved_estimate = display_tokens - new_estimate
@@ -4404,6 +4606,10 @@ This compaction should PRIORITISE preserving all information related to the focu
             new_summary_text=summary_text_for_audit,
             retained_tail_output_count=retained_tail_output_count,
             output_row_ids=None,
+            before_messages=original_messages,
+            after_messages=compressed,
+            retained_tail_messages=retained_tail_messages_for_audit,
+            retained_tail_raw_messages=messages[compress_end:n_messages],
         ))
         self._write_user_message_ground_truth_audit()
 

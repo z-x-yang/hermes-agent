@@ -1846,6 +1846,110 @@ class TestCompressionAuditLog:
         assert record["output_row_ids"] is None
         assert record["tokens"]["before_estimate"] == 90_000
 
+    def test_successful_compression_records_detailed_message_token_accounting(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "agent.context_compressor.get_hermes_home",
+            lambda: tmp_path,
+            raising=False,
+        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=4,
+                quiet_mode=True,
+            )
+        c._compression_audit_session_id = "detail-accounting-session"
+
+        sentinel = "DETAIL_ACCOUNTING_SENTINEL_SHOULD_NOT_LEAK"
+        synthetic_background = (
+            "[Triggering message id: `1523072422226428076` — use as `message_id` "
+            "for reply/react/pin via the discord tools.]\n\n"
+            "[IMPORTANT: Background process proc_123 finished successfully.]\n"
+            "tool noise"
+        )
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "head user"},
+            {"role": "assistant", "content": "middle assistant"},
+            {"role": "user", "content": f"middle user {sentinel}"},
+            {"role": "assistant", "content": "middle reply"},
+            {
+                "role": "user",
+                "content": (
+                    "[Triggering message id: `1523127996003778601` — metadata.]\n\n"
+                    f"real retained user text {sentinel}"
+                ),
+            },
+            {"role": "user", "content": synthetic_background},
+            {
+                "role": "assistant",
+                "content": "tail assistant calling tool",
+                "tool_calls": [{
+                    "id": "call_tail",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"x\"}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_tail", "content": "tail tool result"},
+            {"role": "assistant", "content": "tail assistant answer"},
+            {"role": "user", "content": "[Your active task list was preserved across context compression]\n- pending"},
+        ]
+
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
+            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
+        ):
+            result = c.compress(msgs, current_tokens=90_000, force=True)
+
+        [record] = _read_compression_audit_records(tmp_path)
+        serialized_record = json.dumps(record, sort_keys=True)
+        assert sentinel not in serialized_record
+
+        accounting = record["message_accounting"]
+        assert accounting["before"]["message_count"] == len(msgs)
+        assert accounting["before"]["tokens_estimate"] > 0
+        assert accounting["before"]["role_counts"] == {
+            "system": 1,
+            "user": 5,
+            "assistant": 4,
+            "tool": 1,
+            "other": 0,
+        }
+        assert accounting["before"]["tool_call_count"] == 1
+
+        assert accounting["after"]["message_count"] == len(result)
+        assert accounting["after"]["tokens_estimate"] > 0
+        assert accounting["after"]["tool_call_count"] == 1
+
+        tail = accounting["retained_tail"]
+        assert tail["raw_message_count"] == 6
+        assert tail["message_count"] == 4
+        assert tail["tokens_estimate"] > 0
+        assert tail["raw_tokens_estimate"] >= tail["tokens_estimate"]
+        assert tail["user_messages"] == 3
+        assert tail["retained_user_messages"] == 1
+        assert tail["real_user_messages"] == 1
+        assert tail["synthetic_user_messages"] == 2
+        assert tail["retained_real_user_messages"] == 1
+        assert tail["retained_synthetic_user_messages"] == 0
+        assert tail["assistant_messages"] == 2
+        assert tail["tool_messages"] == 1
+        assert tail["tool_call_count"] == 1
+        assert tail["tool_call_tokens_estimate"] > 0
+        assert tail["real_user_tokens_estimate"] > 0
+        assert tail["synthetic_user_tokens_estimate"] > 0
+        assert tail["token_estimates_by_role"]["assistant"] > 0
+        assert tail["token_estimates_by_role"]["tool"] > 0
+        assert 0 < tail["token_share_of_before"] < 1
+        assert 0 < tail["token_share_of_after"] < 1
+        assert tail["tail_budget_tokens"] == c.tail_token_budget
+        assert 0 < tail["token_share_of_tail_budget"]
+
     def test_compression_audit_survives_session_end_during_active_compression(self):
         """agent_close during a slow summary must not erase the active audit.
 
