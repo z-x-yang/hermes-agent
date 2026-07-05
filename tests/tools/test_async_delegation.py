@@ -626,6 +626,28 @@ def test_gateway_watch_drain_drops_stale_watch_matches(monkeypatch):
     assert q.empty()
 
 
+def test_gateway_watch_drain_keeps_delayed_watch_disabled(monkeypatch):
+    """watch_disabled is a durable state-change summary, not a stale readiness ping."""
+    import gateway.run as gateway_run
+
+    q = queue.Queue()
+    disabled_evt = {
+        "type": "watch_disabled",
+        "session_id": "proc_noisy",
+        "command": "tail -f noisy.log",
+        "created_at": 1000.0,
+        "message": "Watch patterns disabled for process proc_noisy",
+    }
+    q.put(disabled_evt)
+
+    monkeypatch.setattr(gateway_run.time, "time", lambda: 2000.0)
+
+    watch_events = gateway_run._drain_gateway_watch_events(q)
+
+    assert watch_events == [disabled_evt]
+    assert q.empty()
+
+
 def test_gateway_builds_routable_source_from_enriched_event():
     from gateway.run import GatewayRunner
 

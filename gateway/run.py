@@ -2658,9 +2658,13 @@ def _is_stale_gateway_watch_event(evt: dict, now: float) -> bool:
     Watch-pattern matches are readiness nudges, not durable task results. If a
     long user turn or gateway resume drains them minutes later, injecting them
     as synthetic user messages makes old server-startup logs look like new work.
+    Watch-disabled events are state-change summaries (the process has been
+    promoted to notify_on_complete), so they remain deliverable even if delayed.
     Legacy events without a timestamp are delivered for compatibility; newly
     produced watch events carry ``created_at`` from process_registry.
     """
+    if evt.get("type") != "watch_match":
+        return False
     age = _gateway_watch_event_age_seconds(evt, now)
     return age is not None and age > _WATCH_EVENT_MAX_AGE_SECONDS
 
