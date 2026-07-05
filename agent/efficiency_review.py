@@ -30,8 +30,10 @@ deterministic part, the review model does the judgment:
      • sighted in ≥2 distinct sessions: the review may encode an avoidance
        rule into the governing skill;
      • sighted again AFTER a rule landed: the review must NOT pile on more
-       rules; a deterministic escalation line is surfaced to the user
-       instead (the rule did not stick — a human needs to look).
+       rules; a deterministic note is surfaced to the user. Exact duplicate
+       tool calls remain warnings; multi-segment file re-reads are phrased as
+       softer notes because broad source audits may legitimately inspect
+       several anchored regions of a large file.
 
 3. ``apply_efficiency_outcome`` — post-review bookkeeping: appends
    escalation lines to the user-facing action summary and stamps
@@ -330,9 +332,10 @@ _STATUS_INSTRUCTIONS = (
     "the skill that governs this class of task, following the constraints "
     "below.\n"
     "  • recurred_after_encode: do NOT add more rules — a previously "
-    "encoded rule did not stick. The escalation is surfaced to the user "
-    "automatically; you may mention the recurrence in your reply, nothing "
-    "more.\n"
+    "encoded rule was seen again. A deterministic note is surfaced to the "
+    "user automatically; you may mention the recurrence in your reply, "
+    "nothing more. Multi-segment file re-reads may be legitimate broad "
+    "source audits, so judge them softly.\n"
 )
 
 _HARD_CONSTRAINTS = (
@@ -434,6 +437,27 @@ def _made_skill_write(review_messages: List[Dict], prior_snapshot: List[Dict]) -
     return bool(_successful_skill_writes(review_messages, prior_snapshot))
 
 
+def _format_efficiency_escalation(key: str) -> str:
+    """User-visible line for an efficiency pattern seen after a rule exists.
+
+    Re-read patterns are inherently softer than exact duplicate calls: a broad
+    source audit may legitimately inspect multiple anchored regions of a large
+    file. Keep the recurrence signal, but do not frame it as an automatic
+    "rule is not sticking" failure.
+    """
+    if key.startswith("reread:"):
+        return (
+            f"ℹ️ Efficiency note: pattern '{key}' recurred after a skill rule. "
+            "No extra rule was added; review only if these repeated file reads "
+            "were avoidable rather than a deliberate source audit."
+        )
+    return (
+        f"⚠️ Efficiency pattern '{key}' recurred after a skill rule. "
+        "No extra rule was added; review whether the repeated tool use is "
+        "still avoidable."
+    )
+
+
 def apply_efficiency_outcome(
     efficiency_ctx: Optional[Dict[str, List[str]]],
     review_messages: List[Dict],
@@ -445,10 +469,7 @@ def apply_efficiency_outcome(
     if not efficiency_ctx:
         return
     for key in efficiency_ctx.get("escalations") or []:
-        actions.append(
-            f"⚠️ Efficiency pattern '{key}' recurred AFTER a skill rule was "
-            "added — the rule is not sticking; needs human attention"
-        )
+        actions.append(_format_efficiency_escalation(key))
     encode_keys = efficiency_ctx.get("encode_keys") or []
     if encode_keys and _made_skill_write(review_messages, prior_snapshot):
         mark_encoded(encode_keys)

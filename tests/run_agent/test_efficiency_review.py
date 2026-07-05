@@ -262,6 +262,20 @@ def test_apply_outcome_appends_escalation_line(ledger):
     assert len(actions) == 1 and "reread:x" in actions[0]
 
 
+def test_apply_outcome_softens_reread_escalation_line(ledger):
+    ctx = {"encode_keys": [], "escalations": ["reread:/tmp/source.py"]}
+    actions = []
+    er.apply_efficiency_outcome(ctx, [], prior_snapshot=[], actions=actions)
+
+    assert len(actions) == 1
+    assert actions[0].startswith("ℹ️ Efficiency note:")
+    assert "recurred after a skill rule" in actions[0]
+    assert "No extra rule was added" in actions[0]
+    assert "deliberate source audit" in actions[0]
+    assert "rule is not sticking" not in actions[0]
+    assert "needs human attention" not in actions[0]
+
+
 def test_apply_outcome_ignores_stale_skill_writes(ledger):
     """A skill_manage result inherited from the prior conversation snapshot
     must not count as 'the review encoded a rule'."""
