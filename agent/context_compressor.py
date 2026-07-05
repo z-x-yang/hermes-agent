@@ -4003,16 +4003,18 @@ This compaction should PRIORITISE preserving all information related to the focu
             return message_floor_start
 
         target_tokens = max(1, int(int(token_budget) * _TAIL_BUDGET_MIN_UTILIZATION))
+        soft_ceiling = int(int(token_budget) * 1.5)
         accumulated = 0
         target_start = n
         for i in range(n - 1, head_end, -1):
             msg_tokens = _estimate_msg_budget_tokens(messages[i])
             next_accumulated = accumulated + msg_tokens
-            if accumulated < target_tokens <= next_accumulated and next_accumulated > token_budget:
+            if accumulated < target_tokens <= next_accumulated and next_accumulated > soft_ceiling:
                 # Reaching 80% would require pulling in a discrete oversized
-                # message/tool group that blows past the configured budget. In
-                # that shape, keep the old message-count floor and let the tail
-                # tool compaction/source-fidelity path decide what can stay raw.
+                # message/tool group that blows past even the same 1.5x soft
+                # ceiling used by the regular tail-budget walk. In that shape,
+                # keep the old message-count floor and let the tail tool
+                # compaction/source-fidelity path decide what can stay raw.
                 return message_floor_start
             accumulated = next_accumulated
             target_start = i

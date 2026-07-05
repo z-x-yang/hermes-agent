@@ -1345,6 +1345,71 @@ class TestTailToolOutputCompaction:
         assert records[-1]["retained_tail"]["message_count"] >= 10
         assert records[-1]["tail_boundary_promoted"] is True
 
+    def test_tail_budget_floor_allows_soft_overshoot_before_message_floor(self):
+        """A discrete tool result may slightly exceed raw budget to hit 80% tail use.
+
+        Live gateway sessions often have a small recent-message floor preceded
+        by one moderately large tool result. If pulling that result reaches the
+        80% target but lands just over the raw tail budget, the budget floor must
+        still activate within the existing 1.5x soft ceiling; otherwise tail
+        compaction promotes the boundary back to the 10-message floor and the
+        retained tail underuses the budget again.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=10,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 1_000
+
+        crossing_tool_output = "CROSSING_TOOL_RESULT\n" + ("x" * 4_000)
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "middle reply"},
+            {"role": "user", "content": "older middle follow-up"},
+            {"role": "assistant", "content": "older middle answer"},
+            {"role": "user", "content": "one more middle turn"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_crossing",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"python crossing.py"}',
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_crossing", "content": crossing_tool_output},
+        ]
+        for i in range(10):
+            msgs.append({
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"recent floor row {i}",
+            })
+
+        records: list[dict] = []
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
+            patch.object(c, "_write_compression_audit_record", side_effect=records.append),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        retained_tail = records[-1]["message_accounting"]["retained_tail"]
+        assert retained_tail["tail_budget_min_utilization"] == 0.8
+        assert retained_tail["token_share_of_tail_budget"] >= 0.8
+        assert any(
+            m.get("tool_call_id") == "call_crossing"
+            for m in result
+            if m.get("role") == "tool"
+        )
+
     def test_compacted_tail_summary_failure_aborts_to_preserve_raw_source(self):
         """Do not persist compacted tail if the raw tail source was not summarized."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
@@ -1665,7 +1730,7 @@ class TestTailToolOutputCompaction:
         c.tail_token_budget = 600
 
         moderate_one = "MODERATE ONE\n" + ("a" * 3_000)
-        moderate_two = "MODERATE TWO\n" + ("b" * 3_000)
+        moderate_two = "MODERATE TWO\n" + ("b" * 4_000)
         newest_output = "latest small observation"
         msgs = [
             {"role": "system", "content": "System prompt"},
