@@ -580,6 +580,7 @@ def test_gateway_watch_drain_requeues_async_without_looping():
         "command": "pytest",
         "pattern": "READY",
         "output": "READY",
+        "created_at": time.time(),
     }
     q.put(async_evt)
     q.put(watch_evt)
@@ -589,6 +590,40 @@ def test_gateway_watch_drain_requeues_async_without_looping():
     assert watch_events == [watch_evt]
     assert q.qsize() == 1
     assert q.get_nowait() == async_evt
+
+
+def test_gateway_watch_drain_drops_stale_watch_matches(monkeypatch):
+    """Old readiness matches must not become unrelated late agent turns."""
+    import gateway.run as gateway_run
+
+    q = queue.Queue()
+    stale_watch_evt = {
+        "type": "watch_match",
+        "session_id": "proc_stale_ready",
+        "session_key": "agent:main:discord:group:channel:user",
+        "command": "./scripts/run-noema.sh",
+        "pattern": "Application startup complete",
+        "output": "INFO:     Application startup complete.",
+        "created_at": 1000.0,
+    }
+    fresh_watch_evt = {
+        "type": "watch_match",
+        "session_id": "proc_fresh_ready",
+        "session_key": "agent:main:discord:group:channel:user",
+        "command": "./scripts/run-noema.sh",
+        "pattern": "Application startup complete",
+        "output": "INFO:     Application startup complete.",
+        "created_at": 1119.0,
+    }
+    q.put(stale_watch_evt)
+    q.put(fresh_watch_evt)
+
+    monkeypatch.setattr(gateway_run.time, "time", lambda: 1121.0)
+
+    watch_events = gateway_run._drain_gateway_watch_events(q)
+
+    assert watch_events == [fresh_watch_evt]
+    assert q.empty()
 
 
 def test_gateway_builds_routable_source_from_enriched_event():

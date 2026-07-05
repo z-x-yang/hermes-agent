@@ -2639,6 +2639,32 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
     return None
 
 
+_WATCH_EVENT_MAX_AGE_SECONDS = 120.0
+
+
+def _gateway_watch_event_age_seconds(evt: dict, now: float) -> "float | None":
+    created_at_raw = evt.get("created_at")
+    if created_at_raw is None:
+        return None
+    try:
+        return now - float(created_at_raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_stale_gateway_watch_event(evt: dict, now: float) -> bool:
+    """Return True for old watch events that should not wake a fresh turn.
+
+    Watch-pattern matches are readiness nudges, not durable task results. If a
+    long user turn or gateway resume drains them minutes later, injecting them
+    as synthetic user messages makes old server-startup logs look like new work.
+    Legacy events without a timestamp are delivered for compatibility; newly
+    produced watch events carry ``created_at`` from process_registry.
+    """
+    age = _gateway_watch_event_age_seconds(evt, now)
+    return age is not None and age > _WATCH_EVENT_MAX_AGE_SECONDS
+
+
 def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
     """Drain gateway-owned watch events without spinning on requeued events.
 
@@ -2651,6 +2677,7 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
     """
     watch_events: list[dict] = []
     requeue: list[dict] = []
+    now = time.time()
     while not completion_queue.empty():
         try:
             evt = completion_queue.get_nowait()
@@ -2658,6 +2685,16 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
             break
         evt_type = evt.get("type", "completion")
         if evt_type in {"watch_match", "watch_disabled"}:
+            if _is_stale_gateway_watch_event(evt, now):
+                age = _gateway_watch_event_age_seconds(evt, now)
+                logger.info(
+                    "Dropping stale %s event for process %s (age %.1fs > %.1fs)",
+                    evt_type,
+                    evt.get("session_id", "unknown"),
+                    age if age is not None else -1.0,
+                    _WATCH_EVENT_MAX_AGE_SECONDS,
+                )
+                continue
             watch_events.append(evt)
         elif evt_type == "async_delegation":
             requeue.append(evt)

@@ -79,8 +79,11 @@ class TestCheckWatchPatterns:
         registry._check_watch_patterns(session, "INFO: all good\nDEBUG: fine\n")
         assert registry.completion_queue.empty()
 
-    def test_basic_match(self, registry):
-        """Single matching line triggers a notification."""
+    def test_basic_match(self, registry, monkeypatch):
+        """Single matching line triggers a timestamped notification."""
+        import tools.process_registry as pr_module
+
+        monkeypatch.setattr(pr_module.time, "time", lambda: 1234.5)
         session = _make_session(watch_patterns=["ERROR"])
         registry._check_watch_patterns(session, "INFO: ok\nERROR: disk full\n")
         assert not registry.completion_queue.empty()
@@ -89,6 +92,7 @@ class TestCheckWatchPatterns:
         assert evt["pattern"] == "ERROR"
         assert "disk full" in evt["output"]
         assert evt["session_id"] == "proc_test_watch"
+        assert evt["created_at"] == 1234.5
 
     def test_match_carries_session_key_and_watcher_routing_metadata(self, registry):
         session = _make_session(watch_patterns=["ERROR"])
