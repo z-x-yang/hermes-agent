@@ -64,10 +64,13 @@ async def test_standalone_payload_builds_numbered_buttons_and_card(monkeypatch):
     rows, embed = await outbound.standalone_task_payload(f"[Reply](https://notion.so/{PID})")
     assert len(rows) == 1
     buttons = rows[0]["components"]
-    assert [b["custom_id"] for b in buttons] == [f"ntask:done:{PID}", f"ntask:snooze:{PID}"]
-    assert buttons[0]["style"] == 3
+    assert [b["custom_id"] for b in buttons] == [
+        f"ntask:v1:open_thread:{PID}", f"ntask:v1:done:{PID}",
+        f"ntask:v1:hold:{PID}", f"ntask:v1:drop:{PID}", f"ntask:v1:snooze:{PID}"]
+    assert buttons[0]["style"] == 1
+    assert buttons[1]["style"] == 3
     # buttons carry only the row number; full title lives in the card embed
-    assert [b["label"] for b in buttons] == ["✓ 1", "⏰ 1"]
+    assert [b["label"] for b in buttons] == ["🧵 1", "✓ 1", "暂挂 1", "弃置 1", "⏰ 1"]
     assert embed["title"] == "📋 任务"
     assert f"1️⃣ [Reply](https://www.notion.so/{PID})" in embed["description"]
 
@@ -79,13 +82,15 @@ async def test_standalone_payload_builds_buttons_for_app_notion(monkeypatch):
         f"Notion: https://app.notion.com/p/Reply-to-Alice-{PID}"
     )
     assert len(rows) == 1
-    assert [b["custom_id"] for b in rows[0]["components"]] == [f"ntask:done:{PID}", f"ntask:snooze:{PID}"]
+    assert [b["custom_id"] for b in rows[0]["components"]] == [
+        f"ntask:v1:open_thread:{PID}", f"ntask:v1:done:{PID}",
+        f"ntask:v1:hold:{PID}", f"ntask:v1:drop:{PID}", f"ntask:v1:snooze:{PID}"]
     # bare URL (no anchor) -> row title falls back to the Notion page title
     assert f"1️⃣ [Reply to Alice](https://www.notion.so/{PID})" in embed["description"]
 
 
 @pytest.mark.asyncio
-async def test_standalone_payload_preserves_done_buttons_when_snooze_overflows(monkeypatch):
+async def test_standalone_payload_caps_full_workbench_controls_when_overflowing(monkeypatch):
     _fake_client(monkeypatch)
     pids = [f"{i:032x}" for i in range(25)]
     rows, embed = await outbound.standalone_task_payload(
@@ -93,27 +98,35 @@ async def test_standalone_payload_preserves_done_buttons_when_snooze_overflows(m
     buttons = [button for row in rows for button in row["components"]]
 
     assert len(buttons) == 25
-    assert [b["custom_id"] for b in buttons] == [f"ntask:done:{pid}" for pid in pids]
-    # every one of the 25 tasks keeps a numbered card row
+    assert [b["custom_id"] for b in buttons] == [
+        f"ntask:v1:{action}:{pids[i]}"
+        for i in range(5)
+        for action in ("open_thread", "done", "hold", "drop", "snooze")
+    ]
+    # every one of the 25 tasks keeps a numbered card row even when controls cap.
     assert embed["description"].count("\n") == 24
 
 
 @pytest.mark.asyncio
 async def test_standalone_payload_packs_task_groups_onto_shared_rows(monkeypatch):
-    """Two tasks × 2 buttons = 4 buttons fit one row; groups stay adjacent
-    (✓1 ⏰1 ✓2 ⏰2) so each task's controls remain visually paired."""
+    """Two tasks × 5 buttons wrap by whole task group; controls stay adjacent."""
     _fake_client(monkeypatch)
     pid2 = "2f17a58d229e816f839bef72f6f2ec72"
     text = f"[A](https://notion.so/{PID}) 和 [B](https://notion.so/{pid2})"
     rows, embed = await outbound.standalone_task_payload(text)
 
-    assert len(rows) == 1  # both groups share one row instead of one row each
+    assert len(rows) == 2
     assert [b["custom_id"] for b in rows[0]["components"]] == [
-        f"ntask:done:{PID}", f"ntask:snooze:{PID}",
-        f"ntask:done:{pid2}", f"ntask:snooze:{pid2}"]
+        f"ntask:v1:open_thread:{PID}", f"ntask:v1:done:{PID}",
+        f"ntask:v1:hold:{PID}", f"ntask:v1:drop:{PID}", f"ntask:v1:snooze:{PID}"]
+    assert [b["custom_id"] for b in rows[1]["components"]] == [
+        f"ntask:v1:open_thread:{pid2}", f"ntask:v1:done:{pid2}",
+        f"ntask:v1:hold:{pid2}", f"ntask:v1:drop:{pid2}", f"ntask:v1:snooze:{pid2}"]
     # button numbers match the card row order
     assert [b["label"] for b in rows[0]["components"]] == [
-        "✓ 1", "⏰ 1", "✓ 2", "⏰ 2"]
+        "🧵 1", "✓ 1", "暂挂 1", "弃置 1", "⏰ 1"]
+    assert [b["label"] for b in rows[1]["components"]] == [
+        "🧵 2", "✓ 2", "暂挂 2", "弃置 2", "⏰ 2"]
     assert f"1️⃣ [A](https://www.notion.so/{PID})" in embed["description"]
     assert f"2️⃣ [B](https://www.notion.so/{pid2})" in embed["description"]
 

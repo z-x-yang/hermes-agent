@@ -111,6 +111,58 @@ async def test_on_thread_create_delegates_to_controller():
     adapter._notion_controller.on_thread_opened.assert_awaited_once_with(thread)
 
 
+@pytest.mark.asyncio
+async def test_create_task_thread_from_message_direct():
+    adapter = _make_adapter()
+    thread = SimpleNamespace(id=777, name="Task thread", send=AsyncMock())
+    message = SimpleNamespace(
+        channel=SimpleNamespace(send=AsyncMock()),
+        create_thread=AsyncMock(return_value=thread),
+    )
+
+    result = await adapter.create_task_thread_from_message(message, name="Task thread", seed="hello")
+
+    assert result == {"success": True, "thread_id": "777", "thread_name": "Task thread"}
+    message.create_thread.assert_awaited_once_with(name="Task thread", auto_archive_duration=1440)
+    thread.send.assert_awaited_once_with("hello")
+    message.channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_task_thread_does_not_fallback_after_seed_send_failure():
+    adapter = _make_adapter()
+    thread = SimpleNamespace(id=777, name="Task thread", send=AsyncMock(side_effect=RuntimeError("send failed")))
+    message = SimpleNamespace(
+        channel=SimpleNamespace(send=AsyncMock()),
+        create_thread=AsyncMock(return_value=thread),
+    )
+
+    result = await adapter.create_task_thread_from_message(message, name="Task thread", seed="hello")
+
+    assert result["success"] is True
+    assert result["thread_id"] == "777"
+    assert "seed_error" in result
+    message.channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_task_thread_from_message_fallback_seed_message():
+    adapter = _make_adapter()
+    thread = SimpleNamespace(id=888, name="Task thread")
+    seed_msg = SimpleNamespace(create_thread=AsyncMock(return_value=thread))
+    message = SimpleNamespace(
+        channel=SimpleNamespace(send=AsyncMock(return_value=seed_msg)),
+        create_thread=AsyncMock(side_effect=RuntimeError("direct forbidden")),
+    )
+
+    result = await adapter.create_task_thread_from_message(message, name="Task thread", seed="hello")
+
+    assert result["success"] is True
+    assert result["thread_id"] == "888"
+    message.channel.send.assert_awaited_once_with("hello")
+    seed_msg.create_thread.assert_awaited_once_with(name="Task thread", auto_archive_duration=1440)
+
+
 # --- the standalone HTTP path (`hermes send` / cron) MUST attach the card ---
 
 class _FakeResp:

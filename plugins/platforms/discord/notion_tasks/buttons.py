@@ -25,7 +25,11 @@ class TaskActionButton(discord.ui.DynamicItem[discord.ui.Button], template=CUSTO
         self.page_id = page_id
         if action == "done":
             style = discord.ButtonStyle.green
-        elif action in ("undo", "snooze"):
+        elif action in ("resume", "open_thread"):
+            style = discord.ButtonStyle.primary
+        elif action == "drop":
+            style = discord.ButtonStyle.danger
+        elif action in ("undo", "snooze", "hold", "rename_thread"):
             style = discord.ButtonStyle.secondary
         else:
             raise ValueError(f"unknown task action: {action!r}")

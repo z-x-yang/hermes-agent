@@ -11,7 +11,8 @@ carry only a number, and per-task state renders inside the card.
 """
 from __future__ import annotations
 
-CUSTOM_ID_RE = r"ntask:(?P<action>done|undo|snooze):(?P<page_id>[0-9a-f]{32})"
+_ACTIONS = "done|undo|snooze|hold|drop|resume|open_thread|rename_thread"
+CUSTOM_ID_RE = rf"ntask:(?:v1:)?(?P<action>{_ACTIONS}):(?P<page_id>[0-9a-f]{{32}})"
 
 # Legacy full-text labels. Only used when no number is available — i.e. the
 # DynamicItem rebuilt from custom_id after a restart, whose label is never
@@ -20,8 +21,26 @@ LABEL_DONE = "✓ 完成"
 LABEL_UNDO = "↩︎ 撤销"
 LABEL_SNOOZE = "⏰ 稍后提醒"
 
-_ACTION_MARK = {"done": "✓", "undo": "↩", "snooze": "⏰"}
-_LEGACY_LABEL = {"done": LABEL_DONE, "undo": LABEL_UNDO, "snooze": LABEL_SNOOZE}
+_ACTION_MARK = {
+    "done": "✓",
+    "undo": "↩",
+    "snooze": "⏰",
+    "hold": "暂挂",
+    "drop": "弃置",
+    "resume": "继续",
+    "open_thread": "🧵",
+    "rename_thread": "改名",
+}
+_LEGACY_LABEL = {
+    "done": LABEL_DONE,
+    "undo": LABEL_UNDO,
+    "snooze": LABEL_SNOOZE,
+    "hold": "暂挂",
+    "drop": "弃置",
+    "resume": "继续",
+    "open_thread": "打开子区",
+    "rename_thread": "改名",
+}
 
 _NUM_KEYCAP = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣",
                6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣", 10: "🔟"}
@@ -32,10 +51,18 @@ _NUM_KEYCAP = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️�
 _ROW_TITLE_MAX = 150
 _DESC_MAX = 4096
 
-# Discord button styles: 3 = green (success), 2 = grey (secondary)
-_STYLE_DONE = 3
-_STYLE_UNDO = 2
-_STYLE_SNOOZE = 2
+# Discord button styles: 1 = blurple (primary), 2 = grey (secondary),
+# 3 = green (success), 4 = red (danger).
+_STYLE_BY_ACTION = {
+    "done": 3,
+    "undo": 2,
+    "snooze": 2,
+    "hold": 2,
+    "drop": 4,
+    "resume": 1,
+    "open_thread": 1,
+    "rename_thread": 2,
+}
 
 # Discord limits: max 5 action rows per message, max 5 buttons per row.
 _MAX_ROWS = 5
@@ -43,7 +70,9 @@ _MAX_PER_ROW = 5
 
 
 def make_custom_id(action: str, page_id: str) -> str:
-    return f"ntask:{action}:{page_id}"
+    if action not in _ACTION_MARK:
+        raise ValueError(f"unknown task button action: {action!r}")
+    return f"ntask:v1:{action}:{page_id}"
 
 
 def numbered_label(action: str, num: int | None) -> str:
@@ -101,6 +130,8 @@ def task_card_embed(rows: list[dict]) -> dict | None:
         state = r.get("state")
         if state == "done":
             lines.append(f"✅ ~~{title}~~")
+        elif state == "dropped":
+            lines.append(f"🛑 已弃置 · {title}")
         elif state == "snoozed":
             lines.append(f"⏰ 已延后·{r.get('due_label') or '?'} · {title}")
         else:
@@ -116,34 +147,31 @@ def task_card_embed(rows: list[dict]) -> dict | None:
 
 def button_component(action: str, page_id: str, num: int | None = None) -> dict:
     """One Discord button component (raw JSON) for the HTTP send path."""
-    if action == "done":
-        style = _STYLE_DONE
-    elif action == "undo":
-        style = _STYLE_UNDO
-    elif action == "snooze":
-        style = _STYLE_SNOOZE
-    else:
+    style = _STYLE_BY_ACTION.get(action)
+    if style is None:
         raise ValueError(f"unknown task button action: {action!r}")
     return {"type": 2, "style": style, "label": numbered_label(action, num),
             "custom_id": make_custom_id(action, page_id)}
 
 
-def action_pairs_with_snooze(page_ids: list[str]) -> list[tuple[str, str]]:
-    """Return button pairs that preserve ✓ 完成 coverage before adding snooze.
-
-    Existing behavior supported a completion button for up to 25 task links.
-    Snooze is additive and must not steal those completion slots. Therefore we
-    first reserve one ``done`` button for each of the first 25 tasks, then spend
-    any remaining component slots on ``snooze`` buttons for the earliest tasks.
-    """
+def action_pairs_for_task_card(page_ids: list[str]) -> list[tuple[str, str]]:
+    """Default compact V0 Workbench controls for task-card links."""
     capped = list(page_ids)[:_MAX_ROWS * _MAX_PER_ROW]
-    spare = (_MAX_ROWS * _MAX_PER_ROW) - len(capped)
     pairs: list[tuple[str, str]] = []
-    for idx, page_id in enumerate(capped):
+    for page_id in capped:
+        pairs.append(("open_thread", page_id))
         pairs.append(("done", page_id))
-        if idx < spare:
-            pairs.append(("snooze", page_id))
-    return pairs
+        pairs.append(("hold", page_id))
+        pairs.append(("drop", page_id))
+        pairs.append(("snooze", page_id))
+        if len(pairs) >= _MAX_ROWS * _MAX_PER_ROW:
+            break
+    return pairs[:_MAX_ROWS * _MAX_PER_ROW]
+
+
+def action_pairs_with_snooze(page_ids: list[str]) -> list[tuple[str, str]]:
+    """Compatibility alias for callers that still use the old helper name."""
+    return action_pairs_for_task_card(page_ids)
 
 
 def pack_group_rows(group_sizes: list[int]) -> list[int] | None:

@@ -107,8 +107,15 @@ async def test_snooze_action_opens_ephemeral_choice_menu():
 
 
 @pytest.mark.asyncio
-async def test_snooze_choice_persists_reminder_and_confirms():
-    notion = SimpleNamespace(get_page=AsyncMock(return_value=TASK_PAGE), set_status=AsyncMock())
+async def test_snooze_choice_writes_notion_hold_and_confirms():
+    held_page = {**TASK_PAGE, "properties": {**TASK_PAGE["properties"],
+                 "Status": {"type": "status", "status": {"name": "Hold"}},
+                 "Next Check": {"type": "date", "date": {"start": "2026-06-24T16:00:00"}},
+                 "Hold Reason": {"type": "rich_text", "rich_text": [{"plain_text": "snoozed"}]}}}
+    notion = SimpleNamespace(
+        get_page=AsyncMock(return_value=TASK_PAGE),
+        set_hold_verified=AsyncMock(return_value=held_page),
+    )
     ctrl = _ctrl(notion)
     inter = _interaction(content=f"Task https://notion.so/{PID}")
 
@@ -121,12 +128,11 @@ async def test_snooze_choice_persists_reminder_and_confirms():
         source_content=f"Task https://notion.so/{PID}",
     )
 
-    notion.set_status.assert_not_awaited()
+    notion.set_hold_verified.assert_awaited_once()
+    assert notion.set_hold_verified.await_args.kwargs["reason"] == "snoozed"
+    assert notion.set_hold_verified.await_args.kwargs["next_check"] == "2026-06-24T16:00:00"
     pending = ctrl.snoozes.due(now=_now().timestamp() + 3601)
-    assert len(pending) == 1
-    assert pending[0]["page_id"] == PID
-    assert pending[0]["channel_id"] == "9001"
-    assert pending[0]["title"] == "Reply to Alice"
+    assert pending == []
     inter.response.send_message.assert_awaited_once()
     assert "16:00" in inter.response.send_message.call_args.args[0]
 
@@ -154,7 +160,8 @@ async def test_dispatch_due_snooze_sends_reminder_when_task_still_open():
     kwargs = channel.send.call_args.kwargs
     assert kwargs["content"].startswith("⏰ 稍后提醒：Reply to Alice")
     assert "https://app.notion.com/p/" in kwargs["content"]
-    assert kwargs["view"].children[0].item.label == "✓ 1"
+    assert [child.item.label for child in kwargs["view"].children] == [
+        "🧵 1", "✓ 1", "暂挂 1", "弃置 1", "⏰ 1"]
     # reminder carries a fresh open-row task card (the pending record itself
     # must not paint the row as 已延后 — this IS the reminder firing)
     assert f"1️⃣ [Reply to Alice](https://www.notion.so/{PID})" in kwargs["embed"].description

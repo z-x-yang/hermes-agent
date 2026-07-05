@@ -857,6 +857,7 @@ class DiscordAdapter(BasePlatformAdapter):
             allowed_ids_getter=lambda: (self._allowed_user_ids, self._allowed_role_ids),
             fetch_channel=self._fetch_channel_async,
         )
+        self._notion_controller.adapter = self
         set_active_controller(self._notion_controller)
 
     async def _fetch_channel_async(self, channel_id):
@@ -872,6 +873,35 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._notion_controller.on_thread_opened(thread)
         except Exception as exc:
             logger.warning("[%s] notion task on_thread_create failed: %s", self.name, exc)
+
+    async def create_task_thread_from_message(self, message: Any, *, name: str, seed: str) -> Dict[str, Any]:
+        """Create a task-scoped Discord thread from an existing message.
+
+        Falls back to sending a seed message in the parent channel when Discord
+        refuses to create a thread directly from the source message.
+        """
+        parent = getattr(message, "channel", None)
+        if parent is None:
+            return {"error": "Could not resolve Discord message channel."}
+        try:
+            thread = await message.create_thread(name=name, auto_archive_duration=1440)
+        except Exception as direct_error:
+            try:
+                seed_msg = await parent.send(seed or f"Task thread: **{name}**")
+                thread = await seed_msg.create_thread(name=name, auto_archive_duration=1440)
+                return {"success": True, "thread_id": str(thread.id),
+                        "thread_name": getattr(thread, "name", name)}
+            except Exception as fallback_error:
+                return {"error": f"task thread create failed: {direct_error}; fallback: {fallback_error}"}
+
+        result = {"success": True, "thread_id": str(thread.id),
+                  "thread_name": getattr(thread, "name", name)}
+        if seed:
+            try:
+                await thread.send(seed)
+            except Exception as seed_error:
+                result["seed_error"] = str(seed_error)
+        return result
 
     def _start_notion_snooze_loop(self) -> None:
         if self._notion_snooze_task and not self._notion_snooze_task.done():

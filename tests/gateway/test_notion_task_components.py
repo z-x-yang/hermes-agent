@@ -7,7 +7,7 @@ PID = "1f17a58d229e816f839bef72f6f2ec72"
 
 def test_make_and_match_custom_id():
     cid = c.make_custom_id("done", PID)
-    assert cid == f"ntask:done:{PID}"
+    assert cid == f"ntask:v1:done:{PID}"
     m = re.fullmatch(c.CUSTOM_ID_RE, cid)
     assert m and m.group("action") == "done" and m.group("page_id") == PID
 
@@ -15,14 +15,33 @@ def test_make_and_match_custom_id():
     m2 = re.fullmatch(c.CUSTOM_ID_RE, snooze)
     assert m2 and m2.group("action") == "snooze" and m2.group("page_id") == PID
 
+    legacy = re.fullmatch(c.CUSTOM_ID_RE, f"ntask:done:{PID}")
+    assert legacy and legacy.group("action") == "done"
+
+
+def test_workbench_custom_ids_include_v1_and_legacy_regex():
+    assert c.make_custom_id("open_thread", PID) == f"ntask:v1:open_thread:{PID}"
+    assert re.fullmatch(c.CUSTOM_ID_RE, f"ntask:v1:drop:{PID}")
+    assert re.fullmatch(c.CUSTOM_ID_RE, f"ntask:done:{PID}")
+
+
+def test_workbench_action_labels_are_neutral():
+    assert c.numbered_label("open_thread", 2) == "🧵 2"
+    assert c.numbered_label("drop", 2) == "弃置 2"
+    assert "loot" not in c.numbered_label("drop", 2).lower()
+
 
 def test_button_component_done_and_undo():
     done = c.button_component("done", PID)
-    assert done == {"type": 2, "style": 3, "label": c.LABEL_DONE, "custom_id": f"ntask:done:{PID}"}
+    assert done == {"type": 2, "style": 3, "label": c.LABEL_DONE, "custom_id": f"ntask:v1:done:{PID}"}
     undo = c.button_component("undo", PID)
-    assert undo["style"] == 2 and undo["label"] == c.LABEL_UNDO and undo["custom_id"] == f"ntask:undo:{PID}"
+    assert undo["style"] == 2 and undo["label"] == c.LABEL_UNDO and undo["custom_id"] == f"ntask:v1:undo:{PID}"
     snooze = c.button_component("snooze", PID)
-    assert snooze["style"] == 2 and "稍后" in snooze["label"] and snooze["custom_id"] == f"ntask:snooze:{PID}"
+    assert snooze["style"] == 2 and "稍后" in snooze["label"] and snooze["custom_id"] == f"ntask:v1:snooze:{PID}"
+    open_thread = c.button_component("open_thread", PID)
+    assert open_thread["style"] == 1 and open_thread["custom_id"] == f"ntask:v1:open_thread:{PID}"
+    dropped = c.button_component("drop", PID)
+    assert dropped["style"] == 4 and dropped["custom_id"] == f"ntask:v1:drop:{PID}"
 
 
 def test_components_payload_empty():
@@ -45,16 +64,18 @@ def test_components_payload_caps_at_25():
     assert len(rows) == 5
 
 
-def test_action_pairs_with_snooze_preserves_done_buttons_before_snooze_overflow():
+def test_action_pairs_for_task_card_caps_full_workbench_actions():
     page_ids = [f"{i:032x}" for i in range(25)]
     pairs = c.action_pairs_with_snooze(page_ids)
     assert len(pairs) == 25
-    assert pairs == [("done", pid) for pid in page_ids]
+    assert pairs == [
+        (action, page_ids[i])
+        for i in range(5)
+        for action in ("open_thread", "done", "hold", "drop", "snooze")
+    ]
 
-    thirteen = c.action_pairs_with_snooze(page_ids[:13])
-    assert len(thirteen) == 25
-    assert [p for action, p in thirteen if action == "done"] == page_ids[:13]
-    assert [p for action, p in thirteen if action == "snooze"] == page_ids[:12]
+    single = c.action_pairs_for_task_card(page_ids[:1])
+    assert single == [(action, page_ids[0]) for action in ("open_thread", "done", "hold", "drop", "snooze")]
 
 
 # ===========================================================================
@@ -66,12 +87,15 @@ class TestNumberedLabel:
         assert c.numbered_label("done", 1) == "✓ 1"
         assert c.numbered_label("snooze", 2) == "⏰ 2"
         assert c.numbered_label("undo", 3) == "↩ 3"
+        assert c.numbered_label("hold", 4) == "暂挂 4"
+        assert c.numbered_label("drop", 5) == "弃置 5"
 
     def test_none_falls_back_to_legacy_constant(self):
         # from_custom_id 重建的按钮无编号信息,label 仅作路由占位、不展示
         assert c.numbered_label("done", None) == c.LABEL_DONE
         assert c.numbered_label("undo", None) == c.LABEL_UNDO
         assert c.numbered_label("snooze", None) == c.LABEL_SNOOZE
+        assert c.numbered_label("open_thread", None) == "打开子区"
 
     def test_unknown_action_raises(self):
         import pytest
@@ -182,7 +206,7 @@ class TestNumberedComponents:
     def test_button_component_numbered(self):
         b = c.button_component("done", "a" * 32, 2)
         assert b["label"] == "✓ 2"
-        assert b["custom_id"] == f"ntask:done:{'a' * 32}"
+        assert b["custom_id"] == f"ntask:v1:done:{'a' * 32}"
 
     def test_payload_numbers_by_first_occurrence(self):
         p1, p2 = "a" * 32, "b" * 32
