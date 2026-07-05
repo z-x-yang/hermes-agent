@@ -45,6 +45,28 @@ async def test_set_hold_verified_patches_and_reads_back():
 
 
 @pytest.mark.asyncio
+async def test_set_hold_verified_accepts_notion_minute_precision_readback():
+    def handler(req):
+        if req.method == "PATCH":
+            return httpx.Response(200, json=_page("Hold"))
+        if req.method == "GET":
+            return httpx.Response(200, json=_page("Hold", {
+                "Next Check": {"type": "date", "date": {"start": "2026-07-05T15:15:00.000+00:00"}},
+                "Hold Reason": _text_prop("snoozed"),
+            }))
+        raise AssertionError(req)
+
+    client = NotionClient(api_key="secret", transport=httpx.MockTransport(handler), backoff=0)
+    page = await client.set_hold_verified(
+        PID,
+        next_check="2026-07-05T15:15:00",
+        reason="snoozed",
+        waiting_for=None,
+    )
+    assert page["properties"]["Next Check"]["date"]["start"] == "2026-07-05T15:15:00.000+00:00"
+
+
+@pytest.mark.asyncio
 async def test_set_hold_verified_fails_if_next_check_readback_mismatch():
     def handler(req):
         if req.method == "PATCH":

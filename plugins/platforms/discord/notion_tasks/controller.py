@@ -29,7 +29,14 @@ import discord
 from . import detection
 from .buttons import build_button, build_snooze_select
 from .components import pack_group_rows, task_card_embed
-from .snooze import EASTERN, SnoozeStore, reminder_content, resolve_due
+from .snooze import (
+    EASTERN,
+    SnoozeStore,
+    ceil_to_minute,
+    format_notion_datetime,
+    reminder_content,
+    resolve_due,
+)
 from .outbound import detect_task_links
 
 logger = logging.getLogger(__name__)
@@ -582,11 +589,12 @@ class NotionTaskController:
         except ValueError:
             await interaction.response.send_message("这个提醒选项我不认识，没安排。", ephemeral=True)
             return
+        due = ceil_to_minute(due)
 
         try:
             page = await self.notion.set_hold_verified(
                 page_id,
-                next_check=due.isoformat(),
+                next_check=format_notion_datetime(due),
                 reason="snoozed",
                 waiting_for=None,
             )

@@ -57,6 +57,23 @@ def resolve_due(value: str, *, now: datetime | None = None) -> datetime:
     raise ValueError(f"unknown snooze preset: {value!r}")
 
 
+def ceil_to_minute(dt: datetime) -> datetime:
+    """Return ``dt`` at Discord/Notion UI precision without moving earlier."""
+    if dt.second or dt.microsecond:
+        dt = dt + timedelta(minutes=1)
+    return dt.replace(second=0, microsecond=0)
+
+
+def format_notion_datetime(dt: datetime) -> str:
+    """Datetime string for Notion date properties.
+
+    Notion stores date-times at minute precision. Sending seconds/microseconds
+    can make a verified write look like a read-back mismatch even though the UI
+    stored the intended minute, so align before writing.
+    """
+    return ceil_to_minute(dt).isoformat()
+
+
 def _fmt_local(dt: datetime) -> str:
     # Short Chinese-friendly label. Keep weekday out of the confirmation so it
     # stays compact in Discord ephemeral responses.

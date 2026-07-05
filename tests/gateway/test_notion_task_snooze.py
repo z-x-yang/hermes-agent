@@ -31,7 +31,7 @@ def _now():
     return datetime(2026, 6, 24, 15, 0, 0)
 
 
-def _ctrl(notion, *, fetch_channel=None):
+def _ctrl(notion, *, fetch_channel=None, now_fn=_now):
     from plugins.platforms.discord.notion_tasks.snooze import SnoozeStore
     return NotionTaskController(
         notion=notion,
@@ -40,7 +40,7 @@ def _ctrl(notion, *, fetch_channel=None):
         allowed_ids_getter=lambda: ({"42"}, set()),
         tasks_ids={PID},
         fetch_channel=fetch_channel,
-        now_fn=_now,
+        now_fn=now_fn,
     )
 
 
@@ -89,6 +89,14 @@ def test_snooze_time_presets_are_deterministic():
     assert resolve_due("next_monday", now=now).isoformat() == "2026-06-29T09:30:00"
 
 
+def test_format_notion_datetime_ceil_to_minute():
+    from plugins.platforms.discord.notion_tasks.snooze import format_notion_datetime
+
+    now = datetime(2026, 6, 24, 16, 0, 17, 123456)
+
+    assert format_notion_datetime(now) == "2026-06-24T16:01:00"
+
+
 @pytest.mark.asyncio
 async def test_snooze_action_opens_ephemeral_choice_menu():
     notion = SimpleNamespace(get_page=AsyncMock(return_value=TASK_PAGE), set_status=AsyncMock())
@@ -135,6 +143,31 @@ async def test_snooze_choice_writes_notion_hold_and_confirms():
     assert pending == []
     inter.response.send_message.assert_awaited_once()
     assert "16:00" in inter.response.send_message.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_snooze_choice_sends_minute_aligned_next_check():
+    held_page = {**TASK_PAGE, "properties": {**TASK_PAGE["properties"],
+                 "Status": {"type": "status", "status": {"name": "Hold"}},
+                 "Next Check": {"type": "date", "date": {"start": "2026-06-24T16:01:00"}},
+                 "Hold Reason": {"type": "rich_text", "rich_text": [{"plain_text": "snoozed"}]}}}
+    notion = SimpleNamespace(
+        get_page=AsyncMock(return_value=TASK_PAGE),
+        set_hold_verified=AsyncMock(return_value=held_page),
+    )
+    ctrl = _ctrl(notion, now_fn=lambda: datetime(2026, 6, 24, 15, 0, 17, 123456))
+    inter = _interaction(content=f"Task https://notion.so/{PID}")
+
+    await ctrl.handle_snooze_choice(
+        PID,
+        "1h",
+        inter,
+        source_channel_id="9001",
+        source_message_id="1001",
+        source_content=f"Task https://notion.so/{PID}",
+    )
+
+    assert notion.set_hold_verified.await_args.kwargs["next_check"] == "2026-06-24T16:01:00"
 
 
 @pytest.mark.asyncio

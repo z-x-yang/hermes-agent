@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import datetime, timezone
 
 import httpx
 
@@ -68,6 +69,43 @@ def _read_select(page: dict, name: str) -> str:
 
 def _read_number(page: dict, name: str) -> int | float | None:
     return page.get("properties", {}).get(name, {}).get("number")
+
+
+def _parse_date_time(value: str | None) -> datetime | None:
+    if not value or "T" not in str(value):
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _same_notion_minute(expected: str | None, got: str | None) -> bool:
+    """Compare Notion date-time read-back at the precision Notion stores.
+
+    Notion normalizes date-times to minute precision and may add ``.000`` plus
+    an offset even when the PATCH value omitted both. Exact string comparison
+    is still required for date-only values, but date-times need semantic minute
+    comparison to avoid false verified-write failures.
+    """
+    if expected == got:
+        return True
+    if not expected or not got:
+        return False
+    exp_dt = _parse_date_time(expected)
+    got_dt = _parse_date_time(got)
+    if exp_dt is None or got_dt is None:
+        return False
+    exp_min = exp_dt.replace(second=0, microsecond=0)
+    got_min = got_dt.replace(second=0, microsecond=0)
+    if exp_min.tzinfo is not None and got_min.tzinfo is not None:
+        return exp_min.astimezone(timezone.utc) == got_min.astimezone(timezone.utc)
+    if exp_min.tzinfo is None and got_min.tzinfo is None:
+        return exp_min == got_min
+    # A naive timestamp PATCH is read back by Notion with an explicit offset.
+    # In that case, compare the visible wall-clock minute rather than treating
+    # the missing timezone as a different instant.
+    return exp_min.replace(tzinfo=None) == got_min.replace(tzinfo=None)
 
 
 class NotionClient:
@@ -153,7 +191,7 @@ class NotionClient:
         if status != "Hold":
             raise NotionError(f"Notion Hold read-back mismatch: got {status!r}")
         got_next = _read_date(page, "Next Check")
-        if got_next != next_check:
+        if not _same_notion_minute(next_check, got_next):
             raise NotionError(
                 f"Next Check read-back mismatch: expected {next_check!r}, got {got_next!r}"
             )
