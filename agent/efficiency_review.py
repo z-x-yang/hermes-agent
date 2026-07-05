@@ -273,16 +273,21 @@ def record_and_classify(
             (float(e.get("at", 0)) for e in history if e.get("type") == "encoded"),
             default=None,
         )
-        if session_id not in sessions:
+        is_new_session = session_id not in sessions
+        if is_new_session:
             entries.append({
                 "type": "sighting", "key": key, "session": session_id,
                 "family": run_family, "at": now, "desc": p.get("desc", ""),
             })
-        if encoded_at is not None:
+        if encoded_at is not None and is_new_session:
             status = "recurred_after_encode"
-        elif len(sessions | {session_id}) >= 2:
+        elif len(sessions | {session_id}) >= 2 and encoded_at is None:
             status = "encode_now"
         else:
+            # Same-session repeats count once. This is especially important
+            # after a skill write: a later background review may still see the
+            # same pre-rule tool calls in the session snapshot, but that is not
+            # a recurrence after the encoded rule.
             status = "observed"
         out.append({"key": key, "desc": p.get("desc", ""), "status": status})
     _write_ledger(entries)

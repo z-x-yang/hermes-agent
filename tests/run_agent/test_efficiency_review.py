@@ -179,6 +179,22 @@ def test_recurrence_after_encode_escalates(ledger):
     assert _classify(["reread:x"], "s3") == {"reread:x": "recurred_after_encode"}
 
 
+def test_same_session_after_encode_does_not_escalate(ledger):
+    """A later background review of the same snapshot must not look like
+    a post-rule recurrence.
+
+    The encoded marker is written after the review patches a skill. The next
+    review can still see the same old tool calls from that session, but the
+    pattern has not recurred in a new session yet.
+    """
+    _classify(["reread:x"], "s1")
+    assert _classify(["reread:x"], "s2") == {"reread:x": "encode_now"}
+    er.mark_encoded(["reread:x"])
+
+    assert _classify(["reread:x"], "s2") == {"reread:x": "observed"}
+    assert _classify(["reread:x"], "s3") == {"reread:x": "recurred_after_encode"}
+
+
 def test_ledger_corrupt_lines_are_skipped(ledger):
     ledger.write_text('not json\n{"also": "wrong shape"}\n')
     assert _classify(["reread:x"], "s1") == {"reread:x": "observed"}
