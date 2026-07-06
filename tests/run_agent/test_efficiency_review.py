@@ -43,8 +43,11 @@ def _call(name, args):
     }
 
 
-def _assistant(*tool_calls):
-    return {"role": "assistant", "content": "", "tool_calls": list(tool_calls)}
+def _assistant(*tool_calls, timestamp=None):
+    msg = {"role": "assistant", "content": "", "tool_calls": list(tool_calls)}
+    if timestamp is not None:
+        msg["timestamp"] = timestamp
+    return msg
 
 
 def _result(tool_call_id, content="ok"):
@@ -111,6 +114,20 @@ def test_identical_args_duplicate_call_is_flagged():
     digest = er.build_tool_call_digest(msgs)
     assert digest is not None
     assert any(p["key"].startswith("dup:terminal:") for p in digest["patterns"])
+
+
+def test_persisted_output_replay_does_not_count_as_duplicate():
+    """Compression/persisted-output stubs replay historical tool calls; the
+    efficiency digest must not treat those archived references as fresh waste."""
+    live = _call("skill_view", {"name": "brainstorming"})
+    replay = _call("skill_view", {"name": "brainstorming"})
+    msgs = [
+        _assistant(live),
+        _result(live["id"], "ok"),
+        _assistant(replay),
+        _result(replay["id"], "<persisted-output> Tool result archived at: hermes://session/s/message/1"),
+    ]
+    assert er.build_tool_call_digest(msgs) is None
 
 
 def test_write_between_reads_exempts_the_path():
@@ -195,6 +212,35 @@ def test_same_session_after_encode_does_not_escalate(ledger):
     assert _classify(["reread:x"], "s3") == {"reread:x": "recurred_after_encode"}
 
 
+def test_pre_encode_pattern_reviewed_late_does_not_escalate(ledger, monkeypatch):
+    """A long-running/delayed review can observe calls that happened before
+    the rule was encoded. Recurrence requires the call timestamps, not merely
+    review time, to be post-encode."""
+    monkeypatch.setattr(er.time, "time", lambda: 100.0)
+    er.record_and_classify(
+        [{"key": "dup:skill_view:x", "desc": "first", "last_at": 100.0}],
+        session_id="s1",
+        run_family="discord",
+    )
+
+    monkeypatch.setattr(er.time, "time", lambda: 200.0)
+    assert er.record_and_classify(
+        [{"key": "dup:skill_view:x", "desc": "second", "last_at": 200.0}],
+        session_id="s2",
+        run_family="discord",
+    )[0]["status"] == "encode_now"
+
+    monkeypatch.setattr(er.time, "time", lambda: 250.0)
+    er.mark_encoded(["dup:skill_view:x"])
+
+    monkeypatch.setattr(er.time, "time", lambda: 300.0)
+    assert er.record_and_classify(
+        [{"key": "dup:skill_view:x", "desc": "stale", "last_at": 240.0}],
+        session_id="s3",
+        run_family="discord",
+    )[0]["status"] == "observed"
+
+
 def test_ledger_corrupt_lines_are_skipped(ledger):
     ledger.write_text('not json\n{"also": "wrong shape"}\n')
     assert _classify(["reread:x"], "s1") == {"reread:x": "observed"}
@@ -255,25 +301,23 @@ def test_apply_outcome_no_write_no_mark(ledger):
     assert _classify(["reread:x"], "s2") == {"reread:x": "encode_now"}
 
 
-def test_apply_outcome_appends_escalation_line(ledger):
+def test_apply_outcome_logs_escalation_without_user_action(ledger, caplog):
     ctx = {"encode_keys": [], "escalations": ["reread:x"]}
     actions = []
-    er.apply_efficiency_outcome(ctx, [], prior_snapshot=[], actions=actions)
-    assert len(actions) == 1 and "reread:x" in actions[0]
+    with caplog.at_level("INFO", logger=er.logger.name):
+        er.apply_efficiency_outcome(ctx, [], prior_snapshot=[], actions=actions)
+    assert actions == []
+    assert "reread:x" in caplog.text
 
 
-def test_apply_outcome_softens_reread_escalation_line(ledger):
+def test_apply_outcome_suppresses_reread_escalation_line(ledger, caplog):
     ctx = {"encode_keys": [], "escalations": ["reread:/tmp/source.py"]}
     actions = []
-    er.apply_efficiency_outcome(ctx, [], prior_snapshot=[], actions=actions)
+    with caplog.at_level("INFO", logger=er.logger.name):
+        er.apply_efficiency_outcome(ctx, [], prior_snapshot=[], actions=actions)
 
-    assert len(actions) == 1
-    assert actions[0].startswith("ℹ️ Efficiency note:")
-    assert "recurred after a skill rule" in actions[0]
-    assert "No extra rule was added" in actions[0]
-    assert "deliberate source audit" in actions[0]
-    assert "rule is not sticking" not in actions[0]
-    assert "needs human attention" not in actions[0]
+    assert actions == []
+    assert "reread:/tmp/source.py" in caplog.text
 
 
 def test_apply_outcome_ignores_stale_skill_writes(ledger):

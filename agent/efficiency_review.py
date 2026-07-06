@@ -30,14 +30,13 @@ deterministic part, the review model does the judgment:
      • sighted in ≥2 distinct sessions: the review may encode an avoidance
        rule into the governing skill;
      • sighted again AFTER a rule landed: the review must NOT pile on more
-       rules; a deterministic note is surfaced to the user. Exact duplicate
-       tool calls remain warnings; multi-segment file re-reads are phrased as
-       softer notes because broad source audits may legitimately inspect
-       several anchored regions of a large file.
+       rules; the deterministic recurrence is logged internally instead of
+       being pushed to the user. Exact duplicate/re-read recurrence is an
+       audit signal, not a user-facing Discord alert.
 
-3. ``apply_efficiency_outcome`` — post-review bookkeeping: appends
-   escalation lines to the user-facing action summary and stamps
-   ``encoded`` markers when the review actually wrote to a skill.
+3. ``apply_efficiency_outcome`` — post-review bookkeeping: logs recurrence
+   escalations and stamps ``encoded`` markers when the review actually wrote
+   to a skill.
 """
 
 from __future__ import annotations
@@ -76,15 +75,53 @@ LEDGER_MAX_LINES = 1000
 # Digest
 # ---------------------------------------------------------------------------
 
-def _iter_tool_calls(messages: List[Dict]) -> List[Tuple[int, str, str, Dict]]:
-    """Flatten assistant tool_calls into (seq, tool_call_id, name, args)."""
-    out: List[Tuple[int, str, str, Dict]] = []
+def _message_timestamp(msg: Dict) -> Optional[float]:
+    try:
+        raw = msg.get("timestamp")
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _persisted_output_tool_call_ids(messages: List[Dict]) -> set[str]:
+    """Tool-call ids whose results are archived references, not fresh output.
+
+    Cheap context cleanup can replay historical assistant tool_calls and pair
+    them with ``<persisted-output>`` tool-result stubs. Counting those replays as
+    new tool calls creates false duplicate-efficiency alerts.
+    """
+    out: set[str] = set()
+    for msg in messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        tcid = msg.get("tool_call_id")
+        content = msg.get("content")
+        if (
+            isinstance(tcid, str)
+            and tcid
+            and isinstance(content, str)
+            and content.lstrip().startswith("<persisted-output>")
+        ):
+            out.add(tcid)
+    return out
+
+
+def _iter_tool_calls(
+    messages: List[Dict], skip_tool_call_ids: Optional[set[str]] = None
+) -> List[Tuple[int, str, str, Dict, Optional[float]]]:
+    """Flatten assistant tool_calls into (seq, tool_call_id, name, args, ts)."""
+    skip_tool_call_ids = skip_tool_call_ids or set()
+    out: List[Tuple[int, str, str, Dict, Optional[float]]] = []
     seq = 0
     for msg in messages or []:
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
+        ts = _message_timestamp(msg)
         for tc in msg.get("tool_calls") or []:
             if not isinstance(tc, dict):
+                continue
+            tcid = tc.get("id") or ""
+            if tcid and tcid in skip_tool_call_ids:
                 continue
             fn = tc.get("function") or {}
             name = fn.get("name") or ""
@@ -94,19 +131,20 @@ def _iter_tool_calls(messages: List[Dict]) -> List[Tuple[int, str, str, Dict]]:
                 args = {}
             if not isinstance(args, dict):
                 args = {}
-            out.append((seq, tc.get("id") or "", name, args))
+            out.append((seq, tcid, name, args, ts))
             seq += 1
     return out
 
 
-def _result_sizes(messages: List[Dict]) -> Dict[str, int]:
+def _result_sizes(messages: List[Dict], skip_tool_call_ids: Optional[set[str]] = None) -> Dict[str, int]:
+    skip_tool_call_ids = skip_tool_call_ids or set()
     sizes: Dict[str, int] = {}
     for msg in messages or []:
         if not isinstance(msg, dict) or msg.get("role") != "tool":
             continue
         tcid = msg.get("tool_call_id")
         content = msg.get("content")
-        if tcid and isinstance(content, str):
+        if tcid and tcid not in skip_tool_call_ids and isinstance(content, str):
             sizes[tcid] = len(content)
     return sizes
 
@@ -124,14 +162,16 @@ def build_tool_call_digest(messages_snapshot: List[Dict]) -> Optional[Dict[str, 
 
     Returns ``{"lines": [...], "patterns": [{"key", "desc"}], "total_calls": n}``.
     """
-    calls = _iter_tool_calls(messages_snapshot)
+    skipped_ids = _persisted_output_tool_call_ids(messages_snapshot)
+    calls = _iter_tool_calls(messages_snapshot, skip_tool_call_ids=skipped_ids)
     if not calls:
         return None
+    seq_timestamps = {seq: ts for seq, _tcid, _name, _args, ts in calls}
 
     # Path-aggregated read_file grouping + mutation spans for exemption.
     reads_by_path: Dict[str, List[int]] = {}
     writes_by_path: Dict[str, List[int]] = {}
-    for seq, _tcid, name, args in calls:
+    for seq, _tcid, name, args, _ts in calls:
         path = args.get("path")
         if not isinstance(path, str) or not path:
             continue
@@ -140,8 +180,16 @@ def build_tool_call_digest(messages_snapshot: List[Dict]) -> Optional[Dict[str, 
         elif name in WRITE_TOOLS:
             writes_by_path.setdefault(path, []).append(seq)
 
-    patterns: List[Dict[str, str]] = []
+    patterns: List[Dict[str, Any]] = []
     lines: List[str] = []
+
+    def _last_timestamp(seqs: List[int]) -> Optional[float]:
+        seen: List[float] = []
+        for s in seqs:
+            ts = seq_timestamps.get(s)
+            if ts is not None:
+                seen.append(ts)
+        return max(seen) if seen else None
 
     for path, seqs in sorted(reads_by_path.items()):
         if len(seqs) < REREAD_THRESHOLD:
@@ -156,13 +204,17 @@ def build_tool_call_digest(messages_snapshot: List[Dict]) -> Optional[Dict[str, 
             f"read_file '{path}' called {len(seqs)} times (different segments; "
             "no writes to this path in between)"
         )
-        patterns.append({"key": f"reread:{path}", "desc": desc})
+        pattern: Dict[str, Any] = {"key": f"reread:{path}", "desc": desc}
+        last_at = _last_timestamp(seqs)
+        if last_at is not None:
+            pattern["last_at"] = last_at
+        patterns.append(pattern)
         lines.append(f"  • {desc}")
 
     # Identical (tool, canonical-args) duplicates.
     dup_counts: Dict[Tuple[str, str], List[int]] = {}
     canon_args: Dict[Tuple[str, str], str] = {}
-    for seq, _tcid, name, args in calls:
+    for seq, _tcid, name, args, _ts in calls:
         canon = json.dumps(args, sort_keys=True, ensure_ascii=False)
         key = (name, canon)
         dup_counts.setdefault(key, []).append(seq)
@@ -184,14 +236,18 @@ def build_tool_call_digest(messages_snapshot: List[Dict]) -> Optional[Dict[str, 
         except (json.JSONDecodeError, TypeError):
             hint = canon[:60]
         desc = f"{name} called {len(seqs)} times with identical arguments ({hint})"
-        patterns.append({"key": f"dup:{name}:{digest8}", "desc": desc})
+        pattern = {"key": f"dup:{name}:{digest8}", "desc": desc}
+        last_at = _last_timestamp(seqs)
+        if last_at is not None:
+            pattern["last_at"] = last_at
+        patterns.append(pattern)
         lines.append(f"  • {desc}")
 
     if not patterns:
         return None
 
-    sizes = _result_sizes(messages_snapshot)
-    by_id = {tcid: (name, args) for _seq, tcid, name, args in calls if tcid}
+    sizes = _result_sizes(messages_snapshot, skip_tool_call_ids=skipped_ids)
+    by_id = {tcid: (name, args) for _seq, tcid, name, args, _ts in calls if tcid}
     top = sorted(sizes.items(), key=lambda kv: kv[1], reverse=True)[:TOP_RESULTS]
     size_bits = []
     for tcid, n in top:
@@ -253,7 +309,7 @@ def _write_ledger(entries: List[Dict[str, Any]]) -> None:
 
 
 def record_and_classify(
-    patterns: List[Dict[str, str]],
+    patterns: List[Dict[str, Any]],
     session_id: str,
     run_family: str,
 ) -> List[Dict[str, str]]:
@@ -275,13 +331,20 @@ def record_and_classify(
             (float(e.get("at", 0)) for e in history if e.get("type") == "encoded"),
             default=None,
         )
+        try:
+            pattern_at = float(p.get("last_at") or now)
+        except (TypeError, ValueError):
+            pattern_at = now
         is_new_session = session_id not in sessions
         if is_new_session:
-            entries.append({
+            entry = {
                 "type": "sighting", "key": key, "session": session_id,
-                "family": run_family, "at": now, "desc": p.get("desc", ""),
-            })
-        if encoded_at is not None and is_new_session:
+                "family": run_family, "at": pattern_at, "desc": p.get("desc", ""),
+            }
+            if pattern_at != now:
+                entry["recorded_at"] = now
+            entries.append(entry)
+        if encoded_at is not None and is_new_session and pattern_at > encoded_at:
             status = "recurred_after_encode"
         elif len(sessions | {session_id}) >= 2 and encoded_at is None:
             status = "encode_now"
@@ -289,7 +352,8 @@ def record_and_classify(
             # Same-session repeats count once. This is especially important
             # after a skill write: a later background review may still see the
             # same pre-rule tool calls in the session snapshot, but that is not
-            # a recurrence after the encoded rule.
+            # a recurrence after the encoded rule. If call timestamps prove the
+            # pattern predates the encoded rule, it is also stale audit context.
             status = "observed"
         out.append({"key": key, "desc": p.get("desc", ""), "status": status})
     _write_ledger(entries)
@@ -332,10 +396,11 @@ _STATUS_INSTRUCTIONS = (
     "the skill that governs this class of task, following the constraints "
     "below.\n"
     "  • recurred_after_encode: do NOT add more rules — a previously "
-    "encoded rule was seen again. A deterministic note is surfaced to the "
-    "user automatically; you may mention the recurrence in your reply, "
-    "nothing more. Multi-segment file re-reads may be legitimate broad "
-    "source audits, so judge them softly.\n"
+    "encoded rule was seen again. A deterministic note is logged internally "
+    "and suppressed from user-facing background-review summaries; you may "
+    "mention it only if it materially affects the current answer. "
+    "Multi-segment file re-reads may be legitimate broad source audits, so "
+    "judge them softly.\n"
 )
 
 _HARD_CONSTRAINTS = (
@@ -412,7 +477,7 @@ def _successful_skill_writes(
         if isinstance(m, dict) and m.get("role") == "tool" and m.get("tool_call_id")
     }
     write_calls: Dict[str, Dict] = {}
-    for _seq, tcid, name, args in _iter_tool_calls(review_messages):
+    for _seq, tcid, name, args, _ts in _iter_tool_calls(review_messages):
         if name == "skill_manage" and args.get("action") in {"create", "edit", "patch", "write_file"}:
             if tcid:
                 write_calls[tcid] = args
@@ -438,23 +503,15 @@ def _made_skill_write(review_messages: List[Dict], prior_snapshot: List[Dict]) -
 
 
 def _format_efficiency_escalation(key: str) -> str:
-    """User-visible line for an efficiency pattern seen after a rule exists.
+    """Compact log line for an efficiency pattern seen after a rule exists.
 
-    Re-read patterns are inherently softer than exact duplicate calls: a broad
-    source audit may legitimately inspect multiple anchored regions of a large
-    file. Keep the recurrence signal, but do not frame it as an automatic
-    "rule is not sticking" failure.
+    These recurrences are not user-actionable by default; keep them in logs so
+    they remain inspectable without leaking low-value housekeeping into
+    Discord/Telegram final summaries.
     """
-    if key.startswith("reread:"):
-        return (
-            f"ℹ️ Efficiency note: pattern '{key}' recurred after a skill rule. "
-            "No extra rule was added; review only if these repeated file reads "
-            "were avoidable rather than a deliberate source audit."
-        )
     return (
-        f"⚠️ Efficiency pattern '{key}' recurred after a skill rule. "
-        "No extra rule was added; review whether the repeated tool use is "
-        "still avoidable."
+        f"Efficiency pattern '{key}' recurred after a skill rule; "
+        "no extra rule was added."
     )
 
 
@@ -464,12 +521,15 @@ def apply_efficiency_outcome(
     prior_snapshot: List[Dict],
     actions: List[str],
 ) -> None:
-    """Post-review bookkeeping: surface escalations to the user and stamp
-    ``encoded`` markers when the review actually wrote a skill rule."""
+    """Post-review bookkeeping: log recurrences and stamp ``encoded`` markers.
+
+    ``actions`` is user-visible in gateway chats. Recurred-after-encode
+    efficiency notices are internal housekeeping, so they stay in logs.
+    """
     if not efficiency_ctx:
         return
     for key in efficiency_ctx.get("escalations") or []:
-        actions.append(_format_efficiency_escalation(key))
+        logger.info(_format_efficiency_escalation(key))
     encode_keys = efficiency_ctx.get("encode_keys") or []
     if encode_keys and _made_skill_write(review_messages, prior_snapshot):
         mark_encoded(encode_keys)
