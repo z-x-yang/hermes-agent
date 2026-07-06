@@ -2244,8 +2244,31 @@ class ContextCompressor(ContextEngine):
     _TOOL_ARGS_MAX = 1500     # tool call argument chars during overflow fallback
     _TOOL_ARGS_HEAD = 1200    # kept from the start of tool args during fallback
     _SUMMARY_SOURCE_MIN_CHARS = 24_000
-    _SUMMARY_SOURCE_MAX_CHARS = 180_000
-    _SUMMARY_SOURCE_THRESHOLD_RATIO = 0.45
+    # Reserve input/output room outside the serialized source: the iterative
+    # prompt may include the previous summary (up to max_summary_tokens), the
+    # API call reserves completion tokens (max_tokens ~= summary_budget * 1.3),
+    # and the fixed compaction instructions/template need a small input cushion.
+    # The source budget itself should scale with the compression model's actual
+    # context window; do not cap large-window models at the old 180k-char guard.
+    _SUMMARY_SOURCE_PROMPT_RESERVE_TOKENS = 8_000
+    _SUMMARY_SOURCE_OUTPUT_RESERVE_MULTIPLIER = 1.3
+
+    def _summary_source_token_budget(self) -> int:
+        """Rough token budget for serialized raw source fed to the summarizer.
+
+        The summarizer is routed through the compression model, whose input
+        window can be as large as the main model's context window.  Bound the
+        source by the smaller of the live model window and the compression
+        threshold, then reserve room for previous-summary input, static prompt
+        scaffolding, and the requested summary output.
+        """
+        window_tokens = max(0, min(int(self.context_length), int(self.threshold_tokens)))
+        reserved_tokens = (
+            int(self.max_summary_tokens)
+            + int(self.max_summary_tokens * self._SUMMARY_SOURCE_OUTPUT_RESERVE_MULTIPLIER)
+            + self._SUMMARY_SOURCE_PROMPT_RESERVE_TOKENS
+        )
+        return max(self._SUMMARY_SOURCE_MIN_CHARS // _CHARS_PER_TOKEN, window_tokens - reserved_tokens)
 
     def _summary_source_char_budget(self) -> int:
         """Global char budget for serialized raw source fed to the summarizer.
@@ -2257,11 +2280,7 @@ class ContextCompressor(ContextEngine):
         already works in char windows and rough token accounting uses 4 chars ≈
         1 token throughout this module.
         """
-        scaled = int(self.threshold_tokens * _CHARS_PER_TOKEN * self._SUMMARY_SOURCE_THRESHOLD_RATIO)
-        return max(
-            self._SUMMARY_SOURCE_MIN_CHARS,
-            min(self._SUMMARY_SOURCE_MAX_CHARS, scaled),
-        )
+        return self._summary_source_token_budget() * _CHARS_PER_TOKEN
 
     @staticmethod
     def _strip_synthetic_user_ledger_blocks(text: str) -> str:
@@ -2652,9 +2671,11 @@ class ContextCompressor(ContextEngine):
         gets sent to the auxiliary model and persisted across compactions.
         """
         source_char_budget = self._summary_source_char_budget()
+        source_token_budget = self._summary_source_token_budget()
 
         source_audit: dict[str, Any] = {
             "budget_chars": source_char_budget,
+            "budget_tokens_estimate": source_token_budget,
             "raw_chars": 0,
             "final_chars": 0,
             "overflow": False,

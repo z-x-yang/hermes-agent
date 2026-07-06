@@ -1500,6 +1500,21 @@ class TestRetainedTailBudgeting:
         assert retained_tail["token_share_of_tail_budget"] <= 1.2
         assert retained_tail["token_target_met"] is True
 
+    def test_summary_source_budget_uses_compression_model_window_not_180k_cap(self):
+        """Large-context compression models should not be constrained by the old 180k-char guard."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=272_000):
+            c = ContextCompressor(
+                model="gpt-5.5",
+                threshold_percent=0.95,
+                quiet_mode=True,
+            )
+
+        # The compression model can accept a 272k-token input window.  The source
+        # serializer should therefore leave room for previous-summary/template/output
+        # reserves, not clamp the middle-window source at 180k chars (~45k tokens).
+        assert c._summary_source_char_budget() == 891_200
+        assert c._summary_source_char_budget() > 568_699
+
     def test_summary_source_overflow_compacts_tool_outputs_oldest_first(self):
         """If raw source exceeds the summarizer budget, shrink old tools first."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
@@ -4215,10 +4230,14 @@ class TestSummaryTargetRatio:
         assert c.max_summary_tokens == 12_000  # capped at 12K ceiling
 
     def test_ratio_clamped(self):
-        """Ratio should be clamped to [0.10, 0.80]."""
+        """Ratio should allow sub-10% tail targets but still reject negative/high values."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.05)
-        assert c.summary_target_ratio == 0.10
+        assert c.summary_target_ratio == 0.05
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=-0.05)
+        assert c.summary_target_ratio == 0.0
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.95)
