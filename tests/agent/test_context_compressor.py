@@ -493,6 +493,22 @@ class TestCompress:
         assert c.threshold_tokens == int(128000 * 0.95)
         assert c.tail_token_budget == 12800
 
+    def test_tail_budget_ratio_allows_sub_10_percent_targets(self):
+        """A configured tail ratio below 10% should not be silently clamped back to 10%."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=272000):
+            c = ContextCompressor(
+                model="gpt-5.5",
+                threshold_percent=0.95,
+                summary_target_ratio=20000 / 272000,
+                quiet_mode=True,
+            )
+        assert c.threshold_tokens == int(272000 * 0.95)
+        assert c.summary_target_ratio == 20000 / 272000
+        assert c.tail_token_budget == 20000
+
+        c.update_model("same-window-route", 272000)
+        assert c.tail_token_budget == 20000
+
     def test_max_tokens_reservation_lowers_threshold(self):
         """#43547: the provider reserves max_tokens out of the window, so the
         threshold must be based on (context_length - max_tokens), not the full

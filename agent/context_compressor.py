@@ -1291,7 +1291,7 @@ class ContextCompressor(ContextEngine):
         self.threshold_percent = threshold_percent
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
-        self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
+        self.summary_target_ratio = max(0.0, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
         # Output-token reservation: the provider carves max_tokens out of the
         # context window, so the usable input budget is context_length -
