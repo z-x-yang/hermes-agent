@@ -473,6 +473,26 @@ class TestCompress:
         assert c.should_compress(55000) is True
         assert c.should_compress(40000) is False
 
+    def test_tail_budget_ratio_uses_context_window_not_compression_threshold(self):
+        """Tail retention ratio means model context-window ratio, not trigger threshold ratio.
+
+        GPT-5.5 has a 277K window; 10% means ~27.7K retained tail tokens even
+        when auto-compression triggers at 95% of that window.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=277000):
+            c = ContextCompressor(
+                model="gpt-5.5",
+                threshold_percent=0.95,
+                summary_target_ratio=0.10,
+                quiet_mode=True,
+            )
+        assert c.threshold_tokens == int(277000 * 0.95)
+        assert c.tail_token_budget == 27700
+
+        c.update_model("smaller-model", 128000)
+        assert c.threshold_tokens == int(128000 * 0.95)
+        assert c.tail_token_budget == 12800
+
     def test_max_tokens_reservation_lowers_threshold(self):
         """#43547: the provider reserves max_tokens out of the window, so the
         threshold must be based on (context_length - max_tokens), not the full
@@ -4157,16 +4177,16 @@ class TestSummaryTargetRatio:
     """Verify that summary_target_ratio properly scales budgets with context window."""
 
     def test_tail_budget_scales_with_context(self):
-        """Tail token budget should be threshold_tokens * summary_target_ratio."""
+        """Tail token budget should be context_length * summary_target_ratio."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
-        # 200K * 0.50 threshold * 0.40 ratio = 40K
-        assert c.tail_token_budget == 40_000
+        # 200K context window * 0.40 ratio = 80K
+        assert c.tail_token_budget == 80_000
 
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
-        # 1M * 0.50 threshold * 0.40 ratio = 200K
-        assert c.tail_token_budget == 200_000
+        # 1M context window * 0.40 ratio = 400K
+        assert c.tail_token_budget == 400_000
 
     def test_summary_cap_scales_with_context(self):
         """Max summary tokens should be 5% of context, capped at 12K."""
@@ -4686,8 +4706,8 @@ class TestUpdateModelBudgets:
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             comp = ContextCompressor("model-a", threshold_percent=0.50, quiet_mode=True)
         comp.update_model("model-b", context_length=10_000)
-        assert comp.tail_token_budget == int(comp.threshold_tokens * comp.summary_target_ratio)
-        assert comp.max_summary_tokens == min(int(10_000 * 0.05), 4000)
+        assert comp.tail_token_budget == int(10_000 * comp.summary_target_ratio)
+        assert comp.max_summary_tokens == min(int(10_000 * 0.05), 12_000)
 
 
 class TestUpdateModelResetsCalibration:

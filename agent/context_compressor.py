@@ -1170,9 +1170,9 @@ class ContextCompressor(ContextEngine):
         self.threshold_tokens = self._compute_threshold_tokens(
             context_length, self.threshold_percent, self.max_tokens,
         )
-        # Recalculate token budgets for the new context length so the
-        # compressor stays calibrated after a model switch (e.g. 200K → 32K).
-        target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
+        # Recalculate token budgets for the new context length so the tail
+        # retention target stays calibrated after a model switch (e.g. 277K → 128K).
+        target_tokens = int(context_length * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
             int(context_length * 0.05), _SUMMARY_TOKENS_CEILING,
@@ -1322,8 +1322,11 @@ class ContextCompressor(ContextEngine):
         )
         self.compression_count = 0
 
-        # Derive token budgets: ratio is relative to the threshold, not total context
-        target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
+        # Derive token budgets: tail ratio is relative to the model's context
+        # window, not the auto-compression trigger threshold. A 277K model with
+        # compression.target_ratio=0.10 should retain ~27.7K continuation-payload
+        # tail tokens even if compression triggers at 95% of the window.
+        target_tokens = int(self.context_length * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
             int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING,
