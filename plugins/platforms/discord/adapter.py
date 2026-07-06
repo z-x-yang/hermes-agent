@@ -4770,6 +4770,34 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         await self.handle_message(event)
 
+    async def dispatch_task_followthrough(
+        self,
+        interaction: discord.Interaction,
+        *,
+        thread_id: str,
+        thread_name: str,
+        text: str,
+    ) -> None:
+        """Inject a task-button follow-through as a user turn in a task thread.
+
+        The visible seed message in the thread is bot-authored and must not
+        self-trigger. This method is the explicit bridge: it reuses the same
+        MessageEvent path as `/thread ... message=...`, keyed to the target
+        thread session, so Evelyn continues there as if the user typed the
+        chosen direction.
+        """
+        if not thread_id:
+            raise ValueError("thread_id is required for task follow-through")
+        if not str(text or "").strip():
+            raise ValueError("text is required for task follow-through")
+        self._threads.mark(str(thread_id))
+        await self._dispatch_thread_session(
+            interaction,
+            str(thread_id),
+            str(thread_name or thread_id),
+            str(text),
+        )
+
     def _resolve_channel_skills(self, channel_id: str, parent_id: str | None = None) -> list[str] | None:
         """Look up auto-skill bindings for a Discord channel/forum thread.
 

@@ -97,3 +97,27 @@ class NotionTaskTracker:
             loc["orig_content"] = orig_content
         rec["updated_at"] = time.time()
         self._save()
+
+    def upsert_followthrough(self, page_id, *, message_id=None, channel_id=None,
+                             selected_by=None, choice_kind=None, choice_text=None,
+                             thread_id=None, thread_url=None, state=None) -> None:
+        """Persist the latest Task Clarify follow-through state for recovery.
+
+        This is not the authority for whether a task has a Discord thread —
+        Notion's thread binding is. It records the card decision so a stale
+        card click can be explained after a gateway restart.
+        """
+        rec = self._tasks.setdefault(str(page_id), {})
+        rec["followthrough"] = {
+            "card_message_id": str(message_id or ""),
+            "card_channel_id": str(channel_id or ""),
+            "selected_by": str(selected_by or ""),
+            "selected_at": time.time(),
+            "choice_kind": str(choice_kind or ""),
+            "choice_text": str(choice_text or ""),
+            "target_thread_id": str(thread_id or ""),
+            "target_thread_url": str(thread_url or ""),
+            "state": str(state or ""),
+        }
+        rec["updated_at"] = time.time()
+        self._save()

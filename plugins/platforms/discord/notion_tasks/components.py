@@ -172,6 +172,14 @@ def _clean_text(value, default: str = "") -> str:
     return text or default
 
 
+def _first_text(*values) -> str:
+    for value in values:
+        text = _clean_text(value)
+        if text:
+            return text
+    return ""
+
+
 def _compact_page_id(value: str | None) -> str:
     chars = "".join(ch for ch in str(value or "") if ch.lower() in "0123456789abcdef")
     return chars[-32:] if len(chars) >= 32 else ""
@@ -197,6 +205,35 @@ def _choice_lines(choices: list[dict]) -> list[str]:
     return lines
 
 
+def _card_thread_url(card: dict) -> str:
+    thread = card.get("thread") if isinstance(card.get("thread"), dict) else {}
+    return _first_text(
+        card.get("threadUrl"),
+        card.get("discordThreadUrl"),
+        card.get("targetThreadUrl"),
+        thread.get("url") if thread else "",
+    )
+
+
+def _selected_choice_text(card: dict) -> str:
+    selected = card.get("selectedChoice") or card.get("selected_choice") or {}
+    if not isinstance(selected, dict):
+        return _clean_text(selected)
+    return _first_text(selected.get("text"), selected.get("label"), selected.get("value"))
+
+
+def _followthrough_status_text(state: str) -> str:
+    if state == "continued":
+        return "已在子区继续"
+    if state == "following_through":
+        return "正在接到子区"
+    if state == "failed":
+        return "接到子区失败"
+    if state == "selected":
+        return "已记录选择"
+    return "已选择"
+
+
 def task_clarify_embed(card: dict) -> dict:
     """Render a Discord-native task decision card.
 
@@ -208,7 +245,12 @@ def task_clarify_embed(card: dict) -> dict:
     body = card.get("body") or {}
     context = _clean_text(body.get("context") or card.get("context"), "**这是什么**：任务需要你选择下一步。")
     lines = [context]
-    choice_lines = _choice_lines(list(card.get("primaryChoices") or []))
+    selected_text = _selected_choice_text(card)
+    if selected_text:
+        lines.extend(["", f"已选择：{selected_text}"])
+        state = _clean_text(card.get("followthroughState") or card.get("followthrough_state"), "selected")
+        lines.append(f"状态：{_followthrough_status_text(state)}")
+    choice_lines = [] if selected_text else _choice_lines(list(card.get("primaryChoices") or []))
     if choice_lines:
         lines.extend(["", "**可选下一步**", *choice_lines, "", "Other：你也可以直接写自己的方向。"])
     desc = "\n".join(lines)
@@ -233,6 +275,10 @@ def _raw_button(action: str, page_id: str, label: str, *, style: int | None = No
     }
 
 
+def _raw_link_button(label: str, url: str) -> dict:
+    return {"type": 2, "style": 5, "label": label, "url": url}
+
+
 def task_clarify_components(card: dict) -> list[dict]:
     """Raw Discord component rows for a Task Clarify card.
 
@@ -242,12 +288,15 @@ def task_clarify_components(card: dict) -> list[dict]:
     page_id = _task_clarify_page_id(card)
     if not page_id:
         return []
+    selected_text = _selected_choice_text(card)
+    thread_url = _card_thread_url(card)
     primary: list[dict] = []
-    for idx, action in enumerate(_PRIMARY_CHOICE_ACTIONS, start=1):
-        if len(card.get("primaryChoices") or []) >= idx:
-            primary.append(_raw_button(action, page_id, f"{idx}."))
-    if (card.get("otherChoice") or {}).get("enabled", True):
-        primary.append(_raw_button("other", page_id, "Other"))
+    if not selected_text:
+        for idx, action in enumerate(_PRIMARY_CHOICE_ACTIONS, start=1):
+            if len(card.get("primaryChoices") or []) >= idx:
+                primary.append(_raw_button(action, page_id, f"{idx}."))
+        if (card.get("otherChoice") or {}).get("enabled", True):
+            primary.append(_raw_button("other", page_id, "Other"))
     rows = []
     if primary:
         rows.append({"type": 1, "components": primary[:_MAX_PER_ROW]})
@@ -255,7 +304,11 @@ def task_clarify_components(card: dict) -> list[dict]:
     for item in list(card.get("secondaryActions") or []):
         action = _clean_text(item.get("action"))
         if action in _ROUTINE_ACTIONS:
-            secondary.append(_raw_button(action, page_id, _SHORT_LABEL_BY_ROUTINE_ACTION[action]))
+            label = _SHORT_LABEL_BY_ROUTINE_ACTION[action]
+            if action == "open_thread" and thread_url:
+                secondary.append(_raw_link_button(label, thread_url))
+            else:
+                secondary.append(_raw_button(action, page_id, label))
     if secondary:
         rows.append({"type": 1, "components": secondary[:_MAX_PER_ROW]})
     return rows

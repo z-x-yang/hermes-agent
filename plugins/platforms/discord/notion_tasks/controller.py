@@ -30,7 +30,7 @@ import discord
 
 from . import detection
 from .buttons import build_button, build_snooze_select
-from .components import pack_group_rows, task_card_embed
+from .components import pack_group_rows, task_card_embed, task_clarify_embed
 from .snooze import (
     EASTERN,
     SnoozeStore,
@@ -67,6 +67,24 @@ def _hold_due_label(page: dict) -> str | None:
 
 _CHOICE_ACTION_RE = re.compile(r"^choice(?P<num>[123])$")
 _CHOICE_LINE_RE = re.compile(r"(?m)^\s*(?P<num>[123])\.\s+\*\*(?P<label>[^*]+)\*\*\s+—\s+(?P<desc>[^\n]+)")
+_TASK_CLARIFY_SECONDARY_ACTIONS = (
+    {"action": "open_thread"},
+    {"action": "snooze"},
+    {"action": "hold"},
+    {"action": "drop"},
+    {"action": "done"},
+)
+_TASK_CLARIFY_SHORT_LABELS = {
+    "choice1": "1.",
+    "choice2": "2.",
+    "choice3": "3.",
+    "other": "Other",
+    "open_thread": "🧵",
+    "snooze": "⏰",
+    "hold": "暂挂",
+    "drop": "弃置",
+    "done": "✓",
+}
 
 
 def _embed_description(embed) -> str:
@@ -75,20 +93,68 @@ def _embed_description(embed) -> str:
     return str(getattr(embed, "description", "") or "")
 
 
-def _selected_choice_seed(interaction, action: str) -> str:
-    match = _CHOICE_ACTION_RE.match(action or "")
-    if not match:
-        return ""
-    num = match.group("num")
+def _embed_title(embed) -> str:
+    if isinstance(embed, dict):
+        return str(embed.get("title") or "")
+    return str(getattr(embed, "title", "") or "")
+
+
+def _task_clarify_embed_from_interaction(interaction):
     msg = getattr(interaction, "message", None)
     for embed in getattr(msg, "embeds", []) or []:
+        title = _embed_title(embed)
         desc = _embed_description(embed)
-        for line in _CHOICE_LINE_RE.finditer(desc):
+        if title.startswith("🧭 Task Clarify") or "**可选下一步**" in desc or _CHOICE_LINE_RE.search(desc):
+            return embed
+    return None
+
+
+def _task_clarify_context(embed) -> str:
+    desc = _embed_description(embed).strip()
+    if "\n\n**可选下一步**" in desc:
+        return desc.split("\n\n**可选下一步**", 1)[0].strip()
+    return desc or "这个任务需要你选一个下一步。"
+
+
+def _task_clarify_choices(embed) -> list[dict]:
+    desc = _embed_description(embed)
+    choices = []
+    for line in _CHOICE_LINE_RE.finditer(desc):
+        choices.append({"label": line.group("label").strip(), "description": line.group("desc").strip()})
+    return choices[:3]
+
+
+def _thread_url_from_binding(interaction, *, thread_id: str = "", thread_url: str = "") -> str:
+    if thread_url:
+        return thread_url
+    if not thread_id:
+        return ""
+    guild = getattr(interaction, "guild", None) or getattr(getattr(interaction, "message", None), "guild", None)
+    guild_id = str(getattr(guild, "id", "") or "")
+    return f"https://discord.com/channels/{guild_id}/{thread_id}" if guild_id else ""
+
+
+def _selected_choice_from_interaction(interaction, action: str) -> dict:
+    match = _CHOICE_ACTION_RE.match(action or "")
+    if not match:
+        return {"seed": "", "text": "", "kind": action or ""}
+    num = match.group("num")
+    embed = _task_clarify_embed_from_interaction(interaction)
+    if embed is not None:
+        for line in _CHOICE_LINE_RE.finditer(_embed_description(embed)):
             if line.group("num") == num:
                 label = line.group("label").strip()
                 detail = line.group("desc").strip()
-                return f"Selected option: {num}. {label}\nChoice detail: {detail}"
-    return f"Selected option: {num}."
+                return {
+                    "seed": f"Selected option: {num}. {label}\nChoice detail: {detail}",
+                    "text": f"{label} — {detail}",
+                    "kind": action,
+                }
+    return {"seed": f"Selected option: {num}.", "text": f"{num}.", "kind": action}
+
+
+def _selected_choice_seed(interaction, action: str) -> str:
+    return _selected_choice_from_interaction(interaction, action).get("seed", "")
 
 
 def _card_state_from_page(page: dict) -> dict:
@@ -290,6 +356,114 @@ class NotionTaskController:
         card = task_card_embed(self._card_rows(tasks, done_of, state_of=state_of))
         return discord.Embed.from_dict(card) if card else None
 
+    def _short_button(self, action: str, page_id: str, *, row: int | None = None):
+        btn = build_button(action, page_id)
+        label = _TASK_CLARIFY_SHORT_LABELS.get(action)
+        if label:
+            try:
+                btn.item.label = label
+            except Exception:
+                pass
+        if row is not None:
+            try:
+                btn.row = row
+            except Exception:
+                pass
+            try:
+                btn.item.row = row
+            except Exception:
+                pass
+        return btn
+
+    def _task_clarify_view(self, page_id: str, *, thread_url: str = "", embed=None,
+                           selected: bool = False):
+        view = discord.ui.View(timeout=None)
+        if not selected:
+            choice_count = len(_task_clarify_choices(embed)) if embed is not None else 0
+            for idx in range(1, min(choice_count, 3) + 1):
+                view.add_item(self._short_button(f"choice{idx}", page_id, row=0))
+            if "Other" in _embed_description(embed) if embed is not None else False:
+                view.add_item(self._short_button("other", page_id, row=0))
+        if thread_url:
+            thread_btn = discord.ui.Button(
+                label=_TASK_CLARIFY_SHORT_LABELS["open_thread"],
+                style=getattr(discord.ButtonStyle, "link", 5),
+                url=thread_url,
+                row=1,
+            )
+            view.add_item(thread_btn)
+        else:
+            view.add_item(self._short_button("open_thread", page_id, row=1))
+        for action in ("snooze", "hold", "drop", "done"):
+            view.add_item(self._short_button(action, page_id, row=1))
+        return view
+
+    async def _edit_task_clarify_card(self, page_id: str, *, title: str, interaction,
+                                      thread_url: str = "", selected_choice_text: str = "",
+                                      followthrough_state: str = "continued") -> bool:
+        embed = _task_clarify_embed_from_interaction(interaction)
+        if embed is None:
+            return False
+        selected = bool(selected_choice_text)
+        card = {
+            "notionTaskId": page_id,
+            "notionTaskTitle": title,
+            "body": {"context": _task_clarify_context(embed)},
+            "primaryChoices": _task_clarify_choices(embed),
+            "otherChoice": {"enabled": "Other" in _embed_description(embed)},
+            "secondaryActions": list(_TASK_CLARIFY_SECONDARY_ACTIONS),
+            "threadUrl": thread_url,
+        }
+        if selected:
+            card["selectedChoice"] = {"text": selected_choice_text}
+            card["followthroughState"] = followthrough_state
+        view = self._task_clarify_view(page_id, thread_url=thread_url, embed=embed, selected=selected)
+        await _edit_interaction_message(
+            interaction,
+            embed=discord.Embed.from_dict(task_clarify_embed(card)),
+            view=view,
+        )
+        return True
+
+    def _persist_followthrough_state(self, page_id: str, *, interaction, choice_kind: str,
+                                     choice_text: str, thread_id: str, thread_url: str,
+                                     state: str) -> None:
+        msg = getattr(interaction, "message", None)
+        chan = getattr(msg, "channel", None)
+        user = getattr(interaction, "user", None)
+        try:
+            self.tracker.upsert_followthrough(
+                page_id,
+                message_id=str(getattr(msg, "id", "") or ""),
+                channel_id=str(getattr(chan, "id", "") or ""),
+                selected_by=str(getattr(user, "display_name", "") or getattr(user, "name", "") or getattr(user, "id", "") or ""),
+                choice_kind=choice_kind,
+                choice_text=choice_text,
+                thread_id=thread_id,
+                thread_url=thread_url,
+                state=state,
+            )
+        except Exception:
+            logger.warning("notion task: failed to persist follow-through state for %s", page_id, exc_info=True)
+
+    async def _dispatch_followthrough(self, *, interaction, thread_id: str, thread_name: str,
+                                      seed_extra: str) -> bool:
+        if not seed_extra:
+            return True
+        adapter = getattr(self, "adapter", None)
+        dispatch = getattr(adapter, "dispatch_task_followthrough", None)
+        if not callable(dispatch):
+            return True
+        text = "\n".join([
+            seed_extra,
+            "",
+            "等价用户消息：按这个方向继续。",
+        ]).strip()
+        result = dispatch(interaction, thread_id=thread_id, thread_name=thread_name, text=text)
+        if inspect.isawaitable(result):
+            await result
+        return True
+
     async def render_send_attachments(self, text: str):
         """(view, embed) to attach to an outgoing message, or (None, None).
 
@@ -471,7 +645,14 @@ class NotionTaskController:
             await self.handle_open_thread(page_id, interaction)
             return
         if _CHOICE_ACTION_RE.match(action or ""):
-            await self.handle_open_thread(page_id, interaction, seed_extra=_selected_choice_seed(interaction, action))
+            choice = _selected_choice_from_interaction(interaction, action)
+            await self.handle_open_thread(
+                page_id,
+                interaction,
+                seed_extra=choice.get("seed", ""),
+                selected_choice_text=choice.get("text", ""),
+                choice_kind=choice.get("kind", action),
+            )
             return
         if action == "other":
             await _send_interaction_notice(
@@ -601,7 +782,13 @@ class NotionTaskController:
         if len(direction) > 1000:
             direction = direction[:999] + "…"
         seed_extra = f"Selected option: Other\nCustom direction: {direction}"
-        await self.handle_open_thread(page_id, interaction, seed_extra=seed_extra)
+        await self.handle_open_thread(
+            page_id,
+            interaction,
+            seed_extra=seed_extra,
+            selected_choice_text=f"Other — {direction}",
+            choice_kind="other",
+        )
 
     async def _post_seed_to_existing_thread(self, *, thread_id: str, page_id: str, page: dict, seed_extra: str) -> bool:
         if not seed_extra or not self._fetch_channel or not thread_id:
@@ -625,7 +812,8 @@ class NotionTaskController:
             logger.warning("notion task: failed to post choice seed to existing thread %s: %s", thread_id, exc)
             return False
 
-    async def handle_open_thread(self, page_id: str, interaction, *, seed_extra: str = ""):
+    async def handle_open_thread(self, page_id: str, interaction, *, seed_extra: str = "",
+                                 selected_choice_text: str = "", choice_kind: str = "open_thread"):
         if not self._authorized(interaction):
             await interaction.response.send_message("你没有权限操作这个任务。", ephemeral=True)
             return
@@ -640,14 +828,59 @@ class NotionTaskController:
         binding = read_thread_binding(page)
         if binding.get("thread_id"):
             thread_id = str(binding["thread_id"])
+            thread_url = _thread_url_from_binding(
+                interaction,
+                thread_id=thread_id,
+                thread_url=str(binding.get("thread_url") or ""),
+            )
             seeded = await self._post_seed_to_existing_thread(
                 thread_id=thread_id,
                 page_id=page_id,
                 page=page,
                 seed_extra=seed_extra,
             )
-            suffix = "，已把选中策略贴到子区里。" if seeded else "。"
-            await _send_interaction_notice(interaction, f"已有子区：<#{thread_id}>{suffix}", ephemeral=True)
+            thread_name = detection.page_title(page)
+            if self._fetch_channel:
+                try:
+                    thread = await self._fetch_channel(thread_id)
+                    thread_name = str(getattr(thread, "name", "") or thread_name)
+                except Exception:
+                    logger.debug("notion task: could not fetch thread name for %s", thread_id, exc_info=True)
+            state = "continued"
+            if seed_extra:
+                try:
+                    await self._dispatch_followthrough(
+                        interaction=interaction,
+                        thread_id=thread_id,
+                        thread_name=thread_name,
+                        seed_extra=seed_extra,
+                    )
+                except Exception as exc:
+                    logger.warning("notion task: follow-through dispatch failed for %s: %s", page_id, exc, exc_info=True)
+                    state = "failed"
+            if selected_choice_text or choice_kind != "open_thread":
+                self._persist_followthrough_state(
+                    page_id,
+                    interaction=interaction,
+                    choice_kind=choice_kind,
+                    choice_text=selected_choice_text,
+                    thread_id=thread_id,
+                    thread_url=thread_url,
+                    state=state,
+                )
+            edited = await self._edit_task_clarify_card(
+                page_id,
+                title=detection.page_title(page),
+                interaction=interaction,
+                thread_url=thread_url,
+                selected_choice_text=selected_choice_text,
+                followthrough_state=state,
+            )
+            if state == "failed":
+                await _send_interaction_notice(interaction, "已记录选择，但接到子区继续失败。请进子区手动发一句继续。", ephemeral=True)
+            elif not edited:
+                suffix = "，已把选中策略贴到子区里。" if seeded else "。"
+                await _send_interaction_notice(interaction, f"已有子区：<#{thread_id}>{suffix}", ephemeral=True)
             return
 
         msg = getattr(interaction, "message", None)
@@ -685,7 +918,40 @@ class NotionTaskController:
             await _send_interaction_notice(interaction,
                 f"子区已创建 <#{thread_id}>，但 Notion 绑定失败：{exc}", ephemeral=True)
             return
-        await _send_interaction_notice(interaction, f"已打开任务子区：<#{thread_id}>", ephemeral=True)
+        state = "continued"
+        if seed_extra:
+            try:
+                await self._dispatch_followthrough(
+                    interaction=interaction,
+                    thread_id=thread_id,
+                    thread_name=str(result.get("thread_name") or title),
+                    seed_extra=seed_extra,
+                )
+            except Exception as exc:
+                logger.warning("notion task: follow-through dispatch failed for %s: %s", page_id, exc, exc_info=True)
+                state = "failed"
+        if selected_choice_text or choice_kind != "open_thread":
+            self._persist_followthrough_state(
+                page_id,
+                interaction=interaction,
+                choice_kind=choice_kind,
+                choice_text=selected_choice_text,
+                thread_id=thread_id,
+                thread_url=thread_url,
+                state=state,
+            )
+        edited = await self._edit_task_clarify_card(
+            page_id,
+            title=detection.page_title(page),
+            interaction=interaction,
+            thread_url=thread_url,
+            selected_choice_text=selected_choice_text,
+            followthrough_state=state,
+        )
+        if state == "failed":
+            await _send_interaction_notice(interaction, "已创建子区，但接到子区继续失败。请进子区手动发一句继续。", ephemeral=True)
+        elif not edited:
+            await _send_interaction_notice(interaction, f"已打开任务子区：<#{thread_id}>", ephemeral=True)
 
     async def handle_rename_thread(self, page_id: str, interaction):
         await interaction.response.send_message("子区改名候选的实现还在下一步接线。", ephemeral=True)

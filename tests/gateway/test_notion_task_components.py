@@ -299,3 +299,37 @@ class TestTaskClarifyCard:
         assert custom_ids[2] == f"ntask:v1:choice3:{self.PID}"
         assert custom_ids[3] == f"ntask:v1:other:{self.PID}"
         assert custom_ids[4] == f"ntask:v1:open_thread:{self.PID}"
+
+    def test_components_render_existing_thread_as_same_subthread_link_button(self):
+        card = self.card()
+        card["threadUrl"] = "https://discord.com/channels/147/999"
+
+        rows = c.task_clarify_components(card)
+
+        thread_button = rows[1]["components"][0]
+        assert thread_button["label"] == "🧵"
+        assert thread_button["style"] == 5
+        assert thread_button["url"] == "https://discord.com/channels/147/999"
+        assert "custom_id" not in thread_button
+        assert [b["label"] for b in rows[1]["components"]] == ["🧵", "⏰", "暂挂", "弃置", "✓"]
+
+    def test_selected_card_removes_primary_buttons_and_shows_choice_state(self):
+        card = self.card()
+        card["threadUrl"] = "https://discord.com/channels/147/999"
+        card["selectedChoice"] = {
+            "kind": "choice2",
+            "text": "先起草回复/材料 — 先在子区里起草，不直接发送。",
+        }
+        card["followthroughState"] = "continued"
+
+        embed = c.task_clarify_embed(card)
+        rows = c.task_clarify_components(card)
+
+        assert "已选择：先起草回复/材料" in embed["description"]
+        assert "状态：已在子区继续" in embed["description"]
+        labels = [b["label"] for row in rows for b in row["components"]]
+        assert labels == ["🧵", "⏰", "暂挂", "弃置", "✓"]
+        assert all(not str(b.get("custom_id", "")).startswith(f"ntask:v1:choice")
+                   for row in rows for b in row["components"])
+        assert all(b.get("custom_id") != f"ntask:v1:other:{self.PID}"
+                   for row in rows for b in row["components"])
