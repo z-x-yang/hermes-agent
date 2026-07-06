@@ -61,6 +61,37 @@ async def test_callback_routes_to_active_controller(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_other_callback_opens_freeform_modal(monkeypatch):
+    ctrl = SimpleNamespace(handle_action=AsyncMock())
+    monkeypatch.setattr(b, "get_active_controller", lambda: ctrl)
+    btn = b.build_button("other", PID)
+    interaction = SimpleNamespace(response=SimpleNamespace(send_modal=AsyncMock()))
+
+    await btn.callback(interaction)
+
+    interaction.response.send_modal.assert_awaited_once()
+    modal = interaction.response.send_modal.await_args.args[0]
+    assert isinstance(modal, b.OtherDirectionModal)
+    assert modal.page_id == PID
+    assert "自定义" in modal.title
+    assert modal.direction_input.label == "你想怎么处理？"
+    ctrl.handle_action.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_other_modal_submit_routes_custom_direction(monkeypatch):
+    ctrl = SimpleNamespace(handle_other_direction_submit=AsyncMock())
+    monkeypatch.setattr(b, "get_active_controller", lambda: ctrl)
+    modal = b.OtherDirectionModal(PID)
+    modal.direction_input._value = "先查旧邮件，再起草回复"
+    interaction = SimpleNamespace()
+
+    await modal.on_submit(interaction)
+
+    ctrl.handle_other_direction_submit.assert_awaited_once_with(PID, "先查旧邮件，再起草回复", interaction)
+
+
+@pytest.mark.asyncio
 async def test_callback_noop_when_no_controller(monkeypatch):
     monkeypatch.setattr(b, "get_active_controller", lambda: None)
     btn = b.build_button("undo", PID)

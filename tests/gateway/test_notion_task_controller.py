@@ -753,3 +753,56 @@ async def test_primary_choice_posts_strategy_seed_to_existing_thread():
     assert "Selected option: 1. 推荐：先开子区整理上下文" in sent
     assert "整理背景" in sent
     inter.response.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_other_direction_submit_opens_thread_with_custom_seed():
+    notion = SimpleNamespace(
+        get_page=AsyncMock(return_value=TASK_PAGE),
+        set_thread_binding_verified=AsyncMock(return_value=TASK_PAGE),
+    )
+    ctrl = _ctrl(notion)
+    adapter = SimpleNamespace(create_task_thread_from_message=AsyncMock(
+        return_value={"success": True, "thread_id": "889", "thread_name": "Reply to Alice"}))
+    ctrl.adapter = adapter
+    inter = _interaction(content=f"Task https://notion.so/{PID}")
+    inter.message.guild = SimpleNamespace(id="147")
+
+    await ctrl.handle_other_direction_submit(PID, "先查旧邮件，再起草回复", inter)
+
+    adapter.create_task_thread_from_message.assert_awaited_once()
+    seed = adapter.create_task_thread_from_message.await_args.kwargs["seed"]
+    assert "Selected option: Other" in seed
+    assert "Custom direction: 先查旧邮件，再起草回复" in seed
+    notion.set_thread_binding_verified.assert_awaited_once_with(
+        PID,
+        thread_id="889",
+        thread_url="https://discord.com/channels/147/889",
+        title_mode="auto",
+        title_version=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_other_direction_submit_posts_custom_seed_to_existing_thread():
+    bound_page = {**TASK_PAGE, "properties": {**TASK_PAGE["properties"],
+                  "Discord Thread ID": {"type": "rich_text", "rich_text": [{"plain_text": "777"}]}}}
+    notion = SimpleNamespace(get_page=AsyncMock(return_value=bound_page))
+    thread = SimpleNamespace(send=AsyncMock())
+
+    async def fetch_channel(channel_id):
+        assert channel_id == "777"
+        return thread
+
+    ctrl = _ctrl(notion, fetch_channel=fetch_channel)
+    ctrl.adapter = SimpleNamespace(create_task_thread_from_message=AsyncMock())
+    inter = _interaction(content=f"Task https://notion.so/{PID}")
+
+    await ctrl.handle_other_direction_submit(PID, "先查旧邮件，再起草回复", inter)
+
+    ctrl.adapter.create_task_thread_from_message.assert_not_awaited()
+    thread.send.assert_awaited_once()
+    sent = thread.send.await_args.args[0]
+    assert "Selected option: Other" in sent
+    assert "Custom direction: 先查旧邮件，再起草回复" in sent
+    inter.response.send_message.assert_awaited_once()

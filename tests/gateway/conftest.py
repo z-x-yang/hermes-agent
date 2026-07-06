@@ -189,6 +189,25 @@ def _ensure_discord_mock() -> None:
             self.description = description
     discord_mod.SelectOption = _FakeSelectOption
 
+    class _FakeModal(_FakeView):
+        def __init__(self, *, title=None, timeout=None, **_):
+            super().__init__(timeout=timeout)
+            self.title = title
+
+    class _FakeTextInput:
+        def __init__(self, *, label=None, placeholder=None, style=None, required=True,
+                     max_length=None, **_):
+            self.label = label
+            self.placeholder = placeholder
+            self.style = style
+            self.required = required
+            self.max_length = max_length
+            self._value = ""
+
+        @property
+        def value(self):
+            return self._value
+
     class _FakeDynamicItem:
         """Mock of discord.ui.DynamicItem (discord.py >= 2.4).
 
@@ -217,9 +236,12 @@ def _ensure_discord_mock() -> None:
         View=_FakeView,
         Select=_FakeSelect,
         Button=_FakeButton,
+        Modal=_FakeModal,
+        TextInput=_FakeTextInput,
         DynamicItem=_FakeDynamicItem,
         button=lambda *a, **k: (lambda fn: fn),
     )
+    discord_mod.TextStyle = SimpleNamespace(paragraph=2, short=1)
     discord_mod.ButtonStyle = SimpleNamespace(
         success=1, primary=2, secondary=2, danger=3,
         green=1, grey=2, blurple=2, red=3,

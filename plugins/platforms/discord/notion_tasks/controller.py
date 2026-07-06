@@ -593,6 +593,16 @@ class NotionTaskController:
         """V0 lightweight Hold: explicit button click parks the task in Notion."""
         await self.handle_hold_confirm(page_id, "manual_hold", None, interaction)
 
+    async def handle_other_direction_submit(self, page_id: str, direction: str, interaction):
+        direction = str(direction or "").strip()
+        if not direction:
+            await _send_interaction_notice(interaction, "没有收到自定义方向，未创建/更新子区。", ephemeral=True)
+            return
+        if len(direction) > 1000:
+            direction = direction[:999] + "…"
+        seed_extra = f"Selected option: Other\nCustom direction: {direction}"
+        await self.handle_open_thread(page_id, interaction, seed_extra=seed_extra)
+
     async def _post_seed_to_existing_thread(self, *, thread_id: str, page_id: str, page: dict, seed_extra: str) -> bool:
         if not seed_extra or not self._fetch_channel or not thread_id:
             return False

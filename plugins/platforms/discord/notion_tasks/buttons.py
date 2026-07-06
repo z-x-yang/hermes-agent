@@ -7,6 +7,7 @@ must be static there).
 """
 from __future__ import annotations
 
+import inspect
 import logging
 
 import discord
@@ -16,6 +17,29 @@ from .registry import get_active_controller
 from .snooze import snooze_choices
 
 logger = logging.getLogger(__name__)
+
+
+class OtherDirectionModal(discord.ui.Modal):
+    def __init__(self, page_id: str):
+        super().__init__(title="自定义执行方向", timeout=None)
+        self.page_id = page_id
+        self.direction_input = discord.ui.TextInput(
+            label="你想怎么处理？",
+            placeholder="比如：先查旧邮件，再起草回复；或者先整理父任务背景。",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=1000,
+        )
+        self.add_item(self.direction_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ctrl = get_active_controller()
+        if ctrl is None:
+            logger.warning("notion task Other modal submitted but no active controller")
+            await interaction.response.send_message("功能暂不可用，请稍后再试。", ephemeral=True)
+            return
+        direction = str(getattr(self.direction_input, "value", "") or "").strip()
+        await ctrl.handle_other_direction_submit(self.page_id, direction, interaction)
 
 
 class TaskActionButton(discord.ui.DynamicItem[discord.ui.Button], template=CUSTOM_ID_RE):
@@ -53,6 +77,15 @@ class TaskActionButton(discord.ui.DynamicItem[discord.ui.Button], template=CUSTO
                 await interaction.response.send_message("功能暂不可用，请稍后再试。", ephemeral=True)
             except Exception:
                 logger.exception("notion task: failed to send no-controller fallback response")
+            return
+        if self.action == "other":
+            send_modal = getattr(getattr(interaction, "response", None), "send_modal", None)
+            if not callable(send_modal):
+                await interaction.response.send_message("当前客户端不能打开自定义输入框。", ephemeral=True)
+                return
+            result = send_modal(OtherDirectionModal(self.page_id))
+            if inspect.isawaitable(result):
+                await result
             return
         await ctrl.handle_action(self.action, self.page_id, interaction)
 
