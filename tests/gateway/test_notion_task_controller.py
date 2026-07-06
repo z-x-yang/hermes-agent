@@ -693,3 +693,63 @@ async def test_open_thread_returns_existing_binding_without_creating():
     adapter.create_task_thread_from_message.assert_not_awaited()
     inter.response.send_message.assert_awaited_once()
     assert "<#777>" in inter.response.send_message.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_primary_choice_opens_thread_with_selected_strategy_seed():
+    notion = SimpleNamespace(
+        get_page=AsyncMock(return_value=TASK_PAGE),
+        set_thread_binding_verified=AsyncMock(return_value=TASK_PAGE),
+    )
+    ctrl = _ctrl(notion)
+    adapter = SimpleNamespace(create_task_thread_from_message=AsyncMock(
+        return_value={"success": True, "thread_id": "888", "thread_name": "Reply to Alice"}))
+    ctrl.adapter = adapter
+    inter = _interaction(content=f"Task https://notion.so/{PID}")
+    inter.message.guild = SimpleNamespace(id="147")
+    inter.message.embeds = [SimpleNamespace(
+        description="1. **推荐：先开子区整理上下文** — 整理背景。\n2. **先起草回复/材料** — 先在子区里起草，不直接发送。\n3. **先梳理执行图** — 整理依赖。"
+    )]
+
+    await ctrl.handle_action("choice2", PID, inter)
+
+    adapter.create_task_thread_from_message.assert_awaited_once()
+    seed = adapter.create_task_thread_from_message.await_args.kwargs["seed"]
+    assert "Selected option: 2. 先起草回复/材料" in seed
+    assert "不直接发送" in seed
+    notion.set_thread_binding_verified.assert_awaited_once_with(
+        PID,
+        thread_id="888",
+        thread_url="https://discord.com/channels/147/888",
+        title_mode="auto",
+        title_version=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_primary_choice_posts_strategy_seed_to_existing_thread():
+    bound_page = {**TASK_PAGE, "properties": {**TASK_PAGE["properties"],
+                  "Discord Thread ID": {"type": "rich_text", "rich_text": [{"plain_text": "777"}]}}}
+    notion = SimpleNamespace(get_page=AsyncMock(return_value=bound_page))
+    thread = SimpleNamespace(send=AsyncMock())
+
+    async def fetch_channel(channel_id):
+        assert channel_id == "777"
+        return thread
+
+    ctrl = _ctrl(notion, fetch_channel=fetch_channel)
+    adapter = SimpleNamespace(create_task_thread_from_message=AsyncMock())
+    ctrl.adapter = adapter
+    inter = _interaction(content=f"Task https://notion.so/{PID}")
+    inter.message.embeds = [SimpleNamespace(
+        description="1. **推荐：先开子区整理上下文** — 整理背景。\n2. **先起草回复/材料** — 先在子区里起草，不直接发送。"
+    )]
+
+    await ctrl.handle_action("choice1", PID, inter)
+
+    adapter.create_task_thread_from_message.assert_not_awaited()
+    thread.send.assert_awaited_once()
+    sent = thread.send.await_args.args[0]
+    assert "Selected option: 1. 推荐：先开子区整理上下文" in sent
+    assert "整理背景" in sent
+    inter.response.send_message.assert_awaited_once()

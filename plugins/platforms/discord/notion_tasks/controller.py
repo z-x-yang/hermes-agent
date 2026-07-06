@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import re
 from datetime import datetime
 from typing import Any
 
@@ -62,6 +63,32 @@ def _hold_due_label(page: dict) -> str | None:
         return datetime.fromisoformat(start).strftime("%m/%d %H:%M")
     except Exception:
         return start[:16]
+
+
+_CHOICE_ACTION_RE = re.compile(r"^choice(?P<num>[123])$")
+_CHOICE_LINE_RE = re.compile(r"(?m)^\s*(?P<num>[123])\.\s+\*\*(?P<label>[^*]+)\*\*\s+—\s+(?P<desc>[^\n]+)")
+
+
+def _embed_description(embed) -> str:
+    if isinstance(embed, dict):
+        return str(embed.get("description") or "")
+    return str(getattr(embed, "description", "") or "")
+
+
+def _selected_choice_seed(interaction, action: str) -> str:
+    match = _CHOICE_ACTION_RE.match(action or "")
+    if not match:
+        return ""
+    num = match.group("num")
+    msg = getattr(interaction, "message", None)
+    for embed in getattr(msg, "embeds", []) or []:
+        desc = _embed_description(embed)
+        for line in _CHOICE_LINE_RE.finditer(desc):
+            if line.group("num") == num:
+                label = line.group("label").strip()
+                detail = line.group("desc").strip()
+                return f"Selected option: {num}. {label}\nChoice detail: {detail}"
+    return f"Selected option: {num}."
 
 
 def _card_state_from_page(page: dict) -> dict:
@@ -443,6 +470,16 @@ class NotionTaskController:
         if action == "open_thread":
             await self.handle_open_thread(page_id, interaction)
             return
+        if _CHOICE_ACTION_RE.match(action or ""):
+            await self.handle_open_thread(page_id, interaction, seed_extra=_selected_choice_seed(interaction, action))
+            return
+        if action == "other":
+            await _send_interaction_notice(
+                interaction,
+                "你可以直接回复你的自定义方向；我会按你的话继续，而不是执行 1/2/3。",
+                ephemeral=True,
+            )
+            return
         if action == "rename_thread":
             await self.handle_rename_thread(page_id, interaction)
             return
@@ -556,7 +593,29 @@ class NotionTaskController:
         """V0 lightweight Hold: explicit button click parks the task in Notion."""
         await self.handle_hold_confirm(page_id, "manual_hold", None, interaction)
 
-    async def handle_open_thread(self, page_id: str, interaction):
+    async def _post_seed_to_existing_thread(self, *, thread_id: str, page_id: str, page: dict, seed_extra: str) -> bool:
+        if not seed_extra or not self._fetch_channel or not thread_id:
+            return False
+        seed = "\n".join([
+            f"Task: {detection.page_title(page)}",
+            f"Notion: https://app.notion.com/p/{page_id}",
+            seed_extra,
+            "Next action: 从这里继续处理这个任务。",
+        ])
+        try:
+            thread = await self._fetch_channel(thread_id)
+            send = getattr(thread, "send", None)
+            if not callable(send):
+                return False
+            result = send(seed)
+            if inspect.isawaitable(result):
+                await result
+            return True
+        except Exception as exc:
+            logger.warning("notion task: failed to post choice seed to existing thread %s: %s", thread_id, exc)
+            return False
+
+    async def handle_open_thread(self, page_id: str, interaction, *, seed_extra: str = ""):
         if not self._authorized(interaction):
             await interaction.response.send_message("你没有权限操作这个任务。", ephemeral=True)
             return
@@ -570,7 +629,15 @@ class NotionTaskController:
         from .threading import generate_thread_title, read_thread_binding
         binding = read_thread_binding(page)
         if binding.get("thread_id"):
-            await _send_interaction_notice(interaction, f"已有子区：<#{binding['thread_id']}>", ephemeral=True)
+            thread_id = str(binding["thread_id"])
+            seeded = await self._post_seed_to_existing_thread(
+                thread_id=thread_id,
+                page_id=page_id,
+                page=page,
+                seed_extra=seed_extra,
+            )
+            suffix = "，已把选中策略贴到子区里。" if seeded else "。"
+            await _send_interaction_notice(interaction, f"已有子区：<#{thread_id}>{suffix}", ephemeral=True)
             return
 
         msg = getattr(interaction, "message", None)
@@ -580,11 +647,14 @@ class NotionTaskController:
             return
 
         title = generate_thread_title(page)
-        seed = "\n".join([
+        seed_lines = [
             f"Task: {detection.page_title(page)}",
             f"Notion: https://app.notion.com/p/{page_id}",
-            "Next action: 从这里继续处理这个任务。",
-        ])
+        ]
+        if seed_extra:
+            seed_lines.append(seed_extra)
+        seed_lines.append("Next action: 从这里继续处理这个任务。")
+        seed = "\n".join(seed_lines)
         result = await adapter.create_task_thread_from_message(msg, name=title, seed=seed)
         if not result.get("success"):
             await _send_interaction_notice(interaction, f"创建子区失败：{result.get('error')}", ephemeral=True)

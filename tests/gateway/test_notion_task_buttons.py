@@ -35,6 +35,9 @@ def test_build_button_styles_and_labels():
     assert snooze.item.custom_id == f"ntask:v1:snooze:{PID}"
     assert b.build_button("open_thread", PID).item.custom_id == f"ntask:v1:open_thread:{PID}"
     assert b.build_button("drop", PID).item.custom_id == f"ntask:v1:drop:{PID}"
+    assert b.build_button("choice1", PID).item.label == "1."
+    assert b.build_button("choice2", PID).item.custom_id == f"ntask:v1:choice2:{PID}"
+    assert b.build_button("other", PID).item.label == "Other"
 
 
 def test_build_button_numbered_label():

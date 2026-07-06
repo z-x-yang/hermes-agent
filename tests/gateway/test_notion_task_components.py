@@ -247,3 +247,55 @@ class TestButtonRowPacking:
     def test_pack_group_rows_rejects_oversized_or_overflow(self):
         assert c.pack_group_rows([6]) is None        # one group > 5 per row
         assert c.pack_group_rows([1] * 26) is None    # can't fit in 5 rows
+
+
+# ===========================================================================
+# Task Clarify Card — 1/2/3 are intelligent choices, routine controls separate
+# ===========================================================================
+
+class TestTaskClarifyCard:
+    PID = "a" * 32
+
+    def card(self):
+        return {
+            "notionTaskId": self.PID,
+            "notionTaskUrl": f"https://www.notion.so/{self.PID}",
+            "notionTaskTitle": "Paper reply task",
+            "body": {
+                "context": "**这是什么**：合作者回了论文修改意见\n**为什么现在推**：邮件生成了 task\n**不会发生什么**：不会自动发邮件"
+            },
+            "primaryChoices": [
+                {"label": "推荐：先开子区整理上下文", "description": "整理邮件背景、Notion task、关键链接和第一步。"},
+                {"label": "先起草回复/材料", "description": "先在子区里起草，不直接发送。"},
+                {"label": "先梳理执行图", "description": "整理父子任务、依赖和下一步顺序。"},
+            ],
+            "otherChoice": {"enabled": True, "label": "Other / 我自己说"},
+            "secondaryActions": [
+                {"action": "open_thread", "label": "打开/继续子区"},
+                {"action": "snooze", "label": "稍后提醒"},
+                {"action": "hold", "label": "暂挂"},
+                {"action": "drop", "label": "弃置"},
+                {"action": "done", "label": "已完成"},
+            ],
+        }
+
+    def test_embed_puts_long_choice_text_in_body(self):
+        embed = c.task_clarify_embed(self.card())
+        assert embed["title"] == "🧭 Task Clarify · Paper reply task"
+        assert "**这是什么**" in embed["description"]
+        assert "1. **推荐：先开子区整理上下文** — 整理邮件背景" in embed["description"]
+        assert "2. **先起草回复/材料**" in embed["description"]
+        assert "3. **先梳理执行图**" in embed["description"]
+        assert "Snooze" not in embed["description"]
+
+    def test_components_keep_primary_buttons_numeric_and_secondary_separate(self):
+        rows = c.task_clarify_components(self.card())
+        labels = [b["label"] for row in rows for b in row["components"]]
+        assert labels[:4] == ["1.", "2.", "3.", "Other"]
+        assert labels[4:] == ["🧵", "⏰", "暂挂", "弃置", "✓"]
+        custom_ids = [b["custom_id"] for row in rows for b in row["components"]]
+        assert custom_ids[0] == f"ntask:v1:choice1:{self.PID}"
+        assert custom_ids[1] == f"ntask:v1:choice2:{self.PID}"
+        assert custom_ids[2] == f"ntask:v1:choice3:{self.PID}"
+        assert custom_ids[3] == f"ntask:v1:other:{self.PID}"
+        assert custom_ids[4] == f"ntask:v1:open_thread:{self.PID}"

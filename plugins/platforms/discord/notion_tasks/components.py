@@ -11,7 +11,7 @@ carry only a number, and per-task state renders inside the card.
 """
 from __future__ import annotations
 
-_ACTIONS = "done|undo|snooze|hold|drop|resume|open_thread|rename_thread"
+_ACTIONS = "done|undo|snooze|hold|drop|resume|open_thread|rename_thread|choice1|choice2|choice3|other"
 CUSTOM_ID_RE = rf"ntask:(?:v1:)?(?P<action>{_ACTIONS}):(?P<page_id>[0-9a-f]{{32}})"
 
 # Legacy full-text labels. Only used when no number is available — i.e. the
@@ -22,6 +22,10 @@ LABEL_UNDO = "↩︎ 撤销"
 LABEL_SNOOZE = "⏰ 稍后提醒"
 
 _ACTION_MARK = {
+    "choice1": "1.",
+    "choice2": "2.",
+    "choice3": "3.",
+    "other": "Other",
     "done": "✓",
     "undo": "↩",
     "snooze": "⏰",
@@ -32,6 +36,10 @@ _ACTION_MARK = {
     "rename_thread": "改名",
 }
 _LEGACY_LABEL = {
+    "choice1": "1.",
+    "choice2": "2.",
+    "choice3": "3.",
+    "other": "Other",
     "done": LABEL_DONE,
     "undo": LABEL_UNDO,
     "snooze": LABEL_SNOOZE,
@@ -54,6 +62,10 @@ _DESC_MAX = 4096
 # Discord button styles: 1 = blurple (primary), 2 = grey (secondary),
 # 3 = green (success), 4 = red (danger).
 _STYLE_BY_ACTION = {
+    "choice1": 1,
+    "choice2": 2,
+    "choice3": 2,
+    "other": 2,
     "done": 3,
     "undo": 2,
     "snooze": 2,
@@ -62,6 +74,16 @@ _STYLE_BY_ACTION = {
     "resume": 1,
     "open_thread": 1,
     "rename_thread": 2,
+}
+
+_PRIMARY_CHOICE_ACTIONS = ("choice1", "choice2", "choice3")
+_ROUTINE_ACTIONS = {"open_thread", "snooze", "hold", "drop", "done"}
+_SHORT_LABEL_BY_ROUTINE_ACTION = {
+    "open_thread": "🧵",
+    "snooze": "⏰",
+    "hold": "暂挂",
+    "drop": "弃置",
+    "done": "✓",
 }
 
 # Discord limits: max 5 action rows per message, max 5 buttons per row.
@@ -143,6 +165,100 @@ def task_card_embed(rows: list[dict]) -> dict | None:
     card_title = "📋 任务" if not done_n else f"📋 任务 · {done_n}/{len(rows)} 已完成"
     return {"title": card_title, "description": desc, "color": 0x4E8CD8,
             "footer": {"text": "点下方对应编号的按钮操作"}}
+
+
+def _clean_text(value, default: str = "") -> str:
+    text = str(value or "").strip()
+    return text or default
+
+
+def _compact_page_id(value: str | None) -> str:
+    chars = "".join(ch for ch in str(value or "") if ch.lower() in "0123456789abcdef")
+    return chars[-32:] if len(chars) >= 32 else ""
+
+
+def _task_clarify_page_id(card: dict) -> str:
+    return _compact_page_id(card.get("notionTaskId") or card.get("page_id") or card.get("notionTaskUrl"))
+
+
+def _task_clarify_title(card: dict) -> str:
+    title = _clean_text(card.get("notionTaskTitle") or card.get("title"), "Task")
+    if len(title) > 90:
+        title = title[:89] + "…"
+    return title
+
+
+def _choice_lines(choices: list[dict]) -> list[str]:
+    lines: list[str] = []
+    for idx, choice in enumerate((choices or [])[:3], start=1):
+        label = _clean_text(choice.get("label"), f"选项 {idx}")
+        description = _clean_text(choice.get("description"), "选择后我会在任务子区里按这个方向继续。")
+        lines.append(f"{idx}. **{label}** — {description}")
+    return lines
+
+
+def task_clarify_embed(card: dict) -> dict:
+    """Render a Discord-native task decision card.
+
+    The long explanation and the actual 1/2/3 choice text live in the embed
+    body. Buttons stay short (`1.`, `2.`, `3.`, `Other`) for mobile Discord.
+    Routine controls are intentionally not listed as main choices.
+    """
+    title = _task_clarify_title(card)
+    body = card.get("body") or {}
+    context = _clean_text(body.get("context") or card.get("context"), "**这是什么**：任务需要你选择下一步。")
+    lines = [context]
+    choice_lines = _choice_lines(list(card.get("primaryChoices") or []))
+    if choice_lines:
+        lines.extend(["", "**可选下一步**", *choice_lines, "", "Other：你也可以直接写自己的方向。"])
+    desc = "\n".join(lines)
+    if len(desc) > _DESC_MAX:
+        desc = desc[: _DESC_MAX - 1] + "…"
+    return {
+        "title": f"🧭 Task Clarify · {title}",
+        "description": desc,
+        "color": 0xE0A15D,
+        "footer": {"text": "1/2/3 是智能建议；Snooze/Hold/Dropped/Done 在二级操作"},
+    }
+
+
+def _raw_button(action: str, page_id: str, label: str, *, style: int | None = None) -> dict:
+    if action not in _ACTION_MARK:
+        raise ValueError(f"unknown task button action: {action!r}")
+    return {
+        "type": 2,
+        "style": style if style is not None else _STYLE_BY_ACTION[action],
+        "label": label,
+        "custom_id": make_custom_id(action, page_id),
+    }
+
+
+def task_clarify_components(card: dict) -> list[dict]:
+    """Raw Discord component rows for a Task Clarify card.
+
+    Row 1 contains only main strategy choices plus Other. Routine controls live
+    in the following row so they never consume the 1/2/3 choice slots.
+    """
+    page_id = _task_clarify_page_id(card)
+    if not page_id:
+        return []
+    primary: list[dict] = []
+    for idx, action in enumerate(_PRIMARY_CHOICE_ACTIONS, start=1):
+        if len(card.get("primaryChoices") or []) >= idx:
+            primary.append(_raw_button(action, page_id, f"{idx}."))
+    if (card.get("otherChoice") or {}).get("enabled", True):
+        primary.append(_raw_button("other", page_id, "Other"))
+    rows = []
+    if primary:
+        rows.append({"type": 1, "components": primary[:_MAX_PER_ROW]})
+    secondary = []
+    for item in list(card.get("secondaryActions") or []):
+        action = _clean_text(item.get("action"))
+        if action in _ROUTINE_ACTIONS:
+            secondary.append(_raw_button(action, page_id, _SHORT_LABEL_BY_ROUTINE_ACTION[action]))
+    if secondary:
+        rows.append({"type": 1, "components": secondary[:_MAX_PER_ROW]})
+    return rows
 
 
 def button_component(action: str, page_id: str, num: int | None = None) -> dict:
