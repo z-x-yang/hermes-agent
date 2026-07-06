@@ -25,7 +25,7 @@ sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
 sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
-from agent.context_compressor import ContextCompressor
+from agent.context_compressor import CheapToolResultCleanupConfig, ContextCompressor
 
 
 def _make_compressor():
@@ -64,6 +64,8 @@ def _make_compressor():
     c.last_compression_rough_tokens = 0
     c.last_rough_tokens_when_real_prompt_fit = 0
     c.awaiting_real_usage_after_compression = False
+    c.cheap_tool_result_cleanup = CheapToolResultCleanupConfig()
+    c._reset_cheap_tool_cleanup_audit()
     return c
 
 

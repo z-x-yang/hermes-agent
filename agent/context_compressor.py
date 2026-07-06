@@ -1696,10 +1696,93 @@ class ContextCompressor(ContextEngine):
 
         return row_id_int, None
 
+    def _persisted_tool_rows_by_call_id(
+        self,
+    ) -> tuple[dict[str, list[dict[str, Any]]] | None, str | None]:
+        """Build one active-session tool row lookup for missing-id recovery."""
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "") or ""
+        if not session_db or not session_id:
+            return None, "missing_row_id"
+
+        getter = getattr(session_db, "get_messages", None)
+        if getter is None:
+            return None, "missing_row_id"
+
+        try:
+            rows = getter(session_id)
+        except (sqlite3.Error, TypeError, ValueError):
+            return None, "unverified_row_id"
+        except Exception:
+            return None, "unverified_row_id"
+        if not isinstance(rows, list):
+            return None, "unverified_row_id"
+
+        by_call_id: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if row.get("role") != "tool":
+                continue
+            tool_call_id = row.get("tool_call_id")
+            if not tool_call_id:
+                continue
+            try:
+                if int(row.get("id") or 0) <= 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            by_call_id.setdefault(str(tool_call_id), []).append(row)
+        return by_call_id, None
+
+    def _resolve_missing_persisted_tool_row_id(
+        self,
+        msg: dict[str, Any],
+        persisted_tool_rows_by_call_id: dict[str, list[dict[str, Any]]] | None,
+        lookup_failure_reason: str | None,
+    ) -> tuple[int | None, str | None]:
+        """Recover a persisted tool row id for live cached messages lacking ``id``.
+
+        Gateway/CLI live histories are in-memory OpenAI-format messages; they
+        can be faithfully persisted in ``state.db`` while the cached dicts still
+        lack the SQLite row id.  Cheap cleanup must not trust synthetic ids, but
+        when a bound SessionDB has exactly one active tool row with the same
+        tool_call_id we can recover the durable row id and still pass it through
+        the normal validation path before emitting a model-visible handle.
+        """
+        tool_call_id = msg.get("tool_call_id")
+        if not tool_call_id:
+            return None, "missing_row_id"
+        if lookup_failure_reason:
+            return None, lookup_failure_reason
+        if persisted_tool_rows_by_call_id is None:
+            return None, "missing_row_id"
+
+        candidates = list(persisted_tool_rows_by_call_id.get(str(tool_call_id), []))
+        if not candidates:
+            return None, "missing_row_id"
+        if len(candidates) > 1:
+            expected_content = msg.get("content")
+            exact_content_matches = [
+                row for row in candidates if row.get("content") == expected_content
+            ]
+            if len(exact_content_matches) == 1:
+                candidates = exact_content_matches
+            else:
+                return None, "ambiguous_row_id"
+
+        try:
+            return int(candidates[0].get("id") or 0), None
+        except (TypeError, ValueError):
+            return None, "unverified_row_id"
+
     def _cheap_tool_result_replacement(
         self,
         msg: dict[str, Any],
         index: int,
+        *,
+        persisted_tool_rows_by_call_id: dict[str, list[dict[str, Any]]] | None = None,
+        lookup_failure_reason: str | None = None,
     ) -> tuple[str, str, str | None]:
         session_id = getattr(self, "_session_id", "") or ""
         row_id = msg.get("id")
@@ -1712,7 +1795,18 @@ class ContextCompressor(ContextEngine):
                 row_id_int = 0
 
         if row_id_int <= 0:
-            return "sentinel", _CLAUDE_TOOL_RESULT_CLEARED_SENTINEL, "missing_row_id"
+            resolved_row_id, fallback_reason = self._resolve_missing_persisted_tool_row_id(
+                msg,
+                persisted_tool_rows_by_call_id,
+                lookup_failure_reason,
+            )
+            if resolved_row_id is None or resolved_row_id <= 0:
+                return (
+                    "sentinel",
+                    _CLAUDE_TOOL_RESULT_CLEARED_SENTINEL,
+                    fallback_reason or "missing_row_id",
+                )
+            row_id_int = resolved_row_id
 
         validated_row_id, fallback_reason = self._validated_persisted_tool_row_id(
             msg,
@@ -1791,10 +1885,28 @@ class ContextCompressor(ContextEngine):
             return CheapToolResultCleanupResult(messages, False, base_audit)
 
         replacements: list[tuple[int, dict[str, Any], str, str, str | None]] = []
+        persisted_tool_rows_by_call_id: dict[str, list[dict[str, Any]]] | None = None
+        lookup_failure_reason: str | None = None
+
+        def _has_positive_row_id(message: dict[str, Any]) -> bool:
+            try:
+                return int(message.get("id") or 0) > 0
+            except (TypeError, ValueError):
+                return False
+
+        if any(not _has_positive_row_id(msg) for _index, msg in clear_candidates):
+            persisted_tool_rows_by_call_id, lookup_failure_reason = (
+                self._persisted_tool_rows_by_call_id()
+            )
         tokens_saved = 0
         for index, msg in clear_candidates:
             replacement_type, replacement_content, fallback_reason = (
-                self._cheap_tool_result_replacement(msg, index)
+                self._cheap_tool_result_replacement(
+                    msg,
+                    index,
+                    persisted_tool_rows_by_call_id=persisted_tool_rows_by_call_id,
+                    lookup_failure_reason=lookup_failure_reason,
+                )
             )
             old_tokens = estimate_messages_tokens_rough([msg])
             new_msg = {**msg, "content": replacement_content}

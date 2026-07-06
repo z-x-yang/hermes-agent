@@ -165,6 +165,90 @@ def test_persisted_handle_points_to_existing_message_row(tmp_path):
     assert any(msg.get("content") == raw_tool_output for msg in archived_window["window"])
 
 
+def test_persisted_handle_resolves_missing_row_id_from_bound_session_db(tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    session_id = db.create_session("cheap-cleanup-test", "cli")
+    raw_tool_output = "recover me without live row id " + ("x" * 4000)
+    raw_messages = [
+        {"role": "user", "content": "start"},
+        _assistant_call("old-1"),
+        _tool("old-1", raw_tool_output),
+    ]
+    db.replace_messages(session_id, raw_messages)
+    loaded = db.get_messages(session_id)
+    persisted_tool_row = next(msg for msg in loaded if msg.get("role") == "tool")
+    live_tool_msg = dict(persisted_tool_row)
+    live_tool_msg.pop("id", None)
+
+    cfg = CheapToolResultCleanupConfig(enabled=True, keep_recent=0, min_tokens_saved=1)
+    c = _compressor(cheap_tool_result_cleanup=cfg)
+    c.bind_session_state(session_db=db, session_id=session_id)
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "start"},
+        _assistant_call("old-1"),
+        live_tool_msg,
+        {"role": "user", "content": "tail user"},
+    ]
+
+    result = c._cleanup_old_tool_results(messages, summarize_start=2, compress_end=4)
+
+    cleaned_content = result.messages[3]["content"]
+    assert f"hermes://session/{session_id}/message/{persisted_tool_row['id']}" in cleaned_content
+    assert "session_search(" in cleaned_content
+    assert raw_tool_output not in cleaned_content
+    assert result.audit["replacement_counts"] == {"persisted_handle": 1, "sentinel": 0}
+    assert result.audit["sentinel_fallback_reasons"] == {}
+
+
+def test_missing_row_id_lookup_is_built_once_per_cleanup_pass(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    session_id = db.create_session("cheap-cleanup-test", "cli")
+    raw_messages = [
+        {"role": "user", "content": "start"},
+        _assistant_call("old-1"),
+        _tool("old-1", "first recoverable " + ("x" * 4000)),
+        _assistant_call("old-2"),
+        _tool("old-2", "second recoverable " + ("y" * 4000)),
+    ]
+    db.replace_messages(session_id, raw_messages)
+    loaded = db.get_messages(session_id)
+    live_messages = []
+    for msg in loaded:
+        live_msg = dict(msg)
+        live_msg.pop("id", None)
+        live_messages.append(live_msg)
+
+    get_messages_calls = 0
+    original_get_messages = db.get_messages
+
+    def counted_get_messages(*args, **kwargs):
+        nonlocal get_messages_calls
+        get_messages_calls += 1
+        return original_get_messages(*args, **kwargs)
+
+    monkeypatch.setattr(db, "get_messages", counted_get_messages)
+    cfg = CheapToolResultCleanupConfig(enabled=True, keep_recent=0, min_tokens_saved=1)
+    c = _compressor(cheap_tool_result_cleanup=cfg)
+    c.bind_session_state(session_db=db, session_id=session_id)
+    messages = [
+        {"role": "system", "content": "sys"},
+        *live_messages,
+        {"role": "user", "content": "tail user"},
+    ]
+
+    result = c._cleanup_old_tool_results(messages, summarize_start=2, compress_end=6)
+
+    assert get_messages_calls == 1
+    assert result.audit["replacement_counts"] == {"persisted_handle": 2, "sentinel": 0}
+    assert result.audit["sentinel_fallback_reasons"] == {}
+
+
+
 def test_cleanup_uses_sentinel_when_row_id_is_not_in_bound_session_db(tmp_path):
     from hermes_state import SessionDB
 
@@ -453,7 +537,24 @@ def test_hard_message_limit_triggers_do_not_use_cleanup_only(monkeypatch, trigge
     assert audit["cheap_tool_result_cleanup"]["llm_summary_skipped_after_cleanup"] is False
 
 
-def test_manual_compress_does_not_use_cleanup_only(monkeypatch):
+def test_manual_compress_resolves_missing_row_ids_to_persisted_handles(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    session_id = db.create_session("cheap-cleanup-test", "cli")
+    raw_tool_output = "MANUAL_RAW_TOOL_OUTPUT_SHOULD_BE_HANDLE " * 300
+    raw_messages = [
+        {"role": "user", "content": "start"},
+        _assistant_call("old-1"),
+        _tool("old-1", raw_tool_output),
+    ]
+    db.replace_messages(session_id, raw_messages)
+    persisted_tool_row = next(
+        msg for msg in db.get_messages(session_id) if msg.get("role") == "tool"
+    )
+    live_tool_msg = dict(persisted_tool_row)
+    live_tool_msg.pop("id", None)
+
     cfg = CheapToolResultCleanupConfig(
         enabled=True,
         keep_recent=0,
@@ -462,11 +563,11 @@ def test_manual_compress_does_not_use_cleanup_only(monkeypatch):
     )
     c = _compressor(cheap_tool_result_cleanup=cfg)
     c.tail_token_budget = 1
-    c.bind_session_state(session_db=None, session_id="sess-1")
-    called = {"summary": False}
+    c.bind_session_state(session_db=db, session_id=session_id)
+    captured = {}
 
     def fake_generate(turns, focus_topic=None):
-        called["summary"] = True
+        captured["serialized"] = c._serialize_for_summary(turns)
         return "## Current Work\n- manual summary\n"
 
     monkeypatch.setattr(c, "_generate_summary", fake_generate)
@@ -475,7 +576,7 @@ def test_manual_compress_does_not_use_cleanup_only(monkeypatch):
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "start"},
         _assistant_call("old-1"),
-        _tool("old-1", "x" * 220_000, row_id=11),
+        live_tool_msg,
         {"role": "assistant", "content": "bridge before protected tail"},
         {"role": "user", "content": "tail user"},
         {"role": "assistant", "content": "tail assistant"},
@@ -483,4 +584,14 @@ def test_manual_compress_does_not_use_cleanup_only(monkeypatch):
 
     c.compress(messages, current_tokens=80_000, force=True, trigger_reason="manual")
 
-    assert called["summary"] is True
+    persisted_uri = f"hermes://session/{session_id}/message/{persisted_tool_row['id']}"
+    assert persisted_uri in captured["serialized"]
+    assert "MANUAL_RAW_TOOL_OUTPUT_SHOULD_BE_HANDLE" not in captured["serialized"]
+    audit = c._last_compression_audit_record
+    assert audit is not None
+    assert audit["result"] != "cheap_cleanup_only"
+    block = audit["cheap_tool_result_cleanup"]
+    assert block["result"] == "summary_on_cleaned_view"
+    assert block["replacement_counts"] == {"persisted_handle": 1, "sentinel": 0}
+    assert block["sentinel_fallback_reasons"] == {}
+    assert block["raw_tool_results_restored_for_summary"] is False
