@@ -284,6 +284,7 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 # compressor speaks in.  Used when accumulating message "content length"
 # for tail-cut decisions.
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
+_TAIL_BUDGET_SOFT_CEILING_MULTIPLIER = 1.5
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 3
 _SUMMARY_TRANSIENT_FAILURE_COOLDOWN_SECONDS = 3
 # Quota/usage-wall cooldown. Codex/ChatGPT quota walls can be cleared manually
@@ -412,22 +413,22 @@ def _content_length_for_budget(raw_content: Any) -> int:
 
 
 def _estimate_msg_budget_tokens(msg: dict) -> int:
-    """Token estimate for one message in the tail-protection budget walks.
+    """Token estimate for one message in tail-protection budget walks.
 
-    Counts the message content plus the **full** ``tool_call`` envelope —
-    ``id``, ``type``, ``function.name`` and JSON structure — not just
-    ``function.arguments``.  Counting only the arguments string undercounted
-    assistant turns that fan out into parallel tool calls by 2-15x (a
-    4-tool-call turn measures ~73 vs ~1,090 real tokens), so the protected
-    tail overshot ``tail_token_budget`` and compression became ineffective.
-    See issue #28053.
+    Tail selection must use a ceiling estimate that is at least as conservative
+    as the audit/provider-ish rough message estimate.  Older logic counted only
+    content plus a small role overhead, so long runs of small tool-result rows
+    could look cheap during selection but later show up in the audit as a
+    1.6-1.7x tail-budget overshoot.  Keep the explicit content/tool-call walk as
+    a floor for multimodal and tool-call-heavy turns, then cap against the same
+    rough estimator used by retained-tail audit accounting.
     """
     content_len = _content_length_for_budget(msg.get("content") or "")
     tokens = content_len // _CHARS_PER_TOKEN + 10  # +10 for role/key overhead
     for tc in msg.get("tool_calls") or []:
         if isinstance(tc, dict):
             tokens += len(str(tc)) // _CHARS_PER_TOKEN
-    return tokens
+    return max(tokens, estimate_messages_tokens_rough([msg]))
 
 
 def _content_text_for_contains(content: Any) -> str:
@@ -2203,6 +2204,13 @@ class ContextCompressor(ContextEngine):
         after_messages: list[Dict[str, Any]] | None = None,
         retained_tail_messages: list[Dict[str, Any]] | None = None,
         retained_tail_raw_messages: list[Dict[str, Any]] | None = None,
+        trigger_reason: str | None = None,
+        trigger_token_source: str | None = None,
+        trigger_tokens: int | None = None,
+        trigger_threshold_tokens: int | None = None,
+        trigger_context_length: int | None = None,
+        trigger_message_count: int | None = None,
+        trigger_hard_message_limit: int | None = None,
     ) -> dict[str, Any]:
         """Build one content-free compression audit record."""
         saved_estimate = None
@@ -2252,6 +2260,37 @@ class ContextCompressor(ContextEngine):
         if after_messages is None:
             message_accounting["after"]["message_count"] = int(output_messages)
             message_accounting["after"]["tokens_estimate"] = after_estimate
+
+        message_before_estimate = message_accounting["before"].get("tokens_estimate")
+        message_after_estimate = message_accounting["after"].get("tokens_estimate")
+        message_saved_estimate = None
+        if message_before_estimate is not None and message_after_estimate is not None:
+            message_saved_estimate = int(message_before_estimate) - int(message_after_estimate)
+        trigger_vs_message_before_delta = None
+        if before_estimate is not None and message_before_estimate is not None:
+            trigger_vs_message_before_delta = int(before_estimate) - int(message_before_estimate)
+
+        trigger_record = {
+            "reason": trigger_reason,
+            "token_source": trigger_token_source,
+            "tokens": int(trigger_tokens) if trigger_tokens is not None else before_estimate,
+            "threshold_tokens": (
+                int(trigger_threshold_tokens)
+                if trigger_threshold_tokens is not None else getattr(self, "threshold_tokens", None)
+            ),
+            "context_length": (
+                int(trigger_context_length)
+                if trigger_context_length is not None else getattr(self, "context_length", None)
+            ),
+            "message_count": (
+                int(trigger_message_count)
+                if trigger_message_count is not None else int(input_messages)
+            ),
+            "hard_message_limit": (
+                int(trigger_hard_message_limit)
+                if trigger_hard_message_limit is not None else None
+            ),
+        }
         return {
             "event": "context_compression",
             "schema_version": 1,
@@ -2268,6 +2307,7 @@ class ContextCompressor(ContextEngine):
             ),
             "output_row_ids": output_row_ids,
             "message_accounting": message_accounting,
+            "trigger": trigger_record,
             "previous_summary_chars": previous_summary_chars,
             "previous_summary_tokens": previous_summary_tokens,
             "new_summary_chars": new_summary_chars,
@@ -2290,8 +2330,10 @@ class ContextCompressor(ContextEngine):
                 "before_estimate": before_estimate,
                 "after_estimate": after_estimate,
                 "saved_estimate": saved_estimate,
-                "message_before_estimate": message_accounting["before"].get("tokens_estimate"),
-                "message_after_estimate": message_accounting["after"].get("tokens_estimate"),
+                "message_before_estimate": message_before_estimate,
+                "message_after_estimate": message_after_estimate,
+                "message_saved_estimate": message_saved_estimate,
+                "trigger_vs_message_before_delta": trigger_vs_message_before_delta,
                 "retained_tail_estimate": message_accounting["retained_tail"].get("tokens_estimate"),
                 "retained_tail_raw_estimate": message_accounting["retained_tail"].get("raw_tokens_estimate"),
                 "tail_budget_tokens": message_accounting["retained_tail"].get("tail_budget_tokens"),
@@ -4003,7 +4045,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             return message_floor_start
 
         target_tokens = max(1, int(int(token_budget) * _TAIL_BUDGET_MIN_UTILIZATION))
-        soft_ceiling = int(int(token_budget) * 1.5)
+        soft_ceiling = int(int(token_budget) * _TAIL_BUDGET_SOFT_CEILING_MULTIPLIER)
         accumulated = 0
         target_start = n
         for i in range(n - 1, head_end, -1):
@@ -4060,7 +4102,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # ``protect_last_n`` remains a minimum up to the cap; the cap avoids
         # preserving a whole run of bulky tool outputs on every compaction.
         min_tail = self._minimum_tail_message_count(messages, head_end)
-        soft_ceiling = int(token_budget * 1.5)
+        soft_ceiling = int(token_budget * _TAIL_BUDGET_SOFT_CEILING_MULTIPLIER)
         accumulated = 0
         cut_idx = n  # start from beyond the end
 
@@ -4136,7 +4178,20 @@ This compaction should PRIORITISE preserving all information related to the focu
     # Main compression entry point
     # ------------------------------------------------------------------
 
-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None, force: bool = False) -> List[Dict[str, Any]]:
+    def compress(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int = None,
+        focus_topic: str = None,
+        force: bool = False,
+        trigger_reason: str | None = None,
+        trigger_token_source: str | None = None,
+        trigger_tokens: int | None = None,
+        trigger_threshold_tokens: int | None = None,
+        trigger_context_length: int | None = None,
+        trigger_message_count: int | None = None,
+        trigger_hard_message_limit: int | None = None,
+    ) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:
@@ -4190,6 +4245,29 @@ This compaction should PRIORITISE preserving all information related to the focu
         n_messages = len(messages)
         original_messages = messages
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
+        if trigger_reason is None:
+            trigger_reason = (
+                "manual"
+                if force else "token_threshold"
+                if display_tokens >= getattr(self, "threshold_tokens", 0) else "auto_unknown"
+            )
+        if trigger_tokens is None:
+            trigger_tokens = display_tokens
+        if trigger_threshold_tokens is None:
+            trigger_threshold_tokens = getattr(self, "threshold_tokens", None)
+        if trigger_context_length is None:
+            trigger_context_length = getattr(self, "context_length", None)
+        if trigger_message_count is None:
+            trigger_message_count = n_messages
+        audit_trigger_kwargs = {
+            "trigger_reason": trigger_reason,
+            "trigger_token_source": trigger_token_source,
+            "trigger_tokens": trigger_tokens,
+            "trigger_threshold_tokens": trigger_threshold_tokens,
+            "trigger_context_length": trigger_context_length,
+            "trigger_message_count": trigger_message_count,
+            "trigger_hard_message_limit": trigger_hard_message_limit,
+        }
         # Source-fidelity invariant: the LLM summary must see raw turns for the
         # window it is asked to absorb.  The working ``messages`` view below may
         # prune old tool outputs and compact retained tail rows for provider/live
@@ -4214,6 +4292,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 after_estimate=display_tokens,
                 before_messages=original_messages,
                 after_messages=messages,
+                **audit_trigger_kwargs,
             ))
             return messages
 
@@ -4313,6 +4392,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 after_messages=messages,
                 retained_tail_messages=messages[compress_end:],
                 retained_tail_raw_messages=messages[compress_end:],
+                **audit_trigger_kwargs,
             ))
             return messages
 
@@ -4536,6 +4616,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 after_messages=output_messages,
                 retained_tail_messages=output_messages[compress_end:],
                 retained_tail_raw_messages=messages[compress_end:],
+                **audit_trigger_kwargs,
             ))
             return output_messages
 
@@ -4763,6 +4844,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             after_messages=compressed,
             retained_tail_messages=retained_tail_messages_for_audit,
             retained_tail_raw_messages=messages[compress_end:n_messages],
+            **audit_trigger_kwargs,
         ))
         self._write_user_message_ground_truth_audit()
 

@@ -400,6 +400,13 @@ def compress_context(
     task_id: str = "default",
     focus_topic: Optional[str] = None,
     force: bool = False,
+    trigger_reason: Optional[str] = None,
+    trigger_token_source: Optional[str] = None,
+    trigger_tokens: Optional[int] = None,
+    trigger_threshold_tokens: Optional[int] = None,
+    trigger_context_length: Optional[int] = None,
+    trigger_message_count: Optional[int] = None,
+    trigger_hard_message_limit: Optional[int] = None,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -584,7 +591,19 @@ def compress_context(
             setattr(agent.context_compressor, "_compression_audit_session_id", agent.session_id or None)
         except Exception:
             pass
-        compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, force=force)
+        compressed = agent.context_compressor.compress(
+            messages,
+            current_tokens=approx_tokens,
+            focus_topic=focus_topic,
+            force=force,
+            trigger_reason=trigger_reason,
+            trigger_token_source=trigger_token_source,
+            trigger_tokens=trigger_tokens,
+            trigger_threshold_tokens=trigger_threshold_tokens,
+            trigger_context_length=trigger_context_length,
+            trigger_message_count=trigger_message_count,
+            trigger_hard_message_limit=trigger_hard_message_limit,
+        )
     except TypeError:
         # Plugin context engine with strict signature that doesn't accept
         # focus_topic / force — fall back to calling without them.

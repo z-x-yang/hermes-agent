@@ -1410,6 +1410,65 @@ class TestTailToolOutputCompaction:
             if m.get("role") == "tool"
         )
 
+    def test_retained_tail_audit_respects_soft_ceiling_for_small_tool_pairs(self):
+        """Tail selection must cap the same token estimate the audit reports.
+
+        A long run of small assistant/tool pairs can look cheap to the old
+        content-only tail-budget walk while the audit/provider-ish rough payload
+        estimate is much larger because each tool result carries role/id/name
+        envelope overhead. The retained-tail audit must not report an unexplained
+        >1.5x soft-ceiling overshoot in that shape.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=10,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 1_000
+
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "middle answer"},
+        ]
+        for i in range(80):
+            call_id = f"call_small_{i}"
+            msgs.extend([
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "tool_name": "terminal",
+                    "content": "ok",
+                },
+            ])
+
+        records: list[dict] = []
+        with (
+            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
+            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
+            patch.object(c, "_write_compression_audit_record", side_effect=records.append),
+        ):
+            c.compress(msgs, current_tokens=90_000)
+
+        retained_tail = records[-1]["message_accounting"]["retained_tail"]
+        # Tool-pair boundary alignment can add a small atomic-group sliver over
+        # the exact 1.5x ceiling; the regression is the material 1.7x+ audit
+        # overshoot caused by using a cheaper selector estimate than the audit.
+        assert retained_tail["tokens_estimate"] <= int(c.tail_token_budget * 1.55)
+        assert retained_tail["token_share_of_tail_budget"] <= 1.55
+
     def test_compacted_tail_summary_failure_aborts_to_preserve_raw_source(self):
         """Do not persist compacted tail if the raw tail source was not summarized."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
@@ -2073,6 +2132,72 @@ class TestCompressionAuditLog:
         assert tail["tail_budget_tokens"] == c.tail_token_budget
         assert tail["token_share_of_tail_budget"] >= 0.8
         assert tail["tokens_estimate"] >= int(c.tail_token_budget * 0.8)
+
+    def test_audit_records_trigger_reason_and_separates_message_savings(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "agent.context_compressor.get_hermes_home",
+            lambda: tmp_path,
+            raising=False,
+        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=0,
+                protect_last_n=2,
+                quiet_mode=True,
+            )
+
+        before_messages = [
+            {"role": "user", "content": "old turn " + ("x" * 400)},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "latest ask"},
+            {"role": "assistant", "content": "latest answer"},
+        ]
+        after_messages = before_messages[-2:]
+
+        record = c._build_compression_audit_record(
+            result="success",
+            entrypoint="auto",
+            input_messages=401,
+            output_messages=2,
+            summary_start=0,
+            summary_end=2,
+            retained_tail_start=2,
+            before_estimate=153_039,
+            after_estimate=3_526,
+            before_messages=before_messages,
+            after_messages=after_messages,
+            retained_tail_messages=after_messages,
+            trigger_reason="message_count_hard_limit",
+            trigger_token_source="actual",
+            trigger_tokens=153_039,
+            trigger_threshold_tokens=231_200,
+            trigger_context_length=272_000,
+            trigger_message_count=401,
+            trigger_hard_message_limit=400,
+        )
+
+        assert record["trigger"] == {
+            "reason": "message_count_hard_limit",
+            "token_source": "actual",
+            "tokens": 153_039,
+            "threshold_tokens": 231_200,
+            "context_length": 272_000,
+            "message_count": 401,
+            "hard_message_limit": 400,
+        }
+        assert record["tokens"]["before_estimate"] == 153_039
+        assert record["tokens"]["message_before_estimate"] < 153_039
+        assert record["tokens"]["message_saved_estimate"] == (
+            record["tokens"]["message_before_estimate"]
+            - record["tokens"]["message_after_estimate"]
+        )
+        assert record["tokens"]["trigger_vs_message_before_delta"] == (
+            153_039 - record["tokens"]["message_before_estimate"]
+        )
 
     def test_message_accounting_does_not_count_user_role_summary_as_real_user(
         self, tmp_path, monkeypatch

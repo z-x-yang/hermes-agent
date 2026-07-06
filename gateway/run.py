@@ -11093,15 +11093,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _approx_tokens >= _compress_token_threshold
                     or _msg_count >= _HARD_MSG_LIMIT
                 )
+                _trigger_reason = None
+                if _approx_tokens >= _compress_token_threshold and _msg_count >= _HARD_MSG_LIMIT:
+                    _trigger_reason = "token_threshold_and_message_count_hard_limit"
+                elif _approx_tokens >= _compress_token_threshold:
+                    _trigger_reason = "token_threshold"
+                elif _msg_count >= _HARD_MSG_LIMIT:
+                    _trigger_reason = "message_count_hard_limit"
 
                 if _needs_compress:
                     logger.info(
                         "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
-                        "(threshold: %s%% of %s = %s tokens)",
+                        "(reason=%s; threshold: %s%% of %s = %s tokens; hard_message_limit=%s)",
                         _msg_count, f"{_approx_tokens:,}", _token_source,
+                        _trigger_reason,
                         int(_hyg_threshold_pct * 100),
                         f"{_hyg_context_length:,}",
                         f"{_compress_token_threshold:,}",
+                        f"{_HARD_MSG_LIMIT:,}",
                     )
 
                     _hyg_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
@@ -11149,6 +11158,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         lambda: _hyg_agent._compress_context(
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
+                                            trigger_reason=_trigger_reason,
+                                            trigger_token_source=_token_source,
+                                            trigger_tokens=_approx_tokens,
+                                            trigger_threshold_tokens=_compress_token_threshold,
+                                            trigger_context_length=_hyg_context_length,
+                                            trigger_message_count=_msg_count,
+                                            trigger_hard_message_limit=_HARD_MSG_LIMIT,
                                         ),
                                     )
 

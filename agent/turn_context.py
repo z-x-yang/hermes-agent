@@ -406,6 +406,12 @@ def build_turn_context(
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
+                    trigger_reason="token_threshold",
+                    trigger_token_source="preflight_estimate",
+                    trigger_tokens=_preflight_tokens,
+                    trigger_threshold_tokens=_compressor.threshold_tokens,
+                    trigger_context_length=_compressor.context_length,
+                    trigger_message_count=len(messages),
                 )
                 # Re-estimate now so size-only compression (same row count,
                 # lower token count — e.g. summarising tool outputs) is

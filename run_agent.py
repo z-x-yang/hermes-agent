@@ -5541,7 +5541,23 @@ class AIAgent:
         """
         return self.api_mode != "codex_responses"
 
-    def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None, force: bool = False) -> tuple:
+    def _compress_context(
+        self,
+        messages: list,
+        system_message: str,
+        *,
+        approx_tokens: int = None,
+        task_id: str = "default",
+        focus_topic: str = None,
+        force: bool = False,
+        trigger_reason: str = None,
+        trigger_token_source: str = None,
+        trigger_tokens: int = None,
+        trigger_threshold_tokens: int = None,
+        trigger_context_length: int = None,
+        trigger_message_count: int = None,
+        trigger_hard_message_limit: int = None,
+    ) -> tuple:
         """Forwarder — see ``agent.conversation_compression.compress_context``.
 
         ``force=True`` is passed by the manual ``/compress`` slash command
@@ -5554,6 +5570,13 @@ class AIAgent:
             self, messages, system_message,
             approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
             force=force,
+            trigger_reason=trigger_reason,
+            trigger_token_source=trigger_token_source,
+            trigger_tokens=trigger_tokens,
+            trigger_threshold_tokens=trigger_threshold_tokens,
+            trigger_context_length=trigger_context_length,
+            trigger_message_count=trigger_message_count,
+            trigger_hard_message_limit=trigger_hard_message_limit,
         )
 
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:

@@ -3074,6 +3074,12 @@ def run_conversation(
                             messages, system_message,
                             approx_tokens=approx_tokens,
                             task_id=effective_task_id,
+                            trigger_reason="provider_context_error",
+                            trigger_token_source="api_error_recovery",
+                            trigger_tokens=approx_tokens,
+                            trigger_threshold_tokens=getattr(compressor, "threshold_tokens", None),
+                            trigger_context_length=getattr(compressor, "context_length", None),
+                            trigger_message_count=len(messages),
                         )
                         conversation_history = conversation_history_after_compression(
                             agent, messages
@@ -3117,6 +3123,12 @@ def run_conversation(
                         messages, system_message,
                         approx_tokens=approx_tokens,
                         task_id=effective_task_id,
+                        trigger_reason="persistent_overload_self_heal",
+                        trigger_token_source="api_error_recovery",
+                        trigger_tokens=approx_tokens,
+                        trigger_threshold_tokens=getattr(agent.context_compressor, "threshold_tokens", None),
+                        trigger_context_length=getattr(agent.context_compressor, "context_length", None),
+                        trigger_message_count=len(messages),
                     )
                     # Compression created a new session — clear history so
                     # _flush_messages_to_session_db writes compressed messages
