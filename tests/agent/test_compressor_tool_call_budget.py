@@ -97,8 +97,9 @@ class TestTailCutAccountsForToolCalls:
         per_msg = _estimate_msg_budget_tokens(messages[-1])
         assert per_msg > 30  # sanity: a heavy turn is non-trivial once the envelope counts
 
-        # Budget sized so ~6 heavy turns fit under the 1.5x soft ceiling.
-        token_budget = int(per_msg * 6 / 1.5)
+        # Budget sized so about six heavy turns are needed to meet the
+        # configured tail token target.
+        token_budget = int(per_msg * 6)
         cut = compressor._find_tail_cut_by_tokens(messages, head_end=1, token_budget=token_budget)
         protected = len(messages) - cut
 

@@ -50,6 +50,23 @@ COMPACTION_STATUS_MARKER = "Compacting context"
 COMPACTION_STATUS = (
     f"🗜️ {COMPACTION_STATUS_MARKER} — summarizing earlier conversation so I can continue..."
 )
+_DB_PERSISTED_MARKER = "_db_persisted"
+
+
+def _clear_persistence_markers_for_continuation(messages: list[Any]) -> None:
+    """Make a post-rotation compressed transcript writable to the new child.
+
+    The live cached-gateway transcript may carry ``_db_persisted`` markers from
+    the parent session. Normally ``ContextCompressor.compress()`` returns fresh
+    dicts with those markers stripped, but a no-op/empty-window compression can
+    return the original list unchanged. In the legacy rotation path we first
+    flush the parent, then create the child; after that point the returned
+    transcript is the child's initial live context and must be flushed there
+    even if every row was already durable in the parent.
+    """
+    for msg in messages:
+        if isinstance(msg, dict):
+            msg.pop(_DB_PERSISTED_MARKER, None)
 
 
 def _compression_lock_holder(agent: Any) -> str:
@@ -851,6 +868,11 @@ def compress_context(
                         agent._session_db_created = True
                         raise
                     agent._session_db_created = True
+                    # The parent flush above uses the existing persistence markers
+                    # to avoid duplicating old rows. Once the child exists, reset
+                    # those markers on the continuation transcript so the normal
+                    # child-session flush writes the full compressed/no-op result.
+                    _clear_persistence_markers_for_continuation(compressed)
                     # Carry a persistent /goal onto the continuation session.
                     # Compression mints a fresh child id; load_goal does a flat
                     # per-session lookup with no parent walk, so without this an

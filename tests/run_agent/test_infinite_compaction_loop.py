@@ -1,17 +1,17 @@
 """Tests for the infinite compaction loop fix (issue #40803).
 
-When summary_target_ratio is large enough that the entire transcript fits
-within soft_ceiling, the backward walk in _find_tail_cut_by_tokens never
-breaks early.  Without the fix this produces either a no-op compression
-(compress_start >= compress_end) or a single-message compression whose
-summary-of-one overhead saves 0 tokens — both of which cause the
-compressor to fire on every subsequent turn with no progress.
+When the configured token target is larger than the available suffix,
+``_find_tail_cut_by_tokens`` falls back to the user/assistant message floor. If
+that floor consumes the whole non-head transcript, compression can become a
+no-op. Without an explicit ineffective-compression record, the compressor fires
+again on every subsequent turn with no progress.
 
 The fix adds two safeguards:
-1. _find_tail_cut_by_tokens: when the whole transcript fits in soft_ceiling,
-   re-walk with the raw (non-inflated) budget to find a meaningful cut.
-2. compress(): when compress_start >= compress_end, record the no-op as
-   an ineffective compression so should_compress() anti-thrashing fires.
+1. _find_tail_cut_by_tokens: if the suffix cannot meet the token target, do not
+   protect the whole transcript solely because the target is unreachable; use the
+   configured message floor.
+2. compress(): when compress_start >= compress_end, record the no-op as an
+   ineffective compression so should_compress() anti-thrashing fires.
 """
 
 from unittest.mock import patch, MagicMock
@@ -133,12 +133,12 @@ class TestCompressNoOpRegistersIneffective:
 
 
 # ---------------------------------------------------------------------------
-# Test: _find_tail_cut_by_tokens raw-budget fallback
+# Test: unreachable token target falls back to message floor
 # ---------------------------------------------------------------------------
 
-class TestTailCutRawBudgetFallback:
-    """When the entire transcript fits within soft_ceiling, the fix
-    re-walks with the raw budget to find a meaningful cut point."""
+class TestTailCutUnreachableTargetFallback:
+    """When the suffix cannot meet the token target, the message floor still
+    leaves a meaningful cut point when enough middle context exists."""
 
     def test_meaningful_cut_with_large_ratio(self):
         """With summary_target_ratio=0.45, _find_tail_cut_by_tokens still
@@ -185,7 +185,7 @@ class TestTailCutRawBudgetFallback:
             summary_target_ratio=0.45,
             config_context_length=96000,
         )
-        # Simulate the issue scenario: 16 messages, all fitting in soft_ceiling
+        # Simulate the issue scenario: 16 messages, token target unreachable
         messages = _build_session(8, words_per_turn=30)  # 17 messages
         head_end = comp._protect_head_size(messages)
         head_end = comp._align_boundary_forward(messages, head_end)

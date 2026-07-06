@@ -284,7 +284,9 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 # compressor speaks in.  Used when accumulating message "content length"
 # for tail-cut decisions.
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
-_TAIL_BUDGET_SOFT_CEILING_MULTIPLIER = 1.5
+# Keep per-message/tool-group tail selection atomic. There is no secondary
+# utilization floor: the configured tail token budget itself is the target, and
+# `protect_last_n` is enforced as a user/assistant-message floor.
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 3
 _SUMMARY_TRANSIENT_FAILURE_COOLDOWN_SECONDS = 3
 # Quota/usage-wall cooldown. Codex/ChatGPT quota walls can be cleared manually
@@ -304,24 +306,6 @@ _FALLBACK_TURN_MAX_CHARS = 700
 _AUTO_FOCUS_MAX_TURNS = 3
 _AUTO_FOCUS_TURN_MAX_CHARS = 260
 _AUTO_FOCUS_MAX_CHARS = 700
-# Protected-tail tool outputs are handled separately from the normal old-tool
-# pruning pass. Keep the newest result verbatim when older results can bring the
-# tail under budget; if the newest result alone is still too large, bound it with
-# a head/tail truncation marker instead of preserving an unbounded body.
-_TAIL_TOOL_OUTPUT_MIN_COMPACT_CHARS = 200
-_TAIL_TOOL_RESULTS_TO_KEEP_VERBATIM = 1
-_TAIL_TOOL_TRUNCATED_HEAD_CHARS = 3_500
-_TAIL_TOOL_TRUNCATED_TAIL_CHARS = 1_500
-# Keep a short run of recent messages verbatim even when the token budget is
-# already exhausted. A common live config uses protect_last_n=10 alongside a
-# 10% tail-token budget; the cap prevents preserving arbitrarily many bulky
-# tool-output rows, but must not undercut that configured 10-message floor.
-_MAX_TAIL_MESSAGE_FLOOR = 10
-# Try to use a meaningful fraction of the configured tail token budget before
-# relying on the handoff summary alone. This is a target floor when the suffix
-# contains enough safe raw context; source-fidelity/tool-boundary constraints may
-# still force a larger or smaller effective tail in pathological cases.
-_TAIL_BUDGET_MIN_UTILIZATION = 0.80
 
 # Non-visible assistant provider metadata that the compressor copies into the
 # retained head/tail verbatim. None of it is user-visible: it is per-turn
@@ -412,23 +396,98 @@ def _content_length_for_budget(raw_content: Any) -> int:
     return total
 
 
-def _estimate_msg_budget_tokens(msg: dict) -> int:
-    """Token estimate for one message in tail-protection budget walks.
+def _model_consumes_thought_signature_for_budget(model: Any) -> bool:
+    m = str(model or "").lower()
+    return "gemini" in m or "gemma" in m
 
-    Tail selection must use a ceiling estimate that is at least as conservative
-    as the audit/provider-ish rough message estimate.  Older logic counted only
-    content plus a small role overhead, so long runs of small tool-result rows
-    could look cheap during selection but later show up in the audit as a
-    1.6-1.7x tail-budget overshoot.  Keep the explicit content/tool-call walk as
-    a floor for multimodal and tool-call-heavy turns, then cap against the same
-    rough estimator used by retained-tail audit accounting.
+
+def _retained_provider_payload_message_for_budget(
+    msg: dict,
+    *,
+    provider_model: Any | None = None,
+) -> dict:
+    """Return the retained-tail message shape we expect the next API call to carry.
+
+    Tail budgeting should be based on the payload that survives compression and
+    provider-facing request assembly, not on internal session-store metadata.  The
+    full request builder is provider-specific and lives on ``AIAgent``; the
+    compressor only needs the stable retained-message subset:
+
+    * Bound non-visible retained metadata exactly like ``compress()`` does before
+      persistence (Codex replay blobs, bulky reasoning text, oversized tool-call
+      arguments).
+    * Drop fields that the chat-completions/Responses request paths strip or use
+      only internally: persistence markers, timestamps, finish reasons, FTS-only
+      ``tool_name``, and storage-only ``reasoning``.
+    * Preserve provider-visible conversation payload: role/content, assistant
+      ``tool_calls`` with bounded JSON arguments, tool_call_id, and any
+      ``reasoning_content`` placeholder required by thinking providers.
     """
-    content_len = _content_length_for_budget(msg.get("content") or "")
+    if not isinstance(msg, dict):
+        return msg
+
+    working = _fresh_compaction_message_copy(msg)
+    try:
+        bounded, _bounded_count = _bound_retained_nonvisible_metadata([working])
+        if bounded and isinstance(bounded[0], dict):
+            working = dict(bounded[0])
+    except Exception:
+        working = dict(working)
+
+    for key in [k for k in working if isinstance(k, str) and k.startswith("_")]:
+        working.pop(key, None)
+    for key in (
+        "finish_reason",
+        "timestamp",
+        "tool_name",
+        "reasoning",  # storage-only; request assembly promotes/strips separately
+        "codex_reasoning_items",
+        "codex_message_items",
+    ):
+        working.pop(key, None)
+
+    tool_calls = working.get("tool_calls")
+    if isinstance(tool_calls, list):
+        model_hint = provider_model if provider_model is not None else working.get("model")
+        strip_extra_content = not _model_consumes_thought_signature_for_budget(model_hint)
+        cleaned_calls: list[Any] = []
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                cleaned_calls.append(tc)
+                continue
+            cleaned = dict(tc)
+            cleaned.pop("call_id", None)
+            cleaned.pop("response_item_id", None)
+            if strip_extra_content:
+                cleaned.pop("extra_content", None)
+            cleaned_calls.append(cleaned)
+        working["tool_calls"] = cleaned_calls
+
+    return working
+
+
+def _estimate_msg_budget_tokens(
+    msg: dict,
+    *,
+    provider_model: Any | None = None,
+) -> int:
+    """Token estimate for one retained message in tail-protection budget walks.
+
+    The user-facing tail contract is about what survives into the next LLM API
+    payload after compression, not the raw session-row dict.  Estimate that
+    retained/provider-facing shape so oversized internal reasoning replay or
+    tool-call argument blobs do not make a tiny saved tail look like it used the
+    configured 10% tail budget.
+    """
+    budget_msg = _retained_provider_payload_message_for_budget(
+        msg, provider_model=provider_model
+    )
+    content_len = _content_length_for_budget(budget_msg.get("content") or "")
     tokens = content_len // _CHARS_PER_TOKEN + 10  # +10 for role/key overhead
-    for tc in msg.get("tool_calls") or []:
+    for tc in budget_msg.get("tool_calls") or []:
         if isinstance(tc, dict):
             tokens += len(str(tc)) // _CHARS_PER_TOKEN
-    return max(tokens, estimate_messages_tokens_rough([msg]))
+    return max(tokens, estimate_messages_tokens_rough([budget_msg]))
 
 
 def _content_text_for_contains(content: Any) -> str:
@@ -890,55 +949,15 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
     return f"[{tool_name}]{first_arg} ({content_len:,} chars result)"
 
 
-def _truncate_tail_tool_result(tool_name: str, tool_args: str, tool_content: str) -> str:
-    """Keep bounded head/tail evidence for a newest tool result.
-
-    The replacement must be strictly smaller than the original; otherwise this
-    "truncation" can make moderate tool outputs larger and leave compression
-    thrashing.
-    """
-    content = tool_content or ""
-    if len(content) <= _TAIL_TOOL_OUTPUT_MIN_COMPACT_CHARS:
-        return content
-    summary = _summarize_tool_result(tool_name, tool_args, content)
-    prefix = (
-        f"{summary}\n"
-        f"[Tool output truncated during context compaction: original {len(content):,} chars; "
-        "kept head/tail evidence.]\n"
-        "--- output head ---\n"
-    )
-    separator = "\n--- output tail ---\n"
-    max_total = len(content) - 1
-    fixed_len = len(prefix) + len(separator)
-
-    if fixed_len >= max_total:
-        return summary if len(summary) < len(content) else content[:max_total]
-
-    max_kept = max_total - fixed_len
-    tail_chars = 0
-    if max_kept > 200:
-        tail_chars = min(_TAIL_TOOL_TRUNCATED_TAIL_CHARS, max(100, max_kept // 3))
-    head_chars = min(_TAIL_TOOL_TRUNCATED_HEAD_CHARS, max_kept - tail_chars)
-    # If the static head cap left room unused, spend it on the tail; never
-    # exceed max_kept, so the final replacement remains smaller than content.
-    tail_chars = min(_TAIL_TOOL_TRUNCATED_TAIL_CHARS, max_kept - head_chars)
-
-    head = content[:head_chars].rstrip()
-    tail = content[-tail_chars:].lstrip() if tail_chars > 0 else ""
-    truncated = f"{prefix}{head}{separator}{tail}"
-    if len(truncated) >= len(content):
-        return summary if len(summary) < len(content) else content[:max_total]
-    return truncated
-
-
 class ContextCompressor(ContextEngine):
     """Default context engine — compresses conversation context via lossy summarization.
 
     Algorithm:
-      1. Prune old tool results (cheap, no LLM call)
-      2. Protect head messages (system prompt + first exchange)
-      3. Protect tail messages by token budget (most recent ~20K tokens)
-      4. Summarize middle turns with structured LLM prompt
+      1. Protect head messages (system prompt + configured first exchange)
+      2. Select retained tail by continuation-payload token target plus a
+         user/assistant message floor
+      3. Summarize middle turns with structured LLM prompt
+      4. Bound retained non-visible metadata before persistence/continuation
       5. On subsequent compactions, iteratively update the previous summary
     """
 
@@ -1520,7 +1539,12 @@ class ContextCompressor(ContextEngine):
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None,
     ) -> tuple[List[Dict[str, Any]], int]:
-        """Replace old tool result contents with informative 1-line summaries.
+        """Legacy helper: replace old tool result contents with 1-line summaries.
+
+        This helper is retained for direct legacy tests/backward-compatible utility
+        behavior only. The main ``compress()`` path does not call it because old
+        tool-result pruning must not influence retained-tail boundary selection
+        or protected tail content.
 
         Instead of a generic placeholder, generates a summary like::
 
@@ -1664,187 +1688,6 @@ class ContextCompressor(ContextEngine):
 
         return result, pruned
 
-    def _compact_tool_outputs_in_tail(
-        self,
-        messages: List[Dict[str, Any]],
-        tail_start: int,
-        tail_token_budget: int | None,
-        hard_tail_start: int | None = None,
-    ) -> tuple[List[Dict[str, Any]], int]:
-        """Shrink bulky tool result bodies that survived inside the protected tail.
-
-        This mirrors the narrow Codex behavior we want without changing the
-        larger Hermes compaction architecture: do not move boundaries, delete
-        messages, or break tool_call/tool_result pairing. Replace older
-        oversized ``role=tool`` content inside the already-selected tail with
-        the same one-line summaries used by the old-tool pruning pass. Keep the
-        newest tool result verbatim when possible, but if the selected tail is
-        still over budget, truncate that newest result to explicit head/tail
-        evidence instead of preserving an unbounded body.
-
-        ``hard_tail_start`` marks the recent-message floor that must stay raw in
-        the retained tail. Tool results whose required promotion would cross
-        that boundary are not compacted; otherwise source-fidelity promotion can
-        collapse the live tail below the floor.
-        """
-        if not messages or tail_token_budget is None or tail_token_budget <= 0:
-            return messages, 0
-        if tail_start < 0 or tail_start >= len(messages):
-            return messages, 0
-        if hard_tail_start is None:
-            hard_tail_start = len(messages)
-        else:
-            hard_tail_start = max(tail_start, min(len(messages), int(hard_tail_start)))
-
-        tail = messages[tail_start:]
-        if estimate_messages_tokens_rough(tail) <= tail_token_budget:
-            return messages, 0
-
-        result = [m.copy() for m in messages]
-        call_id_to_tool = self._build_tool_call_index(result)
-
-        tool_result_indexes: list[int] = []
-        compactable_tool_indexes: list[int] = []
-
-        def _promotion_end_for_tool_result(index: int) -> int:
-            end = index + 1
-            while end < len(result) and result[end].get("role") == "tool":
-                end += 1
-            return end
-
-        def _can_compact_without_eating_floor(index: int) -> bool:
-            return _promotion_end_for_tool_result(index) <= hard_tail_start
-
-        def _tool_content_is_compactable(content: Any) -> bool:
-            if isinstance(content, str):
-                return len(content) > _TAIL_TOOL_OUTPUT_MIN_COMPACT_CHARS
-            if isinstance(content, list):
-                return _strip_image_parts_from_parts(content) is not None
-            if isinstance(content, dict) and content.get("_multimodal"):
-                return True
-            return False
-
-        def _compact_tool_content(
-            content: Any,
-            tool_name: str,
-            tool_args: str,
-            *,
-            newest: bool,
-        ) -> tuple[Any, bool]:
-            if isinstance(content, list):
-                stripped = _strip_image_parts_from_parts(content)
-                return (stripped, True) if stripped is not None else (content, False)
-            if isinstance(content, dict) and content.get("_multimodal"):
-                summary = content.get("text_summary") or "[screenshot removed to save context]"
-                return f"[screenshot removed] {str(summary)[:200]}", True
-            if not isinstance(content, str):
-                return content, False
-            if len(content) <= _TAIL_TOOL_OUTPUT_MIN_COMPACT_CHARS:
-                return content, False
-            if newest:
-                compacted_content = _truncate_tail_tool_result(tool_name, tool_args, content)
-            else:
-                compacted_content = _summarize_tool_result(tool_name, tool_args, content)
-            return compacted_content, compacted_content != content
-
-        for i in range(tail_start, len(result)):
-            msg = result[i]
-            if msg.get("role") != "tool":
-                continue
-            tool_result_indexes.append(i)
-            if i >= hard_tail_start or not _can_compact_without_eating_floor(i):
-                continue
-            if _tool_content_is_compactable(msg.get("content", "")):
-                compactable_tool_indexes.append(i)
-
-        if not compactable_tool_indexes:
-            return messages, 0
-
-        keep_verbatim = {
-            i for i in tool_result_indexes[-_TAIL_TOOL_RESULTS_TO_KEEP_VERBATIM:]
-            if i < hard_tail_start and _can_compact_without_eating_floor(i)
-        }
-        compacted = 0
-        for i in compactable_tool_indexes:
-            if i in keep_verbatim:
-                continue
-            msg = result[i]
-            call_id = msg.get("tool_call_id", "")
-            tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
-            new_content, changed = _compact_tool_content(
-                msg.get("content", ""),
-                tool_name,
-                tool_args,
-                newest=False,
-            )
-            if not changed:
-                continue
-            result[i] = {**msg, "content": new_content}
-            compacted += 1
-            if estimate_messages_tokens_rough(result[tail_start:]) <= tail_token_budget:
-                break
-
-        if estimate_messages_tokens_rough(result[tail_start:]) > tail_token_budget:
-            for i in reversed(sorted(keep_verbatim)):
-                msg = result[i]
-                call_id = msg.get("tool_call_id", "")
-                tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
-                new_content, changed = _compact_tool_content(
-                    msg.get("content", ""),
-                    tool_name,
-                    tool_args,
-                    newest=True,
-                )
-                if not changed:
-                    continue
-                result[i] = {**msg, "content": new_content}
-                compacted += 1
-                if estimate_messages_tokens_rough(result[tail_start:]) <= tail_token_budget:
-                    break
-
-        return (result, compacted) if compacted else (messages, 0)
-
-    def _compacted_tail_tool_indices(
-        self,
-        raw_messages: List[Dict[str, Any]],
-        working_messages: List[Dict[str, Any]],
-        *,
-        tail_start: int,
-        summarized_start: int,
-        summarized_end: int,
-    ) -> list[int]:
-        """Return retained-tail tool-result indexes shortened in the working view.
-
-        A compaction summary must remain a chronological checkpoint: it may only
-        describe messages before the retained live tail.  Therefore, if a tool
-        result selected for the live tail is shortened, the fix is not to append
-        its raw source out-of-order to the summary input.  Instead the caller
-        promotes the tail boundary forward past the shortened tool result so the
-        raw message is summarized in chronological order and no shortened copy of
-        that tool remains in the retained tail.
-        """
-        if not raw_messages or not working_messages:
-            return []
-
-        existing = set(range(max(0, summarized_start), max(0, summarized_end)))
-        changed: list[int] = []
-        upper = min(len(raw_messages), len(working_messages))
-
-        for i in range(max(0, tail_start), upper):
-            if i in existing:
-                continue
-            raw_msg = raw_messages[i]
-            work_msg = working_messages[i]
-            if not isinstance(raw_msg, dict) or not isinstance(work_msg, dict):
-                continue
-            if raw_msg.get("role") != "tool" or work_msg.get("role") != "tool":
-                continue
-            if raw_msg.get("content") == work_msg.get("content"):
-                continue
-            changed.append(i)
-
-        return changed
-
     # ------------------------------------------------------------------
     # Summarization
     # ------------------------------------------------------------------
@@ -1925,6 +1768,9 @@ class ContextCompressor(ContextEngine):
     def _audit_message_stats(
         cls,
         messages: list[Dict[str, Any]] | None,
+        *,
+        provider_payload: bool = False,
+        provider_model: Any | None = None,
     ) -> dict[str, Any]:
         """Return content-free message/token/role accounting for audit logs."""
         safe_messages = [msg for msg in (messages or []) if isinstance(msg, dict)]
@@ -1939,7 +1785,13 @@ class ContextCompressor(ContextEngine):
         real_user_tokens = 0
         synthetic_user_tokens = 0
 
-        for msg in safe_messages:
+        for raw_msg in safe_messages:
+            msg = (
+                _retained_provider_payload_message_for_budget(
+                    raw_msg, provider_model=provider_model
+                )
+                if provider_payload else raw_msg
+            )
             role = cls._audit_role_key(msg.get("role"))
             role_counts[role] += 1
             msg_tokens = int(estimate_messages_tokens_rough([msg]) or 0)
@@ -2037,16 +1889,29 @@ class ContextCompressor(ContextEngine):
         retained_tail_messages: list[Dict[str, Any]] | None = None,
         retained_tail_raw_messages: list[Dict[str, Any]] | None = None,
         tail_budget_tokens: int | None = None,
+        tail_policy: dict[str, Any] | None = None,
+        tail_target_ratio: float | None = None,
+        provider_model: Any | None = None,
     ) -> dict[str, Any]:
         """Build detailed before/after/tail audit accounting without content."""
         before = cls._audit_message_stats(before_messages)
         after = cls._audit_message_stats(after_messages)
-        tail_output = cls._audit_message_stats(retained_tail_messages)
+        tail_output = cls._audit_message_stats(
+            retained_tail_messages,
+            provider_payload=True,
+            provider_model=provider_model,
+        )
         tail = dict(tail_output)
         raw_tail = cls._audit_message_stats(
             retained_tail_raw_messages
             if retained_tail_raw_messages is not None else retained_tail_messages
         )
+
+        budget_int = int(tail_budget_tokens) if tail_budget_tokens else None
+        token_target_met = bool(
+            budget_int is None or budget_int <= 0 or tail["tokens_estimate"] >= budget_int
+        )
+        policy = tail_policy or {}
 
         tail.update({
             "raw_message_count": raw_tail["message_count"],
@@ -2073,16 +1938,26 @@ class ContextCompressor(ContextEngine):
             "token_share_of_after": cls._audit_share(
                 tail["tokens_estimate"], after["tokens_estimate"]
             ),
-            "tail_budget_tokens": int(tail_budget_tokens) if tail_budget_tokens else None,
-            "tail_budget_min_utilization": _TAIL_BUDGET_MIN_UTILIZATION,
-            "tail_budget_target_tokens": (
-                int(int(tail_budget_tokens) * _TAIL_BUDGET_MIN_UTILIZATION)
-                if tail_budget_tokens else None
-            ),
+            "tail_budget_tokens": budget_int,
+            "tail_target_ratio": tail_target_ratio,
+            "tokens_estimate_scope": "continuation_api_payload",
+            "token_target_met": token_target_met,
             "token_share_of_tail_budget": cls._audit_share(
-                tail["tokens_estimate"], int(tail_budget_tokens) if tail_budget_tokens else None
+                tail["tokens_estimate"], budget_int
             ),
         })
+        for key in (
+            "token_boundary_start",
+            "message_floor_boundary_start",
+            "final_tail_start",
+            "user_assistant_message_floor",
+            "user_assistant_messages_retained",
+            "message_floor_met",
+            "selection_reason",
+            "tool_boundary_adjusted",
+        ):
+            if key in policy:
+                tail[key] = policy[key]
 
         return {
             "before": before,
@@ -2253,6 +2128,9 @@ class ContextCompressor(ContextEngine):
             retained_tail_messages=retained_tail_messages,
             retained_tail_raw_messages=retained_tail_raw_messages,
             tail_budget_tokens=getattr(self, "tail_token_budget", None),
+            tail_policy=getattr(self, "_last_tail_boundary_audit", None),
+            tail_target_ratio=getattr(self, "summary_target_ratio", None),
+            provider_model=getattr(self, "model", None),
         )
         if before_messages is None:
             message_accounting["before"]["message_count"] = int(input_messages)
@@ -2314,6 +2192,7 @@ class ContextCompressor(ContextEngine):
             "new_summary_tokens": new_summary_tokens,
             "tools": {
                 "pruned_before_boundary_count": int(pruned_count or 0),
+                "pruned_old_tool_results": int(pruned_count or 0),
                 "tail_compacted_count": int(tail_compacted_count or 0),
             },
             "tail_boundary_promoted": bool(tail_boundary_promoted),
@@ -4004,160 +3883,127 @@ This compaction should PRIORITISE preserving all information related to the focu
     # Tail protection by token budget
     # ------------------------------------------------------------------
 
-    def _minimum_tail_message_count(self, messages: List[Dict[str, Any]], head_end: int) -> int:
-        """Return the bounded hard floor of recent messages to keep live.
+    @classmethod
+    def _is_tail_floor_message(cls, msg: Dict[str, Any]) -> bool:
+        """Return true for real user/assistant rows counted by protect_last_n."""
+        role = msg.get("role")
+        if role not in {"user", "assistant"}:
+            return False
+        if cls._has_compressed_summary_metadata(msg):
+            return False
+        if role == "user" and cls._is_synthetic_retained_user_note(msg):
+            return False
+        return True
 
-        Token budget decides the preferred tail size, but this floor preserves a
-        small chronological continuation tail so boundary promotion for compacted
-        tail tools cannot collapse the live context to only one or two rows.
-        """
-        n = len(messages)
-        available_tail = max(0, n - head_end - 1)
-        min_tail_floor = max(3, min(self.protect_last_n, _MAX_TAIL_MESSAGE_FLOOR))
-        # Leave at least two non-head messages available to summarize on short
-        # transcripts; otherwise compression can replace a tiny middle with a
-        # summary and save no messages at all.
-        compressible_tail_cap = max(3, available_tail - 2)
-        return (
-            min(min_tail_floor, compressible_tail_cap, available_tail)
-            if available_tail > 1 else 0
-        )
-
-    def _tail_budget_floor_start(
+    def _tail_message_floor_start(
         self,
         messages: List[Dict[str, Any]],
         head_end: int,
-        token_budget: int | None = None,
-    ) -> int:
-        """Return earliest suffix start needed for the configured 80% tail floor.
+    ) -> tuple[int, int]:
+        """Return suffix start/count for the user/assistant message floor."""
+        needed = max(0, int(self.protect_last_n or 0))
+        if needed <= 0:
+            return len(messages), 0
 
-        If the available suffix cannot reach the target while still leaving a
-        useful summary window, fall back to the message-count floor. The returned
-        index is a *floor boundary*: tail compaction/promotion must not move the
-        final live tail to the right of it.
-        """
-        n = len(messages)
-        min_tail = self._minimum_tail_message_count(messages, head_end)
-        message_floor_start = n - min_tail if min_tail else n
-        if token_budget is None:
-            token_budget = self.tail_token_budget
-        if not token_budget or token_budget <= 0:
-            return message_floor_start
+        count = 0
+        start = len(messages)
+        for i in range(len(messages) - 1, head_end - 1, -1):
+            msg = messages[i]
+            if not isinstance(msg, dict):
+                continue
+            if self._is_tail_floor_message(msg):
+                count += 1
+                start = i
+                if count >= needed:
+                    break
 
-        target_tokens = max(1, int(int(token_budget) * _TAIL_BUDGET_MIN_UTILIZATION))
-        soft_ceiling = int(int(token_budget) * _TAIL_BUDGET_SOFT_CEILING_MULTIPLIER)
-        accumulated = 0
-        target_start = n
-        for i in range(n - 1, head_end, -1):
-            msg_tokens = _estimate_msg_budget_tokens(messages[i])
-            next_accumulated = accumulated + msg_tokens
-            if accumulated < target_tokens <= next_accumulated and next_accumulated > soft_ceiling:
-                # Reaching 80% would require pulling in a discrete oversized
-                # message/tool group that blows past even the same 1.5x soft
-                # ceiling used by the regular tail-budget walk. In that shape,
-                # keep the old message-count floor and let the tail tool
-                # compaction/source-fidelity path decide what can stay raw.
-                return message_floor_start
-            accumulated = next_accumulated
-            target_start = i
-            if accumulated >= target_tokens:
-                break
-
-        if accumulated < target_tokens:
-            return message_floor_start
-
-        target_start = self._align_boundary_backward(messages, target_start)
-        # Keep at least one message in the summary window; tiny transcripts that
-        # cannot satisfy both constraints use the bounded message floor instead.
-        if target_start <= head_end + 1:
-            return message_floor_start
-        return min(message_floor_start, target_start)
+        if count <= 0:
+            return len(messages), 0
+        start = self._align_boundary_backward(messages, start)
+        return max(start, head_end), count
 
     def _find_tail_cut_by_tokens(
         self, messages: List[Dict[str, Any]], head_end: int,
         token_budget: int | None = None,
     ) -> int:
-        """Walk backward from the end of messages, accumulating tokens until
-        the budget is reached. Returns the index where the tail starts.
+        """Return the retained-tail start using V2 continuation payload policy.
 
-        ``token_budget`` defaults to ``self.tail_token_budget`` which is
-        derived from ``summary_target_ratio * context_length``, so it
-        scales automatically with the model's context window.
-
-        Token budget is the primary criterion.  A bounded message-count floor
-        keeps a short run of recent turns verbatim even when the budget is
-        exhausted, but the budget is allowed to exceed by up to 1.5x to avoid
-        cutting inside an oversized message (tool output, file read, etc.). If
-        even that floor exceeds 1.5x the budget, the cut is placed right after
-        the head so compression still runs.
-
-        Never cuts inside a tool_call/result group. It does not anchor user or
-        assistant messages; active continuation is carried by the compaction
-        summary.
+        The configured token budget is the target. Walk backward until the
+        retained provider-payload estimate reaches that target, and separately
+        enforce ``protect_last_n`` as a floor over real user/assistant rows.
+        It does not anchor user or assistant messages by role alone; active continuation is carried by the compaction
+        summary and the selected provider-payload tail. The earlier boundary
+        wins. Tool-call/tool-result groups remain atomic.
         """
         if token_budget is None:
             token_budget = self.tail_token_budget
         n = len(messages)
-        # Hard minimum: always keep a bounded recent-message floor in the tail.
-        # ``protect_last_n`` remains a minimum up to the cap; the cap avoids
-        # preserving a whole run of bulky tool outputs on every compaction.
-        min_tail = self._minimum_tail_message_count(messages, head_end)
-        soft_ceiling = int(token_budget * _TAIL_BUDGET_SOFT_CEILING_MULTIPLIER)
-        accumulated = 0
-        cut_idx = n  # start from beyond the end
+        token_budget_int = int(token_budget or 0)
 
-        for i in range(n - 1, head_end - 1, -1):
-            msg = messages[i]
-            msg_tokens = _estimate_msg_budget_tokens(msg)
-            # Stop once we exceed the soft ceiling (unless we haven't hit min_tail yet)
-            if accumulated + msg_tokens > soft_ceiling and (n - i) >= min_tail:
-                break
-            accumulated += msg_tokens
-            cut_idx = i
-
-        # If the backward walk never broke early because the entire transcript
-        # fits within soft_ceiling, accumulated now holds the total transcript
-        # size. Without a meaningful split, the caller's compress_start >=
-        # compress_end guard either returns unchanged (no-op) or compresses a
-        # single message — both of which trigger the infinite compaction loop
-        # described in #40803.
-        #
-        # Fix: when the whole transcript fits in soft_ceiling, compute a
-        # meaningful cut point using the raw (non-inflated) budget so that
-        # compression actually summarizes a worthwhile middle section.
-        if cut_idx <= head_end and accumulated <= soft_ceiling and accumulated > 0:
-            # The entire compressable region fits in the soft ceiling.
-            # Re-walk with the raw budget (no 1.5x multiplier) to find a
-            # split that gives the summarizer something useful.
-            raw_budget = token_budget
-            raw_accumulated = 0
-            for j in range(n - 1, head_end - 1, -1):
-                raw_msg = messages[j]
-                raw_tok = _estimate_msg_budget_tokens(raw_msg)
-                if raw_accumulated + raw_tok > raw_budget and (n - j) >= min_tail:
-                    cut_idx = j
+        token_start = n
+        token_accumulated = 0
+        token_target_met = token_budget_int <= 0
+        provider_model = getattr(self, "model", None)
+        if token_budget_int > 0:
+            for i in range(n - 1, head_end - 1, -1):
+                msg = messages[i]
+                msg_tokens = (
+                    _estimate_msg_budget_tokens(msg, provider_model=provider_model)
+                    if isinstance(msg, dict) else 0
+                )
+                token_accumulated += msg_tokens
+                token_start = i
+                if token_accumulated >= token_budget_int:
+                    token_target_met = True
                     break
-                raw_accumulated += raw_tok
-                cut_idx = j
-            # If the raw-budget walk also consumed everything (very small
-            # transcript), fall through — the existing fallback logic below
-            # will still force a minimal cut after head_end.
+            if token_target_met:
+                token_start = self._align_boundary_backward(messages, token_start)
+            else:
+                # Small/manual compressions often have less total suffix context
+                # than the configured target. In that shape, do not let the token
+                # target protect everything; the user/assistant message floor is
+                # the only applicable tail constraint.
+                token_start = n
 
-        # Ensure we protect at least min_tail messages
-        fallback_cut = n - min_tail
-        cut_idx = min(cut_idx, fallback_cut)
+        message_start, _floor_count_seen = self._tail_message_floor_start(messages, head_end)
+        pre_align_final_start = min(token_start, message_start)
+        final_start = self._align_boundary_backward(messages, pre_align_final_start)
+        if final_start < head_end:
+            final_start = head_end
 
-        # If the token budget would protect everything (small conversations),
-        # force a cut after the head so compression can still remove middle turns.
-        if cut_idx <= head_end:
-            cut_idx = max(fallback_cut, head_end + 1)
+        final_tail = [m for m in messages[final_start:] if isinstance(m, dict)]
+        final_tokens = sum(
+            _estimate_msg_budget_tokens(m, provider_model=provider_model) for m in final_tail
+        )
+        floor_needed = max(0, int(self.protect_last_n or 0))
+        final_floor_count = sum(1 for m in final_tail if self._is_tail_floor_message(m))
+        token_met_final = bool(
+            token_budget_int <= 0 or final_tokens >= token_budget_int or final_start <= head_end
+        )
+        message_floor_met = bool(final_floor_count >= floor_needed) if floor_needed else True
+        if final_start == token_start == message_start:
+            selection_reason = "both"
+        elif final_start == message_start:
+            selection_reason = "message_floor"
+        elif final_start == token_start:
+            selection_reason = "token_target"
+        else:
+            selection_reason = "tool_boundary_alignment"
+        if final_start <= head_end and not final_tail:
+            selection_reason = "all_context_protected"
 
-        # Align to avoid splitting tool groups. User/assistant turns are no
-        # longer anchored into the tail; the nine-section summary carries the
-        # active continuation state.
-        cut_idx = self._align_boundary_backward(messages, cut_idx)
-
-        return max(cut_idx, head_end + 1)
+        self._last_tail_boundary_audit = {
+            "token_boundary_start": int(token_start),
+            "message_floor_boundary_start": int(message_start),
+            "final_tail_start": int(final_start),
+            "token_target_met": token_met_final and token_target_met,
+            "user_assistant_message_floor": int(floor_needed),
+            "user_assistant_messages_retained": int(final_floor_count),
+            "message_floor_met": message_floor_met,
+            "selection_reason": selection_reason,
+            "tool_boundary_adjusted": bool(final_start != pre_align_final_start),
+        }
+        return final_start
 
     # ------------------------------------------------------------------
     # ContextEngine: manual /compress preflight
@@ -4195,13 +4041,13 @@ This compaction should PRIORITISE preserving all information related to the focu
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:
-          1. Keep a raw source view for summary generation
-          2. Build a working/final view for tail budgeting and compaction
-          3. Find tail boundary by token budget (~20K tokens of recent context)
-          4. Summarize raw source turns with structured LLM prompt
-          5. Compact only retained/final live tail, absorbing compacted raw
-             sources into the summary before persistence
-          6. On re-compression, iteratively update the previous summary
+          1. Keep raw/source messages intact for summary generation
+          2. Find tail boundary using continuation-payload token target plus a
+             user/assistant message floor
+          3. Summarize raw source turns with structured LLM prompt
+          4. Assemble head + summary + raw tail and bound retained non-visible
+             metadata before persistence
+          5. On re-compression, iteratively update the previous summary
 
         After compression, orphaned tool_call / tool_result pairs are cleaned
         up so the API never receives mismatched IDs.
@@ -4221,6 +4067,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._last_summary_fallback_used = False
         self._last_summary_error = None
         self._last_summary_source_audit = {}
+        self._last_tail_boundary_audit = {}
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._last_compress_aborted = False
@@ -4270,9 +4117,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         }
         # Source-fidelity invariant: the LLM summary must see raw turns for the
         # window it is asked to absorb.  The working ``messages`` view below may
-        # prune old tool outputs and compact retained tail rows for provider/live
-        # budget, but ``raw_messages`` remains the restart-safe source material
-        # for any turn that is summarized during this compression.
+        # prune old tool outputs for the summarizer/live budget, but
+        # ``raw_messages`` remains the restart-safe source material for any turn
+        # that is summarized during this compression.
         raw_messages = [m.copy() if isinstance(m, dict) else m for m in messages]
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1
@@ -4296,71 +4143,23 @@ This compaction should PRIORITISE preserving all information related to the focu
             ))
             return messages
 
-        # Phase 1: Prune old tool results (cheap, no LLM call)
-        messages, pruned_count = self._prune_old_tool_results(
-            messages, protect_tail_count=self.protect_last_n,
-            protect_tail_tokens=self.tail_token_budget,
-        )
-        if pruned_count and not self.quiet_mode:
-            logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
+        # Phase 1: Keep the working transcript intact. Summary-source overflow is
+        # handled inside _serialize_for_summary(); main-flow old-tool pruning must
+        # not influence tail boundary or retained tail content.
+        pruned_count = 0
 
-        # Phase 2: Determine boundaries
+        # Phase 2: Determine boundaries. The configured token budget is the
+        # target, and protect_last_n is a floor over user/assistant messages.
         compress_start = self._protect_head_size(messages)
         compress_start = self._align_boundary_forward(messages, compress_start)
-
-        # Use token-budget tail protection instead of fixed message count. The
-        # budget floor asks for at least 80% of the configured tail budget when
-        # enough suffix context exists, while still keeping the bounded message
-        # floor as a fallback for small transcripts.
-        minimum_tail_messages = self._minimum_tail_message_count(messages, compress_start)
-        message_floor_start = n_messages - minimum_tail_messages if minimum_tail_messages else n_messages
-        hard_tail_start = self._tail_budget_floor_start(
-            messages,
-            compress_start,
-            self.tail_token_budget,
-        )
-        hard_tail_start = min(message_floor_start, hard_tail_start)
-        tail_budget_floor_active = hard_tail_start < message_floor_start
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
-        if tail_budget_floor_active and compress_end > hard_tail_start:
-            compress_end = hard_tail_start
 
-        # Codex-style narrow tail cleanup: if the selected protected tail is
-        # still too large because it contains bulky tool outputs, shrink older
-        # tool result bodies in-place while preserving message order and
-        # tool_call_id structure.  Recompute the boundary afterwards because the
-        # cheaper tail may allow a smaller verbatim tail. User/assistant turns
-        # are not pinned into the protected tail; continuation is summarized.
-        initial_tail_start = compress_end
+        tail_tool_compacted = 0
         tail_boundary_promoted = False
-        compacted_tail_tool_indices: list[int] = []
-        pre_tail_compaction_messages = messages
-        messages, tail_tool_compacted = self._compact_tool_outputs_in_tail(
-            messages,
-            tail_start=compress_end,
-            tail_token_budget=self.tail_token_budget,
-            hard_tail_start=hard_tail_start,
-        )
-        if tail_tool_compacted:
-            compacted_tail_tool_indices = self._compacted_tail_tool_indices(
-                raw_messages,
-                messages,
-                tail_start=initial_tail_start,
-                summarized_start=0,
-                summarized_end=0,
-            )
-            if not self.quiet_mode:
-                logger.info(
-                    "Pre-compression: compacted %d protected-tail tool result(s)",
-                    tail_tool_compacted,
-                )
-            compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
-            if tail_budget_floor_active and compress_end > hard_tail_start:
-                compress_end = hard_tail_start
 
         if compress_start >= compress_end:
-            # No compressable window — the entire transcript fits within
-            # the tail budget (soft_ceiling).  Without recording this as
+            # No compressable window — the policy-protected suffix consumes the
+            # available non-head transcript. Without recording this as
             # an ineffective compression the anti-thrashing guard in
             # should_compress() never fires and every subsequent turn
             # re-triggers a no-op compression loop.  (#40803)
@@ -4450,30 +4249,6 @@ This compaction should PRIORITISE preserving all information related to the focu
             # into the summarizer prompt via the iterative-update path.
             self._previous_summary = None
 
-        unabsorbed_compacted_tail_tool_indices = [
-            i for i in compacted_tail_tool_indices if i >= compress_end
-        ]
-        if unabsorbed_compacted_tail_tool_indices:
-            promoted_tail_end = max(unabsorbed_compacted_tail_tool_indices) + 1
-            while promoted_tail_end < n_messages and messages[promoted_tail_end].get("role") == "tool":
-                promoted_tail_end += 1
-            if promoted_tail_end > hard_tail_start:
-                # Defensive fallback: _compact_tool_outputs_in_tail should avoid
-                # compacting anything whose source-fidelity promotion would eat
-                # the hard recent-tail floor. If a future change violates that
-                # contract, drop the tail compaction rather than persisting a
-                # two-message tail or a shortened tool result with no chronological
-                # raw source in the summary.
-                messages = pre_tail_compaction_messages
-                tail_tool_compacted = 0
-                compacted_tail_tool_indices = []
-                unabsorbed_compacted_tail_tool_indices = []
-                compress_end = initial_tail_start
-            else:
-                compress_end = max(compress_end, promoted_tail_end)
-                tail_boundary_promoted = True
-                turns_to_summarize = raw_messages[summarize_start:compress_end]
-
         turns_to_summarize = list(turns_to_summarize)
 
         if not self.quiet_mode:
@@ -4530,7 +4305,6 @@ This compaction should PRIORITISE preserving all information related to the focu
             or self._last_summary_auth_failure
             or self._last_summary_network_failure
             or pulled_summary_from_tail
-            or compacted_tail_tool_indices
         ):
             n_skipped = compress_end - compress_start
             self._last_summary_dropped_count = 0  # nothing actually dropped
@@ -4570,14 +4344,6 @@ This compaction should PRIORITISE preserving all information related to the focu
                         "checkpoint. %d message(s) preserved unchanged.",
                         n_skipped,
                     )
-                elif compacted_tail_tool_indices:
-                    _abort_log(
-                        "Summary generation failed after retained-tail tool "
-                        "source was shortened — aborting compression so raw "
-                        "tool evidence is not lost across restart. %d "
-                        "message(s) preserved unchanged.",
-                        n_skipped,
-                    )
                 else:
                     _abort_log(
                         "Summary generation failed — aborting compression "
@@ -4592,11 +4358,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                 abort_reason = "summary_network_failure"
             elif pulled_summary_from_tail:
                 abort_reason = "summary_failed_after_prior_summary_pullup"
-            elif compacted_tail_tool_indices:
-                abort_reason = "summary_failed_after_tail_tool_compaction"
             else:
                 abort_reason = "abort_on_summary_failure"
-            output_messages = original_messages if (pulled_summary_from_tail or compacted_tail_tool_indices) else messages
+            output_messages = original_messages if pulled_summary_from_tail else messages
             self._write_compression_audit_record(self._build_compression_audit_record(
                 result="abort",
                 entrypoint=entrypoint,

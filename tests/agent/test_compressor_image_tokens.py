@@ -130,10 +130,10 @@ class TestTokenBudgetWithImages:
 
         cut = cc._find_tail_cut_by_tokens(messages, head_end=0, token_budget=5000)
 
-        # Budget is 5K, soft ceiling 7.5K. 5 images alone = 8000 image-tokens.
-        # Walking backward, the compressor should stop before including all 5.
-        # Exact cut depends on text lengths and min_tail, but it MUST be > 1
-        # (at least some head-side messages should be compressible).
+        # Budget is 5K. Five images alone cost 8000 image-tokens, so the
+        # configured token target should be met before protecting all five.
+        # Exact cut depends on text lengths and the user/assistant floor, but it
+        # MUST be > 1 (at least some head-side messages should be compressible).
         assert cut > 1, (
             f"Expected image-heavy tail to be trimmed; compressor placed cut at "
             f"{cut} out of {len(messages)} (image tokens were likely ignored)."

@@ -18,7 +18,8 @@ from agent.context_compressor import (
     _SUMMARY_QUOTA_COOLDOWN_MAX_SECONDS,
     _USER_LEDGER_MAX_CHARS,
     _bound_retained_nonvisible_metadata,
-    _truncate_tail_tool_result,
+    _estimate_msg_budget_tokens,
+    _retained_provider_payload_message_for_budget,
 )
 from hermes_state import SessionDB
 
@@ -1131,14 +1132,14 @@ class TestCompress:
 
 
 
-class TestTailToolOutputCompaction:
+class TestRetainedTailBudgeting:
     def test_summarized_window_tool_result_reaches_summary_raw(self):
         """Tool results inside the summarized window must reach the summarizer raw.
 
         Compression is supposed to let the summary absorb the detailed source
-        material.  Replacing a to-be-summarized tool result with the same
-        one-line placeholder used for retained-tail compaction loses the only
-        copy of the evidence before the summarizer can read it.
+        material.  Replacing a to-be-summarized tool result with a compact
+        placeholder loses the only copy of the evidence before the summarizer
+        can read it.
         """
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             c = ContextCompressor(
@@ -1205,15 +1206,8 @@ class TestTailToolOutputCompaction:
         assert raw_sentinel in summarized_text
         assert "[read_file] read /tmp/raw-source.txt" not in summarized_text
 
-    def test_compacted_retained_tail_tool_moves_tail_boundary_forward(self):
-        """Compacted retained-tail tool evidence must preserve chronology.
-
-        A summary represents the messages before the retained tail. If a tool
-        result inside the selected tail must be shortened, its raw source should
-        move into the summarized chronological window and the retained tail
-        should start after it — not keep a compacted placeholder in tail while
-        also appending that later raw source to an earlier summary.
-        """
+    def test_protected_tail_tool_outputs_remain_raw(self):
+        """The protected tail no longer performs tool-output body compaction."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             c = ContextCompressor(
                 model="test/model",
@@ -1222,176 +1216,185 @@ class TestTailToolOutputCompaction:
                 protect_last_n=3,
                 quiet_mode=True,
             )
-        c.tail_token_budget = 900
+        c.tail_token_budget = 1_000
 
-        raw_sentinel = "RAW_COMPACTED_TAIL_SENTINEL_ZX_20260628"
-        old_tail_output = f"old tail evidence\n{raw_sentinel}\n" + ("a" * 12_000)
-        newest_output = "newest output stays small"
+        raw_sentinel = "RAW_TAIL_TOOL_OUTPUT_STAYS_RAW_ZX_20260706"
+        oversized_output = raw_sentinel + "\n" + ("x" * 20_000)
         msgs = [
             {"role": "system", "content": "System prompt"},
             {"role": "user", "content": "initial ask"},
             {"role": "assistant", "content": "middle assistant"},
-            {"role": "user", "content": "middle user"},
-            {"role": "assistant", "content": "middle reply"},
             {"role": "user", "content": "latest protected ask"},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": "call_tail_old",
-                    "type": "function",
-                    "function": {
-                        "name": "terminal",
-                        "arguments": '{"command":"python emit_tail_evidence.py"}',
-                    },
-                }],
-            },
-            {"role": "tool", "tool_call_id": "call_tail_old", "content": old_tail_output},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": "call_tail_new",
-                    "type": "function",
-                    "function": {
-                        "name": "terminal",
-                        "arguments": '{"command":"pytest tests/agent -q"}',
-                    },
-                }],
-            },
-            {"role": "tool", "tool_call_id": "call_tail_new", "content": newest_output},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_tail", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"python dump_big_state.py"}'}}]},
+            {"role": "tool", "tool_call_id": "call_tail", "content": oversized_output},
             {"role": "assistant", "content": "last visible reply"},
         ]
-        captured: dict[str, list[dict]] = {}
-
-        def fake_summary(turns, focus_topic=None):
-            captured["turns"] = [m.copy() for m in turns]
-            return f"{SUMMARY_PREFIX}\nsummary includes durable tail evidence"
-
-        with (
-            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
-            patch.object(c, "_generate_summary", side_effect=fake_summary),
-        ):
-            result = c.compress(msgs, current_tokens=90_000)
-
-        tool_by_id = {m.get("tool_call_id"): m for m in result if m.get("role") == "tool"}
-        assert "call_tail_old" not in tool_by_id
-        assert tool_by_id["call_tail_new"]["content"] == newest_output
-        assert raw_sentinel in _text_messages(captured["turns"])
-        assert captured["turns"][-1]["tool_call_id"] == "call_tail_old"
-
-    def test_tail_boundary_promotion_preserves_minimum_recent_tail_floor(self):
-        """Boundary promotion must not eat the whole recent tail floor.
-
-        If a protected-tail tool result is compacted, the raw source moves into
-        the chronological summary window by promoting the tail boundary. That
-        promotion must stop before the hard recent-message floor; otherwise a
-        tool-heavy tail can collapse from the expected recent context to only a
-        couple of messages.
-        """
-        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
-            c = ContextCompressor(
-                model="test/model",
-                threshold_percent=0.85,
-                protect_first_n=1,
-                protect_last_n=10,
-                quiet_mode=True,
-            )
-        c.tail_token_budget = 350
-
-        older_tail_sentinel = "OLDER_TAIL_TOOL_CAN_BE_SUMMARIZED_ZX_20260629"
-        floor_sentinel = "RECENT_TAIL_FLOOR_MUST_REMAIN_RAW_ZX_20260629"
-        older_tail_output = older_tail_sentinel + "\n" + ("o" * 12_000)
-        floor_tool_output = floor_sentinel + "\n" + ("f" * 12_000)
-        msgs = [
-            {"role": "system", "content": "System prompt"},
-            {"role": "user", "content": "initial ask"},
-            {"role": "assistant", "content": "middle assistant"},
-            {"role": "user", "content": "middle user"},
-            {"role": "assistant", "content": "middle reply"},
-            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_older_tail", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"python older_tail.py"}'}}]},
-            {"role": "tool", "tool_call_id": "call_older_tail", "content": older_tail_output},
-            {"role": "assistant", "content": "after older tail evidence"},
-            {"role": "user", "content": "recent floor user 0"},
-            {"role": "assistant", "content": "recent floor assistant 1"},
-            {"role": "user", "content": "recent floor user 2"},
-            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_floor_tail", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"python recent_floor.py"}'}}]},
-            {"role": "tool", "tool_call_id": "call_floor_tail", "content": floor_tool_output},
-            {"role": "assistant", "content": "recent floor assistant 5"},
-            {"role": "user", "content": "latest protected ask"},
-            {"role": "assistant", "content": "latest protected answer"},
-            {"role": "user", "content": "final user tail"},
-        ]
-        captured: dict[str, list[dict]] = {}
         records: list[dict] = []
-
-        def fake_summary(turns, focus_topic=None):
-            captured["turns"] = [m.copy() for m in turns]
-            return f"{SUMMARY_PREFIX}\nsummary includes older tail evidence"
-
         with (
             patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
-            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
-            patch.object(c, "_generate_summary", side_effect=fake_summary),
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=3),
+            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
             patch.object(c, "_write_compression_audit_record", side_effect=records.append),
         ):
             result = c.compress(msgs, current_tokens=90_000)
 
-        result_text = _text_messages(result)
-        summarized_text = _text_messages(captured["turns"])
-        assert older_tail_sentinel in summarized_text
-        assert floor_sentinel not in summarized_text
-        assert floor_sentinel in result_text
-        assert records[-1]["retained_tail"]["message_count"] >= 10
-        assert records[-1]["tail_boundary_promoted"] is True
+        assert raw_sentinel in _text_messages(result)
+        assert records[-1]["tools"]["tail_compacted_count"] == 0
 
-    def test_tail_budget_floor_allows_soft_overshoot_before_message_floor(self):
-        """A discrete tool result may slightly exceed raw budget to hit 80% tail use.
-
-        Live gateway sessions often have a small recent-message floor preceded
-        by one moderately large tool result. If pulling that result reaches the
-        80% target but lands just over the raw tail budget, the budget floor must
-        still activate within the existing 1.5x soft ceiling; otherwise tail
-        compaction promotes the boundary back to the 10-message floor and the
-        retained tail underuses the budget again.
-        """
+    def test_main_compression_does_not_call_old_tool_pruning(self):
+        """Old tool-result pruning must not run before tail boundary selection."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             c = ContextCompressor(
                 model="test/model",
                 threshold_percent=0.85,
                 protect_first_n=1,
-                protect_last_n=10,
+                protect_last_n=3,
                 quiet_mode=True,
             )
         c.tail_token_budget = 1_000
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "middle reply"},
+            {"role": "user", "content": "latest ask"},
+            {"role": "assistant", "content": "latest answer"},
+        ]
+        records: list[dict] = []
+        with (
+            patch.object(c, "_prune_old_tool_results", side_effect=AssertionError("old pruning must not run")),
+            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
+            patch.object(c, "_write_compression_audit_record", side_effect=records.append),
+        ):
+            c.compress(msgs, current_tokens=90_000)
 
-        crossing_tool_output = "CROSSING_TOOL_RESULT\n" + ("x" * 4_000)
+        assert records[-1]["tools"]["pruned_old_tool_results"] == 0
+
+    def test_user_assistant_message_floor_counts_dialogue_rows_and_preserves_tools(self):
+        """The message floor counts user/assistant rows, then keeps the full interval."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=4,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 1
+
+        tool_sentinel = "TOOL_RESULT_INSIDE_DIALOGUE_FLOOR_ZX_20260706"
         msgs = [
             {"role": "system", "content": "System prompt"},
             {"role": "user", "content": "initial ask"},
             {"role": "assistant", "content": "middle reply"},
             {"role": "user", "content": "older middle follow-up"},
             {"role": "assistant", "content": "older middle answer"},
-            {"role": "user", "content": "one more middle turn"},
+            {"role": "user", "content": "floor user 1"},
             {
                 "role": "assistant",
-                "content": None,
+                "content": "",
                 "tool_calls": [{
-                    "id": "call_crossing",
+                    "id": "call_floor",
                     "type": "function",
                     "function": {
                         "name": "terminal",
-                        "arguments": '{"command":"python crossing.py"}',
+                        "arguments": '{"command":"python inspect.py"}',
                     },
                 }],
             },
-            {"role": "tool", "tool_call_id": "call_crossing", "content": crossing_tool_output},
+            {"role": "tool", "tool_call_id": "call_floor", "content": tool_sentinel},
+            {"role": "assistant", "content": "floor assistant 2"},
+            {"role": "user", "content": "floor user 2"},
         ]
-        for i in range(10):
-            msgs.append({
-                "role": "user" if i % 2 == 0 else "assistant",
-                "content": f"recent floor row {i}",
-            })
+
+        records: list[dict] = []
+        with (
+            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
+            patch.object(c, "_write_compression_audit_record", side_effect=records.append),
+        ):
+            result = c.compress(msgs, current_tokens=90_000)
+
+        retained_tail = records[-1]["message_accounting"]["retained_tail"]
+        assert retained_tail["user_assistant_message_floor"] == 4
+        assert retained_tail["user_assistant_messages_retained"] == 4
+        assert retained_tail["message_floor_met"] is True
+        assert "tail_budget_min_utilization" not in retained_tail
+        assert tool_sentinel in _text_messages(result)
+
+    def test_provider_payload_budget_keeps_gemini_thought_signatures_by_model(self):
+        signature = {"google": {"thought_signature": "s" * 4000}}
+        msg = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_gemini",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+                "extra_content": signature,
+            }],
+        }
+
+        non_gemini = _retained_provider_payload_message_for_budget(
+            msg, provider_model="openai/gpt-5.5"
+        )
+        gemini = _retained_provider_payload_message_for_budget(
+            msg, provider_model="google/gemini-3-pro"
+        )
+
+        assert "extra_content" not in non_gemini["tool_calls"][0]
+        assert gemini["tool_calls"][0]["extra_content"] == signature
+        assert _estimate_msg_budget_tokens(
+            msg, provider_model="google/gemini-3-pro"
+        ) > _estimate_msg_budget_tokens(msg, provider_model="openai/gpt-5.5") + 500
+
+    def test_tail_token_target_uses_retained_payload_after_metadata_bounding(self):
+        """The configured tail token target is measured after retained metadata bounding.
+
+        Live post-restart records showed raw selected tails near the old partial
+        floor while the actual persisted retained tail fell far below the target
+        after oversized assistant tool-call arguments were bounded. Boundary
+        selection must account for the provider payload that will actually be
+        retained, and should target the configured budget directly rather than
+        a secondary utilization floor.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=2,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 2_000
+
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "middle answer"},
+        ]
+        for i in range(18):
+            call_id = f"call_large_args_{i}"
+            msgs.extend([
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": '{"command":"python big_args.py", "payload":"'
+                            + ("x" * 6_000)
+                            + '"}',
+                        },
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "tool_name": "terminal",
+                    "content": "ok",
+                },
+            ])
 
         records: list[dict] = []
         with (
@@ -1399,26 +1402,17 @@ class TestTailToolOutputCompaction:
             patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
             patch.object(c, "_write_compression_audit_record", side_effect=records.append),
         ):
-            result = c.compress(msgs, current_tokens=90_000)
+            c.compress(msgs, current_tokens=90_000)
 
         retained_tail = records[-1]["message_accounting"]["retained_tail"]
-        assert retained_tail["tail_budget_min_utilization"] == 0.8
-        assert retained_tail["token_share_of_tail_budget"] >= 0.8
-        assert any(
-            m.get("tool_call_id") == "call_crossing"
-            for m in result
-            if m.get("role") == "tool"
-        )
+        assert retained_tail["raw_tokens_estimate"] >= c.tail_token_budget
+        assert retained_tail["tokens_estimate"] >= c.tail_token_budget
+        assert retained_tail["token_target_met"] is True
+        assert retained_tail["token_share_of_tail_budget"] >= 1.0
+        assert "tail_budget_min_utilization" not in retained_tail
 
-    def test_retained_tail_audit_respects_soft_ceiling_for_small_tool_pairs(self):
-        """Tail selection must cap the same token estimate the audit reports.
-
-        A long run of small assistant/tool pairs can look cheap to the old
-        content-only tail-budget walk while the audit/provider-ish rough payload
-        estimate is much larger because each tool result carries role/id/name
-        envelope overhead. The retained-tail audit must not report an unexplained
-        >1.5x soft-ceiling overshoot in that shape.
-        """
+    def test_tail_token_target_stops_near_configured_budget_for_small_tool_pairs(self):
+        """A long run of small tool pairs targets the configured budget directly."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             c = ContextCompressor(
                 model="test/model",
@@ -1463,86 +1457,12 @@ class TestTailToolOutputCompaction:
             c.compress(msgs, current_tokens=90_000)
 
         retained_tail = records[-1]["message_accounting"]["retained_tail"]
-        # Tool-pair boundary alignment can add a small atomic-group sliver over
-        # the exact 1.5x ceiling; the regression is the material 1.7x+ audit
-        # overshoot caused by using a cheaper selector estimate than the audit.
-        assert retained_tail["tokens_estimate"] <= int(c.tail_token_budget * 1.55)
-        assert retained_tail["token_share_of_tail_budget"] <= 1.55
-
-    def test_compacted_tail_summary_failure_aborts_to_preserve_raw_source(self):
-        """Do not persist compacted tail if the raw tail source was not summarized."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
-            c = ContextCompressor(
-                model="test/model",
-                threshold_percent=0.85,
-                protect_first_n=1,
-                protect_last_n=3,
-                quiet_mode=True,
-            )
-        c.tail_token_budget = 900
-
-        raw_sentinel = "RAW_TAIL_FAILURE_SENTINEL_ZX_20260628"
-        old_tail_output = f"old tail evidence\n{raw_sentinel}\n" + ("a" * 12_000)
-        msgs = [
-            {"role": "system", "content": "System prompt"},
-            {"role": "user", "content": "initial ask"},
-            {"role": "assistant", "content": "middle assistant"},
-            {"role": "user", "content": "middle user"},
-            {"role": "assistant", "content": "middle reply"},
-            {"role": "user", "content": "latest protected ask"},
-            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_tail_old", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"python emit_tail_evidence.py"}'}}]},
-            {"role": "tool", "tool_call_id": "call_tail_old", "content": old_tail_output},
-            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_tail_new", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"pytest tests/agent -q"}'}}]},
-            {"role": "tool", "tool_call_id": "call_tail_new", "content": "newest output stays small"},
-            {"role": "assistant", "content": "last visible reply"},
-        ]
-
-        with (
-            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
-            patch.object(c, "_generate_summary", return_value=None),
-        ):
-            result = c.compress(msgs, current_tokens=90_000)
-
-        assert result == msgs
-        assert c._last_compress_aborted is True
-        assert c._last_summary_fallback_used is False
-        assert raw_sentinel in _text_messages(result)
-
-    def test_recomputed_boundary_after_tail_compaction_still_aborts_on_summary_failure(self):
-        """A recomputed tail cut must not hide that raw tail evidence was shortened."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
-            c = ContextCompressor(
-                model="test/model",
-                threshold_percent=0.85,
-                protect_first_n=1,
-                protect_last_n=3,
-                quiet_mode=True,
-            )
-        c.tail_token_budget = 4_000
-
-        raw_sentinel = "RAW_RECOMPUTED_BOUNDARY_SENTINEL_ZX_20260628"
-        old_tail_output = raw_sentinel + "\n" + ("x" * 20_000)
-        msgs = [
-            {"role": "system", "content": "System prompt"},
-            {"role": "user", "content": "initial ask"},
-            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_old", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"python big.py"}'}}]},
-            {"role": "tool", "tool_call_id": "call_old", "content": old_tail_output},
-            {"role": "user", "content": "after 0 " + ("a" * 1000)},
-            {"role": "assistant", "content": "after 1 " + ("a" * 1000)},
-            {"role": "user", "content": "after 2 " + ("a" * 1000)},
-            {"role": "assistant", "content": "after 3 " + ("a" * 1000)},
-        ]
-
-        with (
-            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
-            patch.object(c, "_generate_summary", return_value=None),
-        ):
-            result = c.compress(msgs, current_tokens=90_000)
-
-        assert result == msgs
-        assert c._last_compress_aborted is True
-        assert c._last_summary_fallback_used is False
-        assert raw_sentinel in _text_messages(result)
+        # Tool-pair boundary alignment can add one small atomic-group sliver over
+        # the exact configured budget, but it should stay close to that target.
+        assert retained_tail["tokens_estimate"] >= c.tail_token_budget
+        assert retained_tail["tokens_estimate"] <= int(c.tail_token_budget * 1.2)
+        assert retained_tail["token_share_of_tail_budget"] <= 1.2
+        assert retained_tail["token_target_met"] is True
 
     def test_summary_source_overflow_compacts_tool_outputs_oldest_first(self):
         """If raw source exceeds the summarizer budget, shrink old tools first."""
@@ -1631,234 +1551,6 @@ class TestTailToolOutputCompaction:
         assert "..." in serialized
         assert serialized.count("x") < 2_000
         assert "global summary-source budget" not in serialized
-
-    def test_compacts_oversized_tool_outputs_inside_protected_tail(self):
-        """Protected-tail tool output should not survive compaction verbatim.
-
-        The existing old-tool pruning pass only touches messages before the
-        protected tail. A Discord/gateway long-running session can still end up
-        with several large `role=tool` messages inside the tail after the active
-        user/assistant anchors pull the boundary back. Codex-style behavior for
-        this narrow case is to keep the tool-result structure but shrink older
-        tool output bodies.
-        """
-        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
-            c = ContextCompressor(
-                model="test/model",
-                threshold_percent=0.85,
-                protect_first_n=1,
-                protect_last_n=3,
-                quiet_mode=True,
-            )
-        c.tail_token_budget = 1_000
-
-        oversized_output = "OLD TOOL OUTPUT\n" + ("x" * 20_000)
-        newest_output = "LATEST TOOL OUTPUT\n" + ("y" * 500)
-        msgs = [
-            {"role": "system", "content": "System prompt"},
-            {"role": "user", "content": "initial ask"},
-            {"role": "assistant", "content": "middle assistant"},
-            {"role": "user", "content": "middle user"},
-            {"role": "assistant", "content": "middle reply"},
-            {"role": "user", "content": "latest protected ask"},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": "call_old",
-                    "type": "function",
-                    "function": {
-                        "name": "terminal",
-                        "arguments": '{"command":"python dump_big_state.py"}',
-                    },
-                }],
-            },
-            {"role": "tool", "tool_call_id": "call_old", "content": oversized_output},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": "call_new",
-                    "type": "function",
-                    "function": {
-                        "name": "terminal",
-                        "arguments": '{"command":"pytest tests/agent -q"}',
-                    },
-                }],
-            },
-            {"role": "tool", "tool_call_id": "call_new", "content": newest_output},
-            {"role": "assistant", "content": "last visible reply"},
-        ]
-
-        # Force this fixture's large tool outputs to be inside the protected
-        # tail, and disable the existing pre-tail pruning pass so the test only
-        # exercises the new protected-tail behavior.
-        with (
-            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
-            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
-            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
-        ):
-            result = c.compress(msgs, current_tokens=90_000)
-
-        tool_by_id = {
-            m.get("tool_call_id"): m
-            for m in result
-            if m.get("role") == "tool"
-        }
-        assert "call_old" not in tool_by_id
-        assert tool_by_id["call_new"]["content"] == newest_output
-
-    def test_truncates_single_oversized_tail_tool_before_recent_floor(self):
-        """A single oversized tail tool result before the hard floor should be bounded.
-
-        Tool output inside the hard recent-message floor stays raw so boundary
-        promotion cannot erase the live tail. This fixture keeps a few later
-        messages after the tool so its raw source can move into the chronological
-        summary window while the recent floor remains live.
-        """
-        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
-            c = ContextCompressor(
-                model="test/model",
-                threshold_percent=0.85,
-                protect_first_n=1,
-                protect_last_n=4,
-                quiet_mode=True,
-            )
-        c.tail_token_budget = 1_000
-
-        huge_output = "HEAD-LINE\n" + ("x" * 12_000) + "\nTAIL-LINE"
-        msgs = [
-            {"role": "system", "content": "System prompt"},
-            {"role": "user", "content": "initial ask"},
-            {"role": "assistant", "content": "middle assistant"},
-            {"role": "user", "content": "middle user"},
-            {"role": "assistant", "content": "middle reply"},
-            {"role": "user", "content": "latest protected ask"},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": "call_latest",
-                    "type": "function",
-                    "function": {
-                        "name": "terminal",
-                        "arguments": '{"command":"python dump_big_state.py"}',
-                    },
-                }],
-            },
-            {"role": "tool", "tool_call_id": "call_latest", "content": huge_output},
-            {"role": "assistant", "content": "recent floor assistant"},
-            {"role": "user", "content": "recent floor user"},
-            {"role": "assistant", "content": "latest protected answer"},
-            {"role": "user", "content": "final recent floor user"},
-        ]
-
-        with (
-            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
-            patch.object(c, "_find_tail_cut_by_tokens", return_value=3),
-            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
-        ):
-            result = c.compress(msgs, current_tokens=90_000)
-
-        assert [m for m in result if m.get("role") == "tool"] == []
-
-    def test_tail_truncation_never_grows_moderately_large_tool_output(self):
-        original = "HEAD-LINE\n" + ("x" * 4_500) + "\nTAIL-LINE"
-
-        truncated = _truncate_tail_tool_result(
-            "terminal",
-            '{"command":"python dump_big_state.py"}',
-            original,
-        )
-
-        assert truncated != original
-        assert len(truncated) < len(original)
-        assert "Tool output truncated during context compaction" in truncated
-        assert "HEAD-LINE" in truncated
-        assert "TAIL-LINE" in truncated
-
-    def test_compacts_multiple_moderate_tool_outputs_when_tail_is_over_budget(self):
-        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
-            c = ContextCompressor(
-                model="test/model",
-                threshold_percent=0.85,
-                protect_first_n=1,
-                protect_last_n=3,
-                quiet_mode=True,
-            )
-        c.tail_token_budget = 600
-
-        moderate_one = "MODERATE ONE\n" + ("a" * 3_000)
-        moderate_two = "MODERATE TWO\n" + ("b" * 4_000)
-        newest_output = "latest small observation"
-        msgs = [
-            {"role": "system", "content": "System prompt"},
-            {"role": "user", "content": "initial ask"},
-            {"role": "assistant", "content": "middle assistant"},
-            {"role": "user", "content": "middle user"},
-            {"role": "assistant", "content": "middle reply"},
-            {"role": "user", "content": "latest protected ask"},
-            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_one", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"python one.py"}'}}]},
-            {"role": "tool", "tool_call_id": "call_one", "content": moderate_one},
-            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_two", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"python two.py"}'}}]},
-            {"role": "tool", "tool_call_id": "call_two", "content": moderate_two},
-            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_new", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"pytest"}'}}]},
-            {"role": "tool", "tool_call_id": "call_new", "content": newest_output},
-            {"role": "assistant", "content": "recent floor assistant"},
-            {"role": "user", "content": "recent floor user"},
-            {"role": "assistant", "content": "latest protected answer"},
-        ]
-
-        with (
-            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
-            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
-            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
-        ):
-            result = c.compress(msgs, current_tokens=90_000)
-
-        tool_by_id = {m.get("tool_call_id"): m for m in result if m.get("role") == "tool"}
-        assert "call_one" not in tool_by_id
-        assert "call_two" not in tool_by_id
-        assert tool_by_id["call_new"]["content"] == newest_output
-
-    def test_compacts_multimodal_tool_outputs_inside_protected_tail(self):
-        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
-            c = ContextCompressor(
-                model="test/model",
-                threshold_percent=0.85,
-                protect_first_n=1,
-                protect_last_n=4,
-                quiet_mode=True,
-            )
-        c.tail_token_budget = 1_000
-
-        multimodal_output = [
-            {"type": "text", "text": "screenshot evidence"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + ("a" * 10_000)}},
-        ]
-        msgs = [
-            {"role": "system", "content": "System prompt"},
-            {"role": "user", "content": "initial ask"},
-            {"role": "assistant", "content": "middle assistant"},
-            {"role": "user", "content": "middle user"},
-            {"role": "assistant", "content": "middle reply"},
-            {"role": "user", "content": "latest protected ask"},
-            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_img", "type": "function", "function": {"name": "browser_vision", "arguments": '{"question":"inspect"}'}}]},
-            {"role": "tool", "tool_call_id": "call_img", "content": multimodal_output},
-            {"role": "assistant", "content": "visible reply"},
-            {"role": "user", "content": "recent floor user"},
-            {"role": "assistant", "content": "latest protected answer"},
-            {"role": "user", "content": "final recent floor user"},
-        ]
-
-        with (
-            patch.object(c, "_prune_old_tool_results", return_value=(msgs, 0)),
-            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
-            patch.object(c, "_generate_summary", return_value=f"{SUMMARY_PREFIX}\nsummary"),
-        ):
-            result = c.compress(msgs, current_tokens=90_000)
-
-        assert [m for m in result if m.get("role") == "tool"] == []
 
     def test_retained_tool_call_arg_bounding_preserves_json_validity(self):
         """Retained-tail tool-call args are still provider-visible JSON.
@@ -2076,7 +1768,7 @@ class TestCompressionAuditLog:
         assert tail["tail_budget_tokens"] == c.tail_token_budget
         assert 0 < tail["token_share_of_tail_budget"]
 
-    def test_tail_compaction_preserves_at_least_80pct_budget_floor(
+    def test_tail_audit_records_configured_budget_target(
         self, tmp_path, monkeypatch
     ):
         monkeypatch.setattr(
@@ -2130,8 +1822,9 @@ class TestCompressionAuditLog:
         [record] = _read_compression_audit_records(tmp_path)
         tail = record["message_accounting"]["retained_tail"]
         assert tail["tail_budget_tokens"] == c.tail_token_budget
-        assert tail["token_share_of_tail_budget"] >= 0.8
-        assert tail["tokens_estimate"] >= int(c.tail_token_budget * 0.8)
+        assert tail["token_target_met"] is True
+        assert tail["token_share_of_tail_budget"] >= 1.0
+        assert tail["tokens_estimate"] >= c.tail_token_budget
 
     def test_audit_records_trigger_reason_and_separates_message_savings(
         self, tmp_path, monkeypatch
@@ -2415,29 +2108,22 @@ class TestCompressionAuditLog:
                 protect_first_n=1,
                 protect_last_n=3,
                 quiet_mode=True,
+                abort_on_summary_failure=True,
             )
         c.tail_token_budget = 900
 
-        raw_sentinel = "RAW_ABORT_AUDIT_SENTINEL_ZX_20260628"
-        old_tail_output = f"old tail evidence\n{raw_sentinel}\n" + ("a" * 12_000)
+        raw_sentinel = "RAW_ABORT_AUDIT_SENTINEL_ZX_20260706"
         msgs = [
             {"role": "system", "content": "System prompt"},
             {"role": "user", "content": "initial ask"},
-            {"role": "assistant", "content": "middle assistant"},
+            {"role": "assistant", "content": "middle assistant " + raw_sentinel},
             {"role": "user", "content": "middle user"},
             {"role": "assistant", "content": "middle reply"},
             {"role": "user", "content": "latest protected ask"},
-            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_tail_old", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"python emit_tail_evidence.py"}'}}]},
-            {"role": "tool", "tool_call_id": "call_tail_old", "content": old_tail_output},
-            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_tail_new", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"pytest tests/agent -q"}'}}]},
-            {"role": "tool", "tool_call_id": "call_tail_new", "content": "newest output stays small"},
-            {"role": "assistant", "content": "last visible reply"},
+            {"role": "assistant", "content": "latest protected answer"},
         ]
 
-        with (
-            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
-            patch.object(c, "_generate_summary", return_value=None),
-        ):
+        with patch.object(c, "_generate_summary", return_value=None):
             result = c.compress(msgs, current_tokens=90_000)
 
         assert result == msgs
@@ -2445,10 +2131,10 @@ class TestCompressionAuditLog:
         assert raw_sentinel not in json.dumps(record, sort_keys=True)
         assert record["entrypoint"] == "auto"
         assert record["result"] == "abort"
-        assert record["abort_reason"] == "summary_failed_after_tail_tool_compaction"
+        assert record["abort_reason"] == "abort_on_summary_failure"
         assert record["output_messages"] == len(msgs)
-        assert record["tools"]["tail_compacted_count"] >= 1
-        assert record["tail_boundary_promoted"] is True
+        assert record["tools"]["tail_compacted_count"] == 0
+        assert record["tail_boundary_promoted"] is False
 
     def test_fallback_compression_writes_audit(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
@@ -4070,10 +3756,9 @@ class TestCompressWithClient:
         mock_response.choices[0].message.content = "summary text"
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=1)
 
-        # head_last=assistant, tail_first=assistant (same shape as the
-        # existing consecutive-user test) → role resolves to "user".
+        # head_last=assistant, tail_first=assistant → role resolves to "user".
         msgs = [
             {"role": "user", "content": "msg 0"},
             {"role": "assistant", "content": "msg 1"},
@@ -4107,11 +3792,8 @@ class TestCompressWithClient:
         mock_client.chat.completions.create.return_value = mock_response
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=1)
 
-        # head_last=user → summary_role="assistant" (same setup as
-        # test_summary_role_avoids_consecutive_user_when_head_ends_with_user).
-        # With min_tail=3, tail = last 3 messages (indices 5-7).
         # head_last=user, tail_first=user → the assistant-role summary does
         # not collide with either neighbor and should be inserted standalone.
         msgs = [
@@ -4146,8 +3828,8 @@ class TestCompressWithClient:
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
         # Last head message (index 1) is "assistant" → summary should be "user".
-        # With min_tail=3, tail = last 3 messages (indices 5-7).
-        # head_last=assistant, tail_first=assistant → summary_role="user", no collision.
+        # With protect_last_n=2, tail = last 2 messages (indices 6-7).
+        # head_last=assistant, tail_first=user → summary_role="user", collision.
         # Need 8 messages: min_for_compress = 2+3+1 = 6, must have > 6.
         msgs = [
             {"role": "user", "content": "msg 0"},
@@ -4330,15 +4012,15 @@ class TestCompressWithClient:
         mock_response.choices[0].message.content = "summary text"
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=2)
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=3)
 
         # Head: [system, user]        → last head = user
         # Tail: [assistant, user, assistant] → first tail = assistant
         # summary_role="assistant" collides with tail, "user" collides with head → merge
         # NOTE: protect_first_n=1 preserves 1 non-system message in addition to
         # the system prompt (always implicitly protected).
-        # With min_tail=3, tail = last 3 messages (indices 5-7).
-        # Need 8 messages: _min_for_compress = head(2) + 3 + 1 = 6, must have > 6.
+        # With protect_last_n=3, tail = last 3 user/assistant messages (indices 5-7).
+        # The conversation is long enough to leave a middle summary span.
         msgs = [
             {"role": "system", "content": "system prompt"},
             {"role": "user", "content": "msg 1"},
@@ -4374,9 +4056,8 @@ class TestCompressWithClient:
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
-        # Head=assistant, Tail=assistant → summary_role="user", no collision.
-        # With min_tail=3, tail = last 3 messages (indices 5-7).
-        # Need 8 messages: min_for_compress = 2+3+1 = 6, must have > 6.
+        # protect_last_n=2 supplies the message floor; the token target may keep
+        # a slightly earlier suffix, but the test only asserts standalone-summary shape.
         msgs = [
             {"role": "user", "content": "msg 0"},
             {"role": "assistant", "content": "msg 1"},
@@ -4618,9 +4299,9 @@ class TestSummaryTargetRatio:
 class TestTokenBudgetTailProtection:
     """Tests for token-budget-based tail protection (PR #6240).
 
-    The core change: tail protection is now based on a token budget rather
-    than a fixed message count.  This prevents large tool outputs from
-    blocking compaction.
+    The core change: tail protection combines a configured token target with a
+    user/assistant message floor. Tool outputs inside the selected suffix are
+    retained, but they do not count toward the message floor.
     """
 
     @pytest.fixture()
@@ -4631,15 +4312,13 @@ class TestTokenBudgetTailProtection:
                 model="test/model",
                 threshold_percent=0.50,  # 100K threshold
                 protect_first_n=2,
-                protect_last_n=20,
+                protect_last_n=3,
                 quiet_mode=True,
             )
             return c
 
     def test_large_tool_outputs_no_longer_block_compaction(self, budget_compressor):
-        """The motivating scenario: 20 messages with large tool outputs should
-        NOT prevent compaction.  With message-count tail protection they would
-        all be protected, leaving nothing to summarize."""
+        """Token target/floor selection should not count tool rows as floor messages."""
         c = budget_compressor
         messages = [
             {"role": "user", "content": "Start task"},
@@ -4660,17 +4339,18 @@ class TestTokenBudgetTailProtection:
         messages.append({"role": "assistant", "content": "Here's what I found..."})
         messages.append({"role": "user", "content": "Continue"})
 
-        # The tail cut should NOT protect all 20 tool messages
+        # The tail cut should not protect every tool row just because tool
+        # outputs sit between recent assistant/user rows.
         head_end = c.protect_first_n
         cut = c._find_tail_cut_by_tokens(messages, head_end)
         tail_size = len(messages) - cut
         # With token budget, the tail should be much smaller than 20+
         assert tail_size < 20, f"Tail {tail_size} messages — large tool outputs are blocking compaction"
-        # But at least 3 (hard minimum)
+        # But at least the configured 3 user/assistant floor rows survive.
         assert tail_size >= 3
 
-    def test_min_tail_always_3_messages(self, budget_compressor):
-        """Even with a tiny token budget, at least 3 messages are protected."""
+    def test_message_floor_protects_configured_user_assistant_count(self, budget_compressor):
+        """Even with a tiny token budget, the configured message floor is protected."""
         c = budget_compressor
         # Override to a tiny budget
         c.tail_token_budget = 10
@@ -4689,12 +4369,10 @@ class TestTokenBudgetTailProtection:
         assert tail_size >= 3, f"Tail is only {tail_size} messages, min should be 3"
 
     def test_tiny_budget_preserves_bounded_recent_turns(self, budget_compressor):
-        """A token-exhausted tail must preserve more than just the latest ask.
+        """A token-exhausted tail must preserve the configured recent dialogue floor.
 
-        Regression for #9413: the previous hard-coded 3-message floor could
-        leave the latest user message live while summarizing the assistant/tool
-        context immediately before it, which made the post-compression turn feel
-        like a fresh conversation.
+        With protect_last_n=20 and only 13 non-head user/assistant rows available,
+        the floor intentionally protects them all; there is no hidden cap.
         """
         c = budget_compressor
         c.tail_token_budget = 10
@@ -4718,13 +4396,12 @@ class TestTokenBudgetTailProtection:
 
         cut = c._find_tail_cut_by_tokens(messages, head_end=1)
 
-        assert len(messages) - cut >= 10
-        assert messages[cut]["content"] == "middle ack"
+        assert len(messages) - cut == len(messages) - 1
+        assert messages[cut]["content"] == "old start"
         assert messages[-1]["content"] == "latest ask"
 
-    def test_soft_ceiling_allows_oversized_message(self, budget_compressor):
-        """The 1.5x soft ceiling allows an oversized message to be included
-        rather than splitting it."""
+    def test_atomic_target_crossing_allows_oversized_message(self, budget_compressor):
+        """A single oversized message can cross the configured token target atomically."""
         c = budget_compressor
         # Set a small budget — 500 tokens
         c.tail_token_budget = 500
@@ -4732,7 +4409,8 @@ class TestTokenBudgetTailProtection:
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "hi"},
             {"role": "user", "content": "read the file"},
-            # This message is ~600 tokens (> budget of 500, but < 1.5x = 750)
+            # This message is ~600 tokens (> budget of 500) and should be kept
+            # whole when it is the atomic row that crosses the target.
             {"role": "assistant", "content": "a" * 2400},
             {"role": "user", "content": "short"},
             {"role": "assistant", "content": "short reply"},
@@ -4740,15 +4418,13 @@ class TestTokenBudgetTailProtection:
         ]
         head_end = 2
         cut = c._find_tail_cut_by_tokens(messages, head_end)
-        # The oversized message at index 3 should NOT be the cut point
-        # because 1.5x ceiling = 750 tokens and accumulated would be ~610
-        # (short msgs + oversized msg) which is < 750
+        # The oversized message at index 3 should be included as the row that
+        # crosses the configured target; the cut must stay before it.
         tail_size = len(messages) - cut
         assert tail_size >= 3
 
     def test_small_conversation_still_compresses(self, budget_compressor):
-        """With the new min of 8 messages (head=2 + 3 + 1 guard + 2 middle),
-        a small but compressible conversation should still compress."""
+        """A small conversation can still compress when protect_last_n leaves a middle."""
         c = budget_compressor
         # 9 messages: head(2) + 4 middle + 3 tail = compressible
         messages = []
@@ -4756,7 +4432,7 @@ class TestTokenBudgetTailProtection:
             role = "user" if i % 2 == 0 else "assistant"
             messages.append({"role": role, "content": f"Message {i}"})
 
-        # Should not early-return (needs > protect_first_n + 3 + 1 = 6)
+        # Should not early-return: protect_last_n=3 leaves a middle window.
         # Mock the summary generation to avoid real API call
         with patch.object(c, "_generate_summary", return_value="Summary of conversation"):
             result = c.compress(messages, current_tokens=90_000)
@@ -4830,19 +4506,20 @@ class TestTokenBudgetTailProtection:
         # Tool at index 2 is outside the protected tail (last 3 = indices 2,3,4)
         # so it might or might not be pruned depending on boundary
         assert isinstance(pruned, int)
+    def test_multimodal_content_uses_normal_token_estimation(self, budget_compressor):
+        """Multimodal content should be counted by text size, not constant undercount.
 
-    def test_multimodal_message_accumulates_text_chars_not_block_count(self, budget_compressor):
-        """_find_tail_cut_by_tokens must use text char count, not list length,
-        for multimodal content. Regression guard for #16087.
+        Regression guard for #16087.
 
-        Setup: 6 messages, budget=80 (soft_ceiling=120).  The multimodal message
-        at index 1 has 500 chars of text → 135 tokens (correct) or 10 tokens (bug).
+        Setup: 6 messages, budget=80. The multimodal message at index 1 has 500
+        chars of text → 135 tokens (correct) or 10 tokens (bug).
 
-        Fixed path: walk stops at the multimodal (44+135=179 > 120), cut stays at 2,
-        tail = messages[2:] = 4 messages.
+        Fixed path: the text-aware estimate treats that message as large enough to
+        determine the token boundary, so the retained suffix is larger than the
+        bare message-floor-only tail.
 
-        Bug path: walk counts only 10 tokens for the multimodal, exhausts to head_end,
-        the head_end safeguard forces cut = n - min_tail = 3, tail = only 3 messages.
+        Bug path: a constant list-length undercount could walk to ``head_end`` and
+        leave only the configured message floor.
         """
         c = budget_compressor
         # 500 chars → 500//4 + 10 = 135 tokens; len([text, image]) // 4 + 10 = 10 (bug)
@@ -4859,11 +4536,11 @@ class TestTokenBudgetTailProtection:
             {"role": "assistant", "content": "tail3"},           # 4
             {"role": "user", "content": "tail4"},                # 5
         ]
-        c.tail_token_budget = 80  # soft_ceiling = 120
+        c.tail_token_budget = 80
         head_end = 0
         cut = c._find_tail_cut_by_tokens(messages, head_end)
-        # With the fix: cut=2, tail has 4 messages (soft_ceiling not exceeded by tail1-4).
-        # With the bug: head_end safeguard fires → cut = n - min_tail = 3, only 3 in tail.
+        # With the fix, the text-heavy multimodal message expands the suffix
+        # beyond the bare configured message floor.
         assert len(messages) - cut >= 4, (
             f"Expected ≥4 messages in tail (got {len(messages) - cut}, cut={cut}). "
             "The multimodal message was underestimated — len(list) used instead of text chars."
@@ -4874,8 +4551,8 @@ class TestTokenBudgetTailProtection:
         c = budget_compressor
         # Same layout as the multimodal test but with a plain 500-char string.
         # Both buggy and fixed code count plain strings the same way (len(str)).
-        # With 135 tokens the plain string also exceeds soft_ceiling=120, so
-        # the walk stops at index 1 and tail has 4 messages — same as the fix path.
+        # With 135 tokens, the plain string also expands the suffix beyond the
+        # bare message floor — same as the text-aware multimodal path.
         big_plain = "x" * 500
         messages = [
             {"role": "user", "content": "head1"},
@@ -5463,7 +5140,7 @@ class TestDoubleCompactionSummaryRole:
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(
-                model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2,
+                model="test", quiet_mode=True, protect_first_n=2, protect_last_n=3,
             )
         c.compression_count = 1  # decay protect_first_n
 
