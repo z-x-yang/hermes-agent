@@ -294,6 +294,21 @@ class TestMaybePersistToolResult:
         assert PERSISTED_OUTPUT_TAG not in result
         assert "Truncated" in result
 
+    def test_default_persisted_preview_uses_2k_chars(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        content = "x" * 60_000
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_default_preview",
+            env=env,
+            threshold=30_000,
+        )
+        assert PERSISTED_OUTPUT_TAG in result
+        assert "Preview (first 2000 chars):" in result
+        assert "x" * 2_000 in result
+
     def test_env_execute_exception_falls_back(self):
         env = MagicMock()
         env.execute.side_effect = RuntimeError("connection lost")
@@ -550,7 +565,7 @@ class TestPerToolThresholds:
         try:
             import tools.terminal_tool  # noqa: F401
             val = registry.get_max_result_size("terminal")
-            assert val == 100_000
+            assert val == 30_000
         except ImportError:
             pytest.skip("terminal_tool not importable in test env")
 

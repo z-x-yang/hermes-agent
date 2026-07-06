@@ -16,7 +16,7 @@ PINNED_THRESHOLDS: Dict[str, float] = {
 # Kept here as the single source of truth; tool_result_storage.py imports these.
 DEFAULT_RESULT_SIZE_CHARS: int = 100_000
 DEFAULT_TURN_BUDGET_CHARS: int = 200_000
-DEFAULT_PREVIEW_SIZE_CHARS: int = 1_500
+DEFAULT_PREVIEW_SIZE_CHARS: int = 2_000
 
 
 @dataclass(frozen=True)

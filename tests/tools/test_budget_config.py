@@ -37,7 +37,7 @@ class TestModuleConstants:
         assert DEFAULT_TURN_BUDGET_CHARS == 200_000
 
     def test_default_preview_size(self):
-        assert DEFAULT_PREVIEW_SIZE_CHARS == 1_500
+        assert DEFAULT_PREVIEW_SIZE_CHARS == 2_000
 
 
 class TestPinnedThresholds:
@@ -180,7 +180,7 @@ class TestResolveThreshold:
     def test_registry_value_capped_at_default(self, mock_registry):
         """A scaled-down budget caps an oversized registry value (#23767).
 
-        web/terminal/x_search register max_result_size_chars=100_000; a small
+        web/x_search still register max_result_size_chars=100_000; a small
         model's scaled budget must not be re-inflated by that.
         """
         mock_registry.get_max_result_size.return_value = 100_000
