@@ -131,7 +131,7 @@ def task_card_embed(rows: list[dict]) -> dict | None:
         if state == "done":
             lines.append(f"✅ ~~{title}~~")
         elif state == "dropped":
-            lines.append(f"🛑 已弃置 · {title}")
+            lines.append(f"🛑 已弃置 · ~~{title}~~")
         elif state == "snoozed":
             lines.append(f"⏰ 已延后·{r.get('due_label') or '?'} · {title}")
         else:

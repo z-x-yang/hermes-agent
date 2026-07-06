@@ -20,6 +20,7 @@ lives in the matching card row.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 from datetime import datetime
 from typing import Any
@@ -74,8 +75,84 @@ def _card_state_from_page(page: dict) -> dict:
     return {"state": "open", "due_label": None}
 
 
-def _state_is_done(state: dict | None) -> bool:
-    return (state or {}).get("state") == "done"
+def _state_is_undoable(state: dict | None) -> bool:
+    return (state or {}).get("state") in {"done", "dropped"}
+
+
+def _interaction_response_done(interaction) -> bool:
+    response = getattr(interaction, "response", None)
+    is_done = getattr(response, "is_done", None)
+    if callable(is_done):
+        try:
+            return bool(is_done())
+        except Exception:
+            logger.warning("notion task: response.is_done() failed", exc_info=True)
+    return False
+
+
+async def _defer_message_update(interaction) -> None:
+    """ACK a component interaction before Notion/network work.
+
+    Discord shows "interaction failed" if the first response takes too long.
+    A deferred message update is invisible to the user and lets the controller
+    edit the original message once the verified Notion write/read-back finishes.
+    """
+    if _interaction_response_done(interaction):
+        return
+    response = getattr(interaction, "response", None)
+    defer = getattr(response, "defer", None)
+    if not callable(defer):
+        return
+    try:
+        result = defer(thinking=False)
+    except TypeError:
+        result = defer()
+    except Exception:
+        logger.warning("notion task: failed to defer Discord interaction", exc_info=True)
+        return
+    try:
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.warning("notion task: failed to defer Discord interaction", exc_info=True)
+
+
+async def _send_interaction_notice(interaction, content: str, **kwargs) -> None:
+    if not _interaction_response_done(interaction):
+        result = interaction.response.send_message(content, **kwargs)
+        if inspect.isawaitable(result):
+            await result
+        return
+    followup = getattr(interaction, "followup", None)
+    send = getattr(followup, "send", None)
+    if callable(send):
+        result = send(content, **kwargs)
+        if inspect.isawaitable(result):
+            await result
+        return
+    logger.warning("notion task: no interaction followup available for notice: %s", content)
+
+
+async def _edit_interaction_message(interaction, **kwargs) -> None:
+    if not _interaction_response_done(interaction):
+        result = interaction.response.edit_message(**kwargs)
+        if inspect.isawaitable(result):
+            await result
+        return
+    edit_original = getattr(interaction, "edit_original_response", None)
+    if callable(edit_original):
+        result = edit_original(**kwargs)
+        if inspect.isawaitable(result):
+            await result
+        return
+    msg = getattr(interaction, "message", None)
+    edit = getattr(msg, "edit", None)
+    if callable(edit):
+        result = edit(**kwargs)
+        if inspect.isawaitable(result):
+            await result
+        return
+    raise RuntimeError("Discord interaction was already ACKed and cannot edit original message")
 
 
 class NotionTaskController:
@@ -261,20 +338,70 @@ class NotionTaskController:
         # a status changes on the Notion side.
         state_of = {pid: state if (pid == page_id and state is not None) else ns
                     for pid, _t, ns in found}
-        done_of = {pid: _state_is_done(st) for pid, st in state_of.items()}
+        done_of = {pid: _state_is_undoable(st) for pid, st in state_of.items()}
         tasks = [(pid, t) for pid, t, _ns in found]
         return "ok", self._view_for_tasks(tasks, done_of), self._card_embed(tasks, done_of, state_of)
 
-    def _build_snooze_menu(self, page_id, *, source_channel_id, source_message_id, source_content):
-        view = discord.ui.View(timeout=300)
-        view.add_item(build_snooze_select(
+    @staticmethod
+    def _item_row(item) -> int | None:
+        row = getattr(item, "row", None)
+        if row is None and hasattr(item, "item"):
+            row = getattr(item.item, "row", None)
+        return row
+
+    def _try_add_select_to_spare_row(self, view, select) -> bool:
+        used: set[int] = set()
+        for child in getattr(view, "children", []) or []:
+            row = self._item_row(child)
+            if row is None:
+                return False
+            used.add(int(row))
+        if len(used) >= 5:
+            return False
+        for row in range(5):
+            if row not in used:
+                select.row = row
+                view.add_item(select)
+                return True
+        return False
+
+    def _build_snooze_menu(
+        self,
+        page_id,
+        *,
+        source_channel_id,
+        source_message_id,
+        source_content,
+        title,
+        base_view=None,
+    ):
+        select = build_snooze_select(
             page_id,
             source_channel_id=source_channel_id,
             source_message_id=source_message_id,
             source_content=source_content,
             now=self._now_fn(),
-        ))
-        return view
+        )
+        view = base_view if base_view is not None else discord.ui.View(timeout=300)
+        try:
+            view.timeout = 300
+        except Exception:
+            pass
+        preserves_source_controls = base_view is not None and self._try_add_select_to_spare_row(view, select)
+        if not preserves_source_controls:
+            view = discord.ui.View(timeout=300)
+            view.add_item(select)
+
+        async def _restore_on_timeout():
+            await self._refresh_message_card(
+                page_id,
+                title=title,
+                channel_id=source_channel_id,
+                message_id=source_message_id,
+            )
+
+        view.on_timeout = _restore_on_timeout
+        return view, preserves_source_controls
 
     # ---- handling clicks -------------------------------------------------
     def _authorized(self, interaction) -> bool:
@@ -293,6 +420,15 @@ class NotionTaskController:
             raise RuntimeError("Notion client must provide set_status_verified for Discord task actions")
         return await self.notion.set_status_verified(page_id, target, kind)
 
+    async def _set_dropped_confirmed(self, page_id: str, reason: str) -> dict | None:
+        if not hasattr(self.notion, "set_dropped_verified"):
+            raise RuntimeError("Notion client must provide set_dropped_verified for Discord task actions")
+        return await self.notion.set_dropped_verified(
+            page_id,
+            reason=reason,
+            source_fingerprint=None,
+        )
+
     async def handle_action(self, action: str, page_id: str, interaction):
         if not self._authorized(interaction):
             await interaction.response.send_message("你没有权限操作这个任务。", ephemeral=True)
@@ -304,15 +440,17 @@ class NotionTaskController:
         if action == "hold":
             await self.handle_hold_menu(page_id, interaction)
             return
-        if action == "drop":
-            await self.handle_drop_menu(page_id, interaction)
-            return
         if action == "open_thread":
             await self.handle_open_thread(page_id, interaction)
             return
         if action == "rename_thread":
             await self.handle_rename_thread(page_id, interaction)
             return
+        if action not in {"done", "undo", "drop"}:
+            await interaction.response.send_message(f"不认识这个任务操作：{action}", ephemeral=True)
+            return
+
+        await _defer_message_update(interaction)
 
         # Authoritative read at click time — works even if the tracker has no
         # record for this page (standalone-sent button / post-restart).
@@ -320,7 +458,7 @@ class NotionTaskController:
             page = await self.notion.get_page(page_id)
         except Exception as exc:
             logger.warning("notion task: get_page(%s) at click failed: %s", page_id, exc)
-            await interaction.response.send_message(
+            await _send_interaction_notice(interaction,
                 f"读取任务失败（Notion 暂时不可用），未改动：{exc}", ephemeral=True)
             return
         title = detection.page_title(page)
@@ -328,7 +466,7 @@ class NotionTaskController:
         kind = kind or "select"
 
         rec = self.tracker.get(page_id) or {}
-        done = (action == "done")
+        terminal = action in {"done", "drop"}
 
         msg = getattr(interaction, "message", None)
         mid = str(getattr(msg, "id", "") or "")
@@ -336,16 +474,19 @@ class NotionTaskController:
         chan_id = str(getattr(chan, "id", "") or "")
         content_now = getattr(msg, "content", "") or ""
 
-        if done:
+        if action == "done":
             target = "Done"
             # capture the pre-done status as the undo target (keep an earlier one)
+            original = rec.get("original_status") or cur_status
+        elif action == "drop":
+            target = "Dropped"
             original = rec.get("original_status") or cur_status
         else:
             # undo: never guess. Without a recorded original status we cannot
             # safely restore — fail fast instead of defaulting (per fail-fast).
             original = rec.get("original_status")
             if not original:
-                await interaction.response.send_message(
+                await _send_interaction_notice(interaction,
                     "无法撤销：已丢失该任务的原始状态记录，请在 Notion 中手动调整。", ephemeral=True)
                 return
             target = original
@@ -363,25 +504,28 @@ class NotionTaskController:
         except Exception as exc:
             logger.error("notion task: tracker persist failed pre-write for %s: %s",
                          page_id, exc, exc_info=True)
-            await interaction.response.send_message("记录任务状态失败，未改动，请重试。", ephemeral=True)
+            await _send_interaction_notice(interaction, "记录任务状态失败，未改动，请重试。", ephemeral=True)
             return
 
         try:
-            updated_page = await self._set_status_confirmed(page_id, target, kind)
+            if action == "drop":
+                updated_page = await self._set_dropped_confirmed(page_id, "user_dropped")
+            else:
+                updated_page = await self._set_status_confirmed(page_id, target, kind)
         except Exception as exc:
             logger.warning("notion task: set_status(%s,%s) failed: %s", page_id, target, exc)
-            await interaction.response.send_message(
+            await _send_interaction_notice(interaction,
                 f"标记失败（Notion 暂时不可用），任务未改动：{exc}", ephemeral=True)
             return
 
         state = _card_state_from_page(updated_page) if updated_page else {
-            "state": "done" if done else "open", "due_label": None}
-        self.tracker.upsert_meta(page_id, done=done)  # reflect Notion reality
-        if done:
-            self.snoozes.cancel_pending(page_id, reason="completed")
+            "state": target.lower() if terminal else "open", "due_label": None}
+        self.tracker.upsert_meta(page_id, done=terminal)  # reflect undoable terminal state
+        if terminal:
+            self.snoozes.cancel_pending(page_id, reason="dropped" if action == "drop" else "completed")
         orig = self._stored_orig(page_id, mid) or content_now
         mode, view, embed = await self._rebuild_card(
-            orig, page_id=page_id, title=title, done=done, state=state)
+            orig, page_id=page_id, title=title, done=terminal, state=state)
         if mode == "failed":
             # Notion IS updated, but a sibling task link in THIS message couldn't
             # be read, so the card can't be rebuilt without dropping that task's
@@ -389,13 +533,13 @@ class NotionTaskController:
             # explicitly (fail-fast, never silent).
             logger.warning("notion task: card rebuild failed for %s; "
                            "preserving message as-is", page_id)
-            await interaction.response.send_message(
-                "任务已在 Notion 标记完成，但这条消息里另一个任务暂时读不出来，"
+            await _send_interaction_notice(interaction,
+                "任务已在 Notion 更新，但这条消息里另一个任务暂时读不出来，"
                 "卡片没刷新（已保留原样）。请稍后再点一次或手动查看。", ephemeral=True)
-            await self._sync_other(page_id, exclude_mid=mid, done=done, title=title, state=state)
+            await self._sync_other(page_id, exclude_mid=mid, done=terminal, title=title, state=state)
             return
         try:
-            await interaction.response.edit_message(embed=embed, view=view)
+            await _edit_interaction_message(interaction, embed=embed, view=view)
         except Exception as exc:
             # Notion IS updated; only the message visual failed — surface it.
             logger.error("notion task: edit_message after write failed for %s: %s",
@@ -406,51 +550,33 @@ class NotionTaskController:
                     await followup.send("任务状态已更新，但消息刷新失败，请手动查看。", ephemeral=True)
                 except Exception:
                     logger.exception("notion task: failed to send post-write failure notice")
-        await self._sync_other(page_id, exclude_mid=mid, done=done, title=title, state=state)
+        await self._sync_other(page_id, exclude_mid=mid, done=terminal, title=title, state=state)
 
     async def handle_hold_menu(self, page_id: str, interaction):
         """V0 lightweight Hold: explicit button click parks the task in Notion."""
         await self.handle_hold_confirm(page_id, "manual_hold", None, interaction)
 
-    async def handle_drop_menu(self, page_id: str, interaction):
-        """Ask for an extra click before setting Dropped."""
-        if not self._authorized(interaction):
-            await interaction.response.send_message("你没有权限操作这个任务。", ephemeral=True)
-            return
-        view = discord.ui.View(timeout=300)
-        button = discord.ui.Button(label="确认弃置", style=discord.ButtonStyle.danger)
-
-        async def _callback(interaction):
-            await self.handle_drop_confirm(page_id, "user_confirmed_dropped", interaction)
-
-        button.callback = _callback
-        view.add_item(button)
-        await interaction.response.send_message(
-            "确认要把这个任务标为“弃置”吗？之后不会当 Done，也不会被同源更新静默复活。",
-            view=view,
-            ephemeral=True,
-        )
-
     async def handle_open_thread(self, page_id: str, interaction):
         if not self._authorized(interaction):
             await interaction.response.send_message("你没有权限操作这个任务。", ephemeral=True)
             return
+        await _defer_message_update(interaction)
         try:
             page = await self.notion.get_page(page_id)
         except Exception as exc:
-            await interaction.response.send_message(f"读取任务失败，未创建子区：{exc}", ephemeral=True)
+            await _send_interaction_notice(interaction, f"读取任务失败，未创建子区：{exc}", ephemeral=True)
             return
 
         from .threading import generate_thread_title, read_thread_binding
         binding = read_thread_binding(page)
         if binding.get("thread_id"):
-            await interaction.response.send_message(f"已有子区：<#{binding['thread_id']}>", ephemeral=True)
+            await _send_interaction_notice(interaction, f"已有子区：<#{binding['thread_id']}>", ephemeral=True)
             return
 
         msg = getattr(interaction, "message", None)
         adapter = getattr(self, "adapter", None)
         if msg is None or adapter is None:
-            await interaction.response.send_message("当前消息不能创建 Discord 子区。", ephemeral=True)
+            await _send_interaction_notice(interaction, "当前消息不能创建 Discord 子区。", ephemeral=True)
             return
 
         title = generate_thread_title(page)
@@ -461,7 +587,7 @@ class NotionTaskController:
         ])
         result = await adapter.create_task_thread_from_message(msg, name=title, seed=seed)
         if not result.get("success"):
-            await interaction.response.send_message(f"创建子区失败：{result.get('error')}", ephemeral=True)
+            await _send_interaction_notice(interaction, f"创建子区失败：{result.get('error')}", ephemeral=True)
             return
 
         thread_id = str(result["thread_id"])
@@ -476,10 +602,10 @@ class NotionTaskController:
                 title_version=1,
             )
         except Exception as exc:
-            await interaction.response.send_message(
+            await _send_interaction_notice(interaction,
                 f"子区已创建 <#{thread_id}>，但 Notion 绑定失败：{exc}", ephemeral=True)
             return
-        await interaction.response.send_message(f"已打开任务子区：<#{thread_id}>", ephemeral=True)
+        await _send_interaction_notice(interaction, f"已打开任务子区：<#{thread_id}>", ephemeral=True)
 
     async def handle_rename_thread(self, page_id: str, interaction):
         await interaction.response.send_message("子区改名候选的实现还在下一步接线。", ephemeral=True)
@@ -500,6 +626,7 @@ class NotionTaskController:
         if not self._authorized(interaction):
             await interaction.response.send_message("你没有权限操作这个任务。", ephemeral=True)
             return
+        await _defer_message_update(interaction)
         try:
             page = await self.notion.set_hold_verified(
                 page_id,
@@ -508,55 +635,58 @@ class NotionTaskController:
                 waiting_for=None,
             )
         except Exception as exc:
-            await interaction.response.send_message(f"暂挂失败，Notion 未确认：{exc}", ephemeral=True)
+            await _send_interaction_notice(interaction, f"暂挂失败，Notion 未确认：{exc}", ephemeral=True)
             return
         title = detection.page_title(page)
         self.snoozes.cancel_pending(page_id, reason="moved_to_notion_hold")
-        await interaction.response.send_message(f"已暂挂：{title}", ephemeral=True)
-        await self._refresh_message_from_interaction(page_id, title, interaction)
-
-    async def handle_drop_confirm(self, page_id: str, reason: str, interaction):
-        if not self._authorized(interaction):
-            await interaction.response.send_message("你没有权限操作这个任务。", ephemeral=True)
-            return
-        try:
-            page = await self.notion.set_dropped_verified(
-                page_id,
-                reason=reason,
-                source_fingerprint=None,
-            )
-        except Exception as exc:
-            await interaction.response.send_message(f"弃置失败，Notion 未确认：{exc}", ephemeral=True)
-            return
-        title = detection.page_title(page)
-        self.snoozes.cancel_pending(page_id, reason="dropped")
-        await interaction.response.send_message(f"已弃置：{title}", ephemeral=True)
+        await _send_interaction_notice(interaction, f"已暂挂：{title}", ephemeral=True)
         await self._refresh_message_from_interaction(page_id, title, interaction)
 
     async def handle_snooze_menu(self, page_id: str, interaction):
-        """Open an ephemeral select menu for choosing a snooze preset."""
+        """Replace the clicked message controls with an in-place snooze picker."""
+        await _defer_message_update(interaction)
         try:
             page = await self.notion.get_page(page_id)
         except Exception as exc:
             logger.warning("notion task: get_page(%s) for snooze failed: %s", page_id, exc)
-            await interaction.response.send_message(
+            await _send_interaction_notice(interaction,
                 f"读取任务失败（Notion 暂时不可用），没安排提醒：{exc}", ephemeral=True)
             return
         status, _kind = detection.read_status(page)
         if status == "Done":
             self.snoozes.cancel_pending(page_id, reason="already_done")
-            await interaction.response.send_message("这个任务已经是 Done，不再提醒你。", ephemeral=True)
+            await _send_interaction_notice(interaction, "这个任务已经是 Done，不再提醒你。", ephemeral=True)
             return
 
         msg = getattr(interaction, "message", None)
         chan = getattr(msg, "channel", None)
-        view = self._build_snooze_menu(
-            page_id,
-            source_channel_id=str(getattr(chan, "id", "") or ""),
-            source_message_id=str(getattr(msg, "id", "") or ""),
-            source_content=getattr(msg, "content", "") or "",
+        source_channel_id = str(getattr(chan, "id", "") or "")
+        source_message_id = str(getattr(msg, "id", "") or "")
+        source_content = getattr(msg, "content", "") or ""
+        title = detection.page_title(page)
+        state = _card_state_from_page(page)
+        mode, base_view, embed = await self._rebuild_card(
+            source_content,
+            page_id=page_id,
+            title=title,
+            done=False,
+            state=state,
         )
-        await interaction.response.send_message("稍后多久提醒？", view=view, ephemeral=True)
+        view, preserves_source_controls = self._build_snooze_menu(
+            page_id,
+            source_channel_id=source_channel_id,
+            source_message_id=source_message_id,
+            source_content=source_content,
+            title=title,
+            base_view=base_view if mode == "ok" else None,
+        )
+        if not preserves_source_controls:
+            await _send_interaction_notice(interaction, "稍后多久提醒？", view=view, ephemeral=True)
+            return
+        edit_kwargs = {"view": view}
+        if mode == "ok" and embed is not None:
+            edit_kwargs["embed"] = embed
+        await _edit_interaction_message(interaction, **edit_kwargs)
 
     async def handle_snooze_choice(
         self,
@@ -571,23 +701,24 @@ class NotionTaskController:
         if not self._authorized(interaction):
             await interaction.response.send_message("你没有权限操作这个任务。", ephemeral=True)
             return
+        await _defer_message_update(interaction)
         try:
             page = await self.notion.get_page(page_id)
         except Exception as exc:
             logger.warning("notion task: get_page(%s) for snooze choice failed: %s", page_id, exc)
-            await interaction.response.send_message(
+            await _send_interaction_notice(interaction,
                 f"读取任务失败（Notion 暂时不可用），没安排提醒：{exc}", ephemeral=True)
             return
         status, _kind = detection.read_status(page)
         if status == "Done":
             self.snoozes.cancel_pending(page_id, reason="already_done")
-            await interaction.response.send_message("这个任务已经是 Done，不再提醒你。", ephemeral=True)
+            await _send_interaction_notice(interaction, "这个任务已经是 Done，不再提醒你。", ephemeral=True)
             return
 
         try:
             due = resolve_due(choice, now=self._now_fn())
         except ValueError:
-            await interaction.response.send_message("这个提醒选项我不认识，没安排。", ephemeral=True)
+            await _send_interaction_notice(interaction, "这个提醒选项我不认识，没安排。", ephemeral=True)
             return
         due = ceil_to_minute(due)
 
@@ -599,7 +730,7 @@ class NotionTaskController:
                 waiting_for=None,
             )
         except Exception as exc:
-            await interaction.response.send_message(
+            await _send_interaction_notice(interaction,
                 f"稍后提醒设置失败，Notion 未确认：{exc}", ephemeral=True)
             return
         title = detection.page_title(page)
@@ -608,11 +739,39 @@ class NotionTaskController:
             self.tracker.add_location(page_id, message_id=source_message_id,
                                       channel_id=source_channel_id,
                                       orig_content=source_content)
-        await interaction.response.send_message(
-            f"好，{due.strftime('%m/%d %H:%M')} 再提醒你：{title}", ephemeral=True)
-        await self._refresh_message_card(page_id, title=title,
-                                         channel_id=source_channel_id,
-                                         message_id=source_message_id)
+        state = _card_state_from_page(page)
+        current_msg = getattr(interaction, "message", None)
+        current_mid = str(getattr(current_msg, "id", "") or "")
+        current_content = getattr(current_msg, "content", "") or ""
+        mode, view, embed = await self._rebuild_card(
+            source_content or current_content,
+            page_id=page_id,
+            title=title,
+            done=False,
+            state=state,
+        )
+        if mode == "failed":
+            await _send_interaction_notice(
+                interaction,
+                "提醒时间已写入 Notion，但这条消息里另一个任务暂时读不出来，卡片没刷新。",
+                ephemeral=True,
+            )
+        else:
+            try:
+                await _edit_interaction_message(interaction, embed=embed, view=view)
+            except Exception:
+                logger.warning("notion task: failed to edit source after snooze choice", exc_info=True)
+                await _send_interaction_notice(
+                    interaction,
+                    "提醒时间已写入 Notion，但消息刷新失败，请手动查看。",
+                    ephemeral=True,
+                )
+        if source_message_id and source_message_id != current_mid:
+            await self._refresh_message_card(page_id, title=title,
+                                             channel_id=source_channel_id,
+                                             message_id=source_message_id)
+        await self._sync_other(page_id, exclude_mid=source_message_id or current_mid,
+                               done=False, title=title, state=state)
 
     async def _refresh_message_card(self, page_id, *, title, channel_id, message_id):
         """Visual-only card refresh (e.g. a row flipping to ⏰ 已延后).
@@ -747,10 +906,12 @@ class NotionTaskController:
                 continue
             title = link.anchor or detection.page_title(page)
             status, kind = detection.read_status(page)
-            done = (status == "Done")  # live Notion status is the truth, not stale tracker
+            state = _card_state_from_page(page)
+            done = _state_is_undoable(state)  # live Notion status is the truth, not stale tracker
             base = f"📌 {title}"
             tasks = [(link.page_id, title)]
             done_of = {link.page_id: done}
+            state_of = {link.page_id: state}
             # Register the STARTER (main channel) message as a location too, so a
             # click in the thread syncs the original message (and vice versa) —
             # the main message may have been sent standalone with no tracker entry.
@@ -764,7 +925,7 @@ class NotionTaskController:
                 sent = await thread.send(
                     content=base,
                     view=self._view_for_tasks(tasks, done_of),
-                    embed=self._card_embed(tasks, done_of),
+                    embed=self._card_embed(tasks, done_of, state_of=state_of),
                 )
                 self.tracker.add_location(link.page_id, message_id=sent.id,
                                           channel_id=thread.id, orig_content=base)

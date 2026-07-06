@@ -49,6 +49,8 @@ def resolve_due(value: str, *, now: datetime | None = None) -> datetime:
         return due
     if value == "tomorrow_morning":
         return (base + timedelta(days=1)).replace(hour=9, minute=30, second=0, microsecond=0)
+    if value == "three_days_morning":
+        return (base + timedelta(days=3)).replace(hour=9, minute=30, second=0, microsecond=0)
     if value == "next_monday":
         days = (7 - base.weekday()) % 7
         if days == 0:
@@ -86,6 +88,7 @@ def snooze_choices(*, now: datetime | None = None) -> list[SnoozeChoice]:
         ("1h", "1小时后", "短暂停一下，稍后再戳你"),
         ("tonight", "今晚 8:30", "今天晚点再提醒"),
         ("tomorrow_morning", "明早 9:30", "明天开工时提醒"),
+        ("three_days_morning", "3天后 9:30", "三天后的早上再提醒"),
         ("next_monday", "下周一 9:30", "下周开始时提醒"),
     ]
     return [SnoozeChoice(value, label, desc, resolve_due(value, now=base)) for value, label, desc in specs]

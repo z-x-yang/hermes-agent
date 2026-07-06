@@ -86,6 +86,7 @@ def test_snooze_time_presets_are_deterministic():
     assert resolve_due("1h", now=now).isoformat() == "2026-06-24T16:00:00"
     assert resolve_due("tonight", now=now).isoformat() == "2026-06-24T20:30:00"
     assert resolve_due("tomorrow_morning", now=now).isoformat() == "2026-06-25T09:30:00"
+    assert resolve_due("three_days_morning", now=now).isoformat() == "2026-06-27T09:30:00"
     assert resolve_due("next_monday", now=now).isoformat() == "2026-06-29T09:30:00"
 
 
@@ -98,7 +99,7 @@ def test_format_notion_datetime_ceil_to_minute():
 
 
 @pytest.mark.asyncio
-async def test_snooze_action_opens_ephemeral_choice_menu():
+async def test_snooze_action_edits_original_message_with_choice_menu():
     notion = SimpleNamespace(get_page=AsyncMock(return_value=TASK_PAGE), set_status=AsyncMock())
     ctrl = _ctrl(notion)
     inter = _interaction(content=f"Task https://notion.so/{PID}")
@@ -106,12 +107,14 @@ async def test_snooze_action_opens_ephemeral_choice_menu():
     await ctrl.handle_action("snooze", PID, inter)
 
     notion.set_status.assert_not_awaited()
-    inter.response.send_message.assert_awaited_once()
-    kwargs = inter.response.send_message.call_args.kwargs
-    assert kwargs["ephemeral"] is True
-    assert "稍后" in inter.response.send_message.call_args.args[0]
+    inter.response.send_message.assert_not_awaited()
+    inter.response.edit_message.assert_awaited_once()
+    kwargs = inter.response.edit_message.call_args.kwargs
+    assert "content" not in kwargs
     view = kwargs["view"]
-    assert view.children and view.children[0].custom_id.startswith("ntask:snooze-select:")
+    assert any(getattr(child, "custom_id", "").startswith("ntask:snooze-select:") for child in view.children)
+    assert [child.item.label for child in view.children if hasattr(child, "item")] == [
+        "🧵 1", "✓ 1", "暂挂 1", "弃置 1", "⏰ 1"]
 
 
 @pytest.mark.asyncio
@@ -141,8 +144,10 @@ async def test_snooze_choice_writes_notion_hold_and_confirms():
     assert notion.set_hold_verified.await_args.kwargs["next_check"] == "2026-06-24T16:00:00"
     pending = ctrl.snoozes.due(now=_now().timestamp() + 3601)
     assert pending == []
-    inter.response.send_message.assert_awaited_once()
-    assert "16:00" in inter.response.send_message.call_args.args[0]
+    inter.response.send_message.assert_not_awaited()
+    inter.response.edit_message.assert_awaited_once()
+    kwargs = inter.response.edit_message.call_args.kwargs
+    assert "⏰ 已延后·06/24 16:00" in kwargs["embed"].description
 
 
 @pytest.mark.asyncio

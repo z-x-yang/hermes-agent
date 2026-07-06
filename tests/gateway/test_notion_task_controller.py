@@ -50,6 +50,30 @@ def _interaction(user_id="42", msg_id="m1", channel_id="c1", content="Reply to A
     )
 
 
+class _DeferredResponse:
+    def __init__(self, events):
+        self._done = False
+        self._events = events
+        self.send_message = AsyncMock()
+        self.edit_message = AsyncMock()
+
+    def is_done(self):
+        return self._done
+
+    async def defer(self, *args, **kwargs):
+        self._events.append("defer")
+        self._done = True
+
+
+def _deferred_interaction(user_id="42", msg_id="m1", channel_id="c1", content="Reply to Alice"):
+    events = []
+    inter = _interaction(user_id=user_id, msg_id=msg_id, channel_id=channel_id, content=content)
+    inter.response = _DeferredResponse(events)
+    inter.edit_original_response = AsyncMock(side_effect=lambda **_kwargs: events.append("edit_original"))
+    inter._events = events
+    return inter
+
+
 # ===========================================================================
 # send path — render_send_attachments returns (numbered view, task-card embed)
 # ===========================================================================
@@ -98,6 +122,36 @@ async def test_done_edits_embed_only_never_content():
 
 
 @pytest.mark.asyncio
+async def test_done_defers_before_notion_work_and_edits_original_response():
+    events = []
+
+    async def _get_page(_pid):
+        events.append("get_page")
+        return TASK_PAGE
+
+    async def _set_status_verified(*_args):
+        events.append("set_status")
+        return {}
+
+    notion = SimpleNamespace(
+        get_page=AsyncMock(side_effect=_get_page),
+        set_status_verified=AsyncMock(side_effect=_set_status_verified),
+    )
+    ctrl = _ctrl(notion)
+    inter = _deferred_interaction(content="Reply to Alice today")
+    inter.response._events = events
+    inter._events = events
+    inter.edit_original_response = AsyncMock(side_effect=lambda **_kwargs: events.append("edit_original"))
+
+    await ctrl.handle_action("done", PID, inter)
+
+    assert events[0] == "defer"
+    assert events.index("defer") < events.index("get_page")
+    assert events[-1] == "edit_original"
+    inter.response.edit_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_undo_restores_open_row_and_status():
     notion = SimpleNamespace(get_page=AsyncMock(return_value=TASK_PAGE), set_status_verified=AsyncMock(return_value={}))
     ctrl = _ctrl(notion)
@@ -114,6 +168,31 @@ async def test_undo_restores_open_row_and_status():
     assert "已完成" not in kwargs["embed"].title
     labels = [c.item.label for c in kwargs["view"].children]
     assert labels == ["🧵 1", "✓ 1", "暂挂 1", "弃置 1", "⏰ 1"]
+
+
+@pytest.mark.asyncio
+async def test_drop_action_is_immediate_struck_and_undoable():
+    dropped_page = {**TASK_PAGE, "properties": {**TASK_PAGE["properties"],
+                    "Status": {"type": "status", "status": {"name": "Dropped"}}}}
+    notion = SimpleNamespace(
+        get_page=AsyncMock(return_value=TASK_PAGE),
+        set_dropped_verified=AsyncMock(return_value=dropped_page),
+    )
+    ctrl = _ctrl(notion)
+    inter = _interaction(content="Reply to Alice today")
+
+    await ctrl.handle_action("drop", PID, inter)
+
+    notion.set_dropped_verified.assert_awaited_once_with(
+        PID,
+        reason="user_dropped",
+        source_fingerprint=None,
+    )
+    inter.response.send_message.assert_not_awaited()
+    kwargs = inter.response.edit_message.call_args.kwargs
+    assert "content" not in kwargs
+    assert f"🛑 已弃置 · ~~{_link('Reply to Alice')}~~" in kwargs["embed"].description
+    assert [c.item.label for c in kwargs["view"].children] == ["↩ 1"]
 
 
 @pytest.mark.asyncio
@@ -467,7 +546,7 @@ async def test_snooze_choice_marks_row_delayed_on_source_message():
                  "Next Check": {"type": "date", "date": {"start": "2026-07-07T09:30:00-04:00"}},
                  "Hold Reason": {"type": "rich_text", "rich_text": [{"plain_text": "snoozed"}]}}}
     notion = SimpleNamespace(
-        get_page=AsyncMock(side_effect=[TASK_PAGE, held_page]),
+        get_page=AsyncMock(side_effect=[TASK_PAGE, held_page, held_page]),
         set_hold_verified=AsyncMock(return_value=held_page),
     )
     src_msg = SimpleNamespace(content=f"Task https://notion.so/{PID}", edit=AsyncMock())
@@ -512,23 +591,62 @@ async def test_hold_confirm_sets_notion_hold_and_cancels_snooze():
 
 
 @pytest.mark.asyncio
-async def test_drop_confirm_sets_notion_dropped_and_cancels_snooze():
-    dropped_page = {**TASK_PAGE, "properties": {**TASK_PAGE["properties"],
-                    "Status": {"type": "status", "status": {"name": "Dropped"}}}}
-    notion = SimpleNamespace(set_dropped_verified=AsyncMock(return_value=dropped_page))
+async def test_snooze_action_edits_original_message_with_select_instead_of_new_message():
+    notion = SimpleNamespace(get_page=AsyncMock(return_value=TASK_PAGE), set_status=AsyncMock())
     ctrl = _ctrl(notion)
-    ctrl.snoozes.cancel_pending = MagicMock()
-    inter = _interaction()
+    inter = _interaction(content=f"Task https://notion.so/{PID}")
 
-    await ctrl.handle_drop_confirm(PID, "not_worth_doing", inter)
+    await ctrl.handle_action("snooze", PID, inter)
 
-    notion.set_dropped_verified.assert_awaited_once_with(
-        PID,
-        reason="not_worth_doing",
-        source_fingerprint=None,
-    )
-    ctrl.snoozes.cancel_pending.assert_called_once_with(PID, reason="dropped")
-    inter.response.send_message.assert_awaited()
+    notion.set_status.assert_not_awaited()
+    inter.response.send_message.assert_not_awaited()
+    inter.response.edit_message.assert_awaited_once()
+    kwargs = inter.response.edit_message.call_args.kwargs
+    assert "content" not in kwargs
+    view = kwargs["view"]
+    select = next(child for child in view.children if getattr(child, "custom_id", "").startswith("ntask:snooze-select:"))
+    assert [child.item.label for child in view.children if hasattr(child, "item")] == [
+        "🧵 1", "✓ 1", "暂挂 1", "弃置 1", "⏰ 1"]
+    labels = [option.label for option in select.options]
+    assert "3天后 9:30" in labels
+
+
+@pytest.mark.asyncio
+async def test_snooze_picker_timeout_restores_original_buttons():
+    src_msg = SimpleNamespace(content=f"Task https://notion.so/{PID}", edit=AsyncMock())
+    src_chan = SimpleNamespace(fetch_message=AsyncMock(return_value=src_msg))
+    ctrl = _ctrl(SimpleNamespace(get_page=AsyncMock(return_value=TASK_PAGE)),
+                 fetch_channel=AsyncMock(return_value=src_chan))
+    inter = _interaction(msg_id="3003", channel_id="c1", content=f"Task https://notion.so/{PID}")
+
+    await ctrl.handle_action("snooze", PID, inter)
+    view = inter.response.edit_message.call_args.kwargs["view"]
+
+    await view.on_timeout()
+
+    src_msg.edit.assert_awaited_once()
+    restored = src_msg.edit.call_args.kwargs["view"]
+    assert [child.item.label for child in restored.children] == [
+        "🧵 1", "✓ 1", "暂挂 1", "弃置 1", "⏰ 1"]
+    assert not any(getattr(child, "custom_id", "").startswith("ntask:snooze-select:") for child in restored.children)
+
+
+@pytest.mark.asyncio
+async def test_snooze_picker_no_spare_row_falls_back_without_editing_source():
+    pids = [PID] + [f"{i:032x}" for i in range(1, 5)]
+    body = " ".join(f"[T{i}](https://notion.so/{pid})" for i, pid in enumerate(pids))
+    notion = SimpleNamespace(get_page=AsyncMock(return_value=TASK_PAGE), set_status=AsyncMock())
+    ctrl = _ctrl(notion)
+    inter = _interaction(content=body)
+
+    await ctrl.handle_action("snooze", PID, inter)
+
+    inter.response.edit_message.assert_not_awaited()
+    inter.response.send_message.assert_awaited_once()
+    kwargs = inter.response.send_message.call_args.kwargs
+    assert kwargs["ephemeral"] is True
+    assert any(getattr(child, "custom_id", "").startswith("ntask:snooze-select:")
+               for child in kwargs["view"].children)
 
 
 @pytest.mark.asyncio
