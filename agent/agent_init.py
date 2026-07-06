@@ -1459,6 +1459,9 @@ def init_agent(
     compression_abort_on_summary_failure = str(
         _compression_cfg.get("abort_on_summary_failure", False)
     ).lower() in {"true", "1", "yes"}
+    cheap_tool_result_cleanup_cfg = _compression_cfg.get("cheap_tool_result_cleanup", {})
+    if not isinstance(cheap_tool_result_cleanup_cfg, dict):
+        cheap_tool_result_cleanup_cfg = {}
     # In-place compaction: when True, compress_context() rewrites the message
     # list + rebuilds the system prompt WITHOUT rotating the session id (no
     # parent_session_id chain, no `name #N` renumber). See #38763 and
@@ -1706,6 +1709,7 @@ def init_agent(
             api_mode=agent.api_mode,
             abort_on_summary_failure=compression_abort_on_summary_failure,
             max_tokens=agent.max_tokens,
+            cheap_tool_result_cleanup=cheap_tool_result_cleanup_cfg,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):

@@ -1362,6 +1362,13 @@ DEFAULT_CONFIG = {
                                       # Default False matches historical behavior; set to
                                       # True if you'd rather pause than silently lose
                                       # context turns when your aux model is flaky.
+        "cheap_tool_result_cleanup": {
+            "enabled": False,
+            "keep_recent": 5,
+            "min_tokens_saved": 20000,
+            "replacement_mode": "persisted_handle_or_sentinel",
+            "skip_llm_summary_when_below_threshold": True,
+        },
         "codex_gpt55_autoraise": True,  # When True, gpt-5.5 on the ChatGPT Codex OAuth
                                       # route raises its compaction trigger to 85% (vs the
                                       # global `threshold` above). Codex hard-caps gpt-5.5
@@ -7637,6 +7644,13 @@ def show_config():
         print(f"  Target ratio: {compression.get('target_ratio', 0.20) * 100:.0f}% of threshold preserved")
         print(f"  Protect last: {compression.get('protect_last_n', 20)} messages")
         print(f"  Protect first: {compression.get('protect_first_n', 3)} non-system head messages")
+        _cheap = compression.get("cheap_tool_result_cleanup", {})
+        if isinstance(_cheap, dict):
+            _cheap_enabled = str(_cheap.get("enabled", False)).lower() in {"true", "1", "yes"}
+            print(f"  Cheap cleanup: {'yes' if _cheap_enabled else 'no'}")
+            if _cheap_enabled:
+                print(f"    keep_recent:      {_cheap.get('keep_recent', 5)}")
+                print(f"    min_tokens_saved: {_cheap.get('min_tokens_saved', 20000)}")
         _aux_comp = config.get('auxiliary', {}).get('compression', {})
         _sm = _aux_comp.get('model', '') or '(auto)'
         print(f"  Model:        {_sm}")

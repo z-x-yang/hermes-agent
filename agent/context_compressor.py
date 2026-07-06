@@ -22,6 +22,7 @@ import logging
 import sqlite3
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -271,6 +272,66 @@ _GATEWAY_INTERRUPTION_SYSTEM_NOTE_RE = re.compile(
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
+_CLAUDE_TOOL_RESULT_CLEARED_SENTINEL = "[Old tool result content cleared]"
+_CHEAP_TOOL_CLEANUP_REPLACEMENT_MODE = "persisted_handle_or_sentinel"
+
+
+@dataclass(frozen=True)
+class CheapToolResultCleanupConfig:
+    """Config for Claude-like deterministic old tool-result cleanup."""
+
+    enabled: bool = False
+    keep_recent: int = 5
+    min_tokens_saved: int = 20_000
+    replacement_mode: str = _CHEAP_TOOL_CLEANUP_REPLACEMENT_MODE
+    skip_llm_summary_when_below_threshold: bool = True
+
+    @classmethod
+    def normalized(cls, value: Any | None) -> "CheapToolResultCleanupConfig":
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            return cls()
+
+        def _bool(raw: Any, default: bool) -> bool:
+            if isinstance(raw, bool):
+                return raw
+            if raw is None:
+                return default
+            return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+        def _non_negative_int(raw: Any, default: int) -> int:
+            try:
+                parsed = int(raw)
+            except (TypeError, ValueError):
+                return default
+            return max(0, parsed)
+
+        mode = str(value.get("replacement_mode") or _CHEAP_TOOL_CLEANUP_REPLACEMENT_MODE)
+        if mode != _CHEAP_TOOL_CLEANUP_REPLACEMENT_MODE:
+            mode = _CHEAP_TOOL_CLEANUP_REPLACEMENT_MODE
+
+        return cls(
+            enabled=_bool(value.get("enabled"), False),
+            keep_recent=_non_negative_int(value.get("keep_recent"), 5),
+            min_tokens_saved=_non_negative_int(value.get("min_tokens_saved"), 20_000),
+            replacement_mode=mode,
+            skip_llm_summary_when_below_threshold=_bool(
+                value.get("skip_llm_summary_when_below_threshold"), True
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class CheapToolResultCleanupResult:
+    """Result of deterministic old tool-result cleanup."""
+
+    messages: list[dict[str, Any]]
+    applied: bool
+    audit: dict[str, Any]
+    tokens_saved_estimate: int = 0
+    post_tokens_estimate: int | None = None
+
 
 # Chars per token rough estimate
 _CHARS_PER_TOKEN = 4
@@ -965,9 +1026,42 @@ class ContextCompressor(ContextEngine):
     def name(self) -> str:
         return "compressor"
 
+    def _empty_cheap_tool_cleanup_audit(self) -> dict[str, Any]:
+        cfg = getattr(self, "cheap_tool_result_cleanup", CheapToolResultCleanupConfig())
+        return {
+            "enabled": bool(cfg.enabled),
+            "applied": False,
+            "result": "disabled" if not cfg.enabled else "not_attempted",
+            "scope": "summary_window_before_protected_tail",
+            "view": "cleaned_after_cheap_tool_result_cleanup",
+            "keep_recent": int(cfg.keep_recent),
+            "min_tokens_saved": int(cfg.min_tokens_saved),
+            "tail_tool_result_count": 0,
+            "tail_tool_count": 0,
+            "extra_pre_tail_keep_count": 0,
+            "candidate_count": 0,
+            "clear_candidate_count": 0,
+            "kept_recent_pre_tail_count": 0,
+            "cleared_count": 0,
+            "protected_tail_cleared_count": 0,
+            "tokens_saved_estimate": 0,
+            "tokens_saved": 0,
+            "replacement_counts": {"persisted_handle": 0, "sentinel": 0},
+            "sentinel_fallback_reasons": {},
+            "summary_source_view": "not_applicable",
+            "raw_tool_results_restored_for_summary": False,
+            "llm_summary_skipped_after_cleanup": False,
+            "llm_summary_ran_on_cleaned_view": False,
+            "cleared_tool_call_id_hashes": [],
+        }
+
+    def _reset_cheap_tool_cleanup_audit(self) -> None:
+        self._last_cheap_tool_cleanup_audit = self._empty_cheap_tool_cleanup_audit()
+
     def on_session_reset(self) -> None:
         """Reset all per-session state for /new or /reset."""
         super().on_session_reset()
+        self._reset_cheap_tool_cleanup_audit()
         self._context_probed = False
         self._context_probe_persistable = False
         self._previous_summary = None
@@ -1282,6 +1376,7 @@ class ContextCompressor(ContextEngine):
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
         max_tokens: int | None = None,
+        cheap_tool_result_cleanup: CheapToolResultCleanupConfig | dict[str, Any] | None = None,
     ):
         self.model = model
         self.base_url = base_url
@@ -1305,6 +1400,10 @@ class ContextCompressor(ContextEngine):
         # When False (default = historical behavior), insert a
         # deterministic "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
+        self.cheap_tool_result_cleanup = CheapToolResultCleanupConfig.normalized(
+            cheap_tool_result_cleanup
+        )
+        self._reset_cheap_tool_cleanup_audit()
 
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,
@@ -1537,6 +1636,242 @@ class ContextCompressor(ContextEngine):
                     args_str = getattr(fn, "arguments", "") if fn else ""
                     call_id_to_tool[cid] = (name, args_str)
         return call_id_to_tool
+
+    @staticmethod
+    def _is_persisted_output_block(content: Any) -> bool:
+        text = _content_text_for_contains(content).strip()
+        return text.startswith("<persisted-output>") and text.endswith(
+            "</persisted-output>"
+        )
+
+    @staticmethod
+    def _short_audit_hash(value: Any) -> str:
+        text = str(value or "")
+        return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+    def _validated_persisted_tool_row_id(
+        self,
+        msg: dict[str, Any],
+        row_id_int: int,
+    ) -> tuple[int | None, str | None]:
+        """Return a recoverable persisted tool row id, or a sentinel fallback reason."""
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "") or ""
+        if not session_db or not session_id:
+            return None, "unverified_row_id"
+
+        getter = getattr(session_db, "get_messages_around", None)
+        if getter is None:
+            return None, "unverified_row_id"
+
+        try:
+            window = getter(session_id, row_id_int, window=0)
+        except (sqlite3.Error, TypeError, ValueError):
+            return None, "unverified_row_id"
+        except Exception:
+            return None, "unverified_row_id"
+
+        rows = window.get("window") if isinstance(window, dict) else None
+        if not isinstance(rows, list):
+            return None, "unverified_row_id"
+
+        persisted = None
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                if int(row.get("id") or 0) == row_id_int:
+                    persisted = row
+                    break
+            except (TypeError, ValueError):
+                continue
+
+        if not persisted or persisted.get("role") != "tool":
+            return None, "unverified_row_id"
+
+        expected_tool_call_id = msg.get("tool_call_id")
+        persisted_tool_call_id = persisted.get("tool_call_id")
+        if expected_tool_call_id and persisted_tool_call_id != expected_tool_call_id:
+            return None, "unverified_row_id"
+
+        return row_id_int, None
+
+    def _cheap_tool_result_replacement(
+        self,
+        msg: dict[str, Any],
+        index: int,
+    ) -> tuple[str, str, str | None]:
+        session_id = getattr(self, "_session_id", "") or ""
+        row_id = msg.get("id")
+        if row_id is None:
+            row_id_int = 0
+        else:
+            try:
+                row_id_int = int(row_id)
+            except (TypeError, ValueError):
+                row_id_int = 0
+
+        if row_id_int <= 0:
+            return "sentinel", _CLAUDE_TOOL_RESULT_CLEARED_SENTINEL, "missing_row_id"
+
+        validated_row_id, fallback_reason = self._validated_persisted_tool_row_id(
+            msg,
+            row_id_int,
+        )
+        if validated_row_id is None:
+            return (
+                "sentinel",
+                _CLAUDE_TOOL_RESULT_CLEARED_SENTINEL,
+                fallback_reason or "unverified_row_id",
+            )
+
+        handle = f"hermes://session/{session_id}/message/{validated_row_id}"
+        content = (
+            "<persisted-output>\n"
+            f"Tool result archived at: {handle}\n"
+            "Use session_search("
+            f"session_id=\"{session_id}\", "
+            f"around_message_id={validated_row_id}, "
+            "window=1, role_filter=\"tool\") to view it if needed.\n"
+            "</persisted-output>"
+        )
+        return "persisted_handle", content, None
+
+    def _cleanup_old_tool_results(
+        self,
+        messages: list[dict[str, Any]],
+        summarize_start: int,
+        compress_end: int,
+    ) -> CheapToolResultCleanupResult:
+        cfg = self.cheap_tool_result_cleanup
+        base_audit: dict[str, Any] = self._empty_cheap_tool_cleanup_audit()
+        if not cfg.enabled:
+            return CheapToolResultCleanupResult(messages, False, base_audit)
+
+        summarize_start = max(0, int(summarize_start))
+        compress_end = max(summarize_start, min(int(compress_end), len(messages)))
+
+        tail_tool_count = sum(
+            1
+            for msg in messages[compress_end:]
+            if isinstance(msg, dict) and msg.get("role") == "tool"
+        )
+        extra_keep = max(0, int(cfg.keep_recent) - tail_tool_count)
+        base_audit["tail_tool_result_count"] = tail_tool_count
+        base_audit["tail_tool_count"] = tail_tool_count
+        base_audit["extra_pre_tail_keep_count"] = extra_keep
+
+        candidates: list[tuple[int, dict[str, Any]]] = []
+        for index in range(summarize_start, compress_end):
+            msg = messages[index]
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            content = msg.get("content")
+            if content in (None, "", []):
+                continue
+            if content == _CLAUDE_TOOL_RESULT_CLEARED_SENTINEL:
+                continue
+            if self._is_persisted_output_block(content):
+                continue
+            candidates.append((index, msg))
+
+        base_audit["candidate_count"] = len(candidates)
+        if not candidates:
+            base_audit["result"] = "no_candidates"
+            return CheapToolResultCleanupResult(messages, False, base_audit)
+
+        keep_indices = {index for index, _msg in candidates[-extra_keep:]} if extra_keep else set()
+        clear_candidates = [
+            (index, msg) for index, msg in candidates if index not in keep_indices
+        ]
+        base_audit["kept_recent_pre_tail_count"] = len(keep_indices)
+        base_audit["clear_candidate_count"] = len(clear_candidates)
+        if not clear_candidates:
+            base_audit["result"] = "all_candidates_kept_recent"
+            return CheapToolResultCleanupResult(messages, False, base_audit)
+
+        replacements: list[tuple[int, dict[str, Any], str, str, str | None]] = []
+        tokens_saved = 0
+        for index, msg in clear_candidates:
+            replacement_type, replacement_content, fallback_reason = (
+                self._cheap_tool_result_replacement(msg, index)
+            )
+            old_tokens = estimate_messages_tokens_rough([msg])
+            new_msg = {**msg, "content": replacement_content}
+            new_tokens = estimate_messages_tokens_rough([new_msg])
+            tokens_saved += max(0, int(old_tokens) - int(new_tokens))
+            replacements.append(
+                (index, msg, replacement_type, replacement_content, fallback_reason)
+            )
+
+        base_audit["tokens_saved_estimate"] = int(tokens_saved)
+        base_audit["tokens_saved"] = int(tokens_saved)
+        if tokens_saved < int(cfg.min_tokens_saved):
+            base_audit["result"] = "below_min_tokens_saved"
+            return CheapToolResultCleanupResult(messages, False, base_audit, int(tokens_saved))
+
+        cleaned = [m.copy() if isinstance(m, dict) else m for m in messages]
+        fallback_reasons: dict[str, int] = {}
+        cleared_hashes: list[str] = []
+        replacement_counts = {"persisted_handle": 0, "sentinel": 0}
+        for index, old_msg, replacement_type, replacement_content, fallback_reason in replacements:
+            cleaned[index] = {**old_msg, "content": replacement_content}
+            replacement_counts[replacement_type] = replacement_counts.get(
+                replacement_type, 0
+            ) + 1
+            if fallback_reason:
+                fallback_reasons[fallback_reason] = fallback_reasons.get(
+                    fallback_reason, 0
+                ) + 1
+            if len(cleared_hashes) < 50:
+                cleared_hashes.append(self._short_audit_hash(old_msg.get("tool_call_id")))
+
+        post_tokens = int(estimate_messages_tokens_rough(cleaned))
+        audit = dict(base_audit)
+        audit.update(
+            {
+                "applied": True,
+                "result": "applied",
+                "cleared_count": len(replacements),
+                "replacement_counts": replacement_counts,
+                "sentinel_fallback_reasons": fallback_reasons,
+                "post_cleanup_tokens_estimate": post_tokens,
+                "cleared_tool_call_id_hashes": cleared_hashes,
+            }
+        )
+        return CheapToolResultCleanupResult(
+            cleaned, True, audit, int(tokens_saved), post_tokens
+        )
+
+    def _cheap_cleanup_only_allowed(
+        self,
+        *,
+        entrypoint: str,
+        trigger_reason: str | None,
+        focus_topic: str | None,
+        cleanup_result: CheapToolResultCleanupResult,
+    ) -> bool:
+        cfg = self.cheap_tool_result_cleanup
+        if not cfg.enabled or not cfg.skip_llm_summary_when_below_threshold:
+            return False
+        if not cleanup_result.applied:
+            return False
+        if entrypoint != "auto":
+            return False
+        if focus_topic:
+            return False
+        if trigger_reason in {
+            "manual",
+            "hard_message_limit",
+            "hygiene_hard_message_limit",
+            "message_count_hard_limit",
+            "token_threshold_and_message_count_hard_limit",
+        }:
+            return False
+        post_tokens = cleanup_result.post_tokens_estimate
+        if post_tokens is None:
+            return False
+        return int(post_tokens) < int(getattr(self, "threshold_tokens", 0) or 0)
 
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
@@ -2172,6 +2507,10 @@ class ContextCompressor(ContextEngine):
                 if trigger_hard_message_limit is not None else None
             ),
         }
+        cheap_cleanup_audit = self._empty_cheap_tool_cleanup_audit()
+        cheap_cleanup_audit.update(
+            dict(getattr(self, "_last_cheap_tool_cleanup_audit", {}) or {})
+        )
         return {
             "event": "context_compression",
             "schema_version": 1,
@@ -2203,6 +2542,7 @@ class ContextCompressor(ContextEngine):
                 len(_user_ground_truth) if _user_ground_truth is not None else None
             ),
             "summary_source": dict(self._last_summary_source_audit or {}),
+            "cheap_tool_result_cleanup": cheap_cleanup_audit,
             "summary_dropped_count": int(self._last_summary_dropped_count or 0),
             "summary_fallback_used": bool(self._last_summary_fallback_used),
             "abort_reason": abort_reason,
@@ -2673,7 +3013,14 @@ class ContextCompressor(ContextEngine):
         source_char_budget = self._summary_source_char_budget()
         source_token_budget = self._summary_source_token_budget()
 
+        cleanup_audit = getattr(self, "_last_cheap_tool_cleanup_audit", {}) or {}
+        source_view = (
+            "cleaned_after_cheap_tool_result_cleanup"
+            if cleanup_audit.get("applied") else "raw"
+        )
         source_audit: dict[str, Any] = {
+            "view": source_view,
+            "raw_tool_results_restored_for_summary": False if cleanup_audit.get("applied") else None,
             "budget_chars": source_char_budget,
             "budget_tokens_estimate": source_token_budget,
             "raw_chars": 0,
@@ -4094,6 +4441,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._last_tail_boundary_audit = {}
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
+        self._reset_cheap_tool_cleanup_audit()
         self._last_compress_aborted = False
         # NOTE: do NOT reset _last_summary_auth_failure or
         # _last_summary_network_failure here.  These flags are set by
@@ -4139,11 +4487,11 @@ This compaction should PRIORITISE preserving all information related to the focu
             "trigger_message_count": trigger_message_count,
             "trigger_hard_message_limit": trigger_hard_message_limit,
         }
-        # Source-fidelity invariant: the LLM summary must see raw turns for the
-        # window it is asked to absorb.  The working ``messages`` view below may
-        # prune old tool outputs for the summarizer/live budget, but
-        # ``raw_messages`` remains the restart-safe source material for any turn
-        # that is summarized during this compression.
+        # Source-fidelity invariant: the tail boundary is selected against the
+        # original transcript.  By default, the LLM summary sees raw turns for
+        # the window it is asked to absorb.  If cheap old-tool cleanup applies
+        # after the boundary is known, the summarizer deliberately sees that
+        # cleaned view instead, and protected tail content remains untouched.
         raw_messages = [m.copy() if isinstance(m, dict) else m for m in messages]
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1
@@ -4273,7 +4621,75 @@ This compaction should PRIORITISE preserving all information related to the focu
             # into the summarizer prompt via the iterative-update path.
             self._previous_summary = None
 
-        turns_to_summarize = list(turns_to_summarize)
+        cleanup_result = self._cleanup_old_tool_results(
+            messages,
+            summarize_start=summarize_start,
+            compress_end=compress_end,
+        )
+        self._last_cheap_tool_cleanup_audit = dict(cleanup_result.audit)
+        if cleanup_result.applied:
+            messages = cleanup_result.messages
+            raw_messages = [m.copy() if isinstance(m, dict) else m for m in messages]
+            turns_to_summarize = raw_messages[summarize_start:compress_end]
+        else:
+            turns_to_summarize = list(turns_to_summarize)
+
+        if self._cheap_cleanup_only_allowed(
+            entrypoint=entrypoint,
+            trigger_reason=trigger_reason,
+            focus_topic=focus_topic,
+            cleanup_result=cleanup_result,
+        ):
+            cheap_messages = self._sanitize_tool_pairs(messages)
+            cheap_messages = _strip_historical_media(cheap_messages)
+            cheap_messages, metadata_bounded = _bound_retained_nonvisible_metadata(cheap_messages)
+            if metadata_bounded and not self.quiet_mode:
+                logger.info(
+                    "Compression: bounded non-visible metadata on %d retained message(s)",
+                    metadata_bounded,
+                )
+            _strip_persistence_markers(cheap_messages)
+            cheap_estimate = estimate_messages_tokens_rough(cheap_messages)
+            cheap_audit = dict(self._last_cheap_tool_cleanup_audit)
+            cheap_audit["result"] = "cheap_cleanup_only"
+            cheap_audit["llm_summary_skipped_after_cleanup"] = True
+            cheap_audit["llm_summary_ran_on_cleaned_view"] = False
+            self._last_cheap_tool_cleanup_audit = cheap_audit
+            retained_tail_output_count = max(0, n_messages - compress_end)
+            tail_output_start = max(0, len(cheap_messages) - retained_tail_output_count)
+            retained_tail_messages_for_audit = [
+                _fresh_compaction_message_copy(msg)
+                for msg in cheap_messages[tail_output_start:]
+                if isinstance(msg, dict)
+            ]
+            self._write_compression_audit_record(self._build_compression_audit_record(
+                result="cheap_cleanup_only",
+                entrypoint=entrypoint,
+                input_messages=n_messages,
+                output_messages=len(cheap_messages),
+                summary_start=summarize_start,
+                summary_end=compress_end,
+                retained_tail_start=compress_end,
+                pruned_count=pruned_count,
+                tail_compacted_count=tail_tool_compacted,
+                tail_boundary_promoted=tail_boundary_promoted,
+                before_estimate=display_tokens,
+                after_estimate=cheap_estimate,
+                retained_tail_output_count=retained_tail_output_count,
+                before_messages=original_messages,
+                after_messages=cheap_messages,
+                retained_tail_messages=retained_tail_messages_for_audit,
+                retained_tail_raw_messages=original_messages[compress_end:n_messages],
+                **audit_trigger_kwargs,
+            ))
+            return cheap_messages
+
+        if cleanup_result.applied:
+            cleanup_audit = dict(self._last_cheap_tool_cleanup_audit)
+            cleanup_audit["result"] = "summary_on_cleaned_view"
+            cleanup_audit["llm_summary_skipped_after_cleanup"] = False
+            cleanup_audit["llm_summary_ran_on_cleaned_view"] = True
+            self._last_cheap_tool_cleanup_audit = cleanup_audit
 
         if not self.quiet_mode:
             logger.info(
@@ -4384,7 +4800,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 abort_reason = "summary_failed_after_prior_summary_pullup"
             else:
                 abort_reason = "abort_on_summary_failure"
-            output_messages = original_messages if pulled_summary_from_tail else messages
+            output_messages = (
+                original_messages
+                if pulled_summary_from_tail or cleanup_result.applied
+                else messages
+            )
             self._write_compression_audit_record(self._build_compression_audit_record(
                 result="abort",
                 entrypoint=entrypoint,
