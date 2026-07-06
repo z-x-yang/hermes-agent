@@ -1292,6 +1292,22 @@ class TestKillProcess:
         assert result["status"] == "killed"
         assert terminate_calls == [(12345, 67890)]
 
+    def test_expected_process_kill_does_not_enqueue_completion_notification(self, registry, monkeypatch):
+        """Replacing an old monitor should not inject failure-looking IMPORTANT turns."""
+        s = _make_session(sid="proc_expected_kill", command="python monitor.py")
+        s.process = MagicMock()
+        s.process.pid = 12345
+        s.host_start_time = 67890
+        s.notify_on_complete = True
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_terminate_host_pid", lambda pid, expected_start=None: None)
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        result = registry.kill_process(s.id)
+
+        assert result["status"] == "killed"
+        assert registry.drain_notifications() == []
+
     def test_kill_detached_session_uses_host_pid(self, registry):
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
