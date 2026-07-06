@@ -36,9 +36,11 @@ import platform
 import shlex
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
+from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
@@ -52,10 +54,13 @@ logger = logging.getLogger(__name__)
 
 
 # Checkpoint file for crash recovery (gateway only)
-CHECKPOINT_PATH = get_hermes_home() / "processes.json"
+HERMES_HOME = get_hermes_home()
+CHECKPOINT_PATH = HERMES_HOME / "processes.json"
+PROCESS_LOG_DIR = HERMES_HOME / "process_logs"
 
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
+PROCESS_LOG_MAX_BYTES = MAX_OUTPUT_CHARS  # durable local log cap per background process
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
@@ -106,7 +111,10 @@ class ProcessSession:
     termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
     max_output_chars: int = MAX_OUTPUT_CHARS
-    detached: bool = False                      # True if recovered from crash (no pipe)
+    detached: bool = False                      # True if recovered from crash (no pipe/Popen handle)
+    output_log_path: str = ""                   # Durable stdout/stderr log for restart-safe local bg jobs
+    exit_code_path: str = ""                    # Durable exit-code sidecar for restart-safe local bg jobs
+    output_log_offset: int = 0                  # Bytes consumed from output_log_path
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
@@ -213,6 +221,71 @@ class ProcessRegistry:
         while lines and any(noise in lines[0] for noise in ProcessRegistry._SHELL_NOISE_SUBSTRINGS):
             lines.pop(0)
         return "\n".join(lines)
+
+    @staticmethod
+    def _read_exit_code_path(path: str) -> Optional[int]:
+        """Best-effort parse of a durable exit-code sidecar."""
+        if not path:
+            return None
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return None
+        if not text:
+            return None
+        try:
+            return int(text.splitlines()[-1].strip())
+        except (ValueError, IndexError):
+            return None
+
+    def _drain_output_log(self, session: ProcessSession) -> str:
+        """Append new bytes from a durable output log into session.output_buffer.
+
+        Local background jobs used to be stdout-pipe backed. A restarted Gateway
+        cannot reattach to that anonymous pipe, so restart-safe jobs write to a
+        durable log and this method tails it from the persisted byte offset.
+        """
+        path = getattr(session, "output_log_path", "") or ""
+        if not path:
+            return ""
+        try:
+            log_path = Path(path)
+            size = log_path.stat().st_size
+        except OSError:
+            return ""
+
+        with session._lock:
+            offset = max(0, int(getattr(session, "output_log_offset", 0) or 0))
+        if offset > size:
+            # Log was truncated/rotated. Start over rather than wedging forever
+            # past EOF; the buffer is capped so duplicate small logs are cheap.
+            offset = 0
+
+        try:
+            with log_path.open("rb") as fh:
+                fh.seek(offset)
+                raw = fh.read()
+                new_offset = fh.tell()
+        except OSError:
+            return ""
+
+        if not raw:
+            with session._lock:
+                session.output_log_offset = new_offset
+            return ""
+
+        chunk = raw.decode("utf-8", errors="replace")
+        if offset == 0:
+            chunk = self._clean_shell_noise(chunk)
+        with session._lock:
+            session.output_log_offset = new_offset
+            session.output_buffer += chunk
+            if len(session.output_buffer) > session.max_output_chars:
+                session.output_buffer = session.output_buffer[-session.max_output_chars:]
+        if chunk:
+            self._check_watch_patterns(session, chunk)
+            self._emit_output(session, chunk)
+        return chunk
 
     def _emit_output(self, session: ProcessSession, chunk: str) -> None:
         """Forward a freshly-read chunk to the live-output sink, if one is set.
@@ -489,19 +562,28 @@ class ProcessRegistry:
         if session is None or session.exited or not session.detached or session.pid_scope != "host":
             return session
 
+        # A detached recovered process has no pipe/Popen handle.  Its durable
+        # stdout/stderr lives in output_log_path; drain it on every refresh so
+        # poll/list/watcher views stay useful after Gateway restart.
+        self._drain_output_log(session)
+
         # Identity-aware liveness: a recycled PID (alive but a different process
         # than we spawned) must be treated as "our process exited", so it is
         # moved to finished and can never be tree-killed by a later kill().
         if self._host_pid_is_ours(session.pid, session.host_start_time):
             return session
 
+        # One final drain after liveness flips, then read the sidecar exit code
+        # if a log-backed wrapper wrote one.  Legacy checkpoints keep None.
+        self._drain_output_log(session)
+        exit_code = self._read_exit_code_path(getattr(session, "exit_code_path", ""))
         with session._lock:
             if session.exited:
                 return session
             session.exited = True
-            # Recovered sessions no longer have a waitable handle, so the real
-            # exit code is unavailable once the original process object is gone.
-            session.exit_code = None
+            # Recovered sessions no longer have a waitable handle; the sidecar
+            # is the only source of truth for the exit status.
+            session.exit_code = exit_code
 
         self._move_to_finished(session)
         return session
@@ -754,24 +836,103 @@ class ProcessRegistry:
 
         # Standard Popen path (non-PTY or PTY fallback)
         # Use the user's login shell for consistency with LocalEnvironment --
-        # ensures rc files are sourced and user tools are available.
+        # ensures rc files are sourced and user tools are available.  Unlike the
+        # old pipe-backed path, stdout/stderr go to a durable log file so a
+        # restarted Gateway can keep useful output and avoid killing children via
+        # broken stdout pipes.
         user_shell = _find_shell()
         # Force unbuffered output for Python scripts so progress is visible
         # during background execution (libraries like tqdm/datasets buffer when
-        # stdout is a pipe, hiding output from process(action="poll")).
+        # stdout is redirected, hiding output from process(action="poll")).
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
+        log_dir = PROCESS_LOG_DIR / session.id
+        log_dir.mkdir(parents=True, exist_ok=True)
+        output_log_path = log_dir / "stdout.log"
+        exit_code_path = log_dir / "exit_code"
+        fifo_path = log_dir / "stdout.fifo"
+        done_path = log_dir / "stdout.done"
+        output_log_path.touch(exist_ok=True)
+        session.output_log_path = str(output_log_path)
+        session.exit_code_path = str(exit_code_path)
+        session.output_log_offset = 0
+
+        # Run the user's command in a nested copy of the same shell.  If the
+        # command calls `exit`, only the inner shell exits; the outer wrapper can
+        # still persist the exit code for post-restart recovery.  stdout/stderr
+        # go through an independent bounded log writer, so the durable log stays
+        # capped even if Gateway is down and no Python reader thread is alive.
+        quoted_shell = shlex.quote(user_shell)
+        quoted_command = shlex.quote(command)
+        quoted_exit_path = shlex.quote(str(exit_code_path))
+        quoted_log_path = shlex.quote(str(output_log_path))
+        quoted_fifo_path = shlex.quote(str(fifo_path))
+        quoted_done_path = shlex.quote(str(done_path))
+        quoted_python = shlex.quote(sys.executable)
+        log_writer_code = r'''
+import os, select, sys, time
+fifo_path = sys.argv[1]
+log_path = sys.argv[2]
+limit = max(1, int(sys.argv[3]))
+done_path = sys.argv[4]
+chunk_size = 8192
+fd = os.open(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
+try:
+    with os.fdopen(fd, "rb", buffering=0) as stream, open(log_path, "ab", buffering=0) as out:
+        while True:
+            readable, _, _ = select.select([stream], [], [], 0.1)
+            if not readable:
+                continue
+            chunk = stream.read(chunk_size)
+            if not chunk:
+                if os.path.exists(done_path):
+                    break
+                time.sleep(0.05)
+                continue
+            out.write(chunk)
+            try:
+                size = os.path.getsize(log_path)
+                if size > limit:
+                    with open(log_path, "rb+") as fh:
+                        fh.seek(-limit, os.SEEK_END)
+                        tail = fh.read()
+                        fh.seek(0)
+                        fh.write(tail)
+                        fh.truncate()
+            except OSError:
+                pass
+finally:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+'''.strip()
+        quoted_writer_code = shlex.quote(log_writer_code)
+        wrapped_command = (
+            f"rm -f {quoted_fifo_path} {quoted_done_path}; mkfifo {quoted_fifo_path} || exit 125; "
+            f"{quoted_python} -c {quoted_writer_code} {quoted_fifo_path} {quoted_log_path} "
+            f"{int(PROCESS_LOG_MAX_BYTES)} {quoted_done_path} & "
+            "__hermes_log_pid=$!; "
+            f"{quoted_shell} -lic {quoted_command} > {quoted_fifo_path} 2>&1; "
+            "__hermes_rc=$?; "
+            f"printf '%s\\n' \"$__hermes_rc\" > {quoted_exit_path}; "
+            f": > {quoted_done_path}; "
+            f"rm -f {quoted_fifo_path}; "
+            "disown \"$__hermes_log_pid\" 2>/dev/null || true; "
+            "exit \"$__hermes_rc\""
+        )
+
         proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {command}"],
+            [user_shell, "-lc", f"set +m; {wrapped_command}"],
             text=True,
             cwd=session.cwd,
             env=bg_env,
             encoding="utf-8",
             errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
             **_popen_kwargs,
@@ -782,12 +943,12 @@ class ProcessRegistry:
         session.host_start_time = self._safe_host_start_time(session.pid)
 
         try:
-            # Start output reader thread
+            # Start output log tailer thread.
             reader = threading.Thread(
-                target=self._reader_loop,
+                target=self._local_log_poller_loop,
                 args=(session,),
                 daemon=True,
-                name=f"proc-reader-{session.id}",
+                name=f"proc-log-reader-{session.id}",
             )
             session._reader_thread = reader
             reader.start()
@@ -921,6 +1082,35 @@ class ProcessRegistry:
         return session
 
     # ----- Reader / Poller Threads -----
+
+    def _local_log_poller_loop(self, session: ProcessSession):
+        """Background thread: tail a local durable log and reap the Popen child."""
+        try:
+            while not session.exited:
+                self._drain_output_log(session)
+                proc = session.process
+                if proc is None:
+                    return
+                try:
+                    rc = proc.poll()
+                except Exception:
+                    rc = None
+                if rc is not None:
+                    # Final drain after the process exits; the shell wrapper may
+                    # write the exit-code sidecar just before it terminates.
+                    time.sleep(0.05)
+                    self._drain_output_log(session)
+                    sidecar_rc = self._read_exit_code_path(getattr(session, "exit_code_path", ""))
+                    with session._lock:
+                        session.exited = True
+                        if session.completion_reason != "killed":
+                            session.exit_code = sidecar_rc if sidecar_rc is not None else rc
+                            session.completion_reason = "exited"
+                    self._move_to_finished(session)
+                    return
+                time.sleep(0.2)
+        except Exception as e:
+            logger.debug("Local log poller ended: %s", e)
 
     def _reader_loop(self, session: ProcessSession):
         """Background thread: read stdout from a local Popen process.
@@ -1072,6 +1262,10 @@ class ProcessRegistry:
         with the reader thread), the second call is a no-op — no duplicate
         completion notification is enqueued.
         """
+        try:
+            self._drain_output_log(session)
+        except Exception:
+            pass
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
@@ -1206,6 +1400,9 @@ class ProcessRegistry:
             rc = proc.poll()
         except Exception:
             return
+        # For log-backed local processes, poll() should surface recent output
+        # even before the poller thread wakes.
+        self._drain_output_log(session)
         if rc is None:
             return  # Direct child still running — reader block is legitimate.
 
@@ -1235,6 +1432,7 @@ class ProcessRegistry:
             except Exception as e:
                 logger.debug("Non-blocking drain failed for %s: %s", session.id, e)
 
+        sidecar_rc = self._read_exit_code_path(getattr(session, "exit_code_path", ""))
         with session._lock:
             if drained:
                 session.output_buffer += drained
@@ -1242,7 +1440,7 @@ class ProcessRegistry:
                     session.output_buffer = session.output_buffer[-session.max_output_chars:]
             session.exited = True
             if session.completion_reason != "killed":
-                session.exit_code = rc
+                session.exit_code = sidecar_rc if sidecar_rc is not None else rc
                 session.completion_reason = "exited"
         logger.info(
             "Reconciled session %s: direct child exited with code %s but reader "
@@ -1291,7 +1489,7 @@ class ProcessRegistry:
             self._poll_observed.add(session_id)
         if session.detached:
             result["detached"] = True
-            result["note"] = "Process recovered after restart -- output history unavailable"
+            result["note"] = "Process recovered after restart -- output restored from durable log when available"
         return result
 
     def read_log(self, session_id: str, offset: int = 0, limit: int = 200) -> dict:
@@ -1302,6 +1500,7 @@ class ProcessRegistry:
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
+        self._drain_output_log(session)
         with session._lock:
             full_output = strip_ansi(session.output_buffer)
 
@@ -1581,28 +1780,38 @@ class ProcessRegistry:
         except Exception:
             return 0
 
-    def list_sessions(self, task_id: str = None, session_key: str = None) -> list:
-        """List all running and recently-finished processes.
+    def list_sessions(
+        self,
+        task_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+        user_id: Optional[str] = None,
+        platform: Optional[str] = None,
+    ) -> list:
+        """List running and recently-finished processes visible to this caller.
 
-        When ``task_id`` is given, processes for that task are included. When
-        ``session_key`` is also given, session-scoped background processes
-        (``background: true``) registered under that gateway session are
-        surfaced too, even if they belong to a different task — so the agent
-        can discover a forgotten preview server that is blocking session
-        reset (#29177). Such cross-task entries are flagged with
-        ``"session_scoped": true``.
+        With no filters, returns all tracked sessions (CLI/admin-style view).
+        Gateway callers should pass task/session/user identity so they see their
+        own current-session processes plus same-user recovered processes from
+        sibling threads, without exposing other users' commands or PIDs.
         """
         with self._lock:
             all_sessions = list(self._running.values()) + list(self._finished.values())
 
-        all_sessions = [self._refresh_detached_session(s) for s in all_sessions]
+        all_sessions = [s for s in (self._refresh_detached_session(s) for s in all_sessions) if s is not None]
 
-        if task_id or session_key:
-            all_sessions = [
-                s for s in all_sessions
-                if (task_id and s.task_id == task_id)
-                or (session_key and s.session_key == session_key)
-            ]
+        if task_id or session_key or user_id:
+            def _visible(s: ProcessSession) -> bool:
+                if task_id and s.task_id == task_id:
+                    return True
+                if session_key and s.session_key == session_key:
+                    return True
+                if user_id and s.watcher_user_id == user_id:
+                    if platform and s.watcher_platform and s.watcher_platform != platform:
+                        return False
+                    return True
+                return False
+
+            all_sessions = [s for s in all_sessions if _visible(s)]
 
         result = []
         for s in all_sessions:
@@ -1771,6 +1980,9 @@ class ProcessRegistry:
                             "pid": s.pid,
                             "pid_scope": s.pid_scope,
                             "host_start_time": s.host_start_time,
+                            "output_log_path": s.output_log_path,
+                            "exit_code_path": s.exit_code_path,
+                            "output_log_offset": s.output_log_offset,
                             "cwd": s.cwd,
                             "started_at": s.started_at,
                             "task_id": s.task_id,
@@ -1840,6 +2052,58 @@ class ProcessRegistry:
                         "an unrelated process; refusing to adopt it.",
                         entry.get("session_id", "?"), pid,
                     )
+                # If the local log-backed wrapper finished while Gateway was
+                # down, the PID is gone/recycled but the sidecars are the
+                # durable completion evidence. Recover it as a finished session
+                # so notify_on_complete can still deliver a useful result.
+                if entry.get("output_log_path") or entry.get("exit_code_path"):
+                    session = ProcessSession(
+                        id=entry["session_id"],
+                        command=entry.get("command", "unknown"),
+                        task_id=entry.get("task_id", ""),
+                        session_key=entry.get("session_key", ""),
+                        pid=pid,
+                        host_start_time=recorded_start,
+                        pid_scope=pid_scope,
+                        output_log_path=entry.get("output_log_path", ""),
+                        exit_code_path=entry.get("exit_code_path", ""),
+                        output_log_offset=0,
+                        cwd=entry.get("cwd"),
+                        started_at=entry.get("started_at", time.time()),
+                        detached=True,
+                        watcher_platform=entry.get("watcher_platform", ""),
+                        watcher_chat_id=entry.get("watcher_chat_id", ""),
+                        watcher_user_id=entry.get("watcher_user_id", ""),
+                        watcher_user_name=entry.get("watcher_user_name", ""),
+                        watcher_thread_id=entry.get("watcher_thread_id", ""),
+                        watcher_message_id=entry.get("watcher_message_id", ""),
+                        watcher_interval=entry.get("watcher_interval", 0),
+                        notify_on_complete=entry.get("notify_on_complete", False),
+                        watch_patterns=entry.get("watch_patterns", []),
+                    )
+                    self._drain_output_log(session)
+                    session.exited = True
+                    session.exit_code = self._read_exit_code_path(session.exit_code_path)
+                    with self._lock:
+                        self._finished[session.id] = session
+                    recovered += 1
+                    logger.info(
+                        "Recovered completed detached process from sidecars: %s (pid=%s)",
+                        session.command[:60], pid,
+                    )
+                    if session.watcher_interval > 0:
+                        self.pending_watchers.append({
+                            "session_id": session.id,
+                            "check_interval": session.watcher_interval,
+                            "session_key": session.session_key,
+                            "platform": session.watcher_platform,
+                            "chat_id": session.watcher_chat_id,
+                            "user_id": session.watcher_user_id,
+                            "user_name": session.watcher_user_name,
+                            "thread_id": session.watcher_thread_id,
+                            "message_id": session.watcher_message_id,
+                            "notify_on_complete": session.notify_on_complete,
+                        })
                 continue
 
             session = ProcessSession(
@@ -1850,9 +2114,12 @@ class ProcessRegistry:
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,
+                output_log_path=entry.get("output_log_path", ""),
+                exit_code_path=entry.get("exit_code_path", ""),
+                output_log_offset=0,
                 cwd=entry.get("cwd"),
                 started_at=entry.get("started_at", time.time()),
-                detached=True,  # Can't read output, but can report status + kill
+                detached=True,  # Recovered after restart; output tails durable log sidecar.
                 watcher_platform=entry.get("watcher_platform", ""),
                 watcher_chat_id=entry.get("watcher_chat_id", ""),
                 watcher_user_id=entry.get("watcher_user_id", ""),
@@ -2179,18 +2446,29 @@ def _handle_process(args, **kw):
     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
 
     if action == "list":
-        # Surface session-scoped background processes (e.g. a forgotten
-        # preview server) in addition to this task's own — they share the
-        # gateway session_key and can block session reset (#29177).
+        # Gateway-scoped list: include this task/session plus same-user recovered
+        # processes from sibling threads, but never expose another user's
+        # commands/PIDs. CLI/no-session callers keep the unfiltered admin view.
         try:
             from tools.approval import get_current_session_key
+            from gateway.session_context import get_session_env
             session_key = get_current_session_key(default="") or ""
+            user_id = get_session_env("HERMES_SESSION_USER_ID", "") or ""
+            platform = get_session_env("HERMES_SESSION_PLATFORM", "") or ""
         except Exception:
             session_key = ""
-        return json.dumps(
-            {"processes": process_registry.list_sessions(task_id=task_id, session_key=session_key or None)},
-            ensure_ascii=False,
-        )
+            user_id = ""
+            platform = ""
+        if task_id or session_key or user_id:
+            processes = process_registry.list_sessions(
+                task_id=task_id,
+                session_key=session_key or None,
+                user_id=user_id or None,
+                platform=platform or None,
+            )
+        else:
+            processes = process_registry.list_sessions()
+        return json.dumps({"processes": processes}, ensure_ascii=False)
     elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
         if not session_id:
             return tool_error(f"session_id is required for {action}")

@@ -3,6 +3,7 @@
 import json
 import os
 import signal
+import shlex
 import subprocess
 import sys
 import threading
@@ -1087,6 +1088,174 @@ class TestCheckpoint:
                     proc.kill()
                     proc.wait(timeout=5)
 
+    def test_detached_recovery_uses_persisted_log_and_exit_code(self, registry, tmp_path):
+        """Recovered local processes must keep useful completion evidence.
+
+        Regression for Gateway restart recovery: a recovered host PID has no
+        waitable Popen/stdout pipe. The durable local background contract is
+        therefore the persisted stdout log + exit-code sidecar, not the old
+        anonymous pipe. Without this, completion arrives as exit_code=None with
+        empty output even when the monitor wrote useful status before exiting.
+        """
+        proc = _spawn_python_sleep(0.2)
+        log_path = tmp_path / "stdout.log"
+        exit_path = tmp_path / "exit_code"
+        log_path.write_text("progress before restart\nfinal aggregate ready\n")
+        exit_path.write_text("7\n")
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_live",
+            "command": "python monitor.py",
+            "pid": proc.pid,
+            "task_id": "t1",
+            "session_key": "sk1",
+            "output_log_path": str(log_path),
+            "exit_code_path": str(exit_path),
+        }]))
+
+        try:
+            with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+                assert registry.recover_from_checkpoint() == 1
+                session = registry.get("proc_live")
+                assert session is not None
+                assert session.detached is True
+
+                proc.wait(timeout=5)
+
+                assert _wait_until(
+                    lambda: registry.poll("proc_live")["status"] == "exited",
+                    timeout=5,
+                )
+                poll_result = registry.poll("proc_live")
+                assert poll_result["exit_code"] == 7
+                assert "final aggregate ready" in poll_result["output_preview"]
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+
+    def test_spawn_local_assigns_durable_output_artifacts(self, registry, tmp_path):
+        """Local background spawns need restart-safe log/exit sidecars."""
+        with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"), \
+             patch("tools.process_registry.PROCESS_LOG_DIR", tmp_path / "process_logs"):
+            session = registry.spawn_local(
+                f"{shlex.quote(sys.executable)} -c \"import sys; print('durable out'); sys.exit(3)\"",
+                cwd=str(tmp_path),
+            )
+
+            assert getattr(session, "output_log_path", "")
+            assert getattr(session, "exit_code_path", "")
+
+            assert _wait_until(
+                lambda: registry.poll(session.id)["status"] == "exited",
+                timeout=5,
+            )
+            poll_result = registry.poll(session.id)
+            assert poll_result["exit_code"] == 3
+            assert "durable out" in poll_result["output_preview"]
+            assert os.path.exists(session.output_log_path)
+            assert os.path.exists(session.exit_code_path)
+
+    def test_spawn_local_keeps_durable_log_bounded(self, registry, tmp_path):
+        """Persistent logs are restart evidence, not an unbounded disk sink."""
+        command = (
+            f"{shlex.quote(sys.executable)} -c "
+            "\"import sys; sys.stdout.write('x' * 4096); print('END_MARKER')\""
+        )
+        with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"), \
+             patch("tools.process_registry.PROCESS_LOG_DIR", tmp_path / "process_logs"), \
+             patch("tools.process_registry.PROCESS_LOG_MAX_BYTES", 128):
+            session = registry.spawn_local(command, cwd=str(tmp_path))
+
+            assert _wait_until(
+                lambda: registry.poll(session.id)["status"] == "exited",
+                timeout=5,
+            )
+            poll_result = registry.poll(session.id)
+            assert poll_result["exit_code"] == 0
+            assert "END_MARKER" in poll_result["output_preview"]
+            assert os.path.getsize(session.output_log_path) <= 128
+
+    def test_spawn_local_exits_when_daemon_inherits_stdout(self, registry, tmp_path):
+        """A daemon that keeps stdout open must not keep the shell wrapper running."""
+        child_code = "import sys,time; print('daemon inherited stdout'); sys.stdout.flush(); time.sleep(3)"
+        parent_code = (
+            "import subprocess, sys; "
+            f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+            "print('parent done')"
+        )
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(parent_code)}"
+        with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"), \
+             patch("tools.process_registry.PROCESS_LOG_DIR", tmp_path / "process_logs"):
+            session = registry.spawn_local(command, cwd=str(tmp_path))
+
+            assert _wait_until(
+                lambda: registry.poll(session.id)["status"] == "exited",
+                timeout=1.0,
+            )
+            poll_result = registry.poll(session.id)
+            assert poll_result["exit_code"] == 0
+            assert "parent done" in poll_result["output_preview"]
+
+    def test_recover_finished_sidecar_rebuilds_log_tail_after_offset_checkpoint(self, registry, tmp_path):
+        """Recovered sessions have no in-memory buffer, so persisted offsets are stale."""
+        log_path = tmp_path / "stdout.log"
+        exit_path = tmp_path / "exit_code"
+        text = "important pre-restart evidence\n"
+        log_path.write_text(text)
+        exit_path.write_text("0\n")
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_done_offset",
+            "command": "python monitor.py",
+            "pid": 999999999,
+            "task_id": "t1",
+            "session_key": "sk1",
+            "output_log_path": str(log_path),
+            "exit_code_path": str(exit_path),
+            "output_log_offset": len(text),
+        }]))
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry.recover_from_checkpoint() == 1
+            poll_result = registry.poll("proc_done_offset")
+            assert poll_result["status"] == "exited"
+            assert poll_result["exit_code"] == 0
+            assert "important pre-restart evidence" in poll_result["output_preview"]
+
+    def test_recover_finished_sidecar_when_pid_already_dead(self, registry, tmp_path):
+        """If a recovered job finished while Gateway was down, keep its evidence."""
+        log_path = tmp_path / "stdout.log"
+        exit_path = tmp_path / "exit_code"
+        log_path.write_text("finished while gateway was down\n")
+        exit_path.write_text("0\n")
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_done",
+            "command": "python monitor.py",
+            "pid": 999999999,
+            "task_id": "t1",
+            "session_key": "sk1",
+            "watcher_platform": "discord",
+            "watcher_chat_id": "123",
+            "watcher_user_id": "u123",
+            "watcher_user_name": "alice",
+            "watcher_thread_id": "42",
+            "watcher_interval": 5,
+            "notify_on_complete": True,
+            "output_log_path": str(log_path),
+            "exit_code_path": str(exit_path),
+        }]))
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry.recover_from_checkpoint() == 1
+            poll_result = registry.poll("proc_done")
+            assert poll_result["status"] == "exited"
+            assert poll_result["exit_code"] == 0
+            assert "finished while gateway was down" in poll_result["output_preview"]
+            assert len(registry.pending_watchers) == 1
+            assert registry.pending_watchers[0]["session_id"] == "proc_done"
+
 
 # =========================================================================
 # Kill process
@@ -1170,6 +1339,43 @@ class TestProcessToolHandler:
         from tools.process_registry import _handle_process
         result = json.loads(_handle_process({"action": "list"}))
         assert "processes" in result
+
+    def test_list_action_includes_same_user_recovered_process_without_global_leak(self, monkeypatch):
+        """Show this user's recovered processes across threads, not all users'."""
+        import tools.process_registry as pr
+
+        calls = []
+
+        class FakeRegistry:
+            def list_sessions(self, task_id=None, session_key=None, user_id=None, platform=None):
+                calls.append((task_id, session_key, user_id, platform))
+                visible = [{"session_id": "proc_current"}]
+                if user_id == "u-current" and platform == "discord":
+                    visible.append({"session_id": "proc_same_user_other_thread"})
+                # A different user's process is intentionally never returned by
+                # the fake scoped view; the handler must not call unfiltered.
+                return visible
+
+        monkeypatch.setattr(pr, "process_registry", FakeRegistry())
+        monkeypatch.setattr(
+            "tools.approval.get_current_session_key",
+            lambda default="": "session-current",
+        )
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": {
+                "HERMES_SESSION_USER_ID": "u-current",
+                "HERMES_SESSION_PLATFORM": "discord",
+            }.get(name, default),
+        )
+
+        result = json.loads(pr._handle_process({"action": "list"}, task_id="task-current"))
+
+        assert calls == [("task-current", "session-current", "u-current", "discord")]
+        assert {p["session_id"] for p in result["processes"]} == {
+            "proc_current",
+            "proc_same_user_other_thread",
+        }
 
     def test_poll_missing_session_id(self):
         from tools.process_registry import _handle_process
