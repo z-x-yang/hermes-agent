@@ -58,3 +58,45 @@ def test_breakdown_uses_measured_context_when_available():
 
     assert data["context_used"] == 42_000
     assert data["context_percent"] == 21
+
+
+def test_breakdown_categories_do_not_exceed_measured_context():
+    """Measured provider input tokens are the display total; categories must not contradict it."""
+    agent, parts = _make_agent(
+        stable="",
+        context="",
+        volatile="",
+        tools=[],
+        last_prompt_tokens=100,
+    )
+    agent.tools = []
+    history = [{"role": "user", "content": "x" * 2_000}]  # rough estimate: 500 tokens
+
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        data = compute_session_context_breakdown(agent, history)
+
+    assert data["context_used"] == 100
+    assert data["estimated_total"] == 100
+    assert sum(item["tokens"] for item in data["categories"]) == 100
+    conversation = next(item for item in data["categories"] if item["id"] == "conversation")
+    assert conversation["tokens"] == 100
+
+
+def test_breakdown_scales_estimated_prompt_categories_to_measured_context():
+    """Even non-conversation estimates must stay on the measured /usage total basis."""
+    agent, parts = _make_agent(
+        stable="s" * 800,  # rough estimate: 200 tokens
+        context="",
+        volatile="",
+        tools=[],
+        last_prompt_tokens=100,
+    )
+    agent.tools = []
+
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        data = compute_session_context_breakdown(agent, [])
+
+    assert data["context_used"] == 100
+    assert data["estimated_total"] == 100
+    assert sum(item["tokens"] for item in data["categories"]) == 100
+    assert next(item for item in data["categories"] if item["id"] == "system_prompt")["tokens"] == 100

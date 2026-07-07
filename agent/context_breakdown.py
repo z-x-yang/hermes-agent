@@ -112,7 +112,7 @@ def compute_session_context_breakdown(
     tools = list(getattr(agent, "tools", None) or [])
     builtin_tools, mcp_tools, subagent_tools = _split_tools(tools)
 
-    conversation_tokens = estimate_messages_tokens_rough(messages or [])
+    estimated_conversation_tokens = estimate_messages_tokens_rough(messages or [])
 
     categories = [
         ("system_prompt", "System prompt", _chars_to_tokens(system_prompt_text)),
@@ -122,14 +122,52 @@ def compute_session_context_breakdown(
         ("mcp", "MCP", _json_tokens(mcp_tools)),
         ("subagent_definitions", "Subagent definitions", _json_tokens(subagent_tools)),
         ("memory", "Memory", _chars_to_tokens(memory_text)),
-        ("conversation", "Conversation", conversation_tokens),
+        ("conversation", "Conversation", estimated_conversation_tokens),
     ]
-
-    estimated_total = sum(tokens for _, _, tokens in categories)
 
     comp = getattr(agent, "context_compressor", None)
     context_max = int(getattr(comp, "context_length", 0) or 0) if comp else 0
     measured_used = int(getattr(comp, "last_prompt_tokens", 0) or 0) if comp else 0
+    if measured_used > 0:
+        # ``last_prompt_tokens`` is the provider-observed request size that
+        # /usage shows as the current context.  The category estimates use a
+        # coarse chars/4 heuristic and can overshoot it, especially after
+        # compression.  Keep the user-facing breakdown on the same basis by
+        # treating conversation as the measured residual after prompt/tool
+        # categories, rather than showing a conversation slice larger than the
+        # displayed total context.
+        non_conversation_total = sum(
+            tokens for category_id, _label, tokens in categories
+            if category_id != "conversation"
+        )
+        if non_conversation_total <= measured_used:
+            conversation_tokens = measured_used - non_conversation_total
+            categories = [
+                (category_id, label, conversation_tokens if category_id == "conversation" else tokens)
+                for category_id, label, tokens in categories
+            ]
+        else:
+            scaled_tokens: list[int] = []
+            fractions: list[tuple[float, int]] = []
+            for index, (category_id, _label, tokens) in enumerate(categories):
+                if category_id == "conversation" or tokens <= 0:
+                    scaled_tokens.append(0)
+                    continue
+                exact = tokens * measured_used / non_conversation_total
+                whole = int(exact)
+                scaled_tokens.append(whole)
+                fractions.append((exact - whole, index))
+
+            remainder = measured_used - sum(scaled_tokens)
+            for _fraction, index in sorted(fractions, reverse=True)[:remainder]:
+                scaled_tokens[index] += 1
+
+            categories = [
+                (category_id, label, scaled_tokens[index])
+                for index, (category_id, label, _tokens) in enumerate(categories)
+            ]
+
+    estimated_total = sum(tokens for _, _, tokens in categories)
     context_used = measured_used if measured_used > 0 else estimated_total
     context_percent = (
         max(0, min(100, round(context_used / context_max * 100)))
