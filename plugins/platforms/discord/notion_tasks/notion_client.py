@@ -196,6 +196,47 @@ class NotionClient:
             raise first_error
         return results
 
+    async def search_tasks_for_bind(self, query: str, tasks_ids: set[str], *, limit: int = 25) -> list[dict]:
+        """Search/recent Tasks for the /task-bind picker."""
+        max_results = max(1, min(int(limit or 25), 25))
+        page_size = min(max(max_results * 2, max_results), 100)
+        body = {
+            "page_size": page_size,
+            "sorts": [{"timestamp": "last_edited_time", "direction": "descending"}],
+        }
+        clean_query = str(query or "").strip()
+        if clean_query:
+            body["filter"] = {"property": "Name", "title": {"contains": clean_query[:100]}}
+
+        results: list[dict] = []
+        first_error: Exception | None = None
+        attempted = 0
+        succeeded = 0
+        normalized_ids = [nid for nid in (detection.normalize_id(t) for t in (tasks_ids or set())) if nid]
+        for task_source_id in sorted(normalized_ids):
+            attempted += 1
+            try:
+                resp = await self.query_data_source(task_source_id, body)
+            except NotionError as exc:
+                if first_error is None:
+                    first_error = exc
+                if str(exc).startswith(("400:", "404:")):
+                    continue
+                raise
+            succeeded += 1
+            for page in resp.get("results") or []:
+                if not detection.is_task_page(page, {task_source_id}):
+                    continue
+                status, _kind = detection.read_status(page)
+                if str(status or "").lower() in {"done", "dropped"}:
+                    continue
+                results.append(page)
+
+        if attempted and not succeeded and first_error is not None:
+            raise first_error
+        results.sort(key=lambda p: str((p or {}).get("last_edited_time") or ""), reverse=True)
+        return results[:max_results]
+
     async def set_status(self, page_id: str, value: str, kind: str) -> dict:
         body = {"properties": detection.status_patch(value, kind)}
         return await self._request("PATCH", f"/pages/{page_id}", json_body=body)

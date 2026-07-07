@@ -55,6 +55,22 @@ def _item(child):
     return getattr(child, "item", child)
 
 
+def _select_from_view(view):
+    for child in getattr(view, "children", []) or []:
+        item = _item(child)
+        if hasattr(item, "options"):
+            return item
+    raise AssertionError("view has no select")
+
+
+def _button_from_view(view, label):
+    for child in getattr(view, "children", []) or []:
+        item = _item(child)
+        if getattr(item, "label", None) == label:
+            return item
+    raise AssertionError(f"view has no button {label!r}")
+
+
 def _task_clarify_interaction(**kwargs):
     inter = _interaction(**kwargs)
     inter.message.embeds = [SimpleNamespace(
@@ -250,16 +266,41 @@ async def test_slash_bind_writes_current_thread_binding_manual_locked():
 
 
 @pytest.mark.asyncio
-async def test_slash_bind_without_task_ref_opens_bind_modal():
-    ctrl = _ctrl(SimpleNamespace())
+async def test_slash_bind_without_task_ref_shows_recent_picker_and_search_button():
+    page = {**TASK_PAGE, "id": PID}
+    notion = SimpleNamespace(search_tasks_for_bind=AsyncMock(return_value=[page]))
+    ctrl = _ctrl(notion)
     inter = _interaction(channel_id="1523")
-    inter.response.send_modal = AsyncMock()
 
     await ctrl.handle_slash_bind(inter, "")
 
-    inter.response.send_modal.assert_awaited_once()
-    modal = inter.response.send_modal.await_args.args[0]
-    assert "绑定" in getattr(modal, "title", "")
+    inter.response.defer.assert_awaited_once()
+    notion.search_tasks_for_bind.assert_awaited_once_with("", ctrl.tasks_ids, limit=25)
+    inter.response.send_message.assert_awaited_once()
+    assert "选择要绑定" in inter.response.send_message.await_args.args[0]
+    view = inter.response.send_message.await_args.kwargs["view"]
+    select = _select_from_view(view)
+    assert "Reply to Alice" in [opt.label for opt in select.options]
+    _button_from_view(view, "搜索任务")
+
+
+@pytest.mark.asyncio
+async def test_slash_bind_search_submit_queries_keyword_and_shows_picker():
+    page = {**TASK_PAGE, "id": PID}
+    notion = SimpleNamespace(search_tasks_for_bind=AsyncMock(return_value=[page]))
+    ctrl = _ctrl(notion)
+    inter = _interaction(channel_id="1523")
+
+    await ctrl.handle_slash_bind_search_submit("Alice", inter)
+
+    inter.response.defer.assert_awaited_once()
+    notion.search_tasks_for_bind.assert_awaited_once_with("Alice", ctrl.tasks_ids, limit=25)
+    inter.response.send_message.assert_awaited_once()
+    assert "Alice" in inter.response.send_message.await_args.args[0]
+    view = inter.response.send_message.await_args.kwargs["view"]
+    select = _select_from_view(view)
+    assert select.options[0].value == PID
+    _button_from_view(view, "重新搜索")
 
 
 @pytest.mark.asyncio

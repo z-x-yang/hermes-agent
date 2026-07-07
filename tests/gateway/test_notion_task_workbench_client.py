@@ -24,6 +24,18 @@ def _text_prop(value):
     return {"type": "rich_text", "rich_text": [{"plain_text": value, "text": {"content": value}}]}
 
 
+def _task_page(title="Reply to Alice", *, status="To Do", pid=PID):
+    return {
+        "id": pid,
+        "parent": {"type": "data_source_id", "data_source_id": TASKS_DATA_SOURCE_ID},
+        "last_edited_time": "2026-07-07T12:00:00.000Z",
+        "properties": {
+            "Name": {"type": "title", "title": [{"plain_text": title}]},
+            "Status": {"type": "status", "status": {"name": status}},
+        },
+    }
+
+
 @pytest.mark.asyncio
 async def test_query_data_source_posts_filter_body():
     calls = []
@@ -92,6 +104,43 @@ async def test_find_task_by_discord_thread_id_returns_empty_when_real_source_emp
         f"/v1/data_sources/{legacy_database}/query",
         f"/v1/data_sources/{data_source}/query",
     ]
+
+
+@pytest.mark.asyncio
+async def test_search_tasks_for_bind_queries_title_and_recent_sort():
+    calls = []
+    page = _task_page()
+
+    def handler(req):
+        calls.append((req.method, req.url.path, json.loads(req.content or b"{}")))
+        return httpx.Response(200, json={"results": [page]})
+
+    client = NotionClient(api_key="secret", transport=httpx.MockTransport(handler), backoff=0)
+
+    pages = await client.search_tasks_for_bind("Alice", {TASKS_DATA_SOURCE_ID}, limit=25)
+
+    assert pages == [page]
+    body = calls[0][2]
+    assert body["filter"] == {"property": "Name", "title": {"contains": "Alice"}}
+    assert body["sorts"] == [{"timestamp": "last_edited_time", "direction": "descending"}]
+    assert body["page_size"] == 50
+
+
+@pytest.mark.asyncio
+async def test_search_tasks_for_bind_with_blank_query_returns_recent_open_tasks_only():
+    done = _task_page("Done task", status="Done", pid="d" * 32)
+    open_page = _task_page("Open task", status="To Do", pid="e" * 32)
+
+    def handler(req):
+        body = json.loads(req.content or b"{}")
+        assert "filter" not in body
+        return httpx.Response(200, json={"results": [done, open_page]})
+
+    client = NotionClient(api_key="secret", transport=httpx.MockTransport(handler), backoff=0)
+
+    pages = await client.search_tasks_for_bind("", {TASKS_DATA_SOURCE_ID}, limit=25)
+
+    assert pages == [open_page]
 
 
 @pytest.mark.asyncio

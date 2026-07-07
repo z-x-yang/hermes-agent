@@ -29,7 +29,12 @@ from typing import Any
 import discord
 
 from . import detection
-from .buttons import SlashHoldReasonModal, TaskBindModal, build_button, build_snooze_select
+from .buttons import (
+    SlashHoldReasonModal,
+    build_button,
+    build_snooze_select,
+    build_task_bind_picker_view,
+)
 from .components import pack_group_rows, task_card_embed, task_clarify_embed
 from .snooze import (
     create_snooze_cron,
@@ -519,7 +524,36 @@ class NotionTaskController:
         if str(task_ref or "").strip():
             await self.handle_slash_bind_submit(task_ref, interaction)
             return
-        await _send_interaction_modal(interaction, TaskBindModal())
+        await _defer_slash_response(interaction, ephemeral=True)
+        await self._send_slash_bind_picker(interaction, query="")
+
+    async def handle_slash_bind_search_submit(self, query: str, interaction):
+        await _defer_slash_response(interaction, ephemeral=True)
+        await self._send_slash_bind_picker(interaction, query=str(query or "").strip())
+
+    async def _send_slash_bind_picker(self, interaction, *, query: str):
+        finder = getattr(self.notion, "search_tasks_for_bind", None)
+        if not callable(finder):
+            await _send_interaction_notice(interaction, "Notion Task 搜索暂不可用。", ephemeral=True)
+            return
+        try:
+            pages = await _maybe_await(finder(query, self.tasks_ids, limit=25))
+        except Exception as exc:
+            await _send_interaction_notice(interaction, f"搜索 Notion Task 失败：{exc}", ephemeral=True)
+            return
+        pages = list(pages or [])[:25]
+        view = build_task_bind_picker_view(pages, query=query)
+        if query:
+            content = (
+                f"选择要绑定的 Notion Task（搜索：{query}）。"
+                if pages else f"没找到匹配 “{query}” 的未完成 Task，可以重新搜索。"
+            )
+        else:
+            content = (
+                "选择要绑定的 Notion Task，或点“搜索任务”。"
+                if pages else "最近没有可绑定的未完成 Task，点“搜索任务”试试。"
+            )
+        await _send_interaction_notice(interaction, content, view=view, ephemeral=True)
 
     async def handle_slash_bind_submit(self, task_ref: str, interaction):
         await _defer_slash_response(interaction, ephemeral=True)

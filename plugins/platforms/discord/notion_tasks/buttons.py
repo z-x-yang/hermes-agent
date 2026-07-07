@@ -12,6 +12,7 @@ import logging
 
 import discord
 
+from . import detection
 from .components import CUSTOM_ID_RE, make_custom_id, numbered_label  # noqa: F401 (re-exported)
 from .registry import get_active_controller
 from .snooze import snooze_choices
@@ -107,6 +108,28 @@ class TaskBindModal(discord.ui.Modal):
             return
         task_ref = str(getattr(self.task_input, "value", "") or "").strip()
         await ctrl.handle_slash_bind_submit(task_ref, interaction)
+
+
+class TaskBindSearchModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="搜索 Notion Task", timeout=None)
+        self.query_input = discord.ui.TextInput(
+            label="任务标题关键词",
+            placeholder="比如：Alice / rebuttal / camp slides",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=100,
+        )
+        self.add_item(self.query_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ctrl = get_active_controller()
+        if ctrl is None:
+            logger.warning("notion task bind search modal submitted but no active controller")
+            await interaction.response.send_message("功能暂不可用，请稍后再试。", ephemeral=True)
+            return
+        query = str(getattr(self.query_input, "value", "") or "").strip()
+        await ctrl.handle_slash_bind_search_submit(query, interaction)
 
 
 class TaskActionButton(discord.ui.DynamicItem[discord.ui.Button], template=CUSTOM_ID_RE):
@@ -211,3 +234,58 @@ def build_snooze_select(
 
     select.callback = _callback
     return select
+
+
+def _task_bind_option(page: dict):
+    page_id = detection.normalize_id((page or {}).get("id")) or str((page or {}).get("id") or "")
+    title = detection.page_title(page) or "(untitled)"
+    status, _kind = detection.read_status(page)
+    label = title[:100]
+    desc = " · ".join(x for x in (status, page_id[:8]) if x)[:100]
+    return discord.SelectOption(label=label, value=page_id[:100], description=desc or None)
+
+
+def build_task_bind_picker_view(pages: list[dict], *, query: str = ""):
+    """Build the /task-bind picker: recent/search results plus a search button."""
+    view = discord.ui.View(timeout=300)
+    options = [_task_bind_option(p) for p in (pages or []) if detection.normalize_id((p or {}).get("id"))]
+    if options:
+        select = discord.ui.Select(
+            placeholder="选择要绑定的 Notion Task",
+            options=options[:25],
+            custom_id="ntask:bind-select",
+        )
+
+        async def _select_callback(interaction: discord.Interaction):
+            ctrl = get_active_controller()
+            if ctrl is None:
+                logger.warning("notion task bind selected but no active controller")
+                await interaction.response.send_message("功能暂不可用，请稍后再试。", ephemeral=True)
+                return
+            values = getattr(select, "values", None) or []
+            if not values:
+                await interaction.response.send_message("没有选中 Notion Task。", ephemeral=True)
+                return
+            await ctrl.handle_slash_bind_submit(values[0], interaction)
+
+        select.callback = _select_callback
+        view.add_item(select)
+
+    button = discord.ui.Button(
+        label="重新搜索" if str(query or "").strip() else "搜索任务",
+        style=discord.ButtonStyle.secondary,
+        custom_id="ntask:bind-search",
+    )
+
+    async def _button_callback(interaction: discord.Interaction):
+        send_modal = getattr(getattr(interaction, "response", None), "send_modal", None)
+        if not callable(send_modal):
+            await interaction.response.send_message("当前客户端不能打开搜索框。", ephemeral=True)
+            return
+        result = send_modal(TaskBindSearchModal())
+        if inspect.isawaitable(result):
+            await result
+
+    button.callback = _button_callback
+    view.add_item(button)
+    return view
