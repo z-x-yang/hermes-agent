@@ -46,10 +46,11 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # and does not reset _fallback_index=0 to replay the entire chain again.
 # Without this, a client/gateway that re-submits immediately would re-marshal
 # the full (potentially 80k-token) context once per provider every turn and
-# can drive a constrained host into memory/swap exhaustion.  Rate-limit /
-# billing reasons keep their own 60s cooldown (set above); this is the
-# narrower non-rate-limit case.  See issue #24996.
+# can drive a constrained host into memory/swap exhaustion. Rate-limit /
+# billing reasons keep their own 10-minute cooldown; this is the narrower
+# non-rate-limit case. See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
+_RATE_LIMIT_FALLBACK_COOLDOWN_S = 600.0
 
 
 def _ra():
@@ -1189,7 +1190,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         current_provider = (getattr(agent, "provider", "") or "").strip().lower()
         primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
         if (not fallback_already_active) or (primary_provider and current_provider == primary_provider):
-            agent._rate_limited_until = time.monotonic() + 60
+            agent._rate_limited_until = time.monotonic() + _RATE_LIMIT_FALLBACK_COOLDOWN_S
     if agent._fallback_index >= len(agent._fallback_chain):
         # Chain exhausted.  If we actually walked a non-empty chain and the
         # failure was NOT a rate-limit/billing event (those already armed

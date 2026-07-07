@@ -12,13 +12,13 @@ throttle on the non-rate-limit path.
 The fix arms a short cooldown via the existing ``_rate_limited_until`` gate
 when the chain exhausts on a non-rate-limit failure, so the next turn's
 restore stays gated (and does NOT reset the index) until the cooldown clears.
-Rate-limit / billing failures keep their own 60s cooldown and are unaffected.
+Rate-limit / billing failures keep their own 10-minute cooldown and are unaffected.
 """
 
 from unittest.mock import MagicMock, patch
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
-from agent.chat_completion_helpers import _FALLBACK_EXHAUSTED_COOLDOWN_S
+from agent.chat_completion_helpers import _FALLBACK_EXHAUSTED_COOLDOWN_S, _RATE_LIMIT_FALLBACK_COOLDOWN_S
 
 
 def _make_agent(fallback_model=None):
@@ -88,8 +88,8 @@ class TestExhaustionArmsCooldown:
         assert agent._try_activate_fallback() is False
         assert getattr(agent, "_rate_limited_until", 0) == 0
 
-    def test_rate_limit_exhaustion_keeps_60s_cooldown(self):
-        """A rate-limit failure already arms its own 60s cooldown; the short
+    def test_rate_limit_exhaustion_keeps_ten_minute_cooldown(self):
+        """A rate-limit failure already arms its own 10-minute cooldown; the short
         exhaustion window must not shrink it."""
         fbs = [{"provider": "openai", "model": "gpt-4o"}]
         agent = _make_agent(fallback_model=fbs)
@@ -102,14 +102,14 @@ class TestExhaustionArmsCooldown:
                 return_value=(_mock_client(), "resolved"),
             ),
         ):
-            # First activation with rate_limit reason arms the 60s cooldown.
+            # First activation with rate_limit reason arms the 10-minute cooldown.
             assert agent._try_activate_fallback(reason=FailoverReason.rate_limit) is True
             # Chain exhausted on the next call (also rate_limit) -> still False,
-            # and the 60s cooldown must survive (max(), not overwritten down).
+            # and the 10-minute cooldown must survive (max(), not overwritten down).
             assert agent._try_activate_fallback(reason=FailoverReason.rate_limit) is False
             cooldown = getattr(agent, "_rate_limited_until", 0)
-        # ~60s past the frozen clock, far past the short exhaustion window.
-        assert cooldown == frozen + 60
+        # 10 minutes past the frozen clock, far past the short exhaustion window.
+        assert cooldown == frozen + _RATE_LIMIT_FALLBACK_COOLDOWN_S
 
     def test_cooldown_never_shrinks_existing_window(self):
         """If a longer cooldown is already armed, exhaustion must not reduce

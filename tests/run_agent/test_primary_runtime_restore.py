@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 
 from run_agent import AIAgent
+from agent.chat_completion_helpers import _RATE_LIMIT_FALLBACK_COOLDOWN_S
 
 
 def _make_tool_defs(*names: str) -> list:
@@ -624,7 +625,7 @@ class TestRestoreInRunConversation:
 # =============================================================================
 
 class TestRateLimitCooldown:
-    """Verify _restore_primary_runtime() respects the 60s rate-limit cooldown."""
+    """Verify _restore_primary_runtime() respects the 10-minute rate-limit cooldown."""
 
     def test_restore_blocked_during_cooldown(self):
         """While _rate_limited_until is in the future, restore returns False."""
@@ -638,7 +639,7 @@ class TestRateLimitCooldown:
         assert agent._fallback_activated is True
 
         # Manually set cooldown well into the future
-        agent._rate_limited_until = time.monotonic() + 60
+        agent._rate_limited_until = time.monotonic() + _RATE_LIMIT_FALLBACK_COOLDOWN_S
 
         result = agent._restore_primary_runtime()
         assert result is False
@@ -665,7 +666,7 @@ class TestRateLimitCooldown:
         assert agent._fallback_activated is False
 
     def test_cooldown_set_on_rate_limit_reason(self):
-        """_try_activate_fallback with rate_limit reason sets _rate_limited_until."""
+        """_try_activate_fallback with rate_limit reason sets a 10-minute cooldown."""
         from run_agent import FailoverReason
         agent = _make_agent(
             fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
@@ -676,7 +677,7 @@ class TestRateLimitCooldown:
             agent._try_activate_fallback(reason=FailoverReason.rate_limit)
 
         assert hasattr(agent, "_rate_limited_until")
-        assert agent._rate_limited_until > before + 50  # ~60s from now
+        assert agent._rate_limited_until >= before + (_RATE_LIMIT_FALLBACK_COOLDOWN_S - 1)
 
     def test_cooldown_not_set_when_already_on_fallback(self):
         """Chain-switching while already on fallback must not reset cooldown."""
