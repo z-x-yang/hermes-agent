@@ -11,6 +11,7 @@ Uses discord.py library for:
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -4198,6 +4199,39 @@ class DiscordAdapter(BasePlatformAdapter):
             return
 
         tree = self._client.tree
+
+        async def _run_task_slash(interaction, command_text: str, handler_name: str, *args) -> None:
+            if not await self._check_slash_authorization(interaction, command_text):
+                return
+            controller = getattr(self, "_notion_controller", None)
+            handler = getattr(controller, handler_name, None)
+            if not callable(handler):
+                await interaction.response.send_message("Notion Task 控制器暂不可用，请稍后再试。", ephemeral=True)
+                return
+            result = handler(interaction, *args)
+            if inspect.isawaitable(result):
+                await result
+
+        @tree.command(name="task-done", description="Mark the current bound Notion task as Done")
+        async def slash_task_done(interaction):
+            await _run_task_slash(interaction, "/task-done", "handle_slash_done")
+
+        @tree.command(name="task-hold", description="Hold the current bound Notion task")
+        async def slash_task_hold(interaction):
+            await _run_task_slash(interaction, "/task-hold", "handle_slash_hold")
+
+        @tree.command(name="task-snooze", description="Pick a time to remind this task thread later")
+        async def slash_task_snooze(interaction):
+            await _run_task_slash(interaction, "/task-snooze", "handle_slash_snooze")
+
+        @tree.command(name="task-reopen", description="Reopen the current bound Notion task")
+        async def slash_task_reopen(interaction):
+            await _run_task_slash(interaction, "/task-reopen", "handle_slash_reopen")
+
+        @tree.command(name="task-bind", description="Bind this Discord thread to a Notion task")
+        @discord.app_commands.describe(task="Notion Task URL or page id; omit to paste it in a modal")
+        async def slash_task_bind(interaction, task: str = ""):
+            await _run_task_slash(interaction, "/task-bind", "handle_slash_bind", task)
 
         @tree.command(name="new", description="Start a new conversation")
         async def slash_new(interaction: discord.Interaction):
