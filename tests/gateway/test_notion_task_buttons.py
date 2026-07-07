@@ -42,12 +42,12 @@ def test_build_button_styles_and_labels():
 
 def test_build_button_numbered_label():
     # buttons carry ONLY the row number — full task text lives in the card embed
-    assert b.build_button("done", PID, num=3).item.label == "✓ 3"
-    assert b.build_button("snooze", PID, num=1).item.label == "⏰ 1"
+    assert b.build_button("done", PID, num=3).item.label == "✓3"
+    assert b.build_button("snooze", PID, num=1).item.label == "⏰1"
     assert b.build_button("undo", PID, num=2).item.label == "↩ 2"
-    assert b.build_button("open_thread", PID, num=2).item.label == "🧵 2"
-    assert b.build_button("hold", PID, num=2).item.label == "暂挂 2"
-    assert b.build_button("drop", PID, num=2).item.label == "弃置 2"
+    assert b.build_button("open_thread", PID, num=2).item.label == "🧵2"
+    assert b.build_button("hold", PID, num=2).item.label == "⏸2"
+    assert b.build_button("drop", PID, num=2).item.label == "🗑2"
 
 
 @pytest.mark.asyncio

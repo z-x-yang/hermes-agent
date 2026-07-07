@@ -106,7 +106,7 @@ async def test_render_send_attachments_numbered_view_and_card():
     text = f"Built [Reply to Alice](https://notion.so/{PID}) and a [doc](https://notion.so/{'a' * 32})"
     view, embed = await ctrl.render_send_attachments(text)
     assert view is not None and len(view.children) == 5
-    assert [child.item.label for child in view.children] == ["🧵 1", "✓ 1", "暂挂 1", "弃置 1", "⏰ 1"]
+    assert [child.item.label for child in view.children] == ["🧵1", "✓1", "⏸1", "🗑1", "⏰1"]
     assert f"1️⃣ {_link('Reply to Alice')}" in embed.description
     assert embed.title == "📋 任务"
 
@@ -188,7 +188,7 @@ async def test_undo_restores_open_row_and_status():
     assert f"1️⃣ {_link('Reply to Alice')}" in kwargs["embed"].description   # open row again
     assert "已完成" not in kwargs["embed"].title
     labels = [c.item.label for c in kwargs["view"].children]
-    assert labels == ["🧵 1", "✓ 1", "暂挂 1", "弃置 1", "⏰ 1"]
+    assert labels == ["🧵1", "✓1", "⏸1", "🗑1", "⏰1"]
 
 
 @pytest.mark.asyncio
@@ -364,7 +364,7 @@ async def test_multi_task_complete_marks_only_its_row_and_keeps_buttons():
     # numbered labels match card rows
     labels = {child.item.custom_id: child.item.label for child in kwargs["view"].children}
     assert labels[f"ntask:v1:undo:{PID}"] == "↩ 1"
-    assert labels[f"ntask:v1:done:{PID2}"] == "✓ 2"
+    assert labels[f"ntask:v1:done:{PID2}"] == "✓2"
 
 
 @pytest.mark.asyncio
@@ -627,7 +627,7 @@ async def test_snooze_action_edits_original_message_with_select_instead_of_new_m
     view = kwargs["view"]
     select = next(child for child in view.children if getattr(child, "custom_id", "").startswith("ntask:snooze-select:"))
     assert [child.item.label for child in view.children if hasattr(child, "item")] == [
-        "🧵 1", "✓ 1", "暂挂 1", "弃置 1", "⏰ 1"]
+        "🧵1", "✓1", "⏸1", "🗑1", "⏰1"]
     labels = [option.label for option in select.options]
     assert "3天后 9:30" in labels
 
@@ -648,7 +648,7 @@ async def test_snooze_picker_timeout_restores_original_buttons():
     src_msg.edit.assert_awaited_once()
     restored = src_msg.edit.call_args.kwargs["view"]
     assert [child.item.label for child in restored.children] == [
-        "🧵 1", "✓ 1", "暂挂 1", "弃置 1", "⏰ 1"]
+        "🧵1", "✓1", "⏸1", "🗑1", "⏰1"]
     assert not any(getattr(child, "custom_id", "").startswith("ntask:snooze-select:") for child in restored.children)
 
 
@@ -717,7 +717,7 @@ async def test_open_thread_returns_existing_binding_without_creating():
     inter.response.edit_message.assert_awaited_once()
     kwargs = inter.response.edit_message.call_args.kwargs
     labels = [_item(child).label for child in kwargs["view"].children]
-    assert labels == ["1.", "2.", "3.", "Other", "🧵", "⏰", "暂挂", "弃置", "✓"]
+    assert labels == ["1.", "2.", "3.", "Other", "🧵", "⏰", "⏸", "🗑", "✓"]
     assert _item(kwargs["view"].children[4]).url == "https://discord.com/channels/147/777"
 
 
@@ -800,7 +800,7 @@ async def test_primary_choice_posts_strategy_seed_to_existing_thread():
     assert "已选择：推荐：先开子区整理上下文" in kwargs["embed"].description
     assert "状态：已在子区继续" in kwargs["embed"].description
     labels = [_item(child).label for child in kwargs["view"].children]
-    assert labels == ["🧵", "⏰", "暂挂", "弃置", "✓"]
+    assert labels == ["🧵", "⏰", "⏸", "🗑", "✓"]
     assert _item(kwargs["view"].children[0]).url == "https://discord.com/channels/147/777"
     assert all(not str(getattr(_item(child), "custom_id", "")).startswith("ntask:v1:choice")
                for child in kwargs["view"].children)

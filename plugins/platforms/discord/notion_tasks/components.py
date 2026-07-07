@@ -29,8 +29,8 @@ _ACTION_MARK = {
     "done": "✓",
     "undo": "↩",
     "snooze": "⏰",
-    "hold": "暂挂",
-    "drop": "弃置",
+    "hold": "⏸",
+    "drop": "🗑",
     "resume": "继续",
     "open_thread": "🧵",
     "rename_thread": "改名",
@@ -81,8 +81,8 @@ _ROUTINE_ACTIONS = {"open_thread", "snooze", "hold", "drop", "done"}
 _SHORT_LABEL_BY_ROUTINE_ACTION = {
     "open_thread": "🧵",
     "snooze": "⏰",
-    "hold": "暂挂",
-    "drop": "弃置",
+    "hold": "⏸",
+    "drop": "🗑",
     "done": "✓",
 }
 
@@ -107,6 +107,8 @@ def numbered_label(action: str, num: int | None) -> str:
         raise ValueError(f"unknown task button action: {action!r}")
     if num is None:
         return _LEGACY_LABEL[action]
+    if action in _ROUTINE_ACTIONS:
+        return f"{_ACTION_MARK[action]}{num}"
     return f"{_ACTION_MARK[action]} {num}"
 
 

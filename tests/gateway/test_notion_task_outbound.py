@@ -70,7 +70,7 @@ async def test_standalone_payload_builds_numbered_buttons_and_card(monkeypatch):
     assert buttons[0]["style"] == 1
     assert buttons[1]["style"] == 3
     # buttons carry only the row number; full title lives in the card embed
-    assert [b["label"] for b in buttons] == ["🧵 1", "✓ 1", "暂挂 1", "弃置 1", "⏰ 1"]
+    assert [b["label"] for b in buttons] == ["🧵1", "✓1", "⏸1", "🗑1", "⏰1"]
     assert embed["title"] == "📋 任务"
     assert f"1️⃣ [Reply](https://www.notion.so/{PID})" in embed["description"]
 
@@ -124,9 +124,9 @@ async def test_standalone_payload_packs_task_groups_onto_shared_rows(monkeypatch
         f"ntask:v1:hold:{pid2}", f"ntask:v1:drop:{pid2}", f"ntask:v1:snooze:{pid2}"]
     # button numbers match the card row order
     assert [b["label"] for b in rows[0]["components"]] == [
-        "🧵 1", "✓ 1", "暂挂 1", "弃置 1", "⏰ 1"]
+        "🧵1", "✓1", "⏸1", "🗑1", "⏰1"]
     assert [b["label"] for b in rows[1]["components"]] == [
-        "🧵 2", "✓ 2", "暂挂 2", "弃置 2", "⏰ 2"]
+        "🧵2", "✓2", "⏸2", "🗑2", "⏰2"]
     assert f"1️⃣ [A](https://www.notion.so/{PID})" in embed["description"]
     assert f"2️⃣ [B](https://www.notion.so/{pid2})" in embed["description"]
 

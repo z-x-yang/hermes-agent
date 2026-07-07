@@ -81,8 +81,8 @@ _TASK_CLARIFY_SHORT_LABELS = {
     "other": "Other",
     "open_thread": "🧵",
     "snooze": "⏰",
-    "hold": "暂挂",
-    "drop": "弃置",
+    "hold": "⏸",
+    "drop": "🗑",
     "done": "✓",
 }
 

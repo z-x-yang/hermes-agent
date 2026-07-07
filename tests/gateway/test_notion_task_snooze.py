@@ -114,7 +114,7 @@ async def test_snooze_action_edits_original_message_with_choice_menu():
     view = kwargs["view"]
     assert any(getattr(child, "custom_id", "").startswith("ntask:snooze-select:") for child in view.children)
     assert [child.item.label for child in view.children if hasattr(child, "item")] == [
-        "🧵 1", "✓ 1", "暂挂 1", "弃置 1", "⏰ 1"]
+        "🧵1", "✓1", "⏸1", "🗑1", "⏰1"]
 
 
 @pytest.mark.asyncio
@@ -199,7 +199,7 @@ async def test_dispatch_due_snooze_sends_reminder_when_task_still_open():
     assert kwargs["content"].startswith("⏰ 稍后提醒：Reply to Alice")
     assert "https://app.notion.com/p/" in kwargs["content"]
     assert [child.item.label for child in kwargs["view"].children] == [
-        "🧵 1", "✓ 1", "暂挂 1", "弃置 1", "⏰ 1"]
+        "🧵1", "✓1", "⏸1", "🗑1", "⏰1"]
     # reminder carries a fresh open-row task card (the pending record itself
     # must not paint the row as 已延后 — this IS the reminder firing)
     assert f"1️⃣ [Reply to Alice](https://www.notion.so/{PID})" in kwargs["embed"].description

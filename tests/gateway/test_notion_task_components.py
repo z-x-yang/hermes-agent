@@ -26,8 +26,8 @@ def test_workbench_custom_ids_include_v1_and_legacy_regex():
 
 
 def test_workbench_action_labels_are_neutral():
-    assert c.numbered_label("open_thread", 2) == "🧵 2"
-    assert c.numbered_label("drop", 2) == "弃置 2"
+    assert c.numbered_label("open_thread", 2) == "🧵2"
+    assert c.numbered_label("drop", 2) == "🗑2"
     assert "loot" not in c.numbered_label("drop", 2).lower()
 
 
@@ -84,11 +84,11 @@ def test_action_pairs_for_task_card_caps_full_workbench_actions():
 
 class TestNumberedLabel:
     def test_actions_with_number(self):
-        assert c.numbered_label("done", 1) == "✓ 1"
-        assert c.numbered_label("snooze", 2) == "⏰ 2"
+        assert c.numbered_label("done", 1) == "✓1"
+        assert c.numbered_label("snooze", 2) == "⏰2"
         assert c.numbered_label("undo", 3) == "↩ 3"
-        assert c.numbered_label("hold", 4) == "暂挂 4"
-        assert c.numbered_label("drop", 5) == "弃置 5"
+        assert c.numbered_label("hold", 4) == "⏸4"
+        assert c.numbered_label("drop", 5) == "🗑5"
 
     def test_none_falls_back_to_legacy_constant(self):
         # from_custom_id 重建的按钮无编号信息,label 仅作路由占位、不展示
@@ -205,14 +205,14 @@ class TestTaskCardEmbedLinks:
 class TestNumberedComponents:
     def test_button_component_numbered(self):
         b = c.button_component("done", "a" * 32, 2)
-        assert b["label"] == "✓ 2"
+        assert b["label"] == "✓2"
         assert b["custom_id"] == f"ntask:v1:done:{'a' * 32}"
 
     def test_payload_numbers_by_first_occurrence(self):
         p1, p2 = "a" * 32, "b" * 32
         rows = c.components_payload([("done", p1), ("snooze", p1), ("done", p2), ("snooze", p2)])
         labels = [b["label"] for row in rows for b in row["components"]]
-        assert labels == ["✓ 1", "⏰ 1", "✓ 2", "⏰ 2"]
+        assert labels == ["✓1", "⏰1", "✓2", "⏰2"]
 
 
 # ===========================================================================
@@ -226,7 +226,7 @@ class TestButtonRowPacking:
             [("done", p1), ("snooze", p1), ("done", p2), ("snooze", p2)])
         assert len(rows) == 1                       # both tasks' 4 buttons on one row
         assert [b["label"] for b in rows[0]["components"]] == [
-            "✓ 1", "⏰ 1", "✓ 2", "⏰ 2"]
+            "✓1", "⏰1", "✓2", "⏰2"]
 
     def test_third_task_group_wraps_whole_to_next_row(self):
         pids = ["a" * 32, "b" * 32, "c" * 32]
@@ -237,7 +237,7 @@ class TestButtonRowPacking:
         assert len(rows) == 2
         assert len(rows[0]["components"]) == 4       # tasks 1,2 (4 ≤ 5)
         assert [b["label"] for b in rows[1]["components"]] == [
-            "✓ 3", "⏰ 3"]                            # task 3 pair kept intact
+            "✓3", "⏰3"]                            # task 3 pair kept intact
 
     def test_pack_group_rows_first_fit(self):
         assert c.pack_group_rows([2, 2]) == [0, 0]
@@ -292,7 +292,7 @@ class TestTaskClarifyCard:
         rows = c.task_clarify_components(self.card())
         labels = [b["label"] for row in rows for b in row["components"]]
         assert labels[:4] == ["1.", "2.", "3.", "Other"]
-        assert labels[4:] == ["🧵", "⏰", "暂挂", "弃置", "✓"]
+        assert labels[4:] == ["🧵", "⏰", "⏸", "🗑", "✓"]
         custom_ids = [b["custom_id"] for row in rows for b in row["components"]]
         assert custom_ids[0] == f"ntask:v1:choice1:{self.PID}"
         assert custom_ids[1] == f"ntask:v1:choice2:{self.PID}"
@@ -311,7 +311,7 @@ class TestTaskClarifyCard:
         assert thread_button["style"] == 5
         assert thread_button["url"] == "https://discord.com/channels/147/999"
         assert "custom_id" not in thread_button
-        assert [b["label"] for b in rows[1]["components"]] == ["🧵", "⏰", "暂挂", "弃置", "✓"]
+        assert [b["label"] for b in rows[1]["components"]] == ["🧵", "⏰", "⏸", "🗑", "✓"]
 
     def test_selected_card_removes_primary_buttons_and_shows_choice_state(self):
         card = self.card()
@@ -328,7 +328,7 @@ class TestTaskClarifyCard:
         assert "已选择：先起草回复/材料" in embed["description"]
         assert "状态：已在子区继续" in embed["description"]
         labels = [b["label"] for row in rows for b in row["components"]]
-        assert labels == ["🧵", "⏰", "暂挂", "弃置", "✓"]
+        assert labels == ["🧵", "⏰", "⏸", "🗑", "✓"]
         assert all(not str(b.get("custom_id", "")).startswith(f"ntask:v1:choice")
                    for row in rows for b in row["components"])
         assert all(b.get("custom_id") != f"ntask:v1:other:{self.PID}"
