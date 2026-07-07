@@ -212,6 +212,41 @@ async def test_task_clarify_undo_restores_authored_body_not_bare_link():
 
 
 @pytest.mark.asyncio
+async def test_task_clarify_done_then_undo_restores_original_choices():
+    done_page = {**TASK_PAGE, "properties": {**TASK_PAGE["properties"],
+                 "Status": {"type": "status", "status": {"name": "Done"}}}}
+
+    async def _set_status(_pid, target, _kind):
+        return done_page if target == "Done" else TASK_PAGE
+
+    notion = SimpleNamespace(
+        get_page=AsyncMock(side_effect=[TASK_PAGE, done_page]),
+        set_status_verified=AsyncMock(side_effect=_set_status),
+    )
+    ctrl = _ctrl(notion)
+    first = _task_clarify_interaction(content="")
+
+    await ctrl.handle_action("done", PID, first)
+    done_embed = first.response.edit_message.call_args.kwargs["embed"]
+    assert "已选择：完成" in done_embed.description
+    assert "**可选下一步**" not in done_embed.description
+
+    second = _task_clarify_interaction(content="")
+    second.message.embeds = [done_embed]
+    await ctrl.handle_action("undo", PID, second)
+
+    kwargs = second.response.edit_message.call_args.kwargs
+    desc = kwargs["embed"].description
+    assert "合作者回了论文修改意见" in desc
+    assert "**可选下一步**" in desc
+    assert "1. **推荐：先开子区整理上下文**" in desc
+    assert "已选择：完成" not in desc
+    assert "状态：已完成" not in desc
+    labels = [_item(child).label for child in kwargs["view"].children]
+    assert labels == ["1.", "2.", "3.", "Other", "🧵", "⏰", "⏸", "🗑", "✓"]
+
+
+@pytest.mark.asyncio
 async def test_drop_action_is_immediate_struck_and_undoable():
     dropped_page = {**TASK_PAGE, "properties": {**TASK_PAGE["properties"],
                     "Status": {"type": "status", "status": {"name": "Dropped"}}}}

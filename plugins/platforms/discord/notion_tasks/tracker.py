@@ -121,3 +121,37 @@ class NotionTaskTracker:
         }
         rec["updated_at"] = time.time()
         self._save()
+
+    def upsert_task_clarify_snapshot(self, page_id, *, context=None,
+                                     primary_choices=None,
+                                     other_enabled=None) -> None:
+        """Persist the original authored Task Clarify card body.
+
+        Once a card is marked selected/done/dropped, the visible embed no longer
+        carries the full 1/2/3 choice list. Store the pre-edit card shape so an
+        undo/reopen can restore the exact authored brief instead of rebuilding
+        from the already-mutated embed.
+        """
+        rec = self._tasks.setdefault(str(page_id), {})
+        snap = rec.setdefault("task_clarify_card", {})
+        if context is not None:
+            snap["context"] = str(context)
+        if primary_choices is not None:
+            choices = []
+            for item in list(primary_choices or [])[:3]:
+                if not isinstance(item, dict):
+                    continue
+                choices.append({
+                    "label": str(item.get("label") or ""),
+                    "description": str(item.get("description") or ""),
+                })
+            snap["primary_choices"] = choices
+        if other_enabled is not None:
+            snap["other_enabled"] = bool(other_enabled)
+        rec["updated_at"] = time.time()
+        self._save()
+
+    def task_clarify_snapshot(self, page_id) -> dict:
+        rec = self._tasks.get(str(page_id)) or {}
+        snap = rec.get("task_clarify_card") or {}
+        return dict(snap) if isinstance(snap, dict) else {}

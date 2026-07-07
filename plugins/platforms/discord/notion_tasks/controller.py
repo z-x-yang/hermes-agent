@@ -125,6 +125,18 @@ def _task_clarify_choices(embed) -> list[dict]:
     return choices[:3]
 
 
+def _strip_task_clarify_status_lines(context: str) -> str:
+    lines = []
+    for line in str(context or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("已选择：") or stripped.startswith("状态："):
+            continue
+        lines.append(line)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines).strip() or "这个任务需要你选一个下一步。"
+
+
 def _thread_url_from_binding(interaction, *, thread_id: str = "", thread_url: str = "") -> str:
     if thread_url:
         return thread_url
@@ -389,16 +401,57 @@ class NotionTaskController:
                 pass
         return btn
 
+    def _task_clarify_card_parts(self, page_id: str, embed) -> tuple[str, list[dict], bool]:
+        desc = _embed_description(embed)
+        context = _task_clarify_context(embed)
+        choices = _task_clarify_choices(embed)
+        other_enabled = "Other" in desc
+        if choices:
+            try:
+                self.tracker.upsert_task_clarify_snapshot(
+                    page_id,
+                    context=context,
+                    primary_choices=choices,
+                    other_enabled=other_enabled,
+                )
+            except Exception:
+                logger.warning("notion task: failed to persist Task Clarify snapshot for %s", page_id, exc_info=True)
+            return context, choices, other_enabled
+
+        snapshot: dict[str, Any] = {}
+        get_snapshot = getattr(self.tracker, "task_clarify_snapshot", None)
+        if callable(get_snapshot):
+            try:
+                raw_snapshot = get_snapshot(page_id) or {}
+                snapshot = raw_snapshot if isinstance(raw_snapshot, dict) else {}
+            except Exception:
+                logger.warning("notion task: failed to read Task Clarify snapshot for %s", page_id, exc_info=True)
+                snapshot = {}
+        snap_choices = list(snapshot.get("primary_choices") or [])[:3]
+        if snap_choices:
+            return (
+                str(snapshot.get("context") or _strip_task_clarify_status_lines(context)),
+                snap_choices,
+                bool(snapshot.get("other_enabled", other_enabled or True)),
+            )
+        return _strip_task_clarify_status_lines(context), choices, other_enabled
+
     def _task_clarify_view(self, page_id: str, *, thread_url: str = "", embed=None,
-                           selected: bool = False, task_state: dict | None = None):
+                           selected: bool = False, task_state: dict | None = None,
+                           choices: list[dict] | None = None,
+                           other_enabled: bool | None = None):
         view = discord.ui.View(timeout=None)
         state_name = (task_state or {}).get("state")
         terminal = state_name in {"done", "dropped"}
         if not selected and not terminal:
-            choice_count = len(_task_clarify_choices(embed)) if embed is not None else 0
+            available_choices = choices if choices is not None else (_task_clarify_choices(embed) if embed is not None else [])
+            choice_count = len(available_choices)
             for idx in range(1, min(choice_count, 3) + 1):
                 view.add_item(self._short_button(f"choice{idx}", page_id, row=0))
-            if "Other" in _embed_description(embed) if embed is not None else False:
+            show_other = other_enabled
+            if show_other is None:
+                show_other = "Other" in _embed_description(embed) if embed is not None else False
+            if show_other:
                 view.add_item(self._short_button("other", page_id, row=0))
         if thread_url:
             thread_btn = discord.ui.Button(
@@ -432,12 +485,13 @@ class NotionTaskController:
             }.get(state_name, "")
             followthrough_state = state_name
             selected = bool(selected_choice_text)
+        context, primary_choices, other_enabled = self._task_clarify_card_parts(page_id, embed)
         card = {
             "notionTaskId": page_id,
             "notionTaskTitle": title,
-            "body": {"context": _task_clarify_context(embed)},
-            "primaryChoices": _task_clarify_choices(embed),
-            "otherChoice": {"enabled": "Other" in _embed_description(embed)},
+            "body": {"context": context},
+            "primaryChoices": primary_choices,
+            "otherChoice": {"enabled": other_enabled},
             "secondaryActions": list(_TASK_CLARIFY_SECONDARY_ACTIONS),
             "threadUrl": thread_url,
         }
@@ -450,6 +504,8 @@ class NotionTaskController:
             embed=embed,
             selected=selected,
             task_state=task_state,
+            choices=primary_choices,
+            other_enabled=other_enabled,
         )
         await _edit_interaction_message(
             interaction,
