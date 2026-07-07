@@ -28,6 +28,7 @@ if _repo not in sys.path:
 from plugins.platforms.discord.adapter import (  # noqa: E402
     ClarifyChoiceView,
     DiscordAdapter,
+    _clarify_asking_content,
 )
 from gateway.config import PlatformConfig  # noqa: E402
 
@@ -92,6 +93,29 @@ def _embed_text(embed) -> str:
     if footer:
         parts.append(footer.get("text") or "")
     return "\n".join(parts)
+
+
+# ===========================================================================
+# Plain Asking content / notification ping
+# ===========================================================================
+
+class TestClarifyAskingContent:
+    """The real Discord notification lives in normal message content."""
+
+    def test_mentions_numeric_allowed_user_in_asking_line(self):
+        assert _clarify_asking_content({"42"}, has_choices=True) == (
+            "Asking <@42> — tap a choice below, or ✏️ Other to type your own answer."
+        )
+
+    def test_open_ended_mentions_user_and_prompts_reply(self):
+        assert _clarify_asking_content({"42"}, has_choices=False) == (
+            "Asking <@42> — reply in this channel with your answer."
+        )
+
+    def test_non_numeric_allowlist_falls_back_without_raw_mention(self):
+        assert _clarify_asking_content({"*", "alice"}, has_choices=True) == (
+            "Asking for input — tap a choice below, or ✏️ Other to type your own answer."
+        )
 
 
 # ===========================================================================
@@ -379,6 +403,30 @@ class TestDiscordSendClarify:
         embed_text = _embed_text(channel.send.call_args.kwargs["embed"])
         assert "1. **Tight and short** — Covers all 3 audiences without dumbing down" in embed_text
         assert "2. **Long form** — Full detail, slower read" in embed_text
+        assert channel.send.call_args.kwargs["content"].startswith("Asking <@42> —")
+        assert "allowed_mentions" in channel.send.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_open_ended_content_pings_allowed_user(self):
+        adapter = _make_adapter(allowed_users={"42"})
+        channel = MagicMock()
+        sent_msg = MagicMock()
+        sent_msg.id = 9004
+        channel.send = AsyncMock(return_value=sent_msg)
+        assert adapter._client is not None
+        adapter._client.get_channel = MagicMock(return_value=channel)
+
+        await adapter.send_clarify(
+            chat_id="9001",
+            question="What should I do next?",
+            choices=None,
+            clarify_id="cidPingOpen",
+            session_key="sk-PingOpen",
+        )
+
+        assert channel.send.call_args.kwargs["content"] == (
+            "Asking <@42> — reply in this channel with your answer."
+        )
 
     @pytest.mark.asyncio
     async def test_context_renders_above_bold_question(self):

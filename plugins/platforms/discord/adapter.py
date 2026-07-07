@@ -377,6 +377,45 @@ def _build_allowed_mentions():
     )
 
 
+def _build_clarify_allowed_mentions():
+    """Allow only direct user pings for Discord clarify prompts.
+
+    Clarify prompts are control messages authored by Hermes, not arbitrary model
+    text, so they intentionally permit the selected user's ``<@id>`` mention to
+    notify while still blocking roles, @everyone/@here, and reply pings.
+    """
+    if not DISCORD_AVAILABLE or discord is None:
+        return None
+    return discord.AllowedMentions(
+        everyone=False,
+        roles=False,
+        users=True,
+        replied_user=False,
+    )
+
+
+def _clarify_asking_content(allowed_user_ids: set, *, has_choices: bool) -> str:
+    """Build the plain Discord message content that carries the real ping.
+
+    Discord embed descriptions are not reliable notification surfaces for
+    mentions. Keep the full prompt in the embed, but put a short ``Asking ...``
+    line in normal message content so the user actually gets notified.
+    """
+    numeric_ids = sorted(
+        str(uid).strip()
+        for uid in (allowed_user_ids or set())
+        if str(uid).strip().isdigit()
+    )
+    target = " ".join(f"<@{uid}>" for uid in numeric_ids)
+    if has_choices:
+        verb = "tap a choice below, or ✏️ Other to type your own answer"
+    else:
+        verb = "reply in this channel with your answer"
+    if target:
+        return f"Asking {target} — {verb}."
+    return f"Asking for input — {verb}."
+
+
 def _discord_ready_timeout_seconds() -> float:
     """Return the Discord ready wait timeout during gateway startup."""
     raw = os.getenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "").strip()
@@ -5851,7 +5890,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 view = None
 
-            msg = await channel.send(embed=embed, view=view) if view else await channel.send(embed=embed)
+            send_kwargs = {
+                "content": _clarify_asking_content(
+                    self._allowed_user_ids,
+                    has_choices=bool(clean_choices),
+                ),
+                "embed": embed,
+                "allowed_mentions": _build_clarify_allowed_mentions(),
+            }
+            if view:
+                send_kwargs["view"] = view
+
+            msg = await channel.send(**send_kwargs)
             if view:
                 view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))
