@@ -375,6 +375,23 @@ class NotionTaskController:
         self._now_fn = now_fn or datetime.now
         self.adapter: Any = None
 
+    def _mark_thread_title_managed(self, thread_id: str) -> None:
+        """Prevent session auto-title from overwriting a Task-managed thread name."""
+        thread_id = str(thread_id or "").strip()
+        if not thread_id:
+            return
+        marker = getattr(getattr(self, "adapter", None), "mark_auto_titled_thread", None)
+        if not callable(marker):
+            return
+        try:
+            marker(thread_id)
+        except Exception:
+            logger.warning(
+                "notion task: failed to persist title lock for Discord thread %s",
+                thread_id,
+                exc_info=True,
+            )
+
     async def resolve_task_for_discord_interaction(self, interaction, task_ref: str | None = None) -> dict:
         """Resolve a slash-command interaction to one authoritative Notion Task."""
         explicit_id = _page_id_from_ref(task_ref or "")
@@ -537,6 +554,7 @@ class NotionTaskController:
             await _send_interaction_notice(interaction, "目标 Notion Task 已经绑定另一个子区，未抢占。", ephemeral=True)
             return
         if existing_thread_id == current_thread_id:
+            self._mark_thread_title_managed(current_thread_id)
             await _send_interaction_notice(interaction, f"已绑定 Notion Task：{title}\nNotion: https://app.notion.com/p/{page_id}", ephemeral=True)
             return
         thread_url = _thread_url_from_binding(interaction, thread_id=current_thread_id)
@@ -551,6 +569,7 @@ class NotionTaskController:
         except Exception as exc:
             await _send_interaction_notice(interaction, f"绑定失败，Notion 未确认：{exc}", ephemeral=True)
             return
+        self._mark_thread_title_managed(current_thread_id)
         title = detection.page_title(page) or title
         await _send_interaction_notice(
             interaction,
@@ -1195,6 +1214,7 @@ class NotionTaskController:
         binding = read_thread_binding(page)
         if binding.get("thread_id"):
             thread_id = str(binding["thread_id"])
+            self._mark_thread_title_managed(thread_id)
             thread_url = _thread_url_from_binding(
                 interaction,
                 thread_id=thread_id,

@@ -231,6 +231,7 @@ async def test_slash_bind_writes_current_thread_binding_manual_locked():
         set_thread_binding_verified=AsyncMock(return_value=bound_page),
     )
     ctrl = _ctrl(notion)
+    ctrl.adapter = SimpleNamespace(mark_auto_titled_thread=MagicMock())
     inter = _interaction(channel_id="1523")
     inter.guild = SimpleNamespace(id="147")
 
@@ -243,6 +244,7 @@ async def test_slash_bind_writes_current_thread_binding_manual_locked():
         title_mode="manual_locked",
         title_version=1,
     )
+    ctrl.adapter.mark_auto_titled_thread.assert_called_once_with("1523")
     inter.response.send_message.assert_awaited_once()
     assert "已绑定 Notion Task" in inter.response.send_message.await_args.args[0]
 

@@ -126,6 +126,7 @@ async def test_create_task_thread_from_message_direct():
     message.create_thread.assert_awaited_once_with(name="Task thread", auto_archive_duration=1440)
     thread.send.assert_awaited_once_with("hello")
     message.channel.send.assert_not_awaited()
+    assert adapter.has_auto_titled_thread("777")
 
 
 @pytest.mark.asyncio
@@ -161,6 +162,7 @@ async def test_create_task_thread_from_message_fallback_seed_message():
     assert result["thread_id"] == "888"
     message.channel.send.assert_awaited_once_with("hello")
     seed_msg.create_thread.assert_awaited_once_with(name="Task thread", auto_archive_duration=1440)
+    assert adapter.has_auto_titled_thread("888")
 
 
 # --- the standalone HTTP path (`hermes send` / cron) MUST attach the card ---

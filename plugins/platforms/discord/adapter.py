@@ -938,13 +938,24 @@ class DiscordAdapter(BasePlatformAdapter):
             try:
                 seed_msg = await parent.send(seed or f"Task thread: **{name}**")
                 thread = await seed_msg.create_thread(name=name, auto_archive_duration=1440)
-                return {"success": True, "thread_id": str(thread.id),
+                thread_id = str(thread.id)
+                if thread_id:
+                    # Task threads are deliberately named from the Notion task;
+                    # mark them as title-managed so later session auto-title
+                    # propagation does not overwrite the task name.
+                    self.mark_auto_titled_thread(thread_id)
+                return {"success": True, "thread_id": thread_id,
                         "thread_name": getattr(thread, "name", name)}
             except Exception as fallback_error:
                 return {"error": f"task thread create failed: {direct_error}; fallback: {fallback_error}"}
 
         result = {"success": True, "thread_id": str(thread.id),
                   "thread_name": getattr(thread, "name", name)}
+        if result["thread_id"]:
+            # Task threads are deliberately named from the Notion task; mark
+            # them as title-managed so later session auto-title propagation does
+            # not overwrite the task name.
+            self.mark_auto_titled_thread(result["thread_id"])
         if seed:
             try:
                 await thread.send(seed)
