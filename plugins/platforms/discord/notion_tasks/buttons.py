@@ -42,6 +42,29 @@ class OtherDirectionModal(discord.ui.Modal):
         await ctrl.handle_other_direction_submit(self.page_id, direction, interaction)
 
 
+class HoldReasonModal(discord.ui.Modal):
+    def __init__(self, page_id: str):
+        super().__init__(title="暂挂原因", timeout=None)
+        self.page_id = page_id
+        self.reason_input = discord.ui.TextInput(
+            label="为什么先暂挂？（可留空）",
+            placeholder="比如：等老板反馈；等对方回信；现在不是优先级。",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=500,
+        )
+        self.add_item(self.reason_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ctrl = get_active_controller()
+        if ctrl is None:
+            logger.warning("notion task Hold modal submitted but no active controller")
+            await interaction.response.send_message("功能暂不可用，请稍后再试。", ephemeral=True)
+            return
+        reason = str(getattr(self.reason_input, "value", "") or "").strip()
+        await ctrl.handle_hold_reason_submit(self.page_id, reason, interaction)
+
+
 class TaskActionButton(discord.ui.DynamicItem[discord.ui.Button], template=CUSTOM_ID_RE):
     def __init__(self, action: str, page_id: str, *, title: str | None = None,
                  num: int | None = None):
@@ -84,6 +107,15 @@ class TaskActionButton(discord.ui.DynamicItem[discord.ui.Button], template=CUSTO
                 await interaction.response.send_message("当前客户端不能打开自定义输入框。", ephemeral=True)
                 return
             result = send_modal(OtherDirectionModal(self.page_id))
+            if inspect.isawaitable(result):
+                await result
+            return
+        if self.action == "hold":
+            send_modal = getattr(getattr(interaction, "response", None), "send_modal", None)
+            if not callable(send_modal):
+                await interaction.response.send_message("当前客户端不能打开暂挂原因输入框。", ephemeral=True)
+                return
+            result = send_modal(HoldReasonModal(self.page_id))
             if inspect.isawaitable(result):
                 await result
             return

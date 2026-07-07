@@ -231,6 +231,12 @@ def _followthrough_status_text(state: str) -> str:
         return "正在接到子区"
     if state == "failed":
         return "接到子区失败"
+    if state == "done":
+        return "已完成"
+    if state == "dropped":
+        return "已弃置"
+    if state == "snoozed":
+        return "已暂挂 / 延后提醒"
     if state == "selected":
         return "已记录选择"
     return "已选择"

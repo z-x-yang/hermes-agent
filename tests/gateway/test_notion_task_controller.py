@@ -6,6 +6,7 @@ import pytest
 from plugins.platforms.discord.notion_tasks.controller import NotionTaskController
 from plugins.platforms.discord.notion_tasks.tracker import NotionTaskTracker
 from plugins.platforms.discord.notion_tasks.notion_client import NotionError
+from plugins.platforms.discord.notion_tasks.buttons import TaskActionButton
 
 PID = "1f17a58d229e816f839bef72f6f2ec72"
 TASK_PAGE = {
@@ -189,6 +190,25 @@ async def test_undo_restores_open_row_and_status():
     assert "已完成" not in kwargs["embed"].title
     labels = [c.item.label for c in kwargs["view"].children]
     assert labels == ["🧵1", "✓1", "⏸1", "🗑1", "⏰1"]
+
+
+@pytest.mark.asyncio
+async def test_task_clarify_undo_restores_authored_body_not_bare_link():
+    notion = SimpleNamespace(get_page=AsyncMock(return_value=TASK_PAGE), set_status_verified=AsyncMock(return_value=TASK_PAGE))
+    ctrl = _ctrl(notion)
+    ctrl.tracker.upsert_meta(PID, title="Reply to Alice", status_kind="status",
+                             original_status="To Do", done=True)
+    inter = _task_clarify_interaction(content="")
+
+    await ctrl.handle_action("undo", PID, inter)
+
+    kwargs = inter.response.edit_message.call_args.kwargs
+    assert "content" not in kwargs
+    assert kwargs["embed"].title.startswith("🧭 Task Clarify")
+    assert "合作者回了论文修改意见" in kwargs["embed"].description
+    assert "**可选下一步**" in kwargs["embed"].description
+    labels = [_item(child).label for child in kwargs["view"].children]
+    assert labels == ["1.", "2.", "3.", "Other", "🧵", "⏰", "⏸", "🗑", "✓"]
 
 
 @pytest.mark.asyncio
@@ -612,6 +632,24 @@ async def test_hold_confirm_sets_notion_hold_and_cancels_snooze():
 
 
 @pytest.mark.asyncio
+async def test_hold_button_opens_optional_reason_modal(monkeypatch):
+    monkeypatch.setattr(
+        "plugins.platforms.discord.notion_tasks.buttons.get_active_controller",
+        lambda: SimpleNamespace(handle_action=AsyncMock()),
+    )
+    response = SimpleNamespace(send_modal=AsyncMock(), send_message=AsyncMock())
+    inter = SimpleNamespace(response=response)
+    button = TaskActionButton("hold", PID)
+
+    await button.callback(inter)
+
+    response.send_modal.assert_awaited_once()
+    modal = response.send_modal.await_args.args[0]
+    assert modal.title == "暂挂原因"
+    assert modal.reason_input.required is False
+
+
+@pytest.mark.asyncio
 async def test_snooze_action_edits_original_message_with_select_instead_of_new_message():
     notion = SimpleNamespace(get_page=AsyncMock(return_value=TASK_PAGE), set_status=AsyncMock())
     ctrl = _ctrl(notion)
@@ -630,6 +668,25 @@ async def test_snooze_action_edits_original_message_with_select_instead_of_new_m
         "🧵1", "✓1", "⏸1", "🗑1", "⏰1"]
     labels = [option.label for option in select.options]
     assert "3天后 9:30" in labels
+
+
+@pytest.mark.asyncio
+async def test_task_clarify_snooze_picker_preserves_authored_card_body():
+    notion = SimpleNamespace(get_page=AsyncMock(return_value=TASK_PAGE), set_status=AsyncMock())
+    ctrl = _ctrl(notion)
+    inter = _task_clarify_interaction(content="")
+
+    await ctrl.handle_action("snooze", PID, inter)
+
+    inter.response.send_message.assert_not_awaited()
+    kwargs = inter.response.edit_message.call_args.kwargs
+    assert kwargs["embed"].title.startswith("🧭 Task Clarify")
+    assert "合作者回了论文修改意见" in kwargs["embed"].description
+    assert "**可选下一步**" in kwargs["embed"].description
+    labels = [_item(child).label for child in kwargs["view"].children if hasattr(child, "item")]
+    assert labels == ["1.", "2.", "3.", "Other", "🧵", "⏰", "⏸", "🗑", "✓"]
+    assert any(getattr(child, "custom_id", "").startswith("ntask:snooze-select:")
+               for child in kwargs["view"].children)
 
 
 @pytest.mark.asyncio

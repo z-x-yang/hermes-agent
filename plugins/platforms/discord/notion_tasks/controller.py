@@ -80,6 +80,7 @@ _TASK_CLARIFY_SHORT_LABELS = {
     "choice3": "3.",
     "other": "Other",
     "open_thread": "🧵",
+    "undo": "↩",
     "snooze": "⏰",
     "hold": "⏸",
     "drop": "🗑",
@@ -132,6 +133,19 @@ def _thread_url_from_binding(interaction, *, thread_id: str = "", thread_url: st
     guild = getattr(interaction, "guild", None) or getattr(getattr(interaction, "message", None), "guild", None)
     guild_id = str(getattr(guild, "id", "") or "")
     return f"https://discord.com/channels/{guild_id}/{thread_id}" if guild_id else ""
+
+
+def _thread_url_from_page(page: dict, interaction) -> str:
+    try:
+        from .threading import read_thread_binding
+        binding = read_thread_binding(page)
+    except Exception:
+        return ""
+    return _thread_url_from_binding(
+        interaction,
+        thread_id=str(binding.get("thread_id") or ""),
+        thread_url=str(binding.get("thread_url") or ""),
+    )
 
 
 def _selected_choice_from_interaction(interaction, action: str) -> dict:
@@ -376,9 +390,11 @@ class NotionTaskController:
         return btn
 
     def _task_clarify_view(self, page_id: str, *, thread_url: str = "", embed=None,
-                           selected: bool = False):
+                           selected: bool = False, task_state: dict | None = None):
         view = discord.ui.View(timeout=None)
-        if not selected:
+        state_name = (task_state or {}).get("state")
+        terminal = state_name in {"done", "dropped"}
+        if not selected and not terminal:
             choice_count = len(_task_clarify_choices(embed)) if embed is not None else 0
             for idx in range(1, min(choice_count, 3) + 1):
                 view.add_item(self._short_button(f"choice{idx}", page_id, row=0))
@@ -394,17 +410,28 @@ class NotionTaskController:
             view.add_item(thread_btn)
         else:
             view.add_item(self._short_button("open_thread", page_id, row=1))
-        for action in ("snooze", "hold", "drop", "done"):
+        routine = ("undo",) if terminal else ("snooze", "hold", "drop", "done")
+        for action in routine:
             view.add_item(self._short_button(action, page_id, row=1))
         return view
 
     async def _edit_task_clarify_card(self, page_id: str, *, title: str, interaction,
                                       thread_url: str = "", selected_choice_text: str = "",
-                                      followthrough_state: str = "continued") -> bool:
+                                      followthrough_state: str = "continued",
+                                      task_state: dict | None = None) -> bool:
         embed = _task_clarify_embed_from_interaction(interaction)
         if embed is None:
             return False
         selected = bool(selected_choice_text)
+        state_name = (task_state or {}).get("state")
+        if not selected and state_name in {"done", "dropped", "snoozed"}:
+            selected_choice_text = {
+                "done": "完成",
+                "dropped": "弃置",
+                "snoozed": "暂挂 / 延后提醒",
+            }.get(state_name, "")
+            followthrough_state = state_name
+            selected = bool(selected_choice_text)
         card = {
             "notionTaskId": page_id,
             "notionTaskTitle": title,
@@ -417,7 +444,13 @@ class NotionTaskController:
         if selected:
             card["selectedChoice"] = {"text": selected_choice_text}
             card["followthroughState"] = followthrough_state
-        view = self._task_clarify_view(page_id, thread_url=thread_url, embed=embed, selected=selected)
+        view = self._task_clarify_view(
+            page_id,
+            thread_url=thread_url,
+            embed=embed,
+            selected=selected,
+            task_state=task_state,
+        )
         await _edit_interaction_message(
             interaction,
             embed=discord.Embed.from_dict(task_clarify_embed(card)),
@@ -742,6 +775,17 @@ class NotionTaskController:
         if terminal:
             self.snoozes.cancel_pending(page_id, reason="dropped" if action == "drop" else "completed")
         orig = self._stored_orig(page_id, mid) or content_now
+        if _task_clarify_embed_from_interaction(interaction) is not None:
+            edited = await self._edit_task_clarify_card(
+                page_id,
+                title=title,
+                interaction=interaction,
+                thread_url=_thread_url_from_page(updated_page or page, interaction),
+                task_state=state,
+            )
+            if edited:
+                await self._sync_other(page_id, exclude_mid=mid, done=terminal, title=title, state=state)
+                return
         mode, view, embed = await self._rebuild_card(
             orig, page_id=page_id, title=title, done=terminal, state=state)
         if mode == "failed":
@@ -968,6 +1012,12 @@ class NotionTaskController:
             message_id=str(getattr(msg, "id", "") or ""),
         )
 
+    async def handle_hold_reason_submit(self, page_id: str, reason: str, interaction):
+        reason = str(reason or "").strip()
+        if len(reason) > 500:
+            reason = reason[:499] + "…"
+        await self.handle_hold_confirm(page_id, reason or "manual_hold", None, interaction)
+
     async def handle_hold_confirm(self, page_id: str, reason: str, next_check: str | None, interaction):
         if not self._authorized(interaction):
             await interaction.response.send_message("你没有权限操作这个任务。", ephemeral=True)
@@ -985,6 +1035,18 @@ class NotionTaskController:
             return
         title = detection.page_title(page)
         self.snoozes.cancel_pending(page_id, reason="moved_to_notion_hold")
+        state = _card_state_from_page(page)
+        if _task_clarify_embed_from_interaction(interaction) is not None:
+            edited = await self._edit_task_clarify_card(
+                page_id,
+                title=title,
+                interaction=interaction,
+                thread_url=_thread_url_from_page(page, interaction),
+                task_state=state,
+            )
+            if edited:
+                await _send_interaction_notice(interaction, f"已暂挂：{title}", ephemeral=True)
+                return
         await _send_interaction_notice(interaction, f"已暂挂：{title}", ephemeral=True)
         await self._refresh_message_from_interaction(page_id, title, interaction)
 
@@ -1011,6 +1073,40 @@ class NotionTaskController:
         source_content = getattr(msg, "content", "") or ""
         title = detection.page_title(page)
         state = _card_state_from_page(page)
+        clarify_embed = _task_clarify_embed_from_interaction(interaction)
+        if clarify_embed is not None:
+            base_view = self._task_clarify_view(
+                page_id,
+                thread_url=_thread_url_from_page(page, interaction),
+                embed=clarify_embed,
+                task_state=state,
+            )
+            view, preserves_source_controls = self._build_snooze_menu(
+                page_id,
+                source_channel_id=source_channel_id,
+                source_message_id=source_message_id,
+                source_content=source_content,
+                title=title,
+                base_view=base_view,
+            )
+            if not preserves_source_controls:
+                await _send_interaction_notice(interaction, "稍后多久提醒？", view=view, ephemeral=True)
+                return
+            card = {
+                "notionTaskId": page_id,
+                "notionTaskTitle": title,
+                "body": {"context": _task_clarify_context(clarify_embed)},
+                "primaryChoices": _task_clarify_choices(clarify_embed),
+                "otherChoice": {"enabled": "Other" in _embed_description(clarify_embed)},
+                "secondaryActions": list(_TASK_CLARIFY_SECONDARY_ACTIONS),
+                "threadUrl": _thread_url_from_page(page, interaction),
+            }
+            await _edit_interaction_message(
+                interaction,
+                embed=discord.Embed.from_dict(task_clarify_embed(card)),
+                view=view,
+            )
+            return
         mode, base_view, embed = await self._rebuild_card(
             source_content,
             page_id=page_id,
@@ -1089,6 +1185,22 @@ class NotionTaskController:
         current_msg = getattr(interaction, "message", None)
         current_mid = str(getattr(current_msg, "id", "") or "")
         current_content = getattr(current_msg, "content", "") or ""
+        if _task_clarify_embed_from_interaction(interaction) is not None:
+            edited = await self._edit_task_clarify_card(
+                page_id,
+                title=title,
+                interaction=interaction,
+                thread_url=_thread_url_from_page(page, interaction),
+                task_state=state,
+            )
+            if edited:
+                if source_message_id and source_message_id != current_mid:
+                    await self._refresh_message_card(page_id, title=title,
+                                                     channel_id=source_channel_id,
+                                                     message_id=source_message_id)
+                await self._sync_other(page_id, exclude_mid=source_message_id or current_mid,
+                                       done=False, title=title, state=state)
+                return
         mode, view, embed = await self._rebuild_card(
             source_content or current_content,
             page_id=page_id,
