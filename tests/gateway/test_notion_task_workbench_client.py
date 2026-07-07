@@ -70,6 +70,31 @@ async def test_find_task_by_discord_thread_id_filters_tasks_source():
 
 
 @pytest.mark.asyncio
+async def test_find_task_by_discord_thread_id_returns_empty_when_real_source_empty_and_legacy_id_400s():
+    data_source = TASKS_DATA_SOURCE_ID
+    legacy_database = "0" * 32
+    paths = []
+
+    def handler(req):
+        paths.append(req.url.path)
+        if req.url.path == f"/v1/data_sources/{data_source}/query":
+            return httpx.Response(200, json={"results": []})
+        if req.url.path == f"/v1/data_sources/{legacy_database}/query":
+            return httpx.Response(400, json={"message": "not a data source"})
+        raise AssertionError(req.url.path)
+
+    client = NotionClient(api_key="secret", transport=httpx.MockTransport(handler), backoff=0)
+
+    pages = await client.find_task_by_discord_thread_id("1523", {data_source, legacy_database})
+
+    assert pages == []
+    assert paths == [
+        f"/v1/data_sources/{legacy_database}/query",
+        f"/v1/data_sources/{data_source}/query",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_set_hold_verified_patches_and_reads_back():
     calls = []
 

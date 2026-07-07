@@ -252,6 +252,36 @@ async def _defer_message_update(interaction) -> None:
         logger.warning("notion task: failed to defer Discord interaction", exc_info=True)
 
 
+async def _defer_slash_response(interaction, *, ephemeral: bool = True) -> None:
+    """ACK a slash command before Notion/network work.
+
+    Unlike component updates, application commands need a deferred channel
+    response (`thinking=True`) so the later notice can be sent through followup
+    without hitting Discord's short initial-response timeout.
+    """
+    if _interaction_response_done(interaction):
+        return
+    response = getattr(interaction, "response", None)
+    defer = getattr(response, "defer", None)
+    if not callable(defer):
+        return
+    try:
+        result = defer(thinking=True, ephemeral=ephemeral)
+    except TypeError:
+        try:
+            result = defer(thinking=True)
+        except TypeError:
+            result = defer()
+    except Exception:
+        logger.warning("notion task: failed to defer Discord slash interaction", exc_info=True)
+        return
+    try:
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.warning("notion task: failed to defer Discord slash interaction", exc_info=True)
+
+
 async def _send_interaction_notice(interaction, content: str, **kwargs) -> None:
     if not _interaction_response_done(interaction):
         result = interaction.response.send_message(content, **kwargs)
@@ -388,6 +418,7 @@ class NotionTaskController:
         }
 
     async def handle_slash_done(self, interaction):
+        await _defer_slash_response(interaction, ephemeral=True)
         try:
             resolved = await self.resolve_task_for_discord_interaction(interaction)
             page_id = resolved["page_id"]
@@ -406,6 +437,7 @@ class NotionTaskController:
         await _send_interaction_modal(interaction, SlashHoldReasonModal())
 
     async def handle_slash_snooze(self, interaction):
+        await _defer_slash_response(interaction, ephemeral=True)
         try:
             resolved = await self.resolve_task_for_discord_interaction(interaction)
         except Exception as exc:
@@ -431,6 +463,7 @@ class NotionTaskController:
         await _send_interaction_notice(interaction, "稍后多久提醒？", view=view, ephemeral=True)
 
     async def handle_slash_hold_submit(self, reason: str, interaction):
+        await _defer_slash_response(interaction, ephemeral=True)
         reason = str(reason or "").strip()
         if len(reason) > 500:
             reason = reason[:499] + "…"
@@ -452,6 +485,7 @@ class NotionTaskController:
         await _send_interaction_notice(interaction, f"⏸ 已暂挂：{title}", ephemeral=True)
 
     async def handle_slash_reopen(self, interaction):
+        await _defer_slash_response(interaction, ephemeral=True)
         try:
             resolved = await self.resolve_task_for_discord_interaction(interaction)
             page_id = resolved["page_id"]
@@ -471,6 +505,7 @@ class NotionTaskController:
         await _send_interaction_modal(interaction, TaskBindModal())
 
     async def handle_slash_bind_submit(self, task_ref: str, interaction):
+        await _defer_slash_response(interaction, ephemeral=True)
         current_thread_id = _current_channel_id(interaction)
         if not current_thread_id:
             await _send_interaction_notice(interaction, "当前频道没有 Discord thread id，未绑定。", ephemeral=True)

@@ -137,6 +137,7 @@ async def test_slash_snooze_opens_ephemeral_choice_menu_without_notion_write():
 
     await ctrl.handle_slash_snooze(inter)
 
+    inter.response.defer.assert_awaited_once()
     notion.set_hold_verified.assert_not_awaited()
     inter.response.send_message.assert_awaited_once()
     assert "稍后多久提醒" in inter.response.send_message.await_args.args[0]

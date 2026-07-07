@@ -171,6 +171,7 @@ class NotionClient:
         results: list[dict] = []
         first_error: Exception | None = None
         attempted = 0
+        succeeded = 0
         normalized_ids = [nid for nid in (detection.normalize_id(t) for t in (tasks_ids or set())) if nid]
         for task_source_id in sorted(normalized_ids):
             attempted += 1
@@ -186,11 +187,12 @@ class NotionClient:
                 if str(exc).startswith(("400:", "404:")):
                     continue
                 raise
+            succeeded += 1
             for page in resp.get("results") or []:
                 results.append(page)
                 if len(results) >= 2:
                     return results[:2]
-        if attempted and not results and first_error is not None:
+        if attempted and not succeeded and first_error is not None:
             raise first_error
         return results
 

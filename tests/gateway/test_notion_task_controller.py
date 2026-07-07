@@ -151,6 +151,7 @@ async def test_slash_done_resolves_current_task_and_confirms():
 
     await ctrl.handle_slash_done(inter)
 
+    inter.response.defer.assert_awaited_once()
     notion.set_status_verified.assert_awaited_once_with(PID, "Done", "status")
     inter.response.send_message.assert_awaited_once()
     assert "已完成" in inter.response.send_message.await_args.args[0]
@@ -205,6 +206,7 @@ async def test_slash_reopen_resolves_current_task_and_clears_snooze():
 
     await ctrl.handle_slash_reopen(inter)
 
+    inter.response.defer.assert_awaited_once()
     notion.reopen_verified.assert_awaited_once_with(PID)
     assert ctrl.snoozes.pending_for(PID) is None
     inter.response.send_message.assert_awaited_once()
