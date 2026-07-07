@@ -157,6 +157,43 @@ class NotionClient:
     async def get_data_source(self, data_source_id: str) -> dict:
         return await self._request("GET", f"/data_sources/{data_source_id}")
 
+    async def query_data_source(self, data_source_id: str, body: dict) -> dict:
+        return await self._request("POST", f"/data_sources/{data_source_id}/query", json_body=body or {})
+
+    async def find_task_by_discord_thread_id(self, thread_id: str, tasks_ids: set[str]) -> list[dict]:
+        body = {
+            "filter": {
+                "property": "Discord Thread ID",
+                "rich_text": {"equals": str(thread_id)},
+            },
+            "page_size": 2,
+        }
+        results: list[dict] = []
+        first_error: Exception | None = None
+        attempted = 0
+        normalized_ids = [nid for nid in (detection.normalize_id(t) for t in (tasks_ids or set())) if nid]
+        for task_source_id in sorted(normalized_ids):
+            attempted += 1
+            try:
+                resp = await self.query_data_source(task_source_id, body)
+            except NotionError as exc:
+                # DEFAULT_TASKS_IDS includes the legacy database_id alongside the
+                # 2025 data_source_id. Querying the legacy id via /data_sources
+                # may 400/404; skip that id but keep real API failures visible if
+                # every configured id fails.
+                if first_error is None:
+                    first_error = exc
+                if str(exc).startswith(("400:", "404:")):
+                    continue
+                raise
+            for page in resp.get("results") or []:
+                results.append(page)
+                if len(results) >= 2:
+                    return results[:2]
+        if attempted and not results and first_error is not None:
+            raise first_error
+        return results
+
     async def set_status(self, page_id: str, value: str, kind: str) -> dict:
         body = {"properties": detection.status_patch(value, kind)}
         return await self._request("PATCH", f"/pages/{page_id}", json_body=body)

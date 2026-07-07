@@ -6,6 +6,7 @@ import pytest
 from plugins.platforms.discord.notion_tasks.notion_client import NotionClient
 
 PID = "abc123abc123abc123abc123abc123ab"
+TASKS_DATA_SOURCE_ID = "1f17a58d229e814496f3000b99bdcf95"
 
 
 def _page(status="Hold", extra=None):
@@ -21,6 +22,51 @@ def _page(status="Hold", extra=None):
 
 def _text_prop(value):
     return {"type": "rich_text", "rich_text": [{"plain_text": value, "text": {"content": value}}]}
+
+
+@pytest.mark.asyncio
+async def test_query_data_source_posts_filter_body():
+    calls = []
+
+    def handler(req):
+        calls.append((req.method, req.url.path, json.loads(req.content or b"{}")))
+        return httpx.Response(200, json={"results": []})
+
+    client = NotionClient(api_key="secret", transport=httpx.MockTransport(handler), backoff=0)
+    body = {
+        "filter": {"property": "Discord Thread ID", "rich_text": {"equals": "1523"}},
+        "page_size": 2,
+    }
+
+    result = await client.query_data_source(TASKS_DATA_SOURCE_ID, body)
+
+    assert result == {"results": []}
+    assert calls == [("POST", f"/v1/data_sources/{TASKS_DATA_SOURCE_ID}/query", body)]
+
+
+@pytest.mark.asyncio
+async def test_find_task_by_discord_thread_id_filters_tasks_source():
+    bodies = []
+    page = {
+        "id": PID,
+        "parent": {"type": "data_source_id", "data_source_id": TASKS_DATA_SOURCE_ID},
+        "properties": {},
+    }
+
+    def handler(req):
+        bodies.append(json.loads(req.content or b"{}"))
+        return httpx.Response(200, json={"results": [page]})
+
+    client = NotionClient(api_key="secret", transport=httpx.MockTransport(handler), backoff=0)
+
+    pages = await client.find_task_by_discord_thread_id("1523", {TASKS_DATA_SOURCE_ID})
+
+    assert pages == [page]
+    assert bodies[0]["page_size"] == 2
+    assert bodies[0]["filter"] == {
+        "property": "Discord Thread ID",
+        "rich_text": {"equals": "1523"},
+    }
 
 
 @pytest.mark.asyncio

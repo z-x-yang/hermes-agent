@@ -45,7 +45,7 @@ def _interaction(user_id="42", msg_id="m1", channel_id="c1", content="Reply to A
     user = SimpleNamespace(id=user_id, roles=[])
     msg = SimpleNamespace(id=msg_id, content=content, channel=SimpleNamespace(id=channel_id))
     return SimpleNamespace(
-        user=user, message=msg,
+        user=user, message=msg, channel=msg.channel,
         response=SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock(), defer=AsyncMock()),
         client=MagicMock(),
     )
@@ -99,6 +99,42 @@ def _deferred_interaction(user_id="42", msg_id="m1", channel_id="c1", content="R
 # ===========================================================================
 # send path — render_send_attachments returns (numbered view, task-card embed)
 # ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_resolve_task_for_slash_uses_current_thread_binding():
+    page = {**TASK_PAGE, "id": PID}
+    notion = SimpleNamespace(find_task_by_discord_thread_id=AsyncMock(return_value=[page]))
+    ctrl = _ctrl(notion)
+    inter = _interaction(channel_id="1523")
+
+    resolved = await ctrl.resolve_task_for_discord_interaction(inter)
+
+    assert resolved["page_id"] == PID
+    assert resolved["page"] == page
+    assert resolved["title"] == "Reply to Alice"
+    assert resolved["source"] == "current_thread_binding"
+    notion.find_task_by_discord_thread_id.assert_awaited_once_with("1523", ctrl.tasks_ids)
+
+
+@pytest.mark.asyncio
+async def test_resolve_task_for_slash_fails_closed_on_unbound_thread():
+    notion = SimpleNamespace(find_task_by_discord_thread_id=AsyncMock(return_value=[]))
+    ctrl = _ctrl(notion)
+    inter = _interaction(channel_id="1523")
+
+    with pytest.raises(RuntimeError, match="未绑定"):
+        await ctrl.resolve_task_for_discord_interaction(inter)
+
+
+@pytest.mark.asyncio
+async def test_resolve_task_for_slash_fails_closed_on_multiple_thread_matches():
+    notion = SimpleNamespace(find_task_by_discord_thread_id=AsyncMock(return_value=[{"id": "a"}, {"id": "b"}]))
+    ctrl = _ctrl(notion)
+    inter = _interaction(channel_id="1523")
+
+    with pytest.raises(RuntimeError, match="多个 Notion Task"):
+        await ctrl.resolve_task_for_discord_interaction(inter)
 
 @pytest.mark.asyncio
 async def test_render_send_attachments_numbered_view_and_card():

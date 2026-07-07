@@ -160,6 +160,21 @@ def _thread_url_from_page(page: dict, interaction) -> str:
     )
 
 
+def _current_channel_id(interaction) -> str:
+    chan = getattr(interaction, "channel", None)
+    return str(getattr(chan, "id", "") or getattr(interaction, "channel_id", "") or "").strip()
+
+
+def _page_id_from_ref(task_ref: str) -> str:
+    text = str(task_ref or "").strip()
+    if not text:
+        return ""
+    links = detection.extract_notion_links(text)
+    if links:
+        return detection.normalize_id(links[0].page_id) or ""
+    return detection.normalize_id(text) or ""
+
+
 def _selected_choice_from_interaction(interaction, action: str) -> dict:
     match = _CHOICE_ACTION_RE.match(action or "")
     if not match:
@@ -290,6 +305,48 @@ class NotionTaskController:
         self._fetch_channel = fetch_channel
         self._now_fn = now_fn or datetime.now
         self.adapter: Any = None
+
+    async def resolve_task_for_discord_interaction(self, interaction, task_ref: str | None = None) -> dict:
+        """Resolve a slash-command interaction to one authoritative Notion Task."""
+        explicit_id = _page_id_from_ref(task_ref or "")
+        if explicit_id:
+            if not hasattr(self.notion, "get_page"):
+                raise RuntimeError("Notion client must provide get_page for explicit task resolution")
+            page = await self.notion.get_page(explicit_id)
+            if not detection.is_task_page(page, self.tasks_ids):
+                raise RuntimeError("提供的页面不是 Notion Tasks 里的任务。")
+            return {
+                "page_id": explicit_id,
+                "page": page,
+                "title": detection.page_title(page),
+                "source": "explicit_ref",
+            }
+
+        thread_id = _current_channel_id(interaction)
+        if not thread_id:
+            raise RuntimeError("当前频道没有可用的 Discord thread id，请提供 Notion Task URL 或 page id。")
+        finder = getattr(self.notion, "find_task_by_discord_thread_id", None)
+        if not callable(finder):
+            raise RuntimeError("Notion client must provide find_task_by_discord_thread_id")
+        result = finder(thread_id, self.tasks_ids)
+        raw_matches = await result if inspect.isawaitable(result) else result
+        matches = list(raw_matches) if isinstance(raw_matches, (list, tuple)) else []
+        if not matches:
+            raise RuntimeError("当前子区未绑定 Notion Task，请先用 /task-bind。")
+        if len(matches) > 1:
+            raise RuntimeError("当前子区匹配到多个 Notion Task，需要人工修复绑定。")
+        page = matches[0]
+        page_id = detection.normalize_id(page.get("id")) or ""
+        if not page_id:
+            raise RuntimeError("Notion 返回的 Task 缺少 page id，未改动。")
+        if not detection.is_task_page(page, self.tasks_ids):
+            raise RuntimeError("当前子区绑定的页面不是 Notion Tasks 里的任务。")
+        return {
+            "page_id": page_id,
+            "page": page,
+            "title": detection.page_title(page),
+            "source": "current_thread_binding",
+        }
 
     # ---- card + view rendering -------------------------------------------
     def _card_rows(self, tasks, done_of, state_of=None):
