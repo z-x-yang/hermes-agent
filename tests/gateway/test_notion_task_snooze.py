@@ -24,6 +24,11 @@ DONE_PAGE = {
 def home(tmp_path, monkeypatch):
     import hermes_constants
     monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    import cron.jobs as jobs_mod
+    monkeypatch.setattr(jobs_mod, "HERMES_DIR", tmp_path)
+    monkeypatch.setattr(jobs_mod, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(jobs_mod, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(jobs_mod, "OUTPUT_DIR", tmp_path / "cron" / "output")
     return tmp_path
 
 
@@ -46,10 +51,13 @@ def _ctrl(notion, *, fetch_channel=None, now_fn=_now):
 
 def _interaction(user_id="42", msg_id="1001", channel_id="9001", content="Reply to Alice"):
     user = SimpleNamespace(id=user_id, roles=[])
-    msg = SimpleNamespace(id=msg_id, content=content, channel=SimpleNamespace(id=channel_id))
+    channel = SimpleNamespace(id=channel_id, parent_id="8000")
+    msg = SimpleNamespace(id=msg_id, content=content, channel=channel)
     return SimpleNamespace(
         user=user,
         message=msg,
+        channel=channel,
+        guild=SimpleNamespace(id="147"),
         response=SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock(), defer=AsyncMock()),
         followup=SimpleNamespace(send=AsyncMock()),
     )
@@ -118,7 +126,28 @@ async def test_snooze_action_edits_original_message_with_choice_menu():
 
 
 @pytest.mark.asyncio
+async def test_slash_snooze_opens_ephemeral_choice_menu_without_notion_write():
+    page = {**TASK_PAGE, "id": PID}
+    notion = SimpleNamespace(
+        find_task_by_discord_thread_id=AsyncMock(return_value=[page]),
+        set_hold_verified=AsyncMock(),
+    )
+    ctrl = _ctrl(notion)
+    inter = _interaction(content="")
+
+    await ctrl.handle_slash_snooze(inter)
+
+    notion.set_hold_verified.assert_not_awaited()
+    inter.response.send_message.assert_awaited_once()
+    assert "稍后多久提醒" in inter.response.send_message.await_args.args[0]
+    view = inter.response.send_message.await_args.kwargs["view"]
+    assert any(getattr(child, "custom_id", "").startswith("ntask:snooze-select:") for child in view.children)
+
+
+@pytest.mark.asyncio
 async def test_snooze_choice_writes_notion_hold_and_confirms():
+    from cron.jobs import list_jobs
+
     held_page = {**TASK_PAGE, "properties": {**TASK_PAGE["properties"],
                  "Status": {"type": "status", "status": {"name": "Hold"}},
                  "Next Check": {"type": "date", "date": {"start": "2026-06-24T16:00:00"}},
@@ -142,12 +171,59 @@ async def test_snooze_choice_writes_notion_hold_and_confirms():
     notion.set_hold_verified.assert_awaited_once()
     assert notion.set_hold_verified.await_args.kwargs["reason"] == "snoozed"
     assert notion.set_hold_verified.await_args.kwargs["next_check"] == "2026-06-24T16:00:00"
-    pending = ctrl.snoozes.due(now=_now().timestamp() + 3601)
-    assert pending == []
+    jobs = list_jobs(include_disabled=True)
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job["no_agent"] is True
+    assert job["script"].startswith("task_snooze/")
+    assert job["deliver"] == "discord:8000:9001"
+    assert job["repeat"]["times"] == 1
+    pending = ctrl.snoozes.pending_for(PID)
+    assert pending["status"] == "cron_scheduled"
+    assert pending["cron_job_id"] == job["id"]
+    assert pending["deliver"] == "discord:8000:9001"
+    assert ctrl.snoozes.due(now=_now().timestamp() + 3601) == []
+    from hermes_constants import get_hermes_home
+    assert (get_hermes_home() / "scripts" / job["script"]).exists()
     inter.response.send_message.assert_not_awaited()
     inter.response.edit_message.assert_awaited_once()
     kwargs = inter.response.edit_message.call_args.kwargs
     assert "⏰ 已延后·06/24 16:00" in kwargs["embed"].description
+
+
+@pytest.mark.asyncio
+async def test_snooze_choice_reports_partial_failure_when_cron_create_fails(monkeypatch):
+    from plugins.platforms.discord.notion_tasks import controller as controller_mod
+
+    held_page = {**TASK_PAGE, "properties": {**TASK_PAGE["properties"],
+                 "Status": {"type": "status", "status": {"name": "Hold"}},
+                 "Next Check": {"type": "date", "date": {"start": "2026-06-24T16:00:00"}},
+                 "Hold Reason": {"type": "rich_text", "rich_text": [{"plain_text": "snoozed"}]}}}
+    notion = SimpleNamespace(
+        get_page=AsyncMock(return_value=TASK_PAGE),
+        set_hold_verified=AsyncMock(return_value=held_page),
+    )
+    ctrl = _ctrl(notion)
+    inter = _interaction(content=f"Task https://notion.so/{PID}")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("cron down")
+
+    monkeypatch.setattr(controller_mod, "create_snooze_cron", boom, raising=False)
+
+    await ctrl.handle_snooze_choice(
+        PID,
+        "1h",
+        inter,
+        source_channel_id="9001",
+        source_message_id="1001",
+        source_content=f"Task https://notion.so/{PID}",
+    )
+
+    notion.set_hold_verified.assert_awaited_once()
+    inter.response.send_message.assert_awaited_once()
+    assert "Cron" in inter.response.send_message.await_args.args[0]
+    inter.response.edit_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

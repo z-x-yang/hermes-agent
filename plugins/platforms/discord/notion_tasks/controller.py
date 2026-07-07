@@ -32,6 +32,7 @@ from . import detection
 from .buttons import SlashHoldReasonModal, TaskBindModal, build_button, build_snooze_select
 from .components import pack_group_rows, task_card_embed, task_clarify_embed
 from .snooze import (
+    create_snooze_cron,
     EASTERN,
     SnoozeStore,
     ceil_to_minute,
@@ -288,6 +289,23 @@ def _thread_title_version(page: dict) -> int:
     return 1
 
 
+def _discord_thread_deliver(interaction, *, fallback_channel_id: str = "") -> str:
+    chan = getattr(interaction, "channel", None) or getattr(getattr(interaction, "message", None), "channel", None)
+    thread_id = str(getattr(chan, "id", "") or fallback_channel_id or "").strip()
+    parent = getattr(chan, "parent", None)
+    parent_id = str(
+        getattr(chan, "parent_id", "")
+        or getattr(parent, "id", "")
+        or fallback_channel_id
+        or ""
+    ).strip()
+    if parent_id and thread_id and parent_id != thread_id:
+        return f"discord:{parent_id}:{thread_id}"
+    if thread_id:
+        return f"discord:{thread_id}"
+    return "origin"
+
+
 async def _edit_interaction_message(interaction, **kwargs) -> None:
     if not _interaction_response_done(interaction):
         result = interaction.response.edit_message(**kwargs)
@@ -386,6 +404,31 @@ class NotionTaskController:
 
     async def handle_slash_hold(self, interaction):
         await _send_interaction_modal(interaction, SlashHoldReasonModal())
+
+    async def handle_slash_snooze(self, interaction):
+        try:
+            resolved = await self.resolve_task_for_discord_interaction(interaction)
+        except Exception as exc:
+            await _send_interaction_notice(interaction, f"稍后提醒失败：{exc}", ephemeral=True)
+            return
+        page_id = resolved["page_id"]
+        page = resolved["page"]
+        status, _kind = detection.read_status(page)
+        if status in {"Done", "Dropped"}:
+            self.snoozes.cancel_pending(page_id, reason="already_terminal")
+            await _send_interaction_notice(interaction, "这个任务已经结束，不再提醒。", ephemeral=True)
+            return
+        msg = getattr(interaction, "message", None)
+        chan_id = _current_channel_id(interaction)
+        view = discord.ui.View(timeout=300)
+        view.add_item(build_snooze_select(
+            page_id,
+            source_channel_id=chan_id,
+            source_message_id=str(getattr(msg, "id", "") or ""),
+            source_content=str(getattr(msg, "content", "") or ""),
+            now=self._now_fn(),
+        ))
+        await _send_interaction_notice(interaction, "稍后多久提醒？", view=view, ephemeral=True)
 
     async def handle_slash_hold_submit(self, reason: str, interaction):
         reason = str(reason or "").strip()
@@ -1409,10 +1452,11 @@ class NotionTaskController:
             return
         due = ceil_to_minute(due)
 
+        next_check = format_notion_datetime(due)
         try:
             page = await self.notion.set_hold_verified(
                 page_id,
-                next_check=format_notion_datetime(due),
+                next_check=next_check,
                 reason="snoozed",
                 waiting_for=None,
             )
@@ -1421,7 +1465,35 @@ class NotionTaskController:
                 f"稍后提醒设置失败，Notion 未确认：{exc}", ephemeral=True)
             return
         title = detection.page_title(page)
-        self.snoozes.cancel_pending(page_id, reason="moved_to_notion_hold")
+        self.snoozes.cancel_pending(page_id, reason="rescheduled")
+        deliver = _discord_thread_deliver(interaction, fallback_channel_id=source_channel_id)
+        user = getattr(interaction, "user", None)
+        rec_id = self.snoozes.schedule_cron(
+            page_id=page_id,
+            title=title,
+            due_at=due.timestamp(),
+            channel_id=source_channel_id,
+            message_id=source_message_id,
+            user_id=str(getattr(user, "id", "") or ""),
+            original_content=source_content,
+            preset=choice,
+            next_check=next_check,
+            deliver=deliver,
+        )
+        try:
+            record = self.snoozes.get(rec_id) or {}
+            cron_job = create_snooze_cron(record, deliver=deliver, due_at=due)
+            if not cron_job.get("id"):
+                raise RuntimeError("cron create returned no job id")
+            self.snoozes.attach_cron(rec_id, job=cron_job)
+        except Exception as exc:
+            self.snoozes.cancel(rec_id, reason="cron_create_failed")
+            await _send_interaction_notice(
+                interaction,
+                f"提醒时间已写入 Notion，但创建 Cron 提醒失败：{exc}",
+                ephemeral=True,
+            )
+            return
         if source_message_id:
             self.tracker.add_location(page_id, message_id=source_message_id,
                                       channel_id=source_channel_id,
