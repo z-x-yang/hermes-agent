@@ -35,6 +35,10 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional
@@ -44,7 +48,6 @@ from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 from hermes_constants import get_hermes_dir
 from tools.debug_helpers import DebugSession
 from tools.website_policy import check_website_access
-import sys
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +227,7 @@ async def _validate_image_url_async(url: str) -> bool:
 def _detect_image_mime_type(image_path: Path) -> Optional[str]:
     """Return a MIME type when the file looks like a supported image."""
     with image_path.open("rb") as f:
-        header = f.read(64)
+        header = f.read(4096)
 
     if header.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
@@ -236,10 +239,13 @@ def _detect_image_mime_type(image_path: Path) -> Optional[str]:
         return "image/bmp"
     if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
         return "image/webp"
-    if image_path.suffix.lower() == ".svg":
-        head = image_path.read_text(encoding="utf-8", errors="ignore")[:4096].lower()
-        if "<svg" in head:
-            return "image/svg+xml"
+
+    # SVGs are text/XML, and remote downloads may be saved under a generic
+    # temporary suffix (historically .jpg), so detection must look at content,
+    # not only at the filename. OpenAI/Responses does not accept SVG image
+    # inputs; callers rasterize this MIME before embedding it in model history.
+    if b"<svg" in header.lower():
+        return "image/svg+xml"
     return None
 
 
@@ -398,6 +404,219 @@ def _determine_mime_type(image_path: Path) -> str:
         '.svg': 'image/svg+xml'
     }
     return mime_types.get(extension, 'image/jpeg')
+
+
+def _validate_rasterized_png(path: Path) -> bool:
+    """True when ``path`` exists and contains PNG bytes."""
+    try:
+        return path.is_file() and _detect_image_mime_type(path) == "image/png"
+    except Exception:
+        return False
+
+
+def _rasterize_svg_with_command(command: list[str], output_path: Path) -> None:
+    """Run an SVG rasterizer command without a shell and require PNG output."""
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"{command[0]} failed to run: {exc}") from exc
+    if completed.returncode != 0:
+        stderr = (completed.stderr or completed.stdout or "").strip()[:500]
+        raise RuntimeError(f"{command[0]} exited {completed.returncode}: {stderr}")
+    if not _validate_rasterized_png(output_path):
+        raise RuntimeError(f"{command[0]} did not produce a valid PNG")
+
+
+
+# Absolute hard ceiling for SVG raster output dimensions. SVGs are tiny text
+# files that can declare enormous canvases; cap before renderer allocation.
+_SVG_RASTER_MAX_DIMENSION = 4096
+
+
+def _parse_svg_length_to_px(value: Optional[str]) -> Optional[float]:
+    """Parse a simple SVG length into CSS px for raster sizing."""
+    if value is None:
+        return None
+    import re as _re
+    match = _re.match(r"^\s*([-+]?\d*\.?\d+)\s*(px|pt|in|cm|mm)?\s*$", str(value))
+    if not match:
+        return None
+    number = float(match.group(1))
+    unit = (match.group(2) or "px").lower()
+    factors = {
+        "px": 1.0,
+        "pt": 96.0 / 72.0,
+        "in": 96.0,
+        "cm": 96.0 / 2.54,
+        "mm": 96.0 / 25.4,
+    }
+    return number * factors[unit]
+
+
+def _inspect_svg_for_safe_rasterization(svg_path: Path) -> tuple[int, int]:
+    """Reject unsafe SVG features and return bounded output dimensions.
+
+    The SVG may have come from an HTTP URL. Rasterizers can resolve nested
+    resources (``href=``, CSS ``url(...)``, ``@import``) outside Hermes' URL
+    safety checks, so fail closed before invoking any renderer. This parser is
+    intentionally shallow and regex-based: it does not expand XML entities.
+    """
+    if svg_path.stat().st_size > 10 * 1024 * 1024:
+        raise ValueError("SVG too large for safe rasterization (max 10 MB)")
+    text = svg_path.read_text(encoding="utf-8", errors="ignore")
+    lower = text.lower()
+    if "<!doctype" in lower or "<!entity" in lower:
+        raise ValueError("SVG DOCTYPE/entities are not allowed for vision rasterization")
+    if "<script" in lower or "<foreignobject" in lower:
+        raise ValueError("SVG script/foreignObject content is not allowed for vision rasterization")
+
+    import html as _html
+    import re as _re
+
+    for match in _re.finditer(r"(?:\b|:)(?:href)\s*=\s*(['\"])(.*?)\1", text, _re.I | _re.S):
+        target = _html.unescape(match.group(2)).strip()
+        if target and not target.startswith("#"):
+            raise ValueError("SVG external href references are not allowed for vision rasterization")
+    for match in _re.finditer(r"url\(\s*(['\"]?)(.*?)\1\s*\)", text, _re.I | _re.S):
+        target = _html.unescape(match.group(2)).strip()
+        if target and not target.startswith("#"):
+            raise ValueError("SVG external CSS url() references are not allowed for vision rasterization")
+    if _re.search(r"@import\b", text, _re.I):
+        raise ValueError("SVG CSS @import is not allowed for vision rasterization")
+
+    root = _re.search(r"<\s*svg\b([^>]*)>", text, _re.I | _re.S)
+    attrs: dict[str, str] = {}
+    if root:
+        for match in _re.finditer(r"([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*(['\"])(.*?)\2", root.group(1), _re.S):
+            attrs[match.group(1).split(":")[-1].lower()] = _html.unescape(match.group(3))
+
+    width = _parse_svg_length_to_px(attrs.get("width"))
+    height = _parse_svg_length_to_px(attrs.get("height"))
+    view_box = attrs.get("viewbox")
+    if view_box:
+        parts = [_parse_svg_length_to_px(p) for p in view_box.replace(",", " ").split()]
+        if len(parts) == 4 and all(part is not None for part in parts):
+            vb_w = float(parts[2])  # type: ignore[arg-type]
+            vb_h = float(parts[3])  # type: ignore[arg-type]
+            width = width or vb_w
+            height = height or vb_h
+    width = width or 1024.0
+    height = height or 1024.0
+    if width <= 0 or height <= 0:
+        raise ValueError("SVG has invalid raster dimensions")
+
+    scale = min(1.0, _SVG_RASTER_MAX_DIMENSION / max(width, height))
+    return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
+
+
+def _rasterize_svg_to_png_for_vision(svg_path: Path) -> Path:
+    """Rasterize an SVG to a temporary PNG before sending it to a vision model.
+
+    OpenAI's image inputs do not accept SVG.  Embedding ``data:image/svg+xml``
+    in a native tool result is worse than a one-shot error because that payload
+    becomes immutable conversation history and every retry resends it.  This
+    helper is fail-closed: use a real renderer when available, otherwise raise a
+    clear error instead of embedding unsupported SVG bytes in history.
+    """
+    if _detect_image_mime_type(svg_path) != "image/svg+xml":
+        raise ValueError(f"Not an SVG image: {svg_path}")
+
+    out_dir = get_hermes_dir("cache/vision", "temp_vision_images")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_path = out_dir / f"rasterized_svg_{uuid.uuid4().hex}.png"
+    raster_width, raster_height = _inspect_svg_for_safe_rasterization(svg_path)
+    max_side = str(max(raster_width, raster_height))
+    errors: list[str] = []
+
+    try:
+        import cairosvg  # type: ignore[import-not-found]
+        cairosvg.svg2png(
+            url=str(svg_path),
+            write_to=str(output_path),
+            output_width=raster_width,
+            output_height=raster_height,
+        )
+        if _validate_rasterized_png(output_path):
+            return output_path
+        errors.append("cairosvg produced non-PNG output")
+    except Exception as exc:
+        errors.append(f"cairosvg: {exc}")
+
+    rsvg = shutil.which("rsvg-convert")
+    if rsvg:
+        try:
+            _rasterize_svg_with_command(
+                [
+                    rsvg,
+                    "-w",
+                    str(raster_width),
+                    "-h",
+                    str(raster_height),
+                    "-o",
+                    str(output_path),
+                    str(svg_path),
+                ],
+                output_path,
+            )
+            return output_path
+        except Exception as exc:
+            errors.append(f"rsvg-convert: {exc}")
+
+    if sys.platform == "darwin":
+        sips = shutil.which("sips")
+        if sips:
+            try:
+                _rasterize_svg_with_command(
+                    [
+                        sips,
+                        "-s",
+                        "format",
+                        "png",
+                        "-Z",
+                        max_side,
+                        str(svg_path),
+                        "--out",
+                        str(output_path),
+                    ],
+                    output_path,
+                )
+                return output_path
+            except Exception as exc:
+                errors.append(f"sips: {exc}")
+
+        qlmanage = shutil.which("qlmanage")
+        if qlmanage:
+            try:
+                with tempfile.TemporaryDirectory(dir=out_dir) as ql_dir_raw:
+                    ql_dir = Path(ql_dir_raw)
+                    ql_output = ql_dir / f"{svg_path.name}.png"
+                    _rasterize_svg_with_command(
+                        [qlmanage, "-t", "-s", max_side, "-o", str(ql_dir), str(svg_path)],
+                        ql_output,
+                    )
+                    ql_output.replace(output_path)
+                if _validate_rasterized_png(output_path):
+                    return output_path
+                errors.append("qlmanage produced non-PNG output")
+            except Exception as exc:
+                errors.append(f"qlmanage: {exc}")
+
+    if output_path.exists():
+        try:
+            output_path.unlink()
+        except Exception:
+            pass
+    detail = "; ".join(errors[-4:])
+    raise ValueError(
+        "SVG images must be rasterized to PNG before vision analysis, but no "
+        f"available SVG rasterizer succeeded. Install CairoSVG or librsvg. {detail}"
+    )
 
 
 def _image_to_base64_data_url(image_path: Path, mime_type: Optional[str] = None) -> str:
@@ -834,7 +1053,7 @@ async def _vision_analyze_native(
         return tool_error("image_url is required", success=False)
 
     temp_image_path: Optional[Path] = None
-    should_cleanup = False
+    cleanup_paths: list[Path] = []
     try:
         from tools.interrupt import is_interrupted
         if is_interrupted():
@@ -849,7 +1068,6 @@ async def _vision_analyze_native(
 
         if local_path.is_file():
             temp_image_path = local_path
-            should_cleanup = False
         elif await _validate_image_url_async(image_url):
             blocked = check_website_access(image_url)
             if blocked:
@@ -857,7 +1075,7 @@ async def _vision_analyze_native(
             temp_dir = get_hermes_dir("cache/vision", "temp_vision_images")
             temp_image_path = temp_dir / f"temp_image_{uuid.uuid4()}.jpg"
             await _download_image(image_url, temp_image_path)
-            should_cleanup = True
+            cleanup_paths.append(temp_image_path)
         else:
             return tool_error(
                 "Invalid image source. Provide an HTTP/HTTPS URL or a "
@@ -872,6 +1090,15 @@ async def _vision_analyze_native(
                 "Only real image files are supported for vision analysis.",
                 success=False,
             )
+        if detected_mime_type == "image/svg+xml":
+            rasterized_path = Path(await _run_encode_on_cpu_executor(
+                _rasterize_svg_to_png_for_vision, temp_image_path,
+            ))
+            cleanup_paths.append(rasterized_path)
+            temp_image_path = rasterized_path
+            detected_mime_type = "image/png"
+            image_size_bytes = rasterized_path.stat().st_size
+            logger.info("Rasterized SVG to PNG for native vision embed: %s", temp_image_path)
 
         image_data_url = await _run_encode_on_cpu_executor(
             _image_to_base64_data_url,
@@ -923,10 +1150,10 @@ async def _vision_analyze_native(
         return tool_error(f"Native vision failed: {exc}", success=False)
     finally:
         # Only delete temp files we created — never user-provided paths.
-        if should_cleanup and temp_image_path is not None:
+        for cleanup_path in dict.fromkeys(cleanup_paths):
             try:
-                if temp_image_path.exists():
-                    temp_image_path.unlink()
+                if cleanup_path.exists():
+                    cleanup_path.unlink()
             except Exception:
                 pass
 
@@ -983,10 +1210,8 @@ async def vision_analyze_tool(
         "image_size_bytes": 0
     }
     
-    temp_image_path = None
-    # Track whether we should clean up the file after processing.
-    # Local files (e.g. from the image cache) should NOT be deleted.
-    should_cleanup = True
+    temp_image_path: Optional[Path] = None
+    cleanup_paths: list[Path] = []
     detected_mime_type = None
     
     try:
@@ -1007,7 +1232,6 @@ async def vision_analyze_tool(
             # Local file path (e.g. from platform image cache) -- skip download
             logger.info("Using local image file: %s", image_url)
             temp_image_path = local_path
-            should_cleanup = False  # Don't delete cached/local files
         elif await _validate_image_url_async(image_url):
             # Remote URL -- download to a temporary location
             blocked = check_website_access(image_url)
@@ -1017,7 +1241,7 @@ async def vision_analyze_tool(
             temp_dir = get_hermes_dir("cache/vision", "temp_vision_images")
             temp_image_path = temp_dir / f"temp_image_{uuid.uuid4()}.jpg"
             await _download_image(image_url, temp_image_path)
-            should_cleanup = True
+            cleanup_paths.append(temp_image_path)
         else:
             raise ValueError(
                 "Invalid image source. Provide an HTTP/HTTPS URL or a valid local file path."
@@ -1031,6 +1255,16 @@ async def vision_analyze_tool(
         detected_mime_type = _detect_image_mime_type(temp_image_path)
         if not detected_mime_type:
             raise ValueError("Only real image files are supported for vision analysis.")
+        if detected_mime_type == "image/svg+xml":
+            rasterized_path = Path(await _run_encode_on_cpu_executor(
+                _rasterize_svg_to_png_for_vision, temp_image_path,
+            ))
+            cleanup_paths.append(rasterized_path)
+            temp_image_path = rasterized_path
+            detected_mime_type = "image/png"
+            image_size_bytes = rasterized_path.stat().st_size
+            image_size_kb = image_size_bytes / 1024
+            logger.info("Rasterized SVG to PNG for vision analysis (%.1f KB): %s", image_size_kb, temp_image_path)
         
         # Convert image to base64 — send at full resolution first.
         # If the provider rejects it as too large, we auto-resize and retry.
@@ -1208,15 +1442,16 @@ async def vision_analyze_tool(
         return json.dumps(result, indent=2, ensure_ascii=False)
     
     finally:
-        # Clean up temporary image file (but NOT local/cached files)
-        if should_cleanup and temp_image_path and temp_image_path.exists():
-            try:
-                temp_image_path.unlink()
-                logger.debug("Cleaned up temporary image file")
-            except Exception as cleanup_error:
-                logger.warning(
-                    "Could not delete temporary file: %s", cleanup_error, exc_info=True
-                )
+        # Clean up temporary files we created (but NOT local/cached input files).
+        for cleanup_path in dict.fromkeys(cleanup_paths):
+            if cleanup_path.exists():
+                try:
+                    cleanup_path.unlink()
+                    logger.debug("Cleaned up temporary image file")
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "Could not delete temporary file: %s", cleanup_error, exc_info=True
+                    )
 
 
 def check_vision_requirements() -> bool:

@@ -12,7 +12,10 @@ import pytest
 from tools.vision_tools import (
     _validate_image_url,
     _handle_vision_analyze,
+    _detect_image_mime_type,
     _determine_mime_type,
+    _inspect_svg_for_safe_rasterization,
+    _SVG_RASTER_MAX_DIMENSION,
     _image_to_base64_data_url,
     _resize_image_for_vision,
     _image_exceeds_dimension,
@@ -141,6 +144,44 @@ class TestDetermineMimeType:
 
     def test_unknown_extension_defaults_to_jpeg(self):
         assert _determine_mime_type(Path("file.xyz")) == "image/jpeg"
+
+
+class TestDetectImageMimeType:
+    def test_detects_svg_by_content_even_with_generic_temp_suffix(self, tmp_path):
+        img = tmp_path / "temp_image.jpg"
+        img.write_text(
+            '<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>',
+            encoding="utf-8",
+        )
+
+        assert _detect_image_mime_type(img) == "image/svg+xml"
+
+
+class TestSvgRasterSafety:
+    def test_rejects_external_svg_href_before_rasterizer_runs(self, tmp_path):
+        svg = tmp_path / "unsafe.svg"
+        svg.write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">'
+            '<image href="http://169.254.169.254/latest/meta-data/"/>'
+            '</svg>',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="external href"):
+            _inspect_svg_for_safe_rasterization(svg)
+
+    def test_caps_declared_svg_raster_dimensions(self, tmp_path):
+        svg = tmp_path / "huge.svg"
+        svg.write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="100000" height="50000"/>',
+            encoding="utf-8",
+        )
+
+        width, height = _inspect_svg_for_safe_rasterization(svg)
+
+        assert max(width, height) == _SVG_RASTER_MAX_DIMENSION
+        assert width == _SVG_RASTER_MAX_DIMENSION
+        assert height == _SVG_RASTER_MAX_DIMENSION // 2
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ import json
 from unittest.mock import patch
 
 
+from tools import vision_tools
 from tools.vision_tools import (
     _build_native_vision_tool_result,
     _handle_vision_analyze,
@@ -26,6 +27,12 @@ from tools.vision_tools import (
 _TINY_PNG = base64.b64decode(
     b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 )
+
+_TINY_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="16">
+  <rect width="24" height="16" fill="#ffffff"/>
+  <circle cx="8" cy="8" r="5" fill="#d62728"/>
+</svg>
+""".encode("utf-8")
 
 
 # ─── _supports_media_in_tool_results ─────────────────────────────────────────
@@ -110,6 +117,45 @@ class TestVisionAnalyzeNative:
         assert any(p.get("type") == "text" for p in parts)
         url = next(p["image_url"]["url"] for p in parts if p.get("type") == "image_url")
         assert url.startswith("data:image/")
+
+    def test_svg_file_is_rasterized_to_png_before_native_embed(self, tmp_path, monkeypatch):
+        """OpenAI/Responses vision inputs do not accept SVG data URLs.
+
+        SVG files must be rasterized before the native fast path embeds them
+        into immutable conversation history; otherwise every retry resends the
+        unsupported ``data:image/svg+xml`` payload and wedges the session.
+        """
+        svg = tmp_path / "chart.svg"
+        svg.write_bytes(_TINY_SVG)
+        rasterized = tmp_path / "chart.png"
+        calls = []
+
+        def fake_rasterize(svg_path):
+            calls.append(svg_path)
+            rasterized.write_bytes(_TINY_PNG)
+            return rasterized
+
+        monkeypatch.setattr(
+            vision_tools,
+            "_rasterize_svg_to_png_for_vision",
+            fake_rasterize,
+            raising=False,
+        )
+
+        result = asyncio.get_event_loop().run_until_complete(
+            _vision_analyze_native(str(svg), "describe")
+        )
+
+        assert calls == [svg]
+        assert isinstance(result, dict)
+        assert result.get("_multimodal") is True
+        url = next(
+            p["image_url"]["url"]
+            for p in result["content"]
+            if p.get("type") == "image_url"
+        )
+        assert url.startswith("data:image/png;base64,")
+        assert "data:image/svg+xml" not in url
 
     def test_missing_file_returns_error_string(self, tmp_path):
         result = asyncio.get_event_loop().run_until_complete(
