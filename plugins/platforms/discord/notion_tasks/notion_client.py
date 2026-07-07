@@ -245,6 +245,22 @@ class NotionClient:
                 )
         return page
 
+    async def reopen_verified(self, page_id: str) -> dict:
+        props = detection.status_patch("To Do", "status")
+        props["Next Check"] = _date(None)
+        props["Hold Reason"] = _rt("")
+        page = await self.set_properties(page_id, props)
+        status, _kind = detection.read_status(page)
+        if status != "To Do":
+            raise NotionError(f"Notion reopen read-back mismatch: got {status!r}")
+        got_next = _read_date(page, "Next Check")
+        if got_next is not None:
+            raise NotionError(f"Next Check read-back mismatch: expected None, got {got_next!r}")
+        got_reason = _read_rich(page, "Hold Reason")
+        if got_reason != "":
+            raise NotionError(f"Hold Reason read-back mismatch: expected '', got {got_reason!r}")
+        return page
+
     async def set_dropped_verified(
         self,
         page_id: str,

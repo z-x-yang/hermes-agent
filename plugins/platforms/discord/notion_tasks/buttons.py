@@ -65,6 +65,50 @@ class HoldReasonModal(discord.ui.Modal):
         await ctrl.handle_hold_reason_submit(self.page_id, reason, interaction)
 
 
+class SlashHoldReasonModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="暂挂原因", timeout=None)
+        self.reason_input = discord.ui.TextInput(
+            label="为什么先暂挂？（可留空）",
+            placeholder="比如：等老板反馈；等对方回信；现在不是优先级。",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=500,
+        )
+        self.add_item(self.reason_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ctrl = get_active_controller()
+        if ctrl is None:
+            logger.warning("notion task slash Hold modal submitted but no active controller")
+            await interaction.response.send_message("功能暂不可用，请稍后再试。", ephemeral=True)
+            return
+        reason = str(getattr(self.reason_input, "value", "") or "").strip()
+        await ctrl.handle_slash_hold_submit(reason, interaction)
+
+
+class TaskBindModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="绑定 Notion Task", timeout=None)
+        self.task_input = discord.ui.TextInput(
+            label="Notion Task URL 或 page id",
+            placeholder="https://www.notion.so/... 或 32 位 page id",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=500,
+        )
+        self.add_item(self.task_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ctrl = get_active_controller()
+        if ctrl is None:
+            logger.warning("notion task bind modal submitted but no active controller")
+            await interaction.response.send_message("功能暂不可用，请稍后再试。", ephemeral=True)
+            return
+        task_ref = str(getattr(self.task_input, "value", "") or "").strip()
+        await ctrl.handle_slash_bind_submit(task_ref, interaction)
+
+
 class TaskActionButton(discord.ui.DynamicItem[discord.ui.Button], template=CUSTOM_ID_RE):
     def __init__(self, action: str, page_id: str, *, title: str | None = None,
                  num: int | None = None):

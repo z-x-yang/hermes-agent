@@ -29,7 +29,7 @@ from typing import Any
 import discord
 
 from . import detection
-from .buttons import build_button, build_snooze_select
+from .buttons import SlashHoldReasonModal, TaskBindModal, build_button, build_snooze_select
 from .components import pack_group_rows, task_card_embed, task_clarify_embed
 from .snooze import (
     EASTERN,
@@ -267,6 +267,27 @@ async def _send_interaction_notice(interaction, content: str, **kwargs) -> None:
     logger.warning("notion task: no interaction followup available for notice: %s", content)
 
 
+async def _send_interaction_modal(interaction, modal) -> None:
+    send_modal = getattr(getattr(interaction, "response", None), "send_modal", None)
+    if not callable(send_modal):
+        await _send_interaction_notice(interaction, "当前客户端不能打开输入框。", ephemeral=True)
+        return
+    result = send_modal(modal)
+    if inspect.isawaitable(result):
+        await result
+
+
+async def _maybe_await(value):
+    return await value if inspect.isawaitable(value) else value
+
+
+def _thread_title_version(page: dict) -> int:
+    raw = (((page or {}).get("properties") or {}).get("Thread Title Version") or {}).get("number")
+    if isinstance(raw, (int, float)) and raw >= 0:
+        return int(raw) + 1
+    return 1
+
+
 async def _edit_interaction_message(interaction, **kwargs) -> None:
     if not _interaction_response_done(interaction):
         result = interaction.response.edit_message(**kwargs)
@@ -347,6 +368,117 @@ class NotionTaskController:
             "title": detection.page_title(page),
             "source": "current_thread_binding",
         }
+
+    async def handle_slash_done(self, interaction):
+        try:
+            resolved = await self.resolve_task_for_discord_interaction(interaction)
+            page_id = resolved["page_id"]
+            page = resolved["page"]
+            title = resolved["title"]
+            _status, kind = detection.read_status(page)
+            updated_page = await self.notion.set_status_verified(page_id, "Done", kind or "status")
+        except Exception as exc:
+            await _send_interaction_notice(interaction, f"完成失败，Notion 未确认：{exc}", ephemeral=True)
+            return
+        self.snoozes.cancel_pending(page_id, reason="completed")
+        title = detection.page_title(updated_page) or title
+        await _send_interaction_notice(interaction, f"✓ 已完成：{title}", ephemeral=True)
+
+    async def handle_slash_hold(self, interaction):
+        await _send_interaction_modal(interaction, SlashHoldReasonModal())
+
+    async def handle_slash_hold_submit(self, reason: str, interaction):
+        reason = str(reason or "").strip()
+        if len(reason) > 500:
+            reason = reason[:499] + "…"
+        try:
+            resolved = await self.resolve_task_for_discord_interaction(interaction)
+            page_id = resolved["page_id"]
+            title = resolved["title"]
+            page = await self.notion.set_hold_verified(
+                page_id,
+                next_check=None,
+                reason=reason,
+                waiting_for=None,
+            )
+        except Exception as exc:
+            await _send_interaction_notice(interaction, f"暂挂失败，Notion 未确认：{exc}", ephemeral=True)
+            return
+        self.snoozes.cancel_pending(page_id, reason="manual_hold")
+        title = detection.page_title(page) or title
+        await _send_interaction_notice(interaction, f"⏸ 已暂挂：{title}", ephemeral=True)
+
+    async def handle_slash_reopen(self, interaction):
+        try:
+            resolved = await self.resolve_task_for_discord_interaction(interaction)
+            page_id = resolved["page_id"]
+            title = resolved["title"]
+            page = await self.notion.reopen_verified(page_id)
+        except Exception as exc:
+            await _send_interaction_notice(interaction, f"重新打开失败，Notion 未确认：{exc}", ephemeral=True)
+            return
+        self.snoozes.cancel_pending(page_id, reason="reopened")
+        title = detection.page_title(page) or title
+        await _send_interaction_notice(interaction, f"↩ 已重新打开：{title}", ephemeral=True)
+
+    async def handle_slash_bind(self, interaction, task_ref: str = ""):
+        if str(task_ref or "").strip():
+            await self.handle_slash_bind_submit(task_ref, interaction)
+            return
+        await _send_interaction_modal(interaction, TaskBindModal())
+
+    async def handle_slash_bind_submit(self, task_ref: str, interaction):
+        current_thread_id = _current_channel_id(interaction)
+        if not current_thread_id:
+            await _send_interaction_notice(interaction, "当前频道没有 Discord thread id，未绑定。", ephemeral=True)
+            return
+        try:
+            resolved = await self.resolve_task_for_discord_interaction(interaction, task_ref)
+        except Exception as exc:
+            await _send_interaction_notice(interaction, f"绑定失败：{exc}", ephemeral=True)
+            return
+        page_id = resolved["page_id"]
+        page = resolved["page"]
+        title = resolved["title"]
+        from .threading import read_thread_binding
+        try:
+            current_matches = await _maybe_await(
+                self.notion.find_task_by_discord_thread_id(current_thread_id, self.tasks_ids)
+            )
+        except Exception as exc:
+            await _send_interaction_notice(interaction, f"检查当前子区绑定失败：{exc}", ephemeral=True)
+            return
+        for match in list(current_matches or []):
+            match_id = detection.normalize_id(match.get("id")) or ""
+            if match_id and match_id != page_id:
+                await _send_interaction_notice(interaction, "当前子区已经绑定另一个 Notion Task，未覆盖。", ephemeral=True)
+                return
+        binding = read_thread_binding(page)
+        existing_thread_id = str(binding.get("thread_id") or "")
+        if existing_thread_id and existing_thread_id != current_thread_id:
+            await _send_interaction_notice(interaction, "目标 Notion Task 已经绑定另一个子区，未抢占。", ephemeral=True)
+            return
+        if existing_thread_id == current_thread_id:
+            await _send_interaction_notice(interaction, f"已绑定 Notion Task：{title}\nNotion: https://app.notion.com/p/{page_id}", ephemeral=True)
+            return
+        thread_url = _thread_url_from_binding(interaction, thread_id=current_thread_id)
+        try:
+            page = await self.notion.set_thread_binding_verified(
+                page_id,
+                thread_id=current_thread_id,
+                thread_url=thread_url,
+                title_mode="manual_locked",
+                title_version=_thread_title_version(page),
+            )
+        except Exception as exc:
+            await _send_interaction_notice(interaction, f"绑定失败，Notion 未确认：{exc}", ephemeral=True)
+            return
+        title = detection.page_title(page) or title
+        await _send_interaction_notice(
+            interaction,
+            f"已绑定 Notion Task：{title}\nNotion: https://app.notion.com/p/{page_id}\n之后可直接用 /task-done /task-hold /task-snooze /task-reopen。",
+            ephemeral=True,
+        )
 
     # ---- card + view rendering -------------------------------------------
     def _card_rows(self, tasks, done_of, state_of=None):

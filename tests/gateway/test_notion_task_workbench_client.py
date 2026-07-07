@@ -144,6 +144,32 @@ async def test_set_status_verified_fails_if_readback_mismatch():
 
 
 @pytest.mark.asyncio
+async def test_reopen_verified_writes_todo_and_clears_hold_fields():
+    calls = []
+
+    def handler(req):
+        calls.append((req.method, req.url.path, json.loads(req.content or b"{}")))
+        if req.method == "PATCH":
+            return httpx.Response(200, json=_page("To Do"))
+        if req.method == "GET":
+            return httpx.Response(200, json=_page("To Do", {
+                "Next Check": {"type": "date", "date": None},
+                "Hold Reason": {"type": "rich_text", "rich_text": []},
+            }))
+        raise AssertionError(req)
+
+    client = NotionClient(api_key="secret", transport=httpx.MockTransport(handler), backoff=0)
+
+    page = await client.reopen_verified(PID)
+
+    assert page["properties"]["Status"]["status"]["name"] == "To Do"
+    patch = calls[0][2]["properties"]
+    assert patch["Status"]["status"]["name"] == "To Do"
+    assert patch["Next Check"] == {"date": None}
+    assert patch["Hold Reason"] == {"rich_text": []}
+
+
+@pytest.mark.asyncio
 async def test_set_thread_binding_verified_checks_thread_id_readback():
     def handler(req):
         if req.method == "PATCH":

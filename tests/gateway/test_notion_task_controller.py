@@ -136,6 +136,149 @@ async def test_resolve_task_for_slash_fails_closed_on_multiple_thread_matches():
     with pytest.raises(RuntimeError, match="多个 Notion Task"):
         await ctrl.resolve_task_for_discord_interaction(inter)
 
+
+@pytest.mark.asyncio
+async def test_slash_done_resolves_current_task_and_confirms():
+    page = {**TASK_PAGE, "id": PID}
+    done_page = {**page, "properties": {**page["properties"],
+                 "Status": {"type": "status", "status": {"name": "Done"}}}}
+    notion = SimpleNamespace(
+        find_task_by_discord_thread_id=AsyncMock(return_value=[page]),
+        set_status_verified=AsyncMock(return_value=done_page),
+    )
+    ctrl = _ctrl(notion)
+    inter = _interaction(channel_id="1523")
+
+    await ctrl.handle_slash_done(inter)
+
+    notion.set_status_verified.assert_awaited_once_with(PID, "Done", "status")
+    inter.response.send_message.assert_awaited_once()
+    assert "已完成" in inter.response.send_message.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_slash_hold_opens_reason_modal():
+    ctrl = _ctrl(SimpleNamespace())
+    inter = _interaction(channel_id="1523")
+    inter.response.send_modal = AsyncMock()
+
+    await ctrl.handle_slash_hold(inter)
+
+    inter.response.send_modal.assert_awaited_once()
+    modal = inter.response.send_modal.await_args.args[0]
+    assert getattr(modal, "title", "") == "暂挂原因"
+
+
+@pytest.mark.asyncio
+async def test_slash_hold_submit_allows_blank_reason():
+    page = {**TASK_PAGE, "id": PID}
+    held_page = {**page, "properties": {**page["properties"],
+                 "Status": {"type": "status", "status": {"name": "Hold"}},
+                 "Next Check": {"type": "date", "date": None},
+                 "Hold Reason": {"type": "rich_text", "rich_text": []}}}
+    notion = SimpleNamespace(
+        find_task_by_discord_thread_id=AsyncMock(return_value=[page]),
+        set_hold_verified=AsyncMock(return_value=held_page),
+    )
+    ctrl = _ctrl(notion)
+    inter = _interaction(channel_id="1523")
+
+    await ctrl.handle_slash_hold_submit("", inter)
+
+    notion.set_hold_verified.assert_awaited_once_with(PID, next_check=None, reason="", waiting_for=None)
+    inter.response.send_message.assert_awaited_once()
+    assert "已暂挂" in inter.response.send_message.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_slash_reopen_resolves_current_task_and_clears_snooze():
+    page = {**TASK_PAGE, "id": PID}
+    notion = SimpleNamespace(
+        find_task_by_discord_thread_id=AsyncMock(return_value=[page]),
+        reopen_verified=AsyncMock(return_value=page),
+    )
+    ctrl = _ctrl(notion)
+    ctrl.snoozes.schedule(page_id=PID, title="Reply to Alice", due_at=123.0,
+                          channel_id="1523", message_id="m1", user_id="42",
+                          original_content="", preset="1h")
+    inter = _interaction(channel_id="1523")
+
+    await ctrl.handle_slash_reopen(inter)
+
+    notion.reopen_verified.assert_awaited_once_with(PID)
+    assert ctrl.snoozes.pending_for(PID) is None
+    inter.response.send_message.assert_awaited_once()
+    assert "已重新打开" in inter.response.send_message.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_slash_bind_writes_current_thread_binding_manual_locked():
+    page = {**TASK_PAGE, "id": PID, "properties": {**TASK_PAGE["properties"],
+            "Discord Thread ID": {"type": "rich_text", "rich_text": []},
+            "Discord Thread URL": {"type": "url", "url": None},
+            "Thread Title Mode": {"type": "select", "select": None},
+            "Thread Title Version": {"type": "number", "number": None}}}
+    bound_page = {**page, "properties": {**page["properties"],
+                  "Discord Thread ID": {"type": "rich_text", "rich_text": [{"plain_text": "1523"}]},
+                  "Discord Thread URL": {"type": "url", "url": "https://discord.com/channels/147/1523"},
+                  "Thread Title Mode": {"type": "select", "select": {"name": "manual_locked"}},
+                  "Thread Title Version": {"type": "number", "number": 1}}}
+    notion = SimpleNamespace(
+        get_page=AsyncMock(return_value=page),
+        find_task_by_discord_thread_id=AsyncMock(return_value=[]),
+        set_thread_binding_verified=AsyncMock(return_value=bound_page),
+    )
+    ctrl = _ctrl(notion)
+    inter = _interaction(channel_id="1523")
+    inter.guild = SimpleNamespace(id="147")
+
+    await ctrl.handle_slash_bind_submit(PID, inter)
+
+    notion.set_thread_binding_verified.assert_awaited_once_with(
+        PID,
+        thread_id="1523",
+        thread_url="https://discord.com/channels/147/1523",
+        title_mode="manual_locked",
+        title_version=1,
+    )
+    inter.response.send_message.assert_awaited_once()
+    assert "已绑定 Notion Task" in inter.response.send_message.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_slash_bind_without_task_ref_opens_bind_modal():
+    ctrl = _ctrl(SimpleNamespace())
+    inter = _interaction(channel_id="1523")
+    inter.response.send_modal = AsyncMock()
+
+    await ctrl.handle_slash_bind(inter, "")
+
+    inter.response.send_modal.assert_awaited_once()
+    modal = inter.response.send_modal.await_args.args[0]
+    assert "绑定" in getattr(modal, "title", "")
+
+
+@pytest.mark.asyncio
+async def test_slash_bind_rejects_target_already_bound_to_another_thread():
+    page = {**TASK_PAGE, "id": PID, "properties": {**TASK_PAGE["properties"],
+            "Discord Thread ID": {"type": "rich_text", "rich_text": [{"plain_text": "9999"}]},
+            "Discord Thread URL": {"type": "url", "url": "https://discord.com/channels/147/9999"},
+            "Thread Title Mode": {"type": "select", "select": {"name": "auto"}}}}
+    notion = SimpleNamespace(
+        get_page=AsyncMock(return_value=page),
+        find_task_by_discord_thread_id=AsyncMock(return_value=[]),
+        set_thread_binding_verified=AsyncMock(),
+    )
+    ctrl = _ctrl(notion)
+    inter = _interaction(channel_id="1523")
+    inter.guild = SimpleNamespace(id="147")
+
+    await ctrl.handle_slash_bind_submit(PID, inter)
+
+    notion.set_thread_binding_verified.assert_not_awaited()
+    inter.response.send_message.assert_awaited_once()
+    assert "已经绑定另一个子区" in inter.response.send_message.await_args.args[0]
+
 @pytest.mark.asyncio
 async def test_render_send_attachments_numbered_view_and_card():
     notion = SimpleNamespace(get_page=AsyncMock(side_effect=lambda pid: TASK_PAGE if pid == PID else NON_TASK))
