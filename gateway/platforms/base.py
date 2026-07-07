@@ -1860,11 +1860,11 @@ class SendResult:
     raw_response: Any = None
     # Adapter-specific metadata.  Cross-layer contracts that affect delivery
     # semantics must be documented at the producer and consumer sites.  Current
-    # known contract: Telegram edit overflow partials set
+    # known contract: edit/send overflow partials set
     # raw_response["partial_overflow"] with delivered_chunks, total_chunks,
-    # last_message_id, delivered_prefix, and continuation_message_ids so the
-    # stream consumer can send the missing tail instead of marking a clipped
-    # response complete.
+    # last_message_id, delivered_prefix, and continuation_message_ids/message_ids
+    # so the stream consumer can send the missing tail instead of marking a
+    # clipped response complete or re-sending an already-visible prefix.
     retryable: bool = False  # True for transient connection errors — base will retry automatically
     # Server-requested retry delay in seconds (e.g. Telegram FloodWait retry_after).
     # When present, _send_with_retry() honors this instead of its default backoff.

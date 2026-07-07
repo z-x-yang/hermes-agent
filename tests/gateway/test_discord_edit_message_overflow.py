@@ -341,3 +341,45 @@ class TestLengthOverflowDetector:
 
     def test_ignores_other_errors(self):
         assert DiscordAdapter._is_length_overflow_error(RuntimeError("timeout")) is False
+
+
+# --------------------------------------------------------------------------- #
+# Plain send overflow — partial delivery must be machine-readable
+# --------------------------------------------------------------------------- #
+
+
+class TestSendPartialDelivery:
+    @pytest.mark.asyncio
+    async def test_long_send_reports_partial_failure_after_some_chunks_land(self):
+        """If Discord accepts early chunks then rejects a later chunk, the
+        adapter must not collapse that into an opaque total failure. The stream
+        consumer needs the delivered prefix so it can send only the missing tail
+        instead of re-sending the already-visible head."""
+        adapter = _make_adapter()
+
+        def side(n, content, ref):
+            if n <= 2:
+                return SimpleNamespace(id=9000 + n)
+            raise RuntimeError("discord continuation send failed")
+
+        channel, sends = _wire_channel(
+            adapter,
+            original_msg=SimpleNamespace(
+                id=123,
+                to_reference=MagicMock(return_value=object()),
+            ),
+            send_side_effect=side,
+        )
+
+        result = await adapter.send("555", "word " * 1200, reply_to="123")
+
+        assert result.success is False
+        assert result.retryable is False
+        assert result.error == "send_continuation_failed"
+        assert result.message_id == "9002"
+        assert result.raw_response["partial_overflow"] is True
+        assert result.raw_response["delivered_chunks"] == 2
+        assert result.raw_response["total_chunks"] > 2
+        assert result.raw_response["last_message_id"] == "9002"
+        assert result.raw_response["delivered_prefix"].startswith("word ")
+        assert result.raw_response["message_ids"] == ["9001", "9002"]

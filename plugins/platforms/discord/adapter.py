@@ -83,6 +83,54 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
     ),
     re.compile(r"^\s*♻️?\s+Gateway\s+(?:restarted successfully|online\b)[\s\S]*$", re.IGNORECASE),
 )
+_DISCORD_CHUNK_INDICATOR_RE = re.compile(r"\s+\(\d+/\d+\)$")
+
+
+def _strip_discord_chunk_indicator(chunk: str) -> str:
+    return _DISCORD_CHUNK_INDICATOR_RE.sub("", chunk or "")
+
+
+def _discord_delivered_prefix(content: str, chunks: List[str]) -> str:
+    """Best-effort source-text prefix represented by delivered split chunks.
+
+    ``truncate_message`` appends ``(i/N)`` indicators and may trim whitespace at
+    chunk boundaries.  The stream consumer needs a prefix of the original final
+    text, not the decorated Discord chunks, so it can send only the missing tail
+    after a partial split delivery.
+    """
+    pos = 0
+    for raw_chunk in chunks:
+        chunk = _strip_discord_chunk_indicator(raw_chunk)
+        if not chunk:
+            continue
+        candidates = [chunk]
+        if chunk.endswith("\n```"):
+            candidates.append(chunk[:-4])
+        if chunk.startswith("```") and "\n" in chunk:
+            candidates.append(chunk.split("\n", 1)[1])
+        remainder = content[pos:]
+        matched = False
+        for candidate in candidates:
+            if not candidate:
+                continue
+            if remainder.startswith(candidate):
+                pos += len(candidate)
+                matched = True
+                break
+            stripped = remainder.lstrip()
+            skipped = len(remainder) - len(stripped)
+            if stripped.startswith(candidate):
+                pos += skipped + len(candidate)
+                matched = True
+                break
+            found = remainder.find(candidate)
+            if 0 <= found <= 32:
+                pos += found + len(candidate)
+                matched = True
+                break
+        if not matched:
+            break
+    return content[:pos]
 
 try:
     import discord
@@ -2128,6 +2176,38 @@ class DiscordAdapter(BasePlatformAdapter):
                             retry_kwargs["view"] = chunk_view
                         msg = await channel.send(**retry_kwargs)
                     else:
+                        if message_ids:
+                            last_id = message_ids[-1]
+                            delivered_chunks = chunks[:len(message_ids)]
+                            delivered_prefix = _discord_delivered_prefix(
+                                formatted,
+                                delivered_chunks,
+                            )
+                            logger.warning(
+                                "[%s] Discord split send stopped after %d/%d chunks: %s",
+                                self.name,
+                                len(message_ids),
+                                len(chunks),
+                                e,
+                            )
+                            return SendResult(
+                                success=False,
+                                message_id=last_id,
+                                error="send_continuation_failed",
+                                raw_response={
+                                    "partial_overflow": True,
+                                    "delivered_chunks": len(message_ids),
+                                    "total_chunks": len(chunks),
+                                    "last_message_id": last_id,
+                                    "delivered_prefix": delivered_prefix,
+                                    "message_ids": list(message_ids),
+                                },
+                                # Not retryable by generic whole-message retry:
+                                # earlier chunks are already visible, so only
+                                # a stream-aware tail fallback is safe.
+                                retryable=False,
+                                continuation_message_ids=tuple(message_ids[1:]),
+                            )
                         raise
                 message_ids.append(str(msg.id))
 

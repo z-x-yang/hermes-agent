@@ -199,9 +199,13 @@ class GatewayStreamConsumer:
         self._fallback_final_send = False
         self._fallback_prefix = ""
         # True when fallback is sending only the missing tail after a partial
-        # Telegram overflow delivery.  In that case the already-visible prefix
-        # is intentional content, not a stale preview to delete.
+        # overflow/fresh-final delivery.  In that case the already-visible
+        # prefix is intentional content, not a stale preview to delete.
         self._fallback_preserve_partial_messages = False
+        # Whether the first fallback chunk should reply to the original user
+        # message.  Fresh-final partials already sent their first/pinging block,
+        # so their tail-only fallback must not ping a second time.
+        self._fallback_reply_to_initial = True
         self._flood_strikes = 0         # Consecutive flood-control edit failures
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
@@ -402,6 +406,7 @@ class GatewayStreamConsumer:
         self._fallback_final_send = False
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
+        self._fallback_reply_to_initial = True
         # #29346: a tool/segment boundary means what we delivered was an interim
         # preamble, not the final answer — clear the flags so a premature setter
         # can't fool the gateway. Safe: got_done returns before any reset, and
@@ -1107,6 +1112,51 @@ class GatewayStreamConsumer:
         return final_text
 
     @staticmethod
+    def _partial_overflow_raw_response(result: Any) -> Optional[dict]:
+        """Return machine-readable partial-delivery metadata, if present."""
+        raw_response = getattr(result, "raw_response", None)
+        if isinstance(raw_response, dict) and raw_response.get("partial_overflow"):
+            return raw_response
+        return None
+
+    def _enter_partial_overflow_fallback(
+        self,
+        result: Any,
+        *,
+        preserve_partial_messages: bool = True,
+        reply_to_initial: bool = True,
+    ) -> None:
+        """Record that a platform accepted only the prefix of a final reply.
+
+        The fallback path must send only the missing tail.  Returning to an
+        edit/full-send fallback after a partial platform accept duplicates the
+        already-visible head — exactly the Discord split bug this guards.
+        """
+        raw_response = self._partial_overflow_raw_response(result) or {}
+        last_message_id = (
+            raw_response.get("last_message_id")
+            or getattr(result, "message_id", None)
+            or self._message_id
+        )
+        if last_message_id:
+            self._message_id = str(last_message_id)
+        delivered_prefix = raw_response.get("delivered_prefix")
+        if isinstance(delivered_prefix, str) and delivered_prefix:
+            self._last_sent_text = delivered_prefix
+            self._fallback_prefix = delivered_prefix
+        else:
+            self._fallback_prefix = self._visible_prefix()
+        self._fallback_final_send = True
+        self._fallback_preserve_partial_messages = preserve_partial_messages
+        self._fallback_reply_to_initial = reply_to_initial
+        self._edit_supported = False
+        self._already_sent = True
+        self._final_response_sent = False
+        self._final_content_delivered = False
+        if raw_response.get("message_ids") or getattr(result, "continuation_message_ids", None):
+            self._notify_new_message()
+
+    @staticmethod
     def _split_text_chunks(
         text: str, limit: int,
         len_fn: "Callable[[str], int]" = len,
@@ -1171,6 +1221,7 @@ class GatewayStreamConsumer:
                 self._already_sent = True
                 self._final_response_sent = True
                 self._final_content_delivered = True
+                self._fallback_reply_to_initial = True
                 return
 
         raw_limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
@@ -1197,6 +1248,7 @@ class GatewayStreamConsumer:
                         self._initial_reply_to_id
                         if (
                             self.cfg.fresh_final_reply_to_initial
+                            and self._fallback_reply_to_initial
                             and idx == 0
                         )
                         else None
@@ -1225,6 +1277,7 @@ class GatewayStreamConsumer:
                     self._message_id = last_message_id
                     self._last_sent_text = last_successful_chunk
                     self._fallback_prefix = ""
+                    self._fallback_reply_to_initial = True
                     return
                 # No fallback chunk reached the user — allow the normal gateway
                 # final-send path to try one more time.
@@ -1232,6 +1285,7 @@ class GatewayStreamConsumer:
                 self._message_id = None
                 self._last_sent_text = ""
                 self._fallback_prefix = ""
+                self._fallback_reply_to_initial = True
                 return
             sent_any_chunk = True
             last_successful_chunk = chunk
@@ -1274,6 +1328,7 @@ class GatewayStreamConsumer:
         self._mark_delivered_text(final_text)
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
+        self._fallback_reply_to_initial = True
 
     def _is_flood_error(self, result) -> bool:
         """Check if a SendResult failure is due to flood control / rate limiting."""
@@ -1600,6 +1655,18 @@ class GatewayStreamConsumer:
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
             return False
+        partial_raw = self._partial_overflow_raw_response(result)
+        if partial_raw:
+            # Some fresh-final chunks are already visible.  Do NOT fall back to
+            # editing/re-sending the full answer — that duplicates the head.
+            # Send only the missing tail below, and don't @-reply again because
+            # the first fresh-final block already carried the mention.
+            self._enter_partial_overflow_fallback(
+                result,
+                preserve_partial_messages=True,
+                reply_to_initial=False,
+            )
+            return True
         if not getattr(result, "success", False):
             return False
         # Adopt the new message id as the current message so subsequent
@@ -1854,6 +1921,9 @@ class GatewayStreamConsumer:
                         finalize=finalize,
                     )
                     if result.success:
+                        if self._partial_overflow_raw_response(result):
+                            self._enter_partial_overflow_fallback(result)
+                            return False
                         self._already_sent = True
                         self._mark_delivered_text(text)
                         # Record any continuation fragments an oversized edit
@@ -1905,31 +1975,10 @@ class GatewayStreamConsumer:
                             self._final_content_delivered = True
                         raw_response = getattr(result, "raw_response", None)
                         if isinstance(raw_response, dict) and raw_response.get("partial_overflow"):
-                            # Telegram edited/sent one or more overflow chunks,
-                            # but not the complete response.  Preserve the
-                            # visible prefix so the got_done fallback sends the
-                            # missing tail instead of marking a clipped topic
-                            # reply as final delivery.
-                            self._message_id = str(
-                                raw_response.get("last_message_id")
-                                or result.message_id
-                                or self._message_id
-                            )
-                            delivered_prefix = raw_response.get("delivered_prefix")
-                            if isinstance(delivered_prefix, str) and delivered_prefix:
-                                self._last_sent_text = delivered_prefix
-                                self._fallback_prefix = delivered_prefix
-                                self._fallback_preserve_partial_messages = text.startswith(
-                                    delivered_prefix
-                                )
-                            else:
-                                self._fallback_prefix = self._visible_prefix()
-                                self._fallback_preserve_partial_messages = False
-                            self._fallback_final_send = True
-                            self._edit_supported = False
-                            self._already_sent = True
-                            if getattr(result, "continuation_message_ids", ()):
-                                self._notify_new_message()
+                            # The adapter accepted a visible prefix but not the
+                            # whole response.  Preserve that prefix and let the
+                            # got_done fallback send only the missing tail.
+                            self._enter_partial_overflow_fallback(result)
                             return False
 
                         # Edit failed.  If this looks like flood control / rate
@@ -2056,6 +2105,16 @@ class GatewayStreamConsumer:
                     self._notify_new_message()
                     return True
                 else:
+                    if self._partial_overflow_raw_response(result):
+                        self._enter_partial_overflow_fallback(
+                            result,
+                            preserve_partial_messages=True,
+                            reply_to_initial=not (
+                                _turn_final_send
+                                and self.cfg.fresh_final_reply_to_initial
+                            ),
+                        )
+                        return False
                     # Initial send failed — disable streaming for this session
                     self._edit_supported = False
                     return False
