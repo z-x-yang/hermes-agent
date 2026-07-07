@@ -82,15 +82,40 @@ class TestUsageCachedAgent:
 
         assert "claude-sonnet-4.6" in result
         assert "35,000" in result  # input tokens
+        assert "5,000" in result   # cache read tokens
+        assert "2,000" in result   # cache write tokens
         assert "10,000" in result  # output tokens
         assert "50,000" in result  # total
         assert "30,000" in result  # context
         assert "Compressions: 1" in result
-        # Cost and cache-hit reporting is removed everywhere.
+        # Cost reporting is removed everywhere; cache buckets stay visible so
+        # Total = input + cache read + cache write + output is auditable.
         assert "$" not in result
-        assert "Cache read" not in result
-        assert "Cache write" not in result
+        assert "Cache read" in result
+        assert "Cache write" in result
         assert "Cost" not in result
+
+    @pytest.mark.asyncio
+    async def test_usage_shows_cache_buckets_when_total_includes_cached_input(self):
+        """Discord /usage must explain why Total can far exceed uncached input+output."""
+        agent = _make_mock_agent(
+            session_input_tokens=48_023,
+            session_cache_read_tokens=1_640_704,
+            session_cache_write_tokens=0,
+            session_output_tokens=6_822,
+            session_total_tokens=1_695_549,
+            session_prompt_tokens=1_688_727,
+        )
+        runner = _make_runner(SK, cached_agent=agent)
+        event = MagicMock()
+
+        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"):
+            result = await runner._handle_usage_command(event)
+
+        assert "48,023" in result
+        assert "1,640,704" in result
+        assert "6,822" in result
+        assert "1,695,549" in result
 
     @pytest.mark.asyncio
     async def test_running_agent_preferred_over_cache(self):
