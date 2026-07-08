@@ -13,6 +13,7 @@ from agent.context_compressor import (
 )
 from agent.compression_summary_runtime import (
     apply_summary_tool_choice_none,
+    extract_summary_cache_stats,
     extract_summary_response_content,
 )
 from hermes_cli.config import DEFAULT_CONFIG
@@ -88,6 +89,36 @@ def test_extract_summary_response_content_flags_codex_responses_tool_calls():
 
     assert content == ""
     assert tool_call_violation is True
+
+
+def test_extract_summary_cache_stats_treats_zero_cached_tokens_as_reported():
+    response = SimpleNamespace(
+        usage=SimpleNamespace(
+            input_tokens=1000,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+    )
+
+    stats = extract_summary_cache_stats(response)
+
+    assert stats["reported"] is True
+    assert stats["read_tokens"] == 0
+    assert stats["hit_rate_estimate"] == 0.0
+
+
+def test_extract_summary_cache_stats_treats_dict_zero_cached_tokens_as_reported():
+    response = {
+        "usage": {
+            "prompt_tokens": 1000,
+            "prompt_tokens_details": {"cached_tokens": 0},
+        }
+    }
+
+    stats = extract_summary_cache_stats(response)
+
+    assert stats["reported"] is True
+    assert stats["read_tokens"] == 0
+    assert stats["hit_rate_estimate"] == 0.0
 
 
 def test_context_compressor_accepts_summary_call_mode_without_changing_default_behavior():

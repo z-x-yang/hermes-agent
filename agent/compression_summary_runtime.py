@@ -149,25 +149,55 @@ def extract_summary_cache_stats(response: Any) -> dict[str, Any]:
             return obj.get(name)
         return getattr(obj, name, None)
 
+    def _has(obj: Any, name: str) -> bool:
+        if obj is None:
+            return False
+        if isinstance(obj, dict):
+            return name in obj
+        return hasattr(obj, name)
+
+    def _first_present(*paths: tuple[Any, str]) -> tuple[Any, bool]:
+        for obj, name in paths:
+            if _has(obj, name):
+                value = _get(obj, name)
+                if value is not None:
+                    return value, True
+        return None, False
+
+    def _int_or_none(value: Any) -> int | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     details = _get(usage, "prompt_tokens_details") or _get(usage, "input_tokens_details")
-    read_tokens = (
-        _get(details, "cached_tokens")
-        or _get(details, "cache_read_input_tokens")
-        or _get(usage, "cache_read_tokens")
-        or _get(usage, "cache_read_input_tokens")
+    read_tokens, read_reported = _first_present(
+        (details, "cached_tokens"),
+        (details, "cache_read_input_tokens"),
+        (usage, "cache_read_tokens"),
+        (usage, "cache_read_input_tokens"),
     )
-    write_tokens = (
-        _get(usage, "cache_write_tokens")
-        or _get(usage, "cache_creation_input_tokens")
-        or _get(usage, "cache_creation_tokens")
+    write_tokens, write_reported = _first_present(
+        (details, "cache_write_tokens"),
+        (details, "cache_creation_tokens"),
+        (usage, "cache_write_tokens"),
+        (usage, "cache_creation_input_tokens"),
+        (usage, "cache_creation_tokens"),
     )
-    prompt_tokens = _get(usage, "prompt_tokens") or _get(usage, "input_tokens")
-    read_int = int(read_tokens) if read_tokens is not None else None
-    write_int = int(write_tokens) if write_tokens is not None else None
-    prompt_int = int(prompt_tokens) if prompt_tokens else None
+    prompt_tokens, _prompt_reported = _first_present(
+        (usage, "prompt_tokens"),
+        (usage, "input_tokens"),
+    )
+    read_int = _int_or_none(read_tokens) if read_reported else None
+    write_int = _int_or_none(write_tokens) if write_reported else None
+    prompt_int = _int_or_none(prompt_tokens)
     hit_rate = None
     if read_int is not None and prompt_int:
         hit_rate = round(read_int / max(prompt_int, 1), 4)
+    elif read_int == 0 and prompt_int is not None:
+        hit_rate = 0.0
     return {
         "reported": read_int is not None or write_int is not None,
         "read_tokens": read_int,
