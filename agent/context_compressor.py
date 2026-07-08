@@ -2015,7 +2015,6 @@ class ContextCompressor(ContextEngine):
         base_audit["kept_recent_count"] = len(keep_indices)
         base_audit["kept_recent_pre_tail_count"] = kept_recent_pre_tail_count
         base_audit["clear_candidate_count"] = len(clear_candidates)
-        base_audit["protected_tail_cleared_count"] = protected_tail_cleared_count
         if not candidates:
             base_audit["result"] = "no_candidates"
             return CheapToolResultCleanupResult(messages, False, base_audit)
@@ -2084,6 +2083,7 @@ class ContextCompressor(ContextEngine):
                 "applied": True,
                 "result": "applied",
                 "cleared_count": len(replacements),
+                "protected_tail_cleared_count": protected_tail_cleared_count,
                 "replacement_counts": replacement_counts,
                 "sentinel_fallback_reasons": fallback_reasons,
                 "post_cleanup_tokens_estimate": post_tokens,
