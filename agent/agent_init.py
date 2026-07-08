@@ -1471,6 +1471,35 @@ def init_agent(
         _compression_cfg.get("in_place"), default=False
     )
 
+    runtime_context_status_cfg = _compression_cfg.get("runtime_context_status", {})
+    if not isinstance(runtime_context_status_cfg, dict):
+        runtime_context_status_cfg = {}
+    _rcs_mode = str(runtime_context_status_cfg.get("mode", "off") or "off").strip().lower()
+    if _rcs_mode not in {"off", "shadow", "inject"}:
+        _ra().logger.warning(
+            "Invalid compression.runtime_context_status.mode=%r — using 'off'",
+            runtime_context_status_cfg.get("mode"),
+        )
+        _rcs_mode = "off"
+    agent._runtime_context_status_mode = _rcs_mode
+    agent._runtime_context_status_audit_enabled = is_truthy_value(
+        runtime_context_status_cfg.get("audit"), default=True
+    )
+    try:
+        _rcs_near_ratio = float(runtime_context_status_cfg.get("near_threshold_ratio", 0.90))
+    except (TypeError, ValueError):
+        _rcs_near_ratio = 0.90
+    if not (0.0 < _rcs_near_ratio < 1.0):
+        _ra().logger.warning(
+            "Invalid compression.runtime_context_status.near_threshold_ratio=%r — using 0.90",
+            runtime_context_status_cfg.get("near_threshold_ratio"),
+        )
+        _rcs_near_ratio = 0.90
+    agent._runtime_context_status_near_threshold_ratio = _rcs_near_ratio
+    agent._pending_runtime_context_statuses = []
+    agent._queued_runtime_context_status_keys = set()
+    agent._last_context_pressure_notice_compression_count = None
+
     # Read optional explicit context_length override for the auxiliary
     # compression model. Custom endpoints often cannot report this via
     # /models, so the startup feasibility check needs the config hint.

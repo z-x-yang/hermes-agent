@@ -367,6 +367,105 @@ def test_between_turns_refresh_no_churn_when_unchanged():
     assert agent.tools is same  # not replaced → no churn
 
 
+def test_near_compression_preflight_gate_uses_near_threshold_when_enabled():
+    agent = _FakeAgent()
+    agent.compression_enabled = True
+    agent._runtime_context_status_mode = "inject"
+    agent._runtime_context_status_audit_enabled = False
+    agent._runtime_context_status_near_threshold_ratio = 0.90
+    agent._pending_runtime_context_statuses = []
+    agent._queued_runtime_context_status_keys = set()
+    agent._last_context_pressure_notice_compression_count = -1
+    compressor = types.SimpleNamespace(
+        protect_first_n=10,
+        protect_last_n=10,
+        threshold_tokens=1000,
+        context_length=2000,
+        compression_count=0,
+        last_prompt_tokens=0,
+        last_real_prompt_tokens=0,
+        should_defer_preflight_to_real_usage=lambda _tokens: False,
+        get_active_compression_failure_cooldown=lambda: None,
+        should_compress=lambda tokens: tokens >= 1000,
+    )
+    agent.context_compressor = compressor
+    agent._compress_context = MagicMock()
+
+    with patch("agent.turn_context.estimate_messages_tokens_rough", return_value=950), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=950):
+        _build(agent)
+
+    agent._compress_context.assert_not_called()
+    assert len(agent._pending_runtime_context_statuses) == 1
+    assert agent._pending_runtime_context_statuses[0]["kind"] == "pre_near_compression"
+
+
+def test_near_compression_queues_runtime_context_status_once():
+    agent = _FakeAgent()
+    agent.compression_enabled = True
+    agent._runtime_context_status_mode = "inject"
+    agent._runtime_context_status_audit_enabled = False
+    agent._pending_runtime_context_statuses = []
+    agent._queued_runtime_context_status_keys = set()
+    agent._last_context_pressure_notice_compression_count = -1
+    compressor = types.SimpleNamespace(
+        protect_first_n=0,
+        protect_last_n=0,
+        threshold_tokens=1000,
+        context_length=2000,
+        compression_count=0,
+        last_prompt_tokens=0,
+        last_real_prompt_tokens=0,
+        should_defer_preflight_to_real_usage=lambda _tokens: False,
+        get_active_compression_failure_cooldown=lambda: None,
+        should_compress=lambda tokens: tokens >= 1000,
+    )
+    agent.context_compressor = compressor
+    agent._compress_context = MagicMock()
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=950):
+        _build(agent)
+        _build(agent)
+
+    agent._compress_context.assert_not_called()
+    assert len(agent._pending_runtime_context_statuses) == 1
+    pending = agent._pending_runtime_context_statuses[0]
+    assert pending["kind"] == "pre_near_compression"
+    assert "The visible conversation is close" in pending["content"]
+    assert agent._last_context_pressure_notice_compression_count == 0
+
+
+def test_near_compression_notice_not_queued_when_compression_triggers():
+    agent = _FakeAgent()
+    agent.compression_enabled = True
+    agent._runtime_context_status_mode = "inject"
+    agent._runtime_context_status_audit_enabled = False
+    agent._pending_runtime_context_statuses = []
+    agent._queued_runtime_context_status_keys = set()
+    compressor = types.SimpleNamespace(
+        protect_first_n=0,
+        protect_last_n=0,
+        threshold_tokens=1000,
+        context_length=2000,
+        compression_count=0,
+        last_prompt_tokens=0,
+        last_real_prompt_tokens=0,
+        should_defer_preflight_to_real_usage=lambda _tokens: False,
+        get_active_compression_failure_cooldown=lambda: None,
+        should_compress=lambda tokens: tokens >= 1000,
+    )
+    agent.context_compressor = compressor
+    agent._compress_context = MagicMock(side_effect=lambda messages, *_a, **_k: (messages, "SYSTEM"))
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=1000):
+        _build(agent)
+
+    assert agent._pending_runtime_context_statuses == []
+    agent._compress_context.assert_called()
+
+
 def test_preflight_skips_when_persisted_cooldown_survives_restart(tmp_path):
     agent = _make_agent_with_cooldown(
         tmp_path / "state.db",

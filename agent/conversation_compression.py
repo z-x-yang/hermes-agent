@@ -38,6 +38,11 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from agent.model_metadata import estimate_request_tokens_rough
+from agent.runtime_context_status import (
+    build_post_compression_notice,
+    queue_runtime_context_status,
+    runtime_context_status_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1018,6 +1023,25 @@ def compress_context(
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True
+
+        if runtime_context_status_mode(agent) != "off":
+            try:
+                _cc_for_notice = int(getattr(agent.context_compressor, "compression_count", 0) or 0)
+            except (TypeError, ValueError):
+                _cc_for_notice = 0
+            queue_runtime_context_status(
+                agent,
+                build_post_compression_notice(),
+                kind="post_compression_completed",
+                dedupe_key=f"post_compression_completed:{_cc_for_notice}",
+                metadata={
+                    "compression_count": _cc_for_notice,
+                    "trigger_reason": trigger_reason,
+                    "trigger_tokens": trigger_tokens,
+                    "trigger_threshold_tokens": trigger_threshold_tokens,
+                    "trigger_message_count": trigger_message_count,
+                },
+            )
 
         # Clear the file-read dedup cache.  After compression the original
         # read content is summarised away — if the model re-reads the same

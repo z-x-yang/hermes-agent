@@ -1395,6 +1395,17 @@ DEFAULT_CONFIG = {
                                       # session_search and recoverable, not deleted.
                                       # Default False during rollout; will flip on
                                       # after live validation.
+        "runtime_context_status": {
+            "mode": "off",            # off|shadow|inject. Request-local runtime
+                                      # context status blocks near the latest user
+                                      # message. Start disabled; use shadow for
+                                      # audit-only rollout before inject.
+            "audit": True,            # Content-free audit records under
+                                      # ~/.hermes/logs/runtime_context_status_audit.jsonl
+            "near_threshold_ratio": 0.90,  # Queue the pre-compression notice once
+                                      # per compaction cycle when rough usage reaches
+                                      # this fraction of the compression threshold.
+        },
     },
 
     # Kanban subsystem (orchestrator workers + dispatcher-driven child tasks).

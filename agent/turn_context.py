@@ -34,6 +34,11 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
+from agent.runtime_context_status import (
+    build_pre_compression_notice,
+    queue_runtime_context_status,
+    runtime_context_status_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -341,11 +346,26 @@ def build_turn_context(
     # Gate the (expensive) full token estimate behind a cheap pre-check.
     # See ``_should_run_preflight_estimate`` for the OR semantics that fix
     # issue #27405 (a few very large messages slipping past the count gate).
+    _preflight_gate_threshold = 0
+    if agent.compression_enabled:
+        _preflight_gate_threshold = agent.context_compressor.threshold_tokens
+        if runtime_context_status_mode(agent) != "off":
+            try:
+                _near_ratio_for_gate = float(
+                    getattr(agent, "_runtime_context_status_near_threshold_ratio", 0.90) or 0.90
+                )
+            except (TypeError, ValueError):
+                _near_ratio_for_gate = 0.90
+            if 0.0 < _near_ratio_for_gate < 1.0:
+                _preflight_gate_threshold = min(
+                    _preflight_gate_threshold,
+                    max(1, int(agent.context_compressor.threshold_tokens * _near_ratio_for_gate)),
+                )
     if agent.compression_enabled and _should_run_preflight_estimate(
         messages,
         agent.context_compressor.protect_first_n,
         agent.context_compressor.protect_last_n,
-        agent.context_compressor.threshold_tokens,
+        _preflight_gate_threshold,
     ):
         _preflight_tokens = estimate_request_tokens_rough(
             messages,
@@ -436,6 +456,31 @@ def build_turn_context(
                 agent._mute_post_response = False
                 if not _compressor.should_compress(_preflight_tokens):
                     break
+        elif runtime_context_status_mode(agent) != "off":
+            try:
+                _near_ratio = float(getattr(agent, "_runtime_context_status_near_threshold_ratio", 0.90) or 0.90)
+            except (TypeError, ValueError):
+                _near_ratio = 0.90
+            if 0.0 < _near_ratio < 1.0:
+                _near_threshold = int(_compressor.threshold_tokens * _near_ratio)
+                _cc = int(getattr(_compressor, "compression_count", 0) or 0)
+                if (
+                    _preflight_tokens >= _near_threshold
+                    and getattr(agent, "_last_context_pressure_notice_compression_count", None) != _cc
+                ):
+                    queue_runtime_context_status(
+                        agent,
+                        build_pre_compression_notice(),
+                        kind="pre_near_compression",
+                        dedupe_key=f"pre_near_compression:{_cc}",
+                        metadata={
+                            "compression_count": _cc,
+                            "rough_tokens": _preflight_tokens,
+                            "threshold_tokens": _compressor.threshold_tokens,
+                            "near_threshold_ratio": _near_ratio,
+                        },
+                    )
+                    agent._last_context_pressure_notice_compression_count = _cc
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""

@@ -903,6 +903,23 @@ def run_conversation(
             except Exception as _moa_exc:
                 logger.warning("MoA context aggregation failed: %s", _moa_exc)
 
+        try:
+            from agent.runtime_context_status import (
+                consume_runtime_context_statuses,
+                inject_runtime_context_statuses,
+            )
+
+            _pending_runtime_status = consume_runtime_context_statuses(agent)
+            if _pending_runtime_status:
+                inject_runtime_context_statuses(
+                    api_messages,
+                    _pending_runtime_status,
+                    agent=agent,
+                    turn_id=turn_id,
+                )
+        except Exception as _runtime_status_exc:
+            logger.debug("runtime context status injection skipped: %s", _runtime_status_exc)
+
         # Inject ephemeral prefill messages right after the system prompt
         # but before conversation history. Same API-call-time-only pattern.
         if agent.prefill_messages:
