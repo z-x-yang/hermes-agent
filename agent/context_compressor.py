@@ -4031,6 +4031,9 @@ Use this exact structure:
             "reasoning_effort": getattr(runtime, "reasoning_effort", None),
             "tools_included": bool(getattr(runtime, "tools_included", False)),
             "tool_choice_none_requested": bool(tool_choice_requested),
+            "main_api_calls_in_process": int(
+                getattr(runtime, "main_api_calls_in_process", 0) or 0
+            ),
         }
         base_audit["request"] = {
             "message_count": len(request_messages),

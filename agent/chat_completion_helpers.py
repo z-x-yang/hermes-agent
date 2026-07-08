@@ -693,13 +693,17 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
                     getattr(agent, "log_prefix", ""), exc,
                 )
 
+        _ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
+        if _ephemeral_out is not None:
+            agent._ephemeral_max_output_tokens = None
+
         return _ct.build_kwargs(
             model=agent.model,
             messages=_msgs_for_codex,
             tools=tools_for_api,
             reasoning_config=agent.reasoning_config,
             session_id=getattr(agent, "session_id", None),
-            max_tokens=agent.max_tokens,
+            max_tokens=_ephemeral_out if _ephemeral_out is not None else agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
             request_overrides=agent.request_overrides,
             is_github_responses=is_github_responses,

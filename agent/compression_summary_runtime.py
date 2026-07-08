@@ -15,6 +15,7 @@ class SummaryRuntime:
     reasoning_effort: str | None
     context_limit_tokens: int | None
     tools_included: bool
+    main_api_calls_in_process: int
     build_kwargs: Callable[[list[dict[str, Any]], int], dict[str, Any]]
     invoke: Callable[[dict[str, Any]], Any]
     estimate_request_tokens: Callable[[dict[str, Any]], int]
@@ -46,6 +47,7 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
         reasoning_effort=getattr(agent, "reasoning_effort", None),
         context_limit_tokens=getattr(getattr(agent, "context_compressor", None), "context_length", None),
         tools_included=bool(getattr(agent, "tools", None)),
+        main_api_calls_in_process=int(getattr(agent, "session_api_calls", 0) or 0),
         build_kwargs=_build_kwargs,
         invoke=_invoke,
         estimate_request_tokens=estimate_request_context_tokens,

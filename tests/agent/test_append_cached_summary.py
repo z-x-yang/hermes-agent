@@ -15,6 +15,7 @@ from agent.compression_summary_runtime import (
     apply_summary_tool_choice_none,
     extract_summary_cache_stats,
     extract_summary_response_content,
+    make_summary_runtime,
 )
 from hermes_cli.config import DEFAULT_CONFIG
 
@@ -121,6 +122,44 @@ def test_extract_summary_cache_stats_treats_dict_zero_cached_tokens_as_reported(
     assert stats["hit_rate_estimate"] == 0.0
 
 
+class FakeCodexAgentForSummaryRuntime:
+    provider = "openai-codex"
+    model = "gpt-5.5"
+    api_mode = "codex_responses"
+    base_url = "https://chatgpt.com/backend-api/codex"
+    reasoning_effort = None
+    tools = [{"type": "function", "name": "noop"}]
+    session_api_calls = 7
+
+    class Compressor:
+        context_length = 1_000_000
+
+    context_compressor = Compressor()
+
+    def __init__(self):
+        self._ephemeral_max_output_tokens = None
+        self.seen_ephemeral = None
+
+    def _build_api_kwargs(self, messages):
+        self.seen_ephemeral = self._ephemeral_max_output_tokens
+        return {
+            "model": self.model,
+            "input": messages,
+            "max_output_tokens": self._ephemeral_max_output_tokens,
+        }
+
+
+def test_make_summary_runtime_forwards_ephemeral_output_tokens_to_codex_build_kwargs():
+    agent = FakeCodexAgentForSummaryRuntime()
+    runtime = make_summary_runtime(agent)
+
+    kwargs = runtime.build_kwargs([{"role": "user", "content": "summarize"}], 12345)
+
+    assert agent.seen_ephemeral == 12345
+    assert kwargs["max_output_tokens"] == 12345
+    assert getattr(runtime, "main_api_calls_in_process") == 7
+
+
 def test_context_compressor_accepts_summary_call_mode_without_changing_default_behavior():
     with patch("agent.context_compressor.get_model_context_length", return_value=100000):
         compressor = ContextCompressor(model="test/model", quiet_mode=True)
@@ -175,6 +214,7 @@ class CapturingRuntime:
     base_url: str = "https://chatgpt.com/backend-api/codex"
     reasoning_effort: str | None = "medium"
     tools_included: bool = True
+    main_api_calls_in_process: int = 0
     captured_messages: list[dict[str, Any]] | None = None
     captured_kwargs: dict[str, Any] | None = None
 
@@ -360,6 +400,7 @@ def test_compression_audit_contains_summary_call_without_summary_text(tmp_path, 
     records = [json.loads(line) for line in audit_path.read_text().splitlines()]
     record = records[-1]
     assert record["summary_call"]["mode"] == "append_cached"
+    assert record["summary_call"]["cache_key_runtime"]["main_api_calls_in_process"] == 0
     serialized = json.dumps(record, ensure_ascii=False)
     assert "old user" not in serialized
     assert "latest tail" not in serialized
