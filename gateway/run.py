@@ -10947,14 +10947,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 get_model_context_length_async,
             )
 
-            # Read model + compression config from config.yaml.
-            # NOTE: hygiene threshold is intentionally HIGHER than the agent's
-            # own compressor (0.85 vs 0.50).  Hygiene is a safety net for
-            # sessions that grew too large between turns — it fires pre-agent
-            # to prevent API failures.  The agent's own compressor handles
-            # normal context management during its tool loop with accurate
-            # real token counts.  Having hygiene at 0.50 caused premature
-            # compression on every turn in long gateway sessions.
+            # Read model + compression config from config.yaml.  Hygiene is a
+            # safety net for sessions that grew too large between turns — it
+            # fires pre-agent to prevent API failures.  The agent's own
+            # compressor handles normal context management during its tool loop
+            # with accurate real token counts.  Keep the token threshold aligned
+            # with compression.threshold when configured so CLI and gateway
+            # sessions compact at the same context pressure.
             _hyg_model = "anthropic/claude-sonnet-4.6"
             _hyg_threshold_pct = 0.85
             _hyg_compression_enabled = True
@@ -10963,6 +10962,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_provider = None
             _hyg_base_url = None
             _hyg_api_key = None
+            _hyg_max_tokens = None
+            _hyg_codex_gpt55_autoraise = True
             _hyg_data = {}
             try:
                 _hyg_data = _load_gateway_config()
@@ -10985,13 +10986,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hyg_provider = _model_cfg.get("provider") or None
                         _hyg_base_url = _model_cfg.get("base_url") or None
 
-                    # Read compression settings — only use enabled flag.
-                    # The threshold is intentionally separate from the agent's
-                    # compression.threshold (hygiene runs higher).
+                    # Read compression settings.  The token threshold mirrors
+                    # the agent compressor's compression.threshold; the hard
+                    # message-count safety valve remains hygiene-specific.
                     _comp_cfg = _hyg_data.get("compression", {})
                     if isinstance(_comp_cfg, dict):
                         _hyg_compression_enabled = str(
                             _comp_cfg.get("enabled", True)
+                        ).lower() in {"true", "1", "yes"}
+                        _raw_threshold = _comp_cfg.get("threshold")
+                        if _raw_threshold is not None:
+                            try:
+                                _parsed_threshold = float(_raw_threshold)
+                                if 0.0 < _parsed_threshold < 1.0:
+                                    _hyg_threshold_pct = _parsed_threshold
+                            except (TypeError, ValueError):
+                                pass
+                        _hyg_codex_gpt55_autoraise = str(
+                            _comp_cfg.get("codex_gpt55_autoraise", True)
                         ).lower() in {"true", "1", "yes"}
                         _raw_hard_limit = _comp_cfg.get("hygiene_hard_message_limit")
                         if _raw_hard_limit is not None:
@@ -11011,6 +11023,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _hyg_provider = _hyg_runtime.get("provider") or _hyg_provider
                     _hyg_base_url = _hyg_runtime.get("base_url") or _hyg_base_url
                     _hyg_api_key = _hyg_runtime.get("api_key") or _hyg_api_key
+                    _hyg_max_tokens = _hyg_runtime.get("max_tokens") or _hyg_max_tokens
                 except Exception:
                     pass
 
@@ -11052,9 +11065,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     config_context_length=_hyg_config_context_length,
                     provider=_hyg_provider or "",
                 )
-                _compress_token_threshold = int(
-                    _hyg_context_length * _hyg_threshold_pct
-                )
+                try:
+                    from agent.auxiliary_client import (
+                        _compression_threshold_for_model as _hyg_model_threshold,
+                    )
+
+                    _model_threshold = _hyg_model_threshold(
+                        _hyg_model,
+                        _hyg_provider,
+                        allow_codex_gpt55_autoraise=_hyg_codex_gpt55_autoraise,
+                    )
+                    if _model_threshold is not None:
+                        _hyg_threshold_pct = _model_threshold
+                except Exception:
+                    pass
+                try:
+                    from agent.context_compressor import ContextCompressor
+
+                    _compress_token_threshold = ContextCompressor._compute_threshold_tokens(
+                        _hyg_context_length,
+                        _hyg_threshold_pct,
+                        _hyg_max_tokens,
+                    )
+                except Exception:
+                    _compress_token_threshold = int(
+                        _hyg_context_length * _hyg_threshold_pct
+                    )
                 _warn_token_threshold = int(_hyg_context_length * 0.95)
 
                 _msg_count = len(history)
@@ -11070,11 +11106,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _token_source = "estimated"
                     # Note: rough estimates overestimate by 30-50% for code/JSON-heavy
                     # sessions, but that just means hygiene fires a bit early — which
-                    # is safe and harmless.  The 85% threshold already provides ample
-                    # headroom (agent's own compressor runs at 50%).  A previous 1.4x
-                    # multiplier tried to compensate by inflating the threshold, but
-                    # 85% * 1.4 = 119% of context — which exceeds the model's limit
-                    # and prevented hygiene from ever firing for ~200K models (GLM-5).
+                    # is safe and harmless.  A previous 1.4x multiplier tried to
+                    # compensate by inflating the threshold, but that can exceed the
+                    # model's limit and prevent hygiene from ever firing for ~200K
+                    # models (GLM-5). Use the compressor's threshold directly instead.
 
                 # Hard safety valve: force compression if message count is
                 # extreme, regardless of token estimates.  This breaks the
