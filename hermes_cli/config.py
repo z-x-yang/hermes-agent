@@ -1362,6 +1362,20 @@ DEFAULT_CONFIG = {
                                       # Default False matches historical behavior; set to
                                       # True if you'd rather pause than silently lose
                                       # context turns when your aux model is flaky.
+        "summary_call_mode": "serialized_prompt",  # serialized_prompt|append_cached.
+                                      # append_cached reuses the main runtime
+                                      # provider-visible prefix for the one-off
+                                      # summary-generation call, then appends a
+                                      # compression instruction as the final
+                                      # user message. Keep serialized_prompt as
+                                      # default until canary data is good.
+        "append_cached_summary": {
+            "source_scope": "compacted_prefix",
+            "require_main_runtime": True,
+            "allow_tool_choice_none": True,
+            "fallback_to_serialized_prompt": True,
+            "audit_sample_summary_chars": 12000,
+        },
         "cheap_tool_result_cleanup": {
             "enabled": False,
             "keep_recent": 5,

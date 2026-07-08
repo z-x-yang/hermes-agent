@@ -1462,6 +1462,18 @@ def init_agent(
     cheap_tool_result_cleanup_cfg = _compression_cfg.get("cheap_tool_result_cleanup", {})
     if not isinstance(cheap_tool_result_cleanup_cfg, dict):
         cheap_tool_result_cleanup_cfg = {}
+    compression_summary_call_mode = str(
+        _compression_cfg.get("summary_call_mode", "serialized_prompt") or "serialized_prompt"
+    ).strip().lower()
+    if compression_summary_call_mode not in {"serialized_prompt", "append_cached"}:
+        _ra().logger.warning(
+            "Invalid compression.summary_call_mode=%r — using 'serialized_prompt'",
+            _compression_cfg.get("summary_call_mode"),
+        )
+        compression_summary_call_mode = "serialized_prompt"
+    append_cached_summary_cfg = _compression_cfg.get("append_cached_summary", {})
+    if not isinstance(append_cached_summary_cfg, dict):
+        append_cached_summary_cfg = {}
     # In-place compaction: when True, compress_context() rewrites the message
     # list + rebuilds the system prompt WITHOUT rotating the session id (no
     # parent_session_id chain, no `name #N` renumber). See #38763 and
@@ -1739,11 +1751,22 @@ def init_agent(
             abort_on_summary_failure=compression_abort_on_summary_failure,
             max_tokens=agent.max_tokens,
             cheap_tool_result_cleanup=cheap_tool_result_cleanup_cfg,
+            summary_call_mode=compression_summary_call_mode,
+            append_cached_summary=append_cached_summary_cfg,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
         try:
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
+        except Exception:
+            pass
+    _bind_summary_runtime_factory = getattr(
+        agent.context_compressor, "bind_summary_runtime_factory", None
+    )
+    if callable(_bind_summary_runtime_factory):
+        try:
+            from agent.compression_summary_runtime import make_summary_runtime
+            _bind_summary_runtime_factory(lambda: make_summary_runtime(agent))
         except Exception:
             pass
     agent.compression_enabled = compression_enabled

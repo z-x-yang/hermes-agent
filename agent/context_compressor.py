@@ -293,6 +293,71 @@ _CLAUDE_CODE_CHEAP_CLEANUP_TOOL_NAMES = frozenset(
 
 
 @dataclass(frozen=True)
+class AppendCachedSummaryConfig:
+    """Config for cache-friendly append-mode compression summary calls."""
+
+    source_scope: str = "compacted_prefix"
+    require_main_runtime: bool = True
+    allow_tool_choice_none: bool = True
+    fallback_to_serialized_prompt: bool = True
+    audit_sample_summary_chars: int = 12000
+
+    @classmethod
+    def normalized(cls, raw: Any) -> "AppendCachedSummaryConfig":
+        if isinstance(raw, cls):
+            return raw
+        if not isinstance(raw, dict):
+            raw = {}
+
+        source_scope = str(raw.get("source_scope", "compacted_prefix") or "").strip().lower()
+        if source_scope != "compacted_prefix":
+            source_scope = "compacted_prefix"
+
+        def _bool(name: str, default: bool) -> bool:
+            value = raw.get(name, default)
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return default
+            text = str(value).strip().lower()
+            if text in {"1", "true", "yes", "on"}:
+                return True
+            if text in {"0", "false", "no", "off"}:
+                return False
+            return default
+
+        try:
+            sample_chars = int(raw.get("audit_sample_summary_chars", 12000))
+        except (TypeError, ValueError):
+            sample_chars = 12000
+        sample_chars = max(0, min(sample_chars, 100000))
+
+        return cls(
+            source_scope=source_scope,
+            require_main_runtime=_bool("require_main_runtime", True),
+            allow_tool_choice_none=_bool("allow_tool_choice_none", True),
+            fallback_to_serialized_prompt=_bool("fallback_to_serialized_prompt", True),
+            audit_sample_summary_chars=sample_chars,
+        )
+
+
+@dataclass(frozen=True)
+class SummaryRules:
+    """Transport-independent compression summary instructions."""
+
+    preamble: str
+    minimal_sufficient_state_rule: str
+    template_sections: str
+    summary_budget: int
+    rules_hash: str
+
+
+def _hash_summary_rules(*parts: str) -> str:
+    payload = "\n\n".join(parts).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+@dataclass(frozen=True)
 class CheapToolResultCleanupConfig:
     """Config for Claude-like deterministic old tool-result cleanup."""
 
@@ -1169,6 +1234,10 @@ class ContextCompressor(ContextEngine):
         self._last_summary_error = None
         self.get_active_compression_failure_cooldown()
 
+    def bind_summary_runtime_factory(self, factory: Any) -> None:
+        """Bind a request-local main-runtime bridge used by append_cached summaries."""
+        self._summary_runtime_factory = factory
+
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
         super().on_session_start(session_id, **kwargs)
@@ -1397,6 +1466,8 @@ class ContextCompressor(ContextEngine):
         abort_on_summary_failure: bool = False,
         max_tokens: int | None = None,
         cheap_tool_result_cleanup: CheapToolResultCleanupConfig | dict[str, Any] | None = None,
+        summary_call_mode: str = "serialized_prompt",
+        append_cached_summary: AppendCachedSummaryConfig | dict[str, Any] | None = None,
     ):
         self.model = model
         self.base_url = base_url
@@ -1423,6 +1494,16 @@ class ContextCompressor(ContextEngine):
         self.cheap_tool_result_cleanup = CheapToolResultCleanupConfig.normalized(
             cheap_tool_result_cleanup
         )
+        mode = str(summary_call_mode or "serialized_prompt").strip().lower()
+        if mode not in {"serialized_prompt", "append_cached"}:
+            mode = "serialized_prompt"
+        self.summary_call_mode = mode
+        self.append_cached_summary = AppendCachedSummaryConfig.normalized(
+            append_cached_summary
+        )
+        self._summary_runtime_factory: Any = None
+        self._last_summary_call_audit: dict[str, Any] = {}
+        self._last_summary_sample: dict[str, Any] | None = None
         self._reset_cheap_tool_cleanup_audit()
 
         self.context_length = get_model_context_length(
@@ -1494,6 +1575,7 @@ class ContextCompressor(ContextEngine):
         # lifts is noise.
         self._summary_skipped_for_cooldown: bool = False
         self._last_summary_source_audit: dict[str, Any] = {}
+        self._last_summary_fail_closed_reason: str | None = None
         self._compression_audit_session_id: Optional[str] = None
         self._last_compression_audit_record: dict[str, Any] | None = None
         # Verbatim real-user messages of the window the LLM just summarized —
@@ -2388,6 +2470,103 @@ class ContextCompressor(ContextEngine):
         }
 
     @classmethod
+    def _summary_section_check(cls, summary: str) -> dict[str, Any]:
+        """Return structural checks for a redacted compression summary sample."""
+        canonical = [f"## {heading}" for heading in _CANONICAL_SUMMARY_HEADINGS]
+        found: list[str] = []
+        in_fence = False
+        fence_marker = ""
+        for line in (summary or "").splitlines():
+            stripped = line.strip()
+            fence_match = re.match(r"^(`{3,}|~{3,})", stripped)
+            if fence_match:
+                marker = fence_match.group(1)
+                if not in_fence:
+                    in_fence = True
+                    fence_marker = marker[0]
+                elif marker.startswith(fence_marker):
+                    in_fence = False
+                    fence_marker = ""
+                continue
+            if in_fence:
+                continue
+            if line.startswith("## "):
+                found.append(line.strip())
+        missing = [heading for heading in canonical if heading not in found]
+        noncanonical = [heading for heading in found if heading not in canonical]
+        all_user_messages_count = 0
+        in_user_section = False
+        in_fence = False
+        fence_marker = ""
+        for line in (summary or "").splitlines():
+            stripped = line.strip()
+            fence_match = re.match(r"^(`{3,}|~{3,})", stripped)
+            if fence_match:
+                marker = fence_match.group(1)
+                if not in_fence:
+                    in_fence = True
+                    fence_marker = marker[0]
+                elif marker.startswith(fence_marker):
+                    in_fence = False
+                    fence_marker = ""
+                continue
+            if in_fence:
+                continue
+            if line.startswith("## "):
+                in_user_section = line.strip() == "## All User Messages"
+                continue
+            if in_user_section and re.match(r"^\s*\d+\.\s+", line):
+                all_user_messages_count += 1
+        return {
+            "has_all_canonical_sections": not missing,
+            "missing_sections": missing,
+            "noncanonical_heading_count": len(noncanonical),
+            "all_user_messages_count": all_user_messages_count,
+            "pending_tasks_says_none": "## Pending Tasks\nNone." in summary,
+            "current_work_present": "## Current Work" in found,
+            "optional_next_step_present": "## Optional Next Step" in found,
+        }
+
+    def _build_summary_sample_record(
+        self,
+        *,
+        summary: str,
+        rules_hash: str,
+        mode: str,
+    ) -> dict[str, Any]:
+        """Build a redacted summary sample sidecar record for quality audits."""
+        append_cfg = getattr(
+            self,
+            "append_cached_summary",
+            AppendCachedSummaryConfig.normalized(None),
+        )
+        cap = int(getattr(append_cfg, "audit_sample_summary_chars", 12000) or 0)
+        redacted = redact_sensitive_text(summary or "")
+        truncated = bool(cap and len(redacted) > cap)
+        if cap and truncated:
+            half = max(1, cap // 2)
+            excerpt = (
+                redacted[:half].rstrip()
+                + "\n[summary excerpt truncated]\n"
+                + redacted[-half:].lstrip()
+            )
+        elif cap:
+            excerpt = redacted
+        else:
+            excerpt = ""
+        return {
+            "event": "compression_summary_sample",
+            "schema_version": 1,
+            "summary_call_mode": mode,
+            "rules_hash": rules_hash,
+            "summary_chars": len(summary or ""),
+            "summary_excerpt": excerpt,
+            "truncated": truncated,
+            "section_check": self._summary_section_check(summary or ""),
+            "quality_flags": [],
+        }
+
+    @classmethod
     def _build_message_accounting(
         cls,
         *,
@@ -2562,6 +2741,29 @@ class ContextCompressor(ContextEngine):
                 "Failed to write user-message ground-truth record", exc_info=True
             )
 
+    def _write_summary_sample_audit(self) -> None:
+        """Append the latest redacted summary sample after the main audit row."""
+        sample = self._last_summary_sample
+        if not sample:
+            return
+        self._last_summary_sample = None
+        base = self._last_compression_audit_record or {}
+        compression_id = base.get("compression_id")
+        if not compression_id:
+            return
+        record = dict(sample)
+        record["compression_id"] = compression_id
+        record["session_id"] = base.get("session_id") or getattr(
+            self, "_compression_audit_session_id", None
+        )
+        try:
+            log_path = get_hermes_home() / "logs" / "compression_summary_samples.jsonl"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        except Exception:
+            logger.debug("Failed to write compression summary sample", exc_info=True)
+
     def _build_compression_audit_record(
         self,
         *,
@@ -2711,6 +2913,7 @@ class ContextCompressor(ContextEngine):
                 len(_user_ground_truth) if _user_ground_truth is not None else None
             ),
             "summary_source": dict(self._last_summary_source_audit or {}),
+            "summary_call": dict(self._last_summary_call_audit or {}),
             "cheap_tool_result_cleanup": cheap_cleanup_audit,
             "summary_dropped_count": int(self._last_summary_dropped_count or 0),
             "summary_fallback_used": bool(self._last_summary_fallback_used),
@@ -3550,57 +3753,13 @@ Verify current repository/session state with tools, then continue from the prote
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
         self._summary_failure_cooldown_error = None
 
-    def _generate_summary(
+
+    def _build_summary_rules(
         self,
         turns_to_summarize: List[Dict[str, Any]],
-        focus_topic: Optional[str] = None,
-    ) -> Optional[str]:
-        """Generate a structured summary of conversation turns.
-
-        Uses a structured template (Goal, Progress, Decisions, Resolved/Pending
-        Questions, Files, Remaining Work) with explicit preamble telling the
-        summarizer not to answer questions.  When a previous summary exists,
-        generates an iterative update instead of summarizing from scratch.
-
-        Args:
-            focus_topic: Optional focus string for guided compression.  When
-                provided, the summariser prioritises preserving information
-                related to this topic and is more aggressive about compressing
-                everything else.  Inspired by Claude Code's ``/compact``.
-
-        Returns None if all attempts fail — the caller should drop
-        the middle turns without a summary rather than inject a useless
-        placeholder.
-        """
-        # Cleared up front so any failure/early-return leaves no stale window's
-        # user messages behind for the audit sidecar; set again on success.
-        self._last_summary_user_message_ground_truth = None
-
-        now = time.monotonic()
-        if now < self._summary_failure_cooldown_until:
-            remaining = self._summary_failure_cooldown_until - now
-            previous_error = (
-                getattr(self, "_summary_failure_cooldown_error", None)
-                or self._last_summary_error
-                or "previous summary attempt failed"
-            )
-            self._last_summary_error = (
-                f"summary generation cooldown active ({remaining:.0f}s remaining) "
-                f"after previous failure: {previous_error}"
-            )
-            # This turn made no fresh LLM attempt — it just re-hit an active
-            # cooldown. Mark it so compress() logs any resulting abort quietly.
-            self._summary_skipped_for_cooldown = True
-            logger.debug(
-                "Skipping context summary during cooldown (%.0fs remaining): %s",
-                remaining,
-                previous_error,
-            )
-            return None
-
-        summary_budget = self._compute_summary_budget(turns_to_summarize)
-        content_to_summarize = self._serialize_for_summary(turns_to_summarize)
-
+        summary_budget: int,
+    ) -> SummaryRules:
+        """Build transport-independent summary instructions without source text."""
         # Current date for temporal anchoring (see ## Temporal Anchoring below).
         # Date-only granularity matches system_prompt.py:337 (PR #20451) and the
         # user's configured timezone via hermes_time.now(). The compaction summary
@@ -3698,10 +3857,37 @@ Target ~{summary_budget} tokens. Be CONCRETE — name exact file paths, commands
 {_temporal_anchoring_rule}
 Write only the summary body. Do not include any preamble or prefix."""
 
+        return SummaryRules(
+            preamble=_summarizer_preamble,
+            minimal_sufficient_state_rule=_minimal_sufficient_state_rule,
+            template_sections=_template_sections,
+            summary_budget=summary_budget,
+            rules_hash=_hash_summary_rules(
+                _summarizer_preamble,
+                _minimal_sufficient_state_rule,
+                _template_sections,
+            ),
+        )
+
+    def _append_focus_topic_guidance(self, prompt: str, focus_topic: Optional[str]) -> str:
+        """Append user-specified focus guidance to a summary instruction."""
+        if not focus_topic:
+            return prompt
+        return prompt + f"""
+
+FOCUS TOPIC: "{focus_topic}"
+This compaction should PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to "{focus_topic}", summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
+
+    def _build_serialized_summary_prompt(
+        self,
+        rules: SummaryRules,
+        content_to_summarize: str,
+        focus_topic: Optional[str] = None,
+    ) -> str:
+        """Build the legacy serialized-source summary prompt."""
         if self._previous_summary:
             previous_summary_for_prompt = self._previous_summary
-            # Iterative update: preserve existing info, add new progress
-            prompt = f"""{_summarizer_preamble}
+            prompt = f"""{rules.preamble}
 
 You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
 
@@ -3713,34 +3899,310 @@ NEW TURNS TO INCORPORATE:
 
 Role=user messages in NEW TURNS TO INCORPORATE are authoritative over PREVIOUS SUMMARY. If they conflict, preserve the newer user state in active sections.
 
-{_minimal_sufficient_state_rule}
+{rules.minimal_sufficient_state_rule}
 
 Update the summary using this exact nine-section structure. Incorporate the new turns, and remove or mark obsolete information when messages inside the summarized slice cancelled, narrowed, or replaced earlier work. Keep "## Pending Tasks" limited to genuinely open work visible from the previous summary plus the new summarized turns. Update "## Current Work" and "## Optional Next Step" to reflect the precise continuation point at the compression boundary. Do not preserve completed or cancelled work as pending. In "## All User Messages", carry forward every entry from the previous summary and append the new turns' real user messages; never drop, merge, or paraphrase away a user's wording.
 
-{_template_sections}"""
+{rules.template_sections}"""
         else:
-            # First compaction: summarize from scratch
-            prompt = f"""{_summarizer_preamble}
+            prompt = f"""{rules.preamble}
 
 Create a structured checkpoint summary for the conversation after earlier turns are compacted. The summary should preserve enough detail for continuity without re-reading the original turns.
 
-{_minimal_sufficient_state_rule}
+{rules.minimal_sufficient_state_rule}
 
 TURNS TO SUMMARIZE:
 {content_to_summarize}
 
 Use this exact structure:
 
-{_template_sections}"""
+{rules.template_sections}"""
 
-        # Inject focus topic guidance when the user provides one via /compress <focus>.
-        # This goes at the end of the prompt so it takes precedence.
-        if focus_topic:
-            prompt += f"""
+        return self._append_focus_topic_guidance(prompt, focus_topic)
 
-FOCUS TOPIC: "{focus_topic}"
-This compaction should PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
+    def _build_append_cached_summary_instruction(
+        self,
+        rules: SummaryRules,
+        previous_summary: Optional[str],
+        focus_topic: Optional[str] = None,
+    ) -> str:
+        """Build the final user instruction for append-cached summary calls."""
+        if previous_summary:
+            prompt = f"""{rules.preamble}
 
+You are updating a context compaction summary. The conversation messages above are the provider-visible compacted prefix that will be replaced by this summary. The retained tail is not included in this request and will remain verbatim after the summary.
+
+PREVIOUS SUMMARY:
+{previous_summary}
+
+Role=user messages in the conversation above are authoritative over PREVIOUS SUMMARY. If they conflict, preserve the newer user state in active sections.
+
+{rules.minimal_sufficient_state_rule}
+
+Update the summary using this exact nine-section structure. Incorporate the conversation above, and remove or mark obsolete information when messages inside the summarized slice cancelled, narrowed, or replaced earlier work. Keep "## Pending Tasks" limited to genuinely open work visible from the previous summary plus the conversation above. Update "## Current Work" and "## Optional Next Step" to reflect the precise continuation point at the compression boundary. Do not preserve completed or cancelled work as pending. In "## All User Messages", carry forward every entry from the previous summary and append the conversation's real user messages; never drop, merge, or paraphrase away a user's wording.
+
+{rules.template_sections}"""
+        else:
+            prompt = f"""{rules.preamble}
+
+Create a structured checkpoint summary for the conversation messages above. Those messages are the provider-visible compacted prefix that will be replaced by this summary. The retained tail is not included in this request and will remain verbatim after the summary.
+
+{rules.minimal_sufficient_state_rule}
+
+Use this exact structure:
+
+{rules.template_sections}"""
+
+        return self._append_focus_topic_guidance(prompt, focus_topic)
+
+    def _generate_summary_append_cached(
+        self,
+        *,
+        source_messages: List[Dict[str, Any]],
+        turns_to_summarize: List[Dict[str, Any]],
+        summarize_start: int,
+        compress_end: int,
+        focus_topic: Optional[str],
+    ) -> Optional[str]:
+        """Generate a summary by appending a final instruction to provider-visible history."""
+        from agent.compression_summary_runtime import (
+            apply_summary_tool_choice_none,
+            extract_summary_cache_stats,
+            extract_summary_response_content,
+        )
+
+        summary_budget = self._compute_summary_budget(turns_to_summarize)
+        append_cfg = getattr(
+            self,
+            "append_cached_summary",
+            AppendCachedSummaryConfig.normalized(None),
+        )
+        rules = self._build_summary_rules(turns_to_summarize, summary_budget)
+        instruction = self._build_append_cached_summary_instruction(
+            rules,
+            previous_summary=self._previous_summary,
+            focus_topic=focus_topic,
+        )
+        base_audit: dict[str, Any] = {
+            "mode": "append_cached",
+            "source_binding": "provider_payload_prefix_to_compress_end",
+            "rules_hash": rules.rules_hash,
+            "cache_eligible": False,
+            "cache_key_runtime": {},
+            "request": {},
+            "cache": {
+                "reported": False,
+                "read_tokens": None,
+                "write_tokens": None,
+                "hit_rate_estimate": None,
+            },
+            "fallback_reason": None,
+            "tool_call_violation": False,
+        }
+        self._last_summary_call_audit = base_audit
+
+        factory = self._summary_runtime_factory
+        if factory is None:
+            base_audit["fallback_reason"] = "summary_runtime_not_main"
+            return None
+        runtime = factory()
+        if runtime is None:
+            base_audit["fallback_reason"] = "summary_runtime_not_main"
+            return None
+
+        prefix_messages = list(source_messages[:compress_end])
+        request_messages = prefix_messages + [{"role": "user", "content": instruction}]
+        requested_output_tokens = int(summary_budget * 1.3)
+        api_kwargs = runtime.build_kwargs(request_messages, requested_output_tokens)
+        tool_choice_requested = False
+        if append_cfg.allow_tool_choice_none:
+            api_kwargs, tool_choice_requested = apply_summary_tool_choice_none(
+                api_kwargs,
+                getattr(runtime, "api_mode", ""),
+            )
+
+        request_tokens = runtime.estimate_request_tokens(api_kwargs)
+        runtime_limit = getattr(runtime, "context_limit_tokens", None)
+        base_audit["cache_eligible"] = bool(append_cfg.require_main_runtime)
+        base_audit["cache_key_runtime"] = {
+            "provider": getattr(runtime, "provider", "") or "",
+            "model": getattr(runtime, "model", "") or "",
+            "api_mode": getattr(runtime, "api_mode", "") or "",
+            "reasoning_effort": getattr(runtime, "reasoning_effort", None),
+            "tools_included": bool(getattr(runtime, "tools_included", False)),
+            "tool_choice_none_requested": bool(tool_choice_requested),
+        }
+        base_audit["request"] = {
+            "message_count": len(request_messages),
+            "prefix_message_count": len(prefix_messages),
+            "instruction_chars": len(instruction),
+            "tokens_estimate": int(request_tokens),
+            "runtime_context_limit_tokens": int(runtime_limit) if runtime_limit else None,
+            "requested_output_tokens": requested_output_tokens,
+            "summarize_start": int(summarize_start),
+            "compress_end": int(compress_end),
+        }
+        if runtime_limit is None:
+            base_audit["fallback_reason"] = "summary_runtime_context_unknown"
+            return None
+        if request_tokens + requested_output_tokens > int(runtime_limit):
+            base_audit["fallback_reason"] = "append_cached_context_overflow"
+            return None
+
+        try:
+            with aux_interrupt_protection():
+                response = runtime.invoke(api_kwargs)
+            content, tool_call_violation = extract_summary_response_content(response)
+            base_audit["tool_call_violation"] = bool(tool_call_violation)
+            base_audit["cache"] = extract_summary_cache_stats(response)
+            if tool_call_violation:
+                base_audit["fallback_reason"] = "summary_returned_tool_call"
+                self._last_summary_error = "append_cached summary response attempted a tool call"
+                return None
+            if not content.strip():
+                base_audit["fallback_reason"] = "append_cached_validation_failed"
+                self._last_summary_error = "append_cached summary returned empty content"
+                return None
+
+            summary = redact_sensitive_text(content.strip())
+            summary, _demoted_sections = self._normalize_summary_sections(summary)
+            if _demoted_sections and not self.quiet_mode:
+                logger.info(
+                    "Compression summary: demoted %d non-canonical section heading(s) to prevent template erosion",
+                    _demoted_sections,
+                )
+            self._last_summary_user_message_ground_truth = [
+                entry["text"]
+                for entry in self._extract_current_user_ledger_entries(turns_to_summarize)
+            ]
+            self._previous_summary = summary
+            self._last_summary_sample = self._build_summary_sample_record(
+                summary=summary,
+                rules_hash=rules.rules_hash,
+                mode="append_cached",
+            )
+            self._clear_compression_failure_cooldown()
+            self._summary_failure_cooldown_error = None
+            self._summary_model_fallen_back = False
+            self._last_summary_error = None
+            self._last_summary_auth_failure = False
+            self._last_summary_network_failure = False
+            self._summary_skipped_for_cooldown = False
+            return self._with_summary_prefix(summary)
+        except Exception as exc:
+            err_text = str(exc).lower()
+            if tool_choice_requested and "tool_choice" in err_text:
+                base_audit["fallback_reason"] = "provider_rejected_tool_choice_none"
+            else:
+                base_audit["fallback_reason"] = "append_cached_transport_error"
+            self._last_summary_error = str(exc)
+            return None
+
+    def _generate_summary(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        focus_topic: Optional[str] = None,
+        *,
+        source_messages: Optional[List[Dict[str, Any]]] = None,
+        summarize_start: Optional[int] = None,
+        compress_end: Optional[int] = None,
+    ) -> Optional[str]:
+        """Generate a structured summary of conversation turns.
+
+        Uses a structured template (Goal, Progress, Decisions, Resolved/Pending
+        Questions, Files, Remaining Work) with explicit preamble telling the
+        summarizer not to answer questions.  When a previous summary exists,
+        generates an iterative update instead of summarizing from scratch.
+
+        Args:
+            focus_topic: Optional focus string for guided compression.  When
+                provided, the summariser prioritises preserving information
+                related to this topic and is more aggressive about compressing
+                everything else.  Inspired by Claude Code's ``/compact``.
+
+        Returns None if all attempts fail — the caller should drop
+        the middle turns without a summary rather than inject a useless
+        placeholder.
+        """
+        # Cleared up front so any failure/early-return leaves no stale window's
+        # user messages behind for the audit sidecar; set again on success.
+        self._last_summary_user_message_ground_truth = None
+        self._last_summary_sample = None
+
+        now = time.monotonic()
+        if now < self._summary_failure_cooldown_until:
+            remaining = self._summary_failure_cooldown_until - now
+            previous_error = (
+                getattr(self, "_summary_failure_cooldown_error", None)
+                or self._last_summary_error
+                or "previous summary attempt failed"
+            )
+            self._last_summary_error = (
+                f"summary generation cooldown active ({remaining:.0f}s remaining) "
+                f"after previous failure: {previous_error}"
+            )
+            # This turn made no fresh LLM attempt — it just re-hit an active
+            # cooldown. Mark it so compress() logs any resulting abort quietly.
+            self._summary_skipped_for_cooldown = True
+            logger.debug(
+                "Skipping context summary during cooldown (%.0fs remaining): %s",
+                remaining,
+                previous_error,
+            )
+            return None
+
+        if (
+            getattr(self, "summary_call_mode", "serialized_prompt") == "append_cached"
+            and source_messages is not None
+            and summarize_start is not None
+            and compress_end is not None
+        ):
+            summary = self._generate_summary_append_cached(
+                source_messages=source_messages,
+                turns_to_summarize=turns_to_summarize,
+                summarize_start=summarize_start,
+                compress_end=compress_end,
+                focus_topic=focus_topic,
+            )
+            if summary is not None:
+                return summary
+            append_failure_reason = str(
+                (self._last_summary_call_audit or {}).get("fallback_reason") or ""
+            )
+            if append_failure_reason in {
+                "append_cached_context_overflow",
+                "summary_returned_tool_call",
+            }:
+                self._last_summary_fail_closed_reason = append_failure_reason
+            append_cfg = getattr(
+                self,
+                "append_cached_summary",
+                AppendCachedSummaryConfig.normalized(None),
+            )
+            if not append_cfg.fallback_to_serialized_prompt:
+                self._last_summary_fail_closed_reason = (
+                    append_failure_reason or "append_cached_summary_failed"
+                )
+                return None
+
+        summary_budget = self._compute_summary_budget(turns_to_summarize)
+        append_failure = dict(getattr(self, "_last_summary_call_audit", {}) or {})
+        content_to_summarize = self._serialize_for_summary(turns_to_summarize)
+        rules = self._build_summary_rules(turns_to_summarize, summary_budget)
+        prompt = self._build_serialized_summary_prompt(
+            rules,
+            content_to_summarize,
+            focus_topic=focus_topic,
+        )
+        self._last_summary_call_audit = {
+            "mode": "serialized_prompt",
+            "source_binding": "serialized_turns_to_summarize",
+            "rules_hash": rules.rules_hash,
+            "cache_eligible": False,
+            "fallback_from": append_failure if append_failure.get("mode") == "append_cached" else None,
+            "fallback_reason": None,
+            "tool_call_violation": False,
+        }
         try:
             call_kwargs = {
                 "task": "compression",
@@ -3814,6 +4276,11 @@ This compaction should PRIORITISE preserving all information related to the focu
             ]
             # Store for iterative updates on next compaction
             self._previous_summary = summary
+            self._last_summary_sample = self._build_summary_sample_record(
+                summary=summary,
+                rules_hash=rules.rules_hash,
+                mode="serialized_prompt",
+            )
             self._clear_compression_failure_cooldown()
             self._summary_failure_cooldown_error = None
             self._summary_model_fallen_back = False
@@ -4607,6 +5074,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._last_summary_fallback_used = False
         self._last_summary_error = None
         self._last_summary_source_audit = {}
+        self._last_summary_call_audit = {}
+        self._last_summary_sample = None
+        self._last_summary_fail_closed_reason = None
         self._last_tail_boundary_audit = {}
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
@@ -4947,7 +5417,19 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Phase 3: Generate structured summary
         summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
         previous_summary_for_audit = self._previous_summary
-        summary = self._generate_summary(turns_to_summarize, focus_topic=summary_focus_topic)
+        if getattr(self, "summary_call_mode", "serialized_prompt") == "append_cached":
+            summary = self._generate_summary(
+                turns_to_summarize,
+                focus_topic=summary_focus_topic,
+                source_messages=messages,
+                summarize_start=summarize_start,
+                compress_end=compress_end,
+            )
+        else:
+            summary = self._generate_summary(
+                turns_to_summarize,
+                focus_topic=summary_focus_topic,
+            )
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
@@ -4975,6 +5457,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             self.abort_on_summary_failure
             or self._last_summary_auth_failure
             or self._last_summary_network_failure
+            or getattr(self, "_last_summary_fail_closed_reason", None)
             or pulled_summary_from_tail
         ):
             n_skipped = compress_end - compress_start
@@ -5015,6 +5498,13 @@ This compaction should PRIORITISE preserving all information related to the focu
                         "checkpoint. %d message(s) preserved unchanged.",
                         n_skipped,
                     )
+                elif getattr(self, "_last_summary_fail_closed_reason", None):
+                    _abort_log(
+                        "Summary generation hit fail-closed condition %s — "
+                        "aborting compression. %d message(s) preserved unchanged.",
+                        self._last_summary_fail_closed_reason,
+                        n_skipped,
+                    )
                 else:
                     _abort_log(
                         "Summary generation failed — aborting compression "
@@ -5029,6 +5519,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 abort_reason = "summary_network_failure"
             elif pulled_summary_from_tail:
                 abort_reason = "summary_failed_after_prior_summary_pullup"
+            elif getattr(self, "_last_summary_fail_closed_reason", None):
+                abort_reason = str(self._last_summary_fail_closed_reason)
             else:
                 abort_reason = "abort_on_summary_failure"
             output_messages = (
@@ -5285,6 +5777,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             retained_tail_raw_messages=messages[compress_end:n_messages],
             **audit_trigger_kwargs,
         ))
+        self._write_summary_sample_audit()
         self._write_user_message_ground_truth_audit()
 
         return compressed
