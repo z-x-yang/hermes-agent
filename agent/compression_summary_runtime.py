@@ -59,6 +59,13 @@ def apply_summary_tool_choice_none(
     """Return kwargs with provider-appropriate no-tool choice when tools are present."""
     if "tools" not in api_kwargs:
         return api_kwargs, False
+    if api_mode == "codex_responses":
+        # Codex Responses already emits ``tool_choice: auto`` when tools are
+        # present. Keep the main-runtime payload shape unchanged for cache reuse
+        # and rely on the summary instruction + post-response tool-call
+        # validation instead of sending a provider-rejected no-tool override.
+        return api_kwargs, False
+
     updated = dict(api_kwargs)
     if api_mode == "anthropic_messages":
         updated["tool_choice"] = {"type": "none"}

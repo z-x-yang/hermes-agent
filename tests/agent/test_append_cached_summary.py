@@ -11,7 +11,10 @@ from agent.context_compressor import (
     ContextCompressor,
     SummaryRules,
 )
-from agent.compression_summary_runtime import extract_summary_response_content
+from agent.compression_summary_runtime import (
+    apply_summary_tool_choice_none,
+    extract_summary_response_content,
+)
 from hermes_cli.config import DEFAULT_CONFIG
 
 
@@ -40,6 +43,20 @@ def test_append_cached_config_normalizes_invalid_values_to_safe_defaults():
     assert cfg.allow_tool_choice_none is False
     assert cfg.fallback_to_serialized_prompt is False
     assert cfg.audit_sample_summary_chars == 12000
+
+
+def test_codex_responses_keeps_tool_choice_auto_for_append_cached_summary():
+    api_kwargs = {
+        "model": "gpt-5.5",
+        "input": [{"role": "user", "content": "summarize"}],
+        "tools": [{"type": "function", "name": "noop", "parameters": {"type": "object"}}],
+        "tool_choice": "auto",
+    }
+
+    updated, requested = apply_summary_tool_choice_none(api_kwargs, "codex_responses")
+
+    assert requested is False
+    assert updated["tool_choice"] == "auto"
 
 
 def test_extract_summary_response_content_reads_codex_responses_output_text_items():
@@ -267,7 +284,7 @@ def test_append_cached_context_overflow_records_fallback_reason():
 
 
 def test_append_cached_tool_choice_rejection_has_specific_reason():
-    runtime = ToolChoiceRejectRuntime(context_limit_tokens=1_000_000)
+    runtime = ToolChoiceRejectRuntime(context_limit_tokens=1_000_000, api_mode="chat_completions")
     with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
         compressor = ContextCompressor(
             model="gpt-5.5",
