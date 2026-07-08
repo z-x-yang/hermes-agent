@@ -5186,20 +5186,47 @@ Use this exact structure:
                 focus_topic=focus_topic,
                 cleanup_result=empty_cleanup_result,
             ):
+                pipeline_input_tokens = int(display_tokens)
+                after_tool_result_cleanup = int(
+                    empty_cleanup_result.post_tokens_estimate
+                    if empty_cleanup_result.post_tokens_estimate is not None
+                    else estimate_messages_tokens_rough(empty_cleanup_result.messages)
+                )
                 cheap_messages = self._sanitize_tool_pairs(empty_cleanup_result.messages)
+                after_tool_pair_sanitize = int(estimate_messages_tokens_rough(cheap_messages))
                 cheap_messages = _strip_historical_media(cheap_messages)
+                after_historical_media_strip = int(estimate_messages_tokens_rough(cheap_messages))
                 cheap_messages, metadata_bounded = _bound_retained_nonvisible_metadata(cheap_messages)
+                after_nonvisible_metadata_bound = int(estimate_messages_tokens_rough(cheap_messages))
                 if metadata_bounded and not self.quiet_mode:
                     logger.info(
                         "Compression: bounded non-visible metadata on %d retained message(s)",
                         metadata_bounded,
                     )
                 _strip_persistence_markers(cheap_messages)
-                cheap_estimate = estimate_messages_tokens_rough(cheap_messages)
+                cheap_estimate = int(estimate_messages_tokens_rough(cheap_messages))
                 cheap_audit = dict(self._last_cheap_tool_cleanup_audit)
                 cheap_audit["result"] = "cheap_cleanup_only"
                 cheap_audit["llm_summary_skipped_after_cleanup"] = True
                 cheap_audit["llm_summary_ran_on_cleaned_view"] = False
+                cheap_audit["post_cleanup_pipeline"] = {
+                    "input_tokens_estimate": pipeline_input_tokens,
+                    "after_tool_result_cleanup_tokens_estimate": after_tool_result_cleanup,
+                    "after_tool_pair_sanitize_tokens_estimate": after_tool_pair_sanitize,
+                    "after_historical_media_strip_tokens_estimate": after_historical_media_strip,
+                    "after_nonvisible_metadata_bound_tokens_estimate": after_nonvisible_metadata_bound,
+                    "after_persistence_marker_strip_tokens_estimate": cheap_estimate,
+                    "metadata_bounded_count": int(metadata_bounded),
+                    "total_saved_estimate": pipeline_input_tokens - cheap_estimate,
+                    "additional_saved_after_tool_result_cleanup_estimate": after_tool_result_cleanup - cheap_estimate,
+                    "step_saved_estimates": {
+                        "tool_result_cleanup": max(0, pipeline_input_tokens - after_tool_result_cleanup),
+                        "tool_pair_sanitize": max(0, after_tool_result_cleanup - after_tool_pair_sanitize),
+                        "historical_media_strip": max(0, after_tool_pair_sanitize - after_historical_media_strip),
+                        "nonvisible_metadata_bound": max(0, after_historical_media_strip - after_nonvisible_metadata_bound),
+                        "persistence_marker_strip": max(0, after_nonvisible_metadata_bound - cheap_estimate),
+                    },
+                }
                 self._last_cheap_tool_cleanup_audit = cheap_audit
                 retained_tail_output_count = max(0, n_messages - compress_end)
                 tail_output_start = max(0, len(cheap_messages) - retained_tail_output_count)
@@ -5344,20 +5371,47 @@ Use this exact structure:
             focus_topic=focus_topic,
             cleanup_result=cleanup_result,
         ):
+            pipeline_input_tokens = int(display_tokens)
+            after_tool_result_cleanup = int(
+                cleanup_result.post_tokens_estimate
+                if cleanup_result.post_tokens_estimate is not None
+                else estimate_messages_tokens_rough(messages)
+            )
             cheap_messages = self._sanitize_tool_pairs(messages)
+            after_tool_pair_sanitize = int(estimate_messages_tokens_rough(cheap_messages))
             cheap_messages = _strip_historical_media(cheap_messages)
+            after_historical_media_strip = int(estimate_messages_tokens_rough(cheap_messages))
             cheap_messages, metadata_bounded = _bound_retained_nonvisible_metadata(cheap_messages)
+            after_nonvisible_metadata_bound = int(estimate_messages_tokens_rough(cheap_messages))
             if metadata_bounded and not self.quiet_mode:
                 logger.info(
                     "Compression: bounded non-visible metadata on %d retained message(s)",
                     metadata_bounded,
                 )
             _strip_persistence_markers(cheap_messages)
-            cheap_estimate = estimate_messages_tokens_rough(cheap_messages)
+            cheap_estimate = int(estimate_messages_tokens_rough(cheap_messages))
             cheap_audit = dict(self._last_cheap_tool_cleanup_audit)
             cheap_audit["result"] = "cheap_cleanup_only"
             cheap_audit["llm_summary_skipped_after_cleanup"] = True
             cheap_audit["llm_summary_ran_on_cleaned_view"] = False
+            cheap_audit["post_cleanup_pipeline"] = {
+                "input_tokens_estimate": pipeline_input_tokens,
+                "after_tool_result_cleanup_tokens_estimate": after_tool_result_cleanup,
+                "after_tool_pair_sanitize_tokens_estimate": after_tool_pair_sanitize,
+                "after_historical_media_strip_tokens_estimate": after_historical_media_strip,
+                "after_nonvisible_metadata_bound_tokens_estimate": after_nonvisible_metadata_bound,
+                "after_persistence_marker_strip_tokens_estimate": cheap_estimate,
+                "metadata_bounded_count": int(metadata_bounded),
+                "total_saved_estimate": pipeline_input_tokens - cheap_estimate,
+                "additional_saved_after_tool_result_cleanup_estimate": after_tool_result_cleanup - cheap_estimate,
+                "step_saved_estimates": {
+                    "tool_result_cleanup": max(0, pipeline_input_tokens - after_tool_result_cleanup),
+                    "tool_pair_sanitize": max(0, after_tool_result_cleanup - after_tool_pair_sanitize),
+                    "historical_media_strip": max(0, after_tool_pair_sanitize - after_historical_media_strip),
+                    "nonvisible_metadata_bound": max(0, after_historical_media_strip - after_nonvisible_metadata_bound),
+                    "persistence_marker_strip": max(0, after_nonvisible_metadata_bound - cheap_estimate),
+                },
+            }
             self._last_cheap_tool_cleanup_audit = cheap_audit
             retained_tail_output_count = max(0, n_messages - compress_end)
             tail_output_start = max(0, len(cheap_messages) - retained_tail_output_count)

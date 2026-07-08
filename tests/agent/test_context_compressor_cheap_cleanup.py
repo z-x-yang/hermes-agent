@@ -616,6 +616,15 @@ def test_auto_cleanup_only_skips_summary_when_below_threshold(monkeypatch):
     assert audit["result"] == "cheap_cleanup_only"
     assert audit["cheap_tool_result_cleanup"]["result"] == "cheap_cleanup_only"
     assert audit["cheap_tool_result_cleanup"]["llm_summary_skipped_after_cleanup"] is True
+    breakdown = audit["cheap_tool_result_cleanup"]["post_cleanup_pipeline"]
+    assert breakdown["input_tokens_estimate"] == audit["tokens"]["before_estimate"]
+    assert breakdown["after_tool_result_cleanup_tokens_estimate"] is not None
+    assert breakdown["after_persistence_marker_strip_tokens_estimate"] == audit["tokens"]["after_estimate"]
+    assert breakdown["total_saved_estimate"] == (
+        audit["tokens"]["before_estimate"] - audit["tokens"]["after_estimate"]
+    )
+    assert breakdown["additional_saved_after_tool_result_cleanup_estimate"] >= 0
+    assert breakdown["step_saved_estimates"]["tool_result_cleanup"] >= 0
 
 
 def test_auto_cleanup_only_runs_when_tail_floor_leaves_no_summary_window(monkeypatch):
