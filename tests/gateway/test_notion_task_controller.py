@@ -14,6 +14,15 @@ TASK_PAGE = {
     "properties": {"Name": {"type": "title", "title": [{"plain_text": "Reply to Alice"}]},
                    "Status": {"type": "status", "status": {"name": "To Do"}}},
 }
+THREAD_URL = "https://discord.com/channels/147/777"
+BOUND_TASK_PAGE = {
+    **TASK_PAGE,
+    "properties": {
+        **TASK_PAGE["properties"],
+        "Discord Thread ID": {"type": "rich_text", "rich_text": [{"plain_text": "777"}]},
+        "Discord Thread URL": {"type": "url", "url": THREAD_URL},
+    },
+}
 NON_TASK = {"parent": {"type": "page_id"}, "properties": {}}
 
 
@@ -334,6 +343,20 @@ async def test_render_send_attachments_numbered_view_and_card():
     assert [child.item.label for child in view.children] == ["🧵1", "✓1", "⏸1", "🗑1", "⏰1"]
     assert f"1️⃣ {_link('Reply to Alice')}" in embed.description
     assert embed.title == "📋 任务"
+
+
+@pytest.mark.asyncio
+async def test_render_send_attachments_uses_link_button_for_existing_thread():
+    notion = SimpleNamespace(get_page=AsyncMock(return_value=BOUND_TASK_PAGE))
+    ctrl = _ctrl(notion)
+
+    view, _embed = await ctrl.render_send_attachments(f"Built [Reply](https://notion.so/{PID})")
+
+    assert view is not None
+    open_thread = _item(view.children[0])
+    assert getattr(open_thread, "url", None) == THREAD_URL
+    assert getattr(open_thread, "custom_id", None) is None
+    assert _item(view.children[1]).custom_id == f"ntask:v1:done:{PID}"
 
 
 @pytest.mark.asyncio

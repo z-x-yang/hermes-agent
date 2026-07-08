@@ -35,7 +35,7 @@ from .buttons import (
     build_snooze_select,
     build_task_bind_picker_view,
 )
-from .components import pack_group_rows, task_card_embed, task_clarify_embed
+from .components import numbered_label, pack_group_rows, task_card_embed, task_clarify_embed
 from .snooze import (
     create_snooze_cron,
     EASTERN,
@@ -45,7 +45,7 @@ from .snooze import (
     reminder_content,
     resolve_due,
 )
-from .outbound import detect_task_links
+from .outbound import detect_task_link_items, detect_task_links
 
 logger = logging.getLogger(__name__)
 
@@ -642,7 +642,7 @@ class NotionTaskController:
                              "due_label": None, "page_id": pid})
         return rows
 
-    def _view_for_tasks(self, tasks, done_of):
+    def _view_for_tasks(self, tasks, done_of, *, thread_url_by_page: dict[str, str] | None = None):
         """Numbered button view for ``tasks``.
 
         For up to five tasks, show the full Workbench action set for each open
@@ -655,6 +655,7 @@ class NotionTaskController:
             logger.warning("notion task: %d task links in one message; only first 25 get buttons",
                            len(tasks))
         tasks = tasks[:25]
+        thread_url_by_page = thread_url_by_page or {}
         order = [pid for pid, _title in tasks]
         num_of = {pid: i + 1 for i, pid in enumerate(order)}
 
@@ -689,7 +690,16 @@ class NotionTaskController:
         view = discord.ui.View(timeout=None)
         for gi, group in enumerate(groups):
             for action, pid, title in group:
-                btn = build_button(action, pid, title=title, num=num_of[pid])
+                thread_url = thread_url_by_page.get(pid, "") if action == "open_thread" else ""
+                if thread_url:
+                    link_style: Any = getattr(discord.ButtonStyle, "link", 5)
+                    btn = discord.ui.Button(
+                        label=numbered_label(action, num_of[pid]),
+                        style=link_style,
+                        url=thread_url,
+                    )
+                else:
+                    btn = build_button(action, pid, title=title, num=num_of[pid])
                 if rowidx is not None:
                     try:
                         btn.row = rowidx[gi]
@@ -880,10 +890,20 @@ class NotionTaskController:
         path, which has no tracker/snooze state. Click-time rebuilds render the
         true per-task state.
         """
-        tasks = await detect_task_links(text or "", notion=self.notion, tasks_ids=self.tasks_ids)
+        items = await detect_task_link_items(text or "", notion=self.notion, tasks_ids=self.tasks_ids)
+        tasks = [(str(item["page_id"]), str(item["title"])) for item in items]
         if not tasks:
             return None, None
-        view = self._view_for_tasks(tasks, {pid: False for pid, _title in tasks})
+        thread_url_by_page = {
+            str(item["page_id"]): str(item.get("thread_url") or "")
+            for item in items
+            if item.get("thread_url")
+        }
+        view = self._view_for_tasks(
+            tasks,
+            {pid: False for pid, _title in tasks},
+            thread_url_by_page=thread_url_by_page,
+        )
         rows = [{"num": i, "title": title, "state": "open", "due_label": None,
                  "page_id": pid}
                 for i, (pid, title) in enumerate(tasks, start=1)]

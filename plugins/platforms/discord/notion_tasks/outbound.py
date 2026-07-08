@@ -17,22 +17,25 @@ import logging
 
 from . import detection
 from .components import action_pairs_with_snooze, components_payload, task_card_embed
+from .threading import read_thread_binding
 
 logger = logging.getLogger(__name__)
 
 
-async def detect_task_links(message: str, *, notion, tasks_ids=None) -> list[tuple[str, str]]:
-    """Return ``[(page_id, title), ...]`` for Tasks-DB links in ``message``.
+def _thread_url_from_page(page: dict) -> str:
+    try:
+        return str(read_thread_binding(page).get("thread_url") or "").strip()
+    except Exception:
+        logger.warning("notion task: failed to read Discord thread binding", exc_info=True)
+        return ""
 
-    Each candidate link is verified against Notion (``get_page`` + parent match);
-    non-task pages (docs/projects) and unreadable pages are skipped. A get_page
-    failure is logged and the link dropped (no button) — intentional graceful
-    degradation, never a silent success.
-    """
+
+async def detect_task_link_items(message: str, *, notion, tasks_ids=None) -> list[dict]:
+    """Return task-card items with send-time thread-link metadata."""
     if not detection.has_notion_link(message):
         return []
     ids = tasks_ids or detection.DEFAULT_TASKS_IDS
-    out: list[tuple[str, str]] = []
+    out: list[dict] = []
     seen: set[str] = set()
     for link in detection.extract_notion_links(message):
         if link.page_id in seen:
@@ -45,9 +48,24 @@ async def detect_task_links(message: str, *, notion, tasks_ids=None) -> list[tup
         if not detection.is_task_page(page, ids):
             continue
         seen.add(link.page_id)
-        title = link.anchor or detection.page_title(page)
-        out.append((link.page_id, title))
+        out.append({
+            "page_id": link.page_id,
+            "title": link.anchor or detection.page_title(page),
+            "thread_url": _thread_url_from_page(page),
+        })
     return out
+
+
+async def detect_task_links(message: str, *, notion, tasks_ids=None) -> list[tuple[str, str]]:
+    """Return ``[(page_id, title), ...]`` for Tasks-DB links in ``message``.
+
+    Each candidate link is verified against Notion (``get_page`` + parent match);
+    non-task pages (docs/projects) and unreadable pages are skipped. A get_page
+    failure is logged and the link dropped (no button) — intentional graceful
+    degradation, never a silent success.
+    """
+    return [(str(item["page_id"]), str(item["title"]))
+            for item in await detect_task_link_items(message, notion=notion, tasks_ids=tasks_ids)]
 
 
 async def standalone_task_payload(message: str) -> tuple[list[dict], dict | None]:
@@ -66,20 +84,29 @@ async def standalone_task_payload(message: str) -> tuple[list[dict], dict | None
         return [], None
     try:
         from .notion_client import NotionClient
-        tasks = await detect_task_links(message, notion=NotionClient())
+        items = await detect_task_link_items(message, notion=NotionClient())
     except Exception:
         logger.warning("notion task: standalone task-card build failed; sending without card",
                        exc_info=True)
         return [], None
-    if not tasks:
+    if not items:
         return [], None
-    if len(tasks) > 25:
+    if len(items) > 25:
         logger.warning("notion task: %d task links in one message; only first 25 get buttons",
-                       len(tasks))
-    pairs = action_pairs_with_snooze([pid for pid, _title in tasks])
-    if len(pairs) < len(tasks[:25]) * 2:
+                       len(items))
+    page_ids = [str(item["page_id"]) for item in items]
+    pairs = action_pairs_with_snooze(page_ids)
+    if len(pairs) < len(items[:25]) * 2:
         logger.warning("notion task: not enough component slots for snooze on every task")
+    thread_url_by_page = {
+        str(item["page_id"]): str(item.get("thread_url") or "")
+        for item in items
+        if item.get("thread_url")
+    }
     rows = [{"num": i, "title": title, "state": "open", "due_label": None,
              "page_id": pid}
-            for i, (pid, title) in enumerate(tasks, start=1)]
-    return components_payload(pairs), task_card_embed(rows)
+            for i, (pid, title) in enumerate(
+                [(str(item["page_id"]), str(item["title"])) for item in items],
+                start=1,
+            )]
+    return components_payload(pairs, link_url_by_page=thread_url_by_page), task_card_embed(rows)

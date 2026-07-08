@@ -322,11 +322,15 @@ def task_clarify_components(card: dict) -> list[dict]:
     return rows
 
 
-def button_component(action: str, page_id: str, num: int | None = None) -> dict:
+def button_component(action: str, page_id: str, num: int | None = None,
+                     *, link_url: str = "") -> dict:
     """One Discord button component (raw JSON) for the HTTP send path."""
     style = _STYLE_BY_ACTION.get(action)
     if style is None:
         raise ValueError(f"unknown task button action: {action!r}")
+    if action == "open_thread" and link_url:
+        return {"type": 2, "style": 5, "label": numbered_label(action, num),
+                "url": str(link_url)}
     return {"type": 2, "style": style, "label": numbered_label(action, num),
             "custom_id": make_custom_id(action, page_id)}
 
@@ -376,7 +380,8 @@ def pack_group_rows(group_sizes: list[int]) -> list[int] | None:
     return out
 
 
-def components_payload(tasks: list[tuple[str, str]]) -> list[dict]:
+def components_payload(tasks: list[tuple[str, str]], *,
+                       link_url_by_page: dict[str, str] | None = None) -> list[dict]:
     """Pack ``(action, page_id)`` pairs into Discord action-row JSON.
 
     Consecutive actions for the same page are grouped together, then whole
@@ -399,8 +404,14 @@ def components_payload(tasks: list[tuple[str, str]]) -> list[dict]:
     num_of = {pid: i + 1 for i, pid in enumerate(order)}
     # group consecutive actions belonging to the same page
     groups: list[tuple[str, list[dict]]] = []
+    link_url_by_page = link_url_by_page or {}
     for action, page_id in tasks:
-        btn = button_component(action, page_id, num_of[page_id])
+        btn = button_component(
+            action,
+            page_id,
+            num_of[page_id],
+            link_url=link_url_by_page.get(page_id, "") if action == "open_thread" else "",
+        )
         if groups and groups[-1][0] == page_id:
             groups[-1][1].append(btn)
         else:

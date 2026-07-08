@@ -44,6 +44,28 @@ def test_button_component_done_and_undo():
     assert dropped["style"] == 4 and dropped["custom_id"] == f"ntask:v1:drop:{PID}"
 
 
+def test_open_thread_button_uses_link_when_thread_url_known():
+    url = "https://discord.com/channels/147/777"
+
+    button = c.button_component("open_thread", PID, num=1, link_url=url)
+
+    assert button == {"type": 2, "style": 5, "label": "🧵1", "url": url}
+    assert "custom_id" not in button
+
+
+def test_components_payload_uses_thread_link_only_for_open_thread():
+    url = "https://discord.com/channels/147/777"
+
+    rows = c.components_payload(
+        [("open_thread", PID), ("done", PID)],
+        link_url_by_page={PID: url},
+    )
+
+    open_thread, done = rows[0]["components"]
+    assert open_thread == {"type": 2, "style": 5, "label": "🧵1", "url": url}
+    assert done["custom_id"] == f"ntask:v1:done:{PID}"
+
+
 def test_components_payload_empty():
     assert c.components_payload([]) == []
 

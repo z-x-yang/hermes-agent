@@ -11,6 +11,15 @@ TASK_PAGE = {
     "properties": {"Name": {"type": "title", "title": [{"plain_text": "Reply to Alice"}]},
                    "Status": {"type": "status", "status": {"name": "To Do"}}},
 }
+THREAD_URL = "https://discord.com/channels/147/777"
+BOUND_TASK_PAGE = {
+    **TASK_PAGE,
+    "properties": {
+        **TASK_PAGE["properties"],
+        "Discord Thread ID": {"type": "rich_text", "rich_text": [{"plain_text": "777"}]},
+        "Discord Thread URL": {"type": "url", "url": THREAD_URL},
+    },
+}
 NON_TASK = {"parent": {"type": "page_id"}, "properties": {}}
 
 
@@ -73,6 +82,18 @@ async def test_standalone_payload_builds_numbered_buttons_and_card(monkeypatch):
     assert [b["label"] for b in buttons] == ["🧵1", "✓1", "⏸1", "🗑1", "⏰1"]
     assert embed["title"] == "📋 任务"
     assert f"1️⃣ [Reply](https://www.notion.so/{PID})" in embed["description"]
+
+
+@pytest.mark.asyncio
+async def test_standalone_payload_uses_thread_url_for_existing_binding(monkeypatch):
+    _fake_client(monkeypatch, page=BOUND_TASK_PAGE)
+
+    rows, _embed = await outbound.standalone_task_payload(f"[Reply](https://notion.so/{PID})")
+
+    buttons = rows[0]["components"]
+    assert buttons[0] == {"type": 2, "style": 5, "label": "🧵1", "url": THREAD_URL}
+    assert "custom_id" not in buttons[0]
+    assert buttons[1]["custom_id"] == f"ntask:v1:done:{PID}"
 
 
 @pytest.mark.asyncio
