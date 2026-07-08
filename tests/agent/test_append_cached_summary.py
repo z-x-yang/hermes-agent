@@ -11,6 +11,7 @@ from agent.context_compressor import (
     ContextCompressor,
     SummaryRules,
 )
+from agent.compression_summary_runtime import extract_summary_response_content
 from hermes_cli.config import DEFAULT_CONFIG
 
 
@@ -39,6 +40,37 @@ def test_append_cached_config_normalizes_invalid_values_to_safe_defaults():
     assert cfg.allow_tool_choice_none is False
     assert cfg.fallback_to_serialized_prompt is False
     assert cfg.audit_sample_summary_chars == 12000
+
+
+def test_extract_summary_response_content_reads_codex_responses_output_text_items():
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(type="reasoning", summary=[]),
+            SimpleNamespace(
+                type="message",
+                role="assistant",
+                content=[
+                    SimpleNamespace(type="output_text", text="summary from responses item")
+                ],
+            ),
+        ]
+    )
+
+    content, tool_call_violation = extract_summary_response_content(response)
+
+    assert content == "summary from responses item"
+    assert tool_call_violation is False
+
+
+def test_extract_summary_response_content_flags_codex_responses_tool_calls():
+    response = SimpleNamespace(
+        output=[SimpleNamespace(type="function_call", name="terminal", arguments="{}")]
+    )
+
+    content, tool_call_violation = extract_summary_response_content(response)
+
+    assert content == ""
+    assert tool_call_violation is True
 
 
 def test_context_compressor_accepts_summary_call_mode_without_changing_default_behavior():

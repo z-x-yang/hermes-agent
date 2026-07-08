@@ -69,8 +69,51 @@ def apply_summary_tool_choice_none(
 
 def extract_summary_response_content(response: Any) -> tuple[str, bool]:
     """Return response text and whether the model attempted a tool call."""
+    def _get(obj: Any, name: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(name, default)
+        return getattr(obj, name, default)
+
+    def _content_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    if part:
+                        parts.append(part)
+                    continue
+                part_type = str(_get(part, "type", "") or "").strip().lower()
+                if part_type not in {"output_text", "text"}:
+                    continue
+                text = _get(part, "text", "")
+                if not isinstance(text, str):
+                    text = str(text or "")
+                if text:
+                    parts.append(text)
+            return "\n".join(parts).strip()
+        return str(content) if content else ""
+
     choices = getattr(response, "choices", None) or []
     if not choices:
+        output = _get(response, "output") or []
+        content_parts: list[str] = []
+        if isinstance(output, list):
+            for item in output:
+                item_type = str(_get(item, "type", "") or "").strip().lower()
+                if item_type in {"function_call", "custom_tool_call"}:
+                    return "", True
+                if item_type != "message":
+                    continue
+                text = _content_text(_get(item, "content", ""))
+                if text:
+                    content_parts.append(text)
+        if content_parts:
+            return "\n".join(content_parts).strip(), False
+        output_text = _get(response, "output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip(), False
         return "", False
     message = getattr(choices[0], "message", None)
     if isinstance(message, dict):
@@ -81,9 +124,7 @@ def extract_summary_response_content(response: Any) -> tuple[str, bool]:
         content = getattr(message, "content", message)
     if tool_calls:
         return "", True
-    if not isinstance(content, str):
-        content = str(content) if content else ""
-    return content, False
+    return _content_text(content), False
 
 
 def extract_summary_cache_stats(response: Any) -> dict[str, Any]:
