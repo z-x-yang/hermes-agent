@@ -109,6 +109,93 @@ def test_cleanup_counts_tail_tools_against_keep_recent():
     assert result.audit["protected_tail_cleared_count"] == 0
 
 
+def test_cleanup_ignores_tools_outside_claude_code_cleanup_list():
+    cfg = CheapToolResultCleanupConfig(enabled=True, keep_recent=0, min_tokens_saved=1)
+    c = _compressor(cheap_tool_result_cleanup=cfg)
+    c.bind_session_state(session_id="sess-1")
+    eligible_raw = "ELIGIBLE_READ_OUTPUT " + ("x" * 4000)
+    ineligible_raw = "INELIGIBLE_DELEGATE_OUTPUT " + ("y" * 4000)
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "start"},
+        _assistant_call("read-call", name="read_file"),
+        _tool("read-call", eligible_raw, row_id=10),
+        _assistant_call("delegate-call", name="delegate_task"),
+        _tool("delegate-call", ineligible_raw, row_id=11),
+        {"role": "user", "content": "tail"},
+    ]
+
+    result = c._cleanup_old_tool_results(messages, summarize_start=2, compress_end=6)
+
+    assert result.applied is True
+    assert result.messages[3]["content"] == "[Old tool result content cleared]"
+    assert result.messages[5]["content"] == ineligible_raw
+    assert result.audit["candidate_count"] == 1
+    assert result.audit["clear_candidate_count"] == 1
+    assert result.audit["ineligible_tool_result_count"] == 1
+
+
+def test_cleanup_keep_recent_can_clear_older_protected_tail_tool_results():
+    cfg = CheapToolResultCleanupConfig(enabled=True, keep_recent=5, min_tokens_saved=1)
+    c = _compressor(cheap_tool_result_cleanup=cfg)
+    c.bind_session_state(session_id="sess-1")
+    big = "x" * 4000
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "start"},
+        _assistant_call("pre-tail-0", name="read_file"),
+        _tool("pre-tail-0", f"PRE_TAIL_RAW\n{big}", row_id=10),
+    ]
+    for i in range(6):
+        messages.append(_assistant_call(f"tail-{i}", name="read_file"))
+        messages.append(_tool(f"tail-{i}", f"TAIL_RAW_{i}\n{big}", row_id=20 + i))
+
+    result = c._cleanup_old_tool_results(messages, summarize_start=2, compress_end=4)
+
+    assert result.applied is True
+    assert result.messages[3]["content"] == "[Old tool result content cleared]"
+    # keep_recent=5 is global, so the oldest retained-tail tool result is also
+    # cleared when the tail itself has more than 5 eligible tool results.
+    assert result.messages[5]["content"] == "[Old tool result content cleared]"
+    for index, tail_i in zip([7, 9, 11, 13, 15], range(1, 6), strict=True):
+        assert f"TAIL_RAW_{tail_i}" in result.messages[index]["content"]
+    assert result.audit["tail_tool_result_count"] == 6
+    assert result.audit["candidate_count"] == 7
+    assert result.audit["kept_recent_count"] == 5
+    assert result.audit["cleared_count"] == 2
+    assert result.audit["protected_tail_cleared_count"] == 1
+
+
+def test_cleanup_keep_recent_counts_only_eligible_tail_tools():
+    cfg = CheapToolResultCleanupConfig(enabled=True, keep_recent=2, min_tokens_saved=1)
+    c = _compressor(cheap_tool_result_cleanup=cfg)
+    c.bind_session_state(session_id="sess-1")
+    big = "x" * 4000
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "start"},
+        _assistant_call("old-read", name="read_file"),
+        _tool("old-read", f"OLD_READ\n{big}", row_id=10),
+        _assistant_call("tail-delegate", name="delegate_task"),
+        _tool("tail-delegate", f"TAIL_DELEGATE\n{big}", row_id=20),
+        _assistant_call("tail-read-0", name="read_file"),
+        _tool("tail-read-0", f"TAIL_READ_0\n{big}", row_id=21),
+        _assistant_call("tail-read-1", name="read_file"),
+        _tool("tail-read-1", f"TAIL_READ_1\n{big}", row_id=22),
+    ]
+
+    result = c._cleanup_old_tool_results(messages, summarize_start=2, compress_end=4)
+
+    assert result.applied is True
+    assert result.messages[3]["content"] == "[Old tool result content cleared]"
+    assert "TAIL_DELEGATE" in result.messages[5]["content"]
+    assert "TAIL_READ_0" in result.messages[7]["content"]
+    assert "TAIL_READ_1" in result.messages[9]["content"]
+    assert result.audit["tail_tool_result_count"] == 2
+    assert result.audit["ineligible_tool_result_count"] == 1
+    assert result.audit["kept_recent_count"] == 2
+
+
 def test_cleanup_uses_sentinel_when_row_id_missing():
     cfg = CheapToolResultCleanupConfig(enabled=True, keep_recent=0, min_tokens_saved=1)
     c = _compressor(cheap_tool_result_cleanup=cfg)
@@ -312,12 +399,17 @@ def test_audit_records_cleanup_block_for_disabled_feature():
     assert block["enabled"] is False
     assert block["applied"] is False
     assert block["result"] in {"not_attempted", "disabled"}
-    assert block["scope"] == "summary_window_before_protected_tail"
+    assert block["scope"] == "eligible_tool_results_across_provider_history"
+    assert "read_file" in block["eligible_tool_names"]
+    assert "delegate_task" not in block["eligible_tool_names"]
     assert block["tail_tool_result_count"] == 0
     assert block["tail_tool_count"] == 0
     assert block["extra_pre_tail_keep_count"] == 0
     assert block["candidate_count"] == 0
+    assert block["eligible_tool_result_count"] == 0
+    assert block["ineligible_tool_result_count"] == 0
     assert block["clear_candidate_count"] == 0
+    assert block["kept_recent_count"] == 0
     assert block["cleared_count"] == 0
     assert block["tokens_saved_estimate"] == 0
     assert block["tokens_saved"] == 0
@@ -493,6 +585,60 @@ def test_auto_cleanup_only_skips_summary_when_below_threshold(monkeypatch):
     assert audit["result"] == "cheap_cleanup_only"
     assert audit["cheap_tool_result_cleanup"]["result"] == "cheap_cleanup_only"
     assert audit["cheap_tool_result_cleanup"]["llm_summary_skipped_after_cleanup"] is True
+
+
+def test_auto_cleanup_only_runs_when_tail_floor_leaves_no_summary_window(monkeypatch):
+    cfg = CheapToolResultCleanupConfig(
+        enabled=True,
+        keep_recent=1,
+        min_tokens_saved=1,
+        skip_llm_summary_when_below_threshold=True,
+    )
+    with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+        c = ContextCompressor(
+            model="test/model",
+            threshold_percent=0.80,
+            protect_first_n=1,
+            protect_last_n=50,
+            summary_target_ratio=0.10,
+            quiet_mode=True,
+            cheap_tool_result_cleanup=cfg,
+        )
+    c.bind_session_state(session_db=None, session_id="sess-1")
+    monkeypatch.setattr(c, "threshold_tokens", 80_000)
+    monkeypatch.setattr(
+        c,
+        "_generate_summary",
+        lambda turns, focus_topic=None: (_ for _ in ()).throw(
+            AssertionError("summary should not run for cleanup-only relief")
+        ),
+    )
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "start"},
+    ]
+    for i in range(4):
+        messages.append(_assistant_call(f"tail-read-{i}", name="read_file"))
+        messages.append(_tool(f"tail-read-{i}", f"TAIL_READ_{i}\n" + ("x" * 220_000), row_id=20 + i))
+    messages.append({"role": "user", "content": "latest tail user"})
+
+    out = c.compress(
+        messages,
+        current_tokens=90_000,
+        force=False,
+        trigger_reason="token_threshold",
+    )
+
+    assert any("[Old tool result content cleared]" in str(msg.get("content")) for msg in out)
+    assert "TAIL_READ_3" in str(out[-2]["content"])
+    audit = c._last_compression_audit_record
+    assert audit is not None
+    assert audit["result"] == "cheap_cleanup_only"
+    block = audit["cheap_tool_result_cleanup"]
+    assert block["cleared_count"] == 3
+    assert block["protected_tail_cleared_count"] == 3
+    assert block["kept_recent_count"] == 1
+    assert block["llm_summary_skipped_after_cleanup"] is True
 
 
 @pytest.mark.parametrize(

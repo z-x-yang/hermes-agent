@@ -134,37 +134,42 @@ Only the visible `content` body changes.
 
 ## 7. `keep_recent` semantics
 
-`keep_recent` counts recent tool results globally across protected tail and pre-tail candidates, but protected tail has higher priority.
+`keep_recent` counts recent **eligible** tool results globally across the provider-visible history selected for cheap cleanup. The protected tail no longer has higher priority: if the retained tail contains more than `keep_recent` eligible tool results, older tail tool results are cleared too.
 
 Algorithm:
 
 ```python
-tail_tool_count = count_tool_results(messages[compress_end:])
-extra_keep_before_tail = max(0, keep_recent - tail_tool_count)
-
-pre_tail_candidates = eligible_tool_results(messages[summarize_start:compress_end])
-keep_newest_pre_tail = newest(pre_tail_candidates, extra_keep_before_tail)
-clear_candidates = pre_tail_candidates - keep_newest_pre_tail
+eligible = eligible_tool_results(messages[first_non_system_index:])
+keep_indices = newest(eligible, keep_recent)
+clear_candidates = eligible - keep_indices
 ```
 
 Consequences:
 
-- Tail tool results are always preserved, even when they exceed `keep_recent`.
-- If protected tail already contains at least 5 tool results, `keep_recent=5` keeps no additional pre-tail tool results.
-- If protected tail contains 2 tool results, keep the newest 3 eligible pre-tail tool results and clear older eligible results.
-- This matches the intent of Claude Code's `keepRecent=5` while respecting Hermes' stronger protected-tail invariant.
+- `keep_recent=5` means keep the newest 5 eligible tool results, not newest 5 files and not newest 5 tail results plus extras.
+- If protected tail contains 10 eligible tool results, only the newest 5 stay raw and the older 5 are replaced.
+- Ineligible tools do not count against `keep_recent` and are never cleared by this pass.
+- This intentionally follows Claude Code's `keepRecent=5` behavior rather than Hermes' older protected-tail-wins invariant.
 
 ## 8. Eligibility and token-savings gate
 
 A tool result is eligible when all conditions hold:
 
 - message role is `tool`;
-- message is inside the pre-tail summary window;
-- message is outside protected head and protected tail;
+- assistant tool name is in the Claude Code-aligned whitelist:
+  - `read_file` (Claude `Read`)
+  - `terminal` (Claude `Bash` / `PowerShell`)
+  - `search_files` (Claude `Grep` / `Glob`)
+  - `web_search` (Claude `WebSearch`)
+  - `web_extract` (Claude `WebFetch`)
+  - `patch` (Claude `Edit`)
+  - `write_file` (Claude `Write`)
 - content is non-empty;
 - content is not already `[Old tool result content cleared]`;
 - content is not already a `<persisted-output>...</persisted-output>` block;
 - replacing it does not create an orphan tool call/result pair.
+
+Generic Hermes tools (`todo`, `delegate_task`, `clarify`, `cronjob`, `session_search`, memory/fact-store, MCP/Notion/email/Discord tools, `browser_*`, `process`, `execute_code`, etc.) are intentionally out of scope unless future Claude evidence expands the list.
 
 Before mutating messages, estimate token savings for `clear_candidates`:
 
@@ -192,7 +197,7 @@ When cleanup is applied:
 
 ### 9.2 Cheap-only completion
 
-If cleanup is applied and the full active payload estimate drops below the active compression threshold, auto-compression may complete without LLM summary.
+If cleanup is applied and the full active payload estimate drops below the active compression threshold, auto-compression may complete without LLM summary. This is allowed even when the retained-tail/message-floor policy leaves no summarizable middle window; in that case cheap cleanup is the only deterministic relief layer.
 
 Allowed only when all are true:
 
@@ -251,8 +256,9 @@ Add a top-level block to `context_compression` records:
   "enabled": true,
   "applied": true,
   "result": "applied",
-  "scope": "summary_window_before_protected_tail",
+  "scope": "eligible_tool_results_across_provider_history",
   "view": "cleaned_after_cheap_tool_result_cleanup",
+  "eligible_tool_names": ["patch", "read_file", "search_files", "terminal", "web_extract", "web_search", "write_file"],
 
   "keep_recent": 5,
   "min_tokens_saved": 20000,
@@ -260,10 +266,13 @@ Add a top-level block to `context_compression` records:
   "extra_pre_tail_keep_count": 0,
 
   "candidate_count": 41,
-  "clear_candidate_count": 34,
+  "eligible_tool_result_count": 41,
+  "ineligible_tool_result_count": 6,
+  "clear_candidate_count": 36,
+  "kept_recent_count": 5,
   "kept_recent_pre_tail_count": 0,
-  "cleared_count": 34,
-  "protected_tail_cleared_count": 0,
+  "cleared_count": 36,
+  "protected_tail_cleared_count": 4,
 
   "pre_cleanup_tokens_estimate": 260000,
   "post_cleanup_tokens_estimate": 218000,
@@ -292,7 +301,7 @@ Audit rules:
 - Never log raw tool content.
 - Never log raw tool arguments.
 - Never log full unbounded tool ids if they can bloat records; use short stable hashes, bounded list length.
-- Always record `protected_tail_cleared_count`; expected value is `0`.
+- Always record `protected_tail_cleared_count`; value may be `>0` when old eligible tool results inside the retained tail are beyond the global keep-recent window.
 - Record fallback reasons whenever sentinel is used.
 - If cleanup is disabled or savings are below threshold, emit the block with `applied=false` and a clear `result` such as `disabled` or `below_min_tokens_saved`.
 
@@ -318,8 +327,8 @@ Expected files:
 
 - `agent/context_compressor.py`
   - config fields on `ContextCompressor`;
-  - helper to identify eligible tool results;
-  - helper to compute global `keep_recent` with protected tail count;
+  - helper to identify Claude Code-aligned eligible tool results;
+  - helper to compute global `keep_recent` across eligible results, including retained-tail tool results;
   - helper to build persisted handles or sentinel replacements;
   - integration before `_generate_summary()`;
   - cheap-only return path;

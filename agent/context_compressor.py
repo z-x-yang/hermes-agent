@@ -274,6 +274,22 @@ _GATEWAY_INTERRUPTION_SYSTEM_NOTE_RE = re.compile(
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 _CLAUDE_TOOL_RESULT_CLEARED_SENTINEL = "[Old tool result content cleared]"
 _CHEAP_TOOL_CLEANUP_REPLACEMENT_MODE = "persisted_handle_or_sentinel"
+# Claude Code 2.1.195 applies cheap keep-recent cleanup only to a fixed set of
+# high-context built-in tools: Read, Bash/PowerShell, Grep, Glob, WebSearch,
+# WebFetch, Edit, and Write.  This is the Hermes tool-name equivalent.  Generic
+# tools such as todo, delegation, browser, MCP, process, and execute_code stay
+# out unless future Claude evidence shows they belong in this cleanup set.
+_CLAUDE_CODE_CHEAP_CLEANUP_TOOL_NAMES = frozenset(
+    {
+        "read_file",  # Claude Read
+        "terminal",  # Claude Bash / PowerShell
+        "search_files",  # Claude Grep / Glob
+        "web_search",  # Claude WebSearch
+        "web_extract",  # Claude WebFetch
+        "patch",  # Claude Edit
+        "write_file",  # Claude Write
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -1032,15 +1048,19 @@ class ContextCompressor(ContextEngine):
             "enabled": bool(cfg.enabled),
             "applied": False,
             "result": "disabled" if not cfg.enabled else "not_attempted",
-            "scope": "summary_window_before_protected_tail",
+            "scope": "eligible_tool_results_across_provider_history",
             "view": "cleaned_after_cheap_tool_result_cleanup",
+            "eligible_tool_names": sorted(_CLAUDE_CODE_CHEAP_CLEANUP_TOOL_NAMES),
             "keep_recent": int(cfg.keep_recent),
             "min_tokens_saved": int(cfg.min_tokens_saved),
             "tail_tool_result_count": 0,
             "tail_tool_count": 0,
             "extra_pre_tail_keep_count": 0,
             "candidate_count": 0,
+            "eligible_tool_result_count": 0,
+            "ineligible_tool_result_count": 0,
             "clear_candidate_count": 0,
+            "kept_recent_count": 0,
             "kept_recent_pre_tail_count": 0,
             "cleared_count": 0,
             "protected_tail_cleared_count": 0,
@@ -1638,6 +1658,28 @@ class ContextCompressor(ContextEngine):
         return call_id_to_tool
 
     @staticmethod
+    def _cheap_cleanup_tool_name_for_result(
+        msg: dict[str, Any],
+        call_id_to_tool: Dict[str, tuple[str, str]],
+    ) -> str:
+        """Resolve the assistant tool name for a tool-result row."""
+        call_id = str(msg.get("tool_call_id") or "")
+        if call_id and call_id in call_id_to_tool:
+            return str(call_id_to_tool[call_id][0] or "unknown")
+        return str(msg.get("tool_name") or "unknown")
+
+    @classmethod
+    def _is_cheap_cleanup_eligible_tool_result(
+        cls,
+        msg: dict[str, Any],
+        call_id_to_tool: Dict[str, tuple[str, str]],
+    ) -> bool:
+        return (
+            cls._cheap_cleanup_tool_name_for_result(msg, call_id_to_tool)
+            in _CLAUDE_CODE_CHEAP_CLEANUP_TOOL_NAMES
+        )
+
+    @staticmethod
     def _is_persisted_output_block(content: Any) -> bool:
         text = _content_text_for_contains(content).strip()
         return text.startswith("<persisted-output>") and text.endswith(
@@ -1837,26 +1879,20 @@ class ContextCompressor(ContextEngine):
         summarize_start: int,
         compress_end: int,
     ) -> CheapToolResultCleanupResult:
-        cfg = self.cheap_tool_result_cleanup
+        cfg = getattr(self, "cheap_tool_result_cleanup", CheapToolResultCleanupConfig())
         base_audit: dict[str, Any] = self._empty_cheap_tool_cleanup_audit()
         if not cfg.enabled:
             return CheapToolResultCleanupResult(messages, False, base_audit)
 
         summarize_start = max(0, int(summarize_start))
         compress_end = max(summarize_start, min(int(compress_end), len(messages)))
-
-        tail_tool_count = sum(
-            1
-            for msg in messages[compress_end:]
-            if isinstance(msg, dict) and msg.get("role") == "tool"
-        )
-        extra_keep = max(0, int(cfg.keep_recent) - tail_tool_count)
-        base_audit["tail_tool_result_count"] = tail_tool_count
-        base_audit["tail_tool_count"] = tail_tool_count
-        base_audit["extra_pre_tail_keep_count"] = extra_keep
+        candidate_start = 1 if messages and messages[0].get("role") == "system" else 0
+        call_id_to_tool = self._build_tool_call_index(messages)
 
         candidates: list[tuple[int, dict[str, Any]]] = []
-        for index in range(summarize_start, compress_end):
+        ineligible_tool_count = 0
+        tail_tool_count = 0
+        for index in range(candidate_start, len(messages)):
             msg = messages[index]
             if not isinstance(msg, dict) or msg.get("role") != "tool":
                 continue
@@ -1867,19 +1903,40 @@ class ContextCompressor(ContextEngine):
                 continue
             if self._is_persisted_output_block(content):
                 continue
+            if not self._is_cheap_cleanup_eligible_tool_result(msg, call_id_to_tool):
+                ineligible_tool_count += 1
+                continue
             candidates.append((index, msg))
+            if index >= compress_end:
+                tail_tool_count += 1
 
-        base_audit["candidate_count"] = len(candidates)
-        if not candidates:
-            base_audit["result"] = "no_candidates"
-            return CheapToolResultCleanupResult(messages, False, base_audit)
-
-        keep_indices = {index for index, _msg in candidates[-extra_keep:]} if extra_keep else set()
+        keep_count = max(0, int(cfg.keep_recent))
+        keep_indices = (
+            {index for index, _msg in candidates[-keep_count:]}
+            if keep_count
+            else set()
+        )
         clear_candidates = [
             (index, msg) for index, msg in candidates if index not in keep_indices
         ]
-        base_audit["kept_recent_pre_tail_count"] = len(keep_indices)
+        kept_recent_pre_tail_count = sum(1 for index in keep_indices if index < compress_end)
+        protected_tail_cleared_count = sum(
+            1 for index, _msg in clear_candidates if index >= compress_end
+        )
+        extra_keep = max(0, keep_count - tail_tool_count)
+        base_audit["tail_tool_result_count"] = tail_tool_count
+        base_audit["tail_tool_count"] = tail_tool_count
+        base_audit["extra_pre_tail_keep_count"] = extra_keep
+        base_audit["candidate_count"] = len(candidates)
+        base_audit["eligible_tool_result_count"] = len(candidates)
+        base_audit["ineligible_tool_result_count"] = ineligible_tool_count
+        base_audit["kept_recent_count"] = len(keep_indices)
+        base_audit["kept_recent_pre_tail_count"] = kept_recent_pre_tail_count
         base_audit["clear_candidate_count"] = len(clear_candidates)
+        base_audit["protected_tail_cleared_count"] = protected_tail_cleared_count
+        if not candidates:
+            base_audit["result"] = "no_candidates"
+            return CheapToolResultCleanupResult(messages, False, base_audit)
         if not clear_candidates:
             base_audit["result"] = "all_candidates_kept_recent"
             return CheapToolResultCleanupResult(messages, False, base_audit)
@@ -1963,7 +2020,7 @@ class ContextCompressor(ContextEngine):
         focus_topic: str | None,
         cleanup_result: CheapToolResultCleanupResult,
     ) -> bool:
-        cfg = self.cheap_tool_result_cleanup
+        cfg = getattr(self, "cheap_tool_result_cleanup", CheapToolResultCleanupConfig())
         if not cfg.enabled or not cfg.skip_llm_summary_when_below_threshold:
             return False
         if not cleanup_result.applied:
@@ -4601,9 +4658,11 @@ This compaction should PRIORITISE preserving all information related to the focu
         }
         # Source-fidelity invariant: the tail boundary is selected against the
         # original transcript.  By default, the LLM summary sees raw turns for
-        # the window it is asked to absorb.  If cheap old-tool cleanup applies
-        # after the boundary is known, the summarizer deliberately sees that
-        # cleaned view instead, and protected tail content remains untouched.
+        # the window it is asked to absorb.  If Claude-like cheap old-tool cleanup
+        # applies after the boundary is known, the summarizer deliberately sees
+        # that cleaned view instead.  The cleanup keep_recent set is global over
+        # eligible tool results and may also replace older retained-tail tool
+        # results, matching Claude Code rather than giving the tail an exemption.
         raw_messages = [m.copy() if isinstance(m, dict) else m for m in messages]
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1
@@ -4642,6 +4701,66 @@ This compaction should PRIORITISE preserving all information related to the focu
         tail_boundary_promoted = False
 
         if compress_start >= compress_end:
+            empty_cleanup_result = self._cleanup_old_tool_results(
+                messages,
+                summarize_start=compress_start,
+                compress_end=compress_end,
+            )
+            self._last_cheap_tool_cleanup_audit = dict(empty_cleanup_result.audit)
+            if self._cheap_cleanup_only_allowed(
+                entrypoint=entrypoint,
+                trigger_reason=trigger_reason,
+                focus_topic=focus_topic,
+                cleanup_result=empty_cleanup_result,
+            ):
+                cheap_messages = self._sanitize_tool_pairs(empty_cleanup_result.messages)
+                cheap_messages = _strip_historical_media(cheap_messages)
+                cheap_messages, metadata_bounded = _bound_retained_nonvisible_metadata(cheap_messages)
+                if metadata_bounded and not self.quiet_mode:
+                    logger.info(
+                        "Compression: bounded non-visible metadata on %d retained message(s)",
+                        metadata_bounded,
+                    )
+                _strip_persistence_markers(cheap_messages)
+                cheap_estimate = estimate_messages_tokens_rough(cheap_messages)
+                cheap_audit = dict(self._last_cheap_tool_cleanup_audit)
+                cheap_audit["result"] = "cheap_cleanup_only"
+                cheap_audit["llm_summary_skipped_after_cleanup"] = True
+                cheap_audit["llm_summary_ran_on_cleaned_view"] = False
+                self._last_cheap_tool_cleanup_audit = cheap_audit
+                retained_tail_output_count = max(0, n_messages - compress_end)
+                tail_output_start = max(0, len(cheap_messages) - retained_tail_output_count)
+                retained_tail_messages_for_audit = [
+                    _fresh_compaction_message_copy(msg)
+                    for msg in cheap_messages[tail_output_start:]
+                    if isinstance(msg, dict)
+                ]
+                self._write_compression_audit_record(self._build_compression_audit_record(
+                    result="cheap_cleanup_only",
+                    entrypoint=entrypoint,
+                    input_messages=n_messages,
+                    output_messages=len(cheap_messages),
+                    summary_start=compress_start,
+                    summary_end=compress_end,
+                    retained_tail_start=compress_end,
+                    pruned_count=pruned_count,
+                    tail_compacted_count=tail_tool_compacted,
+                    tail_boundary_promoted=tail_boundary_promoted,
+                    before_estimate=display_tokens,
+                    after_estimate=cheap_estimate,
+                    retained_tail_output_count=retained_tail_output_count,
+                    before_messages=original_messages,
+                    after_messages=cheap_messages,
+                    retained_tail_messages=retained_tail_messages_for_audit,
+                    retained_tail_raw_messages=original_messages[compress_end:n_messages],
+                    **audit_trigger_kwargs,
+                ))
+                return cheap_messages
+            if empty_cleanup_result.applied:
+                skipped_cleanup_audit = dict(empty_cleanup_result.audit)
+                skipped_cleanup_audit["applied"] = False
+                skipped_cleanup_audit["result"] = "not_persisted_empty_summary_window"
+                self._last_cheap_tool_cleanup_audit = skipped_cleanup_audit
             # No compressable window — the policy-protected suffix consumes the
             # available non-head transcript. Without recording this as
             # an ineffective compression the anti-thrashing guard in
