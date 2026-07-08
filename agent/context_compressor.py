@@ -655,6 +655,40 @@ def _content_text_for_contains(content: Any) -> str:
     return str(content)
 
 
+def _content_has_multimodal_payload(content: Any, msg: dict[str, Any] | None = None) -> bool:
+    """Return True for image/document content parts.
+
+    Claude Code's older-tool cleanup replaces image/document tool results with
+    the cleared sentinel instead of a persisted-output pointer. Hermes also
+    treats OpenAI-style image_url/input_image parts, Hermes ``_multimodal``
+    envelopes, and Anthropic back-compat stashed blocks as image payloads.
+    """
+
+    def _parts_have_multimodal(parts: Any) -> bool:
+        if not isinstance(parts, list):
+            return False
+        for item in parts:
+            if isinstance(item, dict) and item.get("type") in {
+                "document",
+                "image",
+                "image_url",
+                "input_image",
+            }:
+                return True
+        return False
+
+    if _parts_have_multimodal(content):
+        return True
+    if isinstance(content, dict) and content.get("_multimodal"):
+        if _parts_have_multimodal(content.get("content")):
+            return True
+    if msg is not None and _parts_have_multimodal(
+        msg.get("_anthropic_content_blocks")
+    ):
+        return True
+    return False
+
+
 def _append_text_to_content(content: Any, text: str, *, prepend: bool = False) -> Any:
     """Append or prepend plain text to message content safely.
 
@@ -1909,6 +1943,9 @@ class ContextCompressor(ContextEngine):
         lookup_failure_reason: str | None = None,
     ) -> tuple[str, str, str | None]:
         session_id = getattr(self, "_session_id", "") or ""
+        if _content_has_multimodal_payload(msg.get("content"), msg):
+            return "sentinel", _CLAUDE_TOOL_RESULT_CLEARED_SENTINEL, None
+
         row_id = msg.get("id")
         if row_id is None:
             row_id_int = 0

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -63,7 +64,7 @@ def _assistant_call(call_id: str, name: str = "terminal") -> dict:
     }
 
 
-def _tool(call_id: str, content: str, *, row_id: int | None = None) -> dict:
+def _tool(call_id: str, content: Any, *, row_id: int | None = None) -> dict:
     msg: dict[str, object] = {"role": "tool", "tool_call_id": call_id, "content": content}
     if row_id is not None:
         msg["id"] = row_id
@@ -281,6 +282,109 @@ def test_persisted_handle_points_to_existing_message_row(tmp_path):
     assert raw_tool_output not in cleaned_content
     archived_window = db.get_messages_around(session_id, int(tool_row["id"]), window=1)
     assert any(msg.get("content") == raw_tool_output for msg in archived_window["window"])
+
+
+def test_cleanup_multimodal_tool_result_uses_sentinel_not_persisted_handle(monkeypatch):
+    cfg = CheapToolResultCleanupConfig(enabled=True, keep_recent=0, min_tokens_saved=1)
+    c = _compressor(cheap_tool_result_cleanup=cfg)
+    c.bind_session_state(session_id="sess-1")
+    monkeypatch.setattr(
+        c,
+        "_validated_persisted_tool_row_id",
+        lambda _msg, row_id: (row_id, None),
+    )
+    multimodal_content = [
+        {"type": "text", "text": "screenshot raw " + ("x" * 4000)},
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "not-real-image-data",
+            },
+        },
+    ]
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "start"},
+        _assistant_call("old-image", name="read_file"),
+        _tool("old-image", multimodal_content, row_id=123),
+        {"role": "user", "content": "tail user"},
+    ]
+
+    result = c._cleanup_old_tool_results(messages, summarize_start=2, compress_end=4)
+
+    assert result.applied is True
+    assert result.messages[3]["content"] == "[Old tool result content cleared]"
+    assert result.audit["replacement_counts"] == {"persisted_handle": 0, "sentinel": 1}
+    assert result.audit["sentinel_fallback_reasons"] == {}
+
+
+def test_cleanup_multimodal_envelope_uses_sentinel_not_persisted_handle(monkeypatch):
+    cfg = CheapToolResultCleanupConfig(enabled=True, keep_recent=0, min_tokens_saved=1)
+    c = _compressor(cheap_tool_result_cleanup=cfg)
+    c.bind_session_state(session_id="sess-1")
+    monkeypatch.setattr(
+        c,
+        "_validated_persisted_tool_row_id",
+        lambda _msg, row_id: (row_id, None),
+    )
+    envelope_content = {
+        "_multimodal": True,
+        "text_summary": "screenshot raw " + ("x" * 4000),
+        "content": [
+            {"type": "text", "text": "screenshot raw"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        ],
+    }
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "start"},
+        _assistant_call("old-image", name="read_file"),
+        _tool("old-image", envelope_content, row_id=123),
+        {"role": "user", "content": "tail user"},
+    ]
+
+    result = c._cleanup_old_tool_results(messages, summarize_start=2, compress_end=4)
+
+    assert result.applied is True
+    assert result.messages[3]["content"] == "[Old tool result content cleared]"
+    assert result.audit["replacement_counts"] == {"persisted_handle": 0, "sentinel": 1}
+
+
+def test_cleanup_stashed_anthropic_blocks_use_sentinel_not_persisted_handle(monkeypatch):
+    cfg = CheapToolResultCleanupConfig(enabled=True, keep_recent=0, min_tokens_saved=1)
+    c = _compressor(cheap_tool_result_cleanup=cfg)
+    c.bind_session_state(session_id="sess-1")
+    monkeypatch.setattr(
+        c,
+        "_validated_persisted_tool_row_id",
+        lambda _msg, row_id: (row_id, None),
+    )
+    tool_msg = _tool("old-image", "screenshot raw " + ("x" * 4000), row_id=123)
+    tool_msg["_anthropic_content_blocks"] = [
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "not-real-image-data",
+            },
+        }
+    ]
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "start"},
+        _assistant_call("old-image", name="read_file"),
+        tool_msg,
+        {"role": "user", "content": "tail user"},
+    ]
+
+    result = c._cleanup_old_tool_results(messages, summarize_start=2, compress_end=4)
+
+    assert result.applied is True
+    assert result.messages[3]["content"] == "[Old tool result content cleared]"
+    assert result.audit["replacement_counts"] == {"persisted_handle": 0, "sentinel": 1}
 
 
 def test_persisted_handle_resolves_missing_row_id_from_bound_session_db(tmp_path):
