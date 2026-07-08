@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import patch
 
@@ -9,6 +10,7 @@ from agent.context_compressor import (
     CheapToolResultCleanupConfig,
     ContextCompressor,
 )
+from agent.model_metadata import estimate_messages_tokens_rough
 
 
 def _compressor(**kwargs) -> ContextCompressor:
@@ -677,6 +679,81 @@ def test_cleanup_abort_preserves_raw_transcript_when_summary_generation_fails(mo
     assert not any("[Old tool result content cleared]" in str(msg.get("content")) for msg in out)
 
 
+def test_chat_provider_visible_estimate_ignores_storage_only_reasoning_metadata():
+    c = _compressor(api_mode="chat_completions")
+    messages = [
+        {"role": "user", "content": "hello"},
+        {
+            "role": "assistant",
+            "content": "small visible reply",
+            "reasoning": "R" * 40_000,
+            "reasoning_content": "C" * 40_000,
+            "codex_reasoning_items": [{
+                "id": "rs_1",
+                "type": "reasoning",
+                "encrypted_content": "E" * 80_000,
+            }],
+            "codex_message_items": [{
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "M" * 30_000}],
+            }],
+        },
+    ]
+
+    raw_storage_estimate = estimate_messages_tokens_rough(messages)
+    provider_visible_estimate = c.estimate_provider_messages_tokens(messages)
+
+    assert raw_storage_estimate > provider_visible_estimate * 100
+    assert provider_visible_estimate < 100
+
+
+def test_deepseek_tool_call_reasoning_without_reasoning_content_counts_pad_only():
+    c = _compressor(api_mode="chat_completions", provider="deepseek")
+    c.model = "deepseek-chat"
+    messages = [{
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "terminal", "arguments": "{}"},
+        }],
+        "reasoning": "R" * 80_000,
+    }]
+
+    raw_storage_estimate = estimate_messages_tokens_rough(messages)
+    provider_visible_estimate = c.estimate_provider_messages_tokens(messages)
+
+    assert raw_storage_estimate > provider_visible_estimate * 100
+    assert provider_visible_estimate < 100
+
+
+def test_non_codex_non_gemini_estimate_strips_non_wire_tool_call_fields():
+    c = _compressor(api_mode="chat_completions")
+    c.model = "openai/gpt-5"
+    huge_extra = {"google": {"thought_signature": "S" * 120_000}}
+    messages = [{
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "call-1",
+            "call_id": "call-1",
+            "response_item_id": "resp-1",
+            "extra_content": huge_extra,
+            "type": "function",
+            "function": {"name": "terminal", "arguments": "{}"},
+        }],
+    }]
+
+    raw_storage_estimate = estimate_messages_tokens_rough(messages)
+    provider_visible_estimate = c.estimate_provider_messages_tokens(messages)
+
+    assert raw_storage_estimate > provider_visible_estimate * 100
+    assert provider_visible_estimate < 100
+
+
 def test_auto_cleanup_only_skips_summary_when_below_threshold(monkeypatch):
     cfg = CheapToolResultCleanupConfig(
         enabled=True,
@@ -721,14 +798,89 @@ def test_auto_cleanup_only_skips_summary_when_below_threshold(monkeypatch):
     assert audit["cheap_tool_result_cleanup"]["result"] == "cheap_cleanup_only"
     assert audit["cheap_tool_result_cleanup"]["llm_summary_skipped_after_cleanup"] is True
     breakdown = audit["cheap_tool_result_cleanup"]["post_cleanup_pipeline"]
-    assert breakdown["input_tokens_estimate"] == audit["tokens"]["before_estimate"]
+    assert breakdown["estimate_scope"] == "provider_visible_messages"
+    assert breakdown["input_tokens_estimate"] <= audit["tokens"]["before_estimate"]
     assert breakdown["after_tool_result_cleanup_tokens_estimate"] is not None
     assert breakdown["after_persistence_marker_strip_tokens_estimate"] == audit["tokens"]["after_estimate"]
     assert breakdown["total_saved_estimate"] == (
-        audit["tokens"]["before_estimate"] - audit["tokens"]["after_estimate"]
+        breakdown["input_tokens_estimate"]
+        - breakdown["after_persistence_marker_strip_tokens_estimate"]
     )
     assert breakdown["additional_saved_after_tool_result_cleanup_estimate"] >= 0
     assert breakdown["step_saved_estimates"]["tool_result_cleanup"] >= 0
+
+
+def test_cleanup_only_audit_separates_provider_visible_from_storage_internal_metadata(monkeypatch):
+    cfg = CheapToolResultCleanupConfig(
+        enabled=True,
+        keep_recent=0,
+        min_tokens_saved=1,
+        skip_llm_summary_when_below_threshold=True,
+    )
+    c = _compressor(cheap_tool_result_cleanup=cfg, api_mode="chat_completions")
+    c.tail_token_budget = 1
+    c.bind_session_state(session_db=None, session_id="sess-1")
+    monkeypatch.setattr(c, "_generate_summary", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("summary should be skipped")))
+    monkeypatch.setattr(c, "threshold_tokens", 50_000)
+    big = "x" * 220_000
+    huge_args = json.dumps({"command": "python run.py " + ("--flag value " * 600)})
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "start"},
+        _assistant_call("old-1"),
+        _tool("old-1", big, row_id=11),
+        _assistant_call("old-2"),
+        _tool("old-2", big, row_id=12),
+        {
+            "role": "assistant",
+            "content": "tail assistant with small visible text",
+            "tool_calls": [{
+                "id": "tail-call",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": huge_args},
+            }],
+            "reasoning": "R" * 20_000,
+            "reasoning_content": "C" * 20_000,
+            "codex_reasoning_items": [{
+                "id": "rs_tail",
+                "type": "reasoning",
+                "encrypted_content": "E" * 40_000,
+            }],
+            "codex_message_items": [{
+                "id": "msg_tail",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "M" * 8_000}],
+            }],
+        },
+        {"role": "tool", "tool_call_id": "tail-call", "content": "tail-call output"},
+        {"role": "user", "content": "tail user"},
+    ]
+
+    out = c.compress(
+        messages,
+        current_tokens=80_000,
+        force=False,
+        trigger_reason="token_threshold",
+    )
+
+    assert any("[Old tool result content cleared]" in str(msg.get("content")) for msg in out)
+    breakdown = c._last_compression_audit_record["cheap_tool_result_cleanup"]["post_cleanup_pipeline"]
+    provider_steps = breakdown["step_saved_estimates"]
+    storage_only = breakdown["storage_internal_step_saved_estimates"]
+    fields = breakdown["nonvisible_metadata_bound_field_saved_estimates"]
+
+    assert provider_steps["nonvisible_metadata_bound"] > 0
+    assert fields["provider_visible"]["tool_call_arguments"] > 0
+    assert fields["provider_visible"]["codex_reasoning_items"] == 0
+    assert fields["provider_visible"]["codex_message_items"] == 0
+    assert fields["provider_visible"]["reasoning"] == 0
+    assert fields["provider_visible"]["reasoning_content"] == 0
+    assert storage_only["nonvisible_metadata_bound"] > provider_steps["nonvisible_metadata_bound"]
+    assert fields["storage_internal"]["codex_reasoning_items"] > 0
+    assert fields["storage_internal"]["codex_message_items"] > 0
+    assert fields["storage_internal"]["reasoning"] > 0
+    assert fields["storage_internal"]["reasoning_content"] > 0
 
 
 def test_auto_cleanup_only_runs_when_tail_floor_leaves_no_summary_window(monkeypatch):

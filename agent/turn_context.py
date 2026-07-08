@@ -367,12 +367,33 @@ def build_turn_context(
         agent.context_compressor.protect_last_n,
         _preflight_gate_threshold,
     ):
-        _preflight_tokens = estimate_request_tokens_rough(
-            messages,
-            system_prompt=active_system_prompt or "",
-            tools=agent.tools or None,
-        )
         _compressor = agent.context_compressor
+        _estimate_request_tokens = getattr(
+            _compressor,
+            "estimate_provider_request_tokens",
+            None,
+        )
+        if callable(_estimate_request_tokens):
+            _estimated_value = _estimate_request_tokens(
+                messages,
+                system_prompt=active_system_prompt or "",
+                tools=agent.tools or None,
+            )
+            _preflight_tokens = (
+                int(_estimated_value)
+                if isinstance(_estimated_value, (int, float, str))
+                else estimate_request_tokens_rough(
+                    messages,
+                    system_prompt=active_system_prompt or "",
+                    tools=agent.tools or None,
+                )
+            )
+        else:
+            _preflight_tokens = estimate_request_tokens_rough(
+                messages,
+                system_prompt=active_system_prompt or "",
+                tools=agent.tools or None,
+            )
         _defer_preflight = getattr(
             _compressor,
             "should_defer_preflight_to_real_usage",
@@ -437,11 +458,27 @@ def build_turn_context(
                 # lower token count — e.g. summarising tool outputs) is
                 # recognised as progress instead of being misread as
                 # "Cannot compress further". Fixes #39548.
-                _preflight_tokens = estimate_request_tokens_rough(
-                    messages,
-                    system_prompt=active_system_prompt or "",
-                    tools=agent.tools or None,
-                )
+                if callable(_estimate_request_tokens):
+                    _estimated_value = _estimate_request_tokens(
+                        messages,
+                        system_prompt=active_system_prompt or "",
+                        tools=agent.tools or None,
+                    )
+                    _preflight_tokens = (
+                        int(_estimated_value)
+                        if isinstance(_estimated_value, (int, float, str))
+                        else estimate_request_tokens_rough(
+                            messages,
+                            system_prompt=active_system_prompt or "",
+                            tools=agent.tools or None,
+                        )
+                    )
+                else:
+                    _preflight_tokens = estimate_request_tokens_rough(
+                        messages,
+                        system_prompt=active_system_prompt or "",
+                        tools=agent.tools or None,
+                    )
                 if not _compression_made_progress(
                     _orig_len, len(messages), _orig_tokens, _preflight_tokens
                 ):

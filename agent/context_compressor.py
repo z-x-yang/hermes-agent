@@ -35,6 +35,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
+from utils import base_url_host_matches
 
 logger = logging.getLogger(__name__)
 
@@ -541,6 +542,257 @@ def _content_length_for_budget(raw_content: Any) -> int:
 def _model_consumes_thought_signature_for_budget(model: Any) -> bool:
     m = str(model or "").lower()
     return "gemini" in m or "gemma" in m
+
+
+def _api_mode_uses_codex_responses(api_mode: Any) -> bool:
+    return str(api_mode or "").strip().lower() == "codex_responses"
+
+
+def _provider_needs_reasoning_content_for_budget(
+    *,
+    provider: Any = "",
+    model: Any = "",
+    base_url: Any = "",
+) -> bool:
+    provider_s = str(provider or "").strip().lower()
+    model_s = str(model or "").strip().lower()
+    base_url_s = str(base_url or "").strip().lower()
+    return (
+        provider_s in {"deepseek", "kimi-coding", "kimi-coding-cn", "xiaomi"}
+        or "deepseek" in model_s
+        or "mimo" in model_s
+        or base_url_host_matches(base_url_s, "api.deepseek.com")
+        or base_url_host_matches(base_url_s, "api.kimi.com")
+        or base_url_host_matches(base_url_s, "moonshot.ai")
+        or base_url_host_matches(base_url_s, "moonshot.cn")
+        or base_url_host_matches(base_url_s, "api.xiaomimimo.com")
+        or base_url_host_matches(base_url_s, "xiaomimimo.com")
+    )
+
+
+def _sanitize_chat_tool_calls_for_estimate(
+    tool_calls: Any,
+    *,
+    model: Any = "",
+) -> Any:
+    if not isinstance(tool_calls, list):
+        return tool_calls
+    strip_keys = {"call_id", "response_item_id"}
+    if not _model_consumes_thought_signature_for_budget(model):
+        strip_keys.add("extra_content")
+    sanitized: list[Any] = []
+    for tc in tool_calls:
+        if isinstance(tc, dict):
+            sanitized.append({k: v for k, v in tc.items() if k not in strip_keys})
+        else:
+            sanitized.append(tc)
+    return sanitized
+
+
+def _chat_visible_message_for_estimate(
+    msg: dict,
+    *,
+    provider: Any = "",
+    model: Any = "",
+    base_url: Any = "",
+) -> dict:
+    """Approximate the Chat/Anthropic message shape that survives to provider input.
+
+    This intentionally excludes storage-only Hermes fields so compression
+    accounting does not treat DB/session metadata as model-context pressure.
+    """
+    if not isinstance(msg, dict):
+        return msg
+    working = _fresh_compaction_message_copy(msg)
+    needs_reasoning_content = _provider_needs_reasoning_content_for_budget(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+    )
+
+    if working.get("role") == "assistant":
+        if "tool_calls" in working:
+            working["tool_calls"] = _sanitize_chat_tool_calls_for_estimate(
+                working.get("tool_calls"),
+                model=model,
+            )
+        if needs_reasoning_content:
+            existing = working.get("reasoning_content")
+            if isinstance(existing, str):
+                working["reasoning_content"] = " " if existing == "" else existing
+            elif (
+                working.get("tool_calls")
+                and isinstance(working.get("reasoning"), str)
+                and working.get("reasoning")
+            ):
+                # Mirrors copy_reasoning_content_for_api: cross-provider
+                # tool-call history with only storage `reasoning` is replayed as
+                # a single-space pad, not as full reasoning text.
+                working["reasoning_content"] = " "
+            elif isinstance(working.get("reasoning"), str) and working.get("reasoning"):
+                working["reasoning_content"] = str(working["reasoning"])
+            else:
+                working["reasoning_content"] = " "
+        else:
+            working.pop("reasoning_content", None)
+
+    for key in [k for k in list(working) if isinstance(k, str) and k.startswith("_")]:
+        # _anthropic_content_blocks can still represent provider-visible image
+        # blocks for Anthropic conversion; keep it for the image estimator.
+        if key == "_anthropic_content_blocks":
+            continue
+        working.pop(key, None)
+    for key in (
+        "finish_reason",
+        "timestamp",
+        "tool_name",
+        "reasoning",
+        "codex_reasoning_items",
+        "codex_message_items",
+    ):
+        working.pop(key, None)
+    return working
+
+
+def _estimate_provider_visible_messages_tokens_rough(
+    messages: List[Dict[str, Any]],
+    *,
+    api_mode: Any = "",
+    provider: Any = "",
+    model: Any = "",
+    base_url: Any = "",
+) -> int:
+    """Roughly estimate only the message material that can reach provider input."""
+    if _api_mode_uses_codex_responses(api_mode):
+        try:
+            from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+            items = _chat_messages_to_responses_input(
+                messages,
+                replay_encrypted_reasoning=True,
+                current_issuer_kind=None,
+            )
+            return (len(str(items)) + 3) // _CHARS_PER_TOKEN
+        except Exception:
+            # Fall back to the conservative chat-shape estimator if the Responses
+            # converter is unavailable in a test/minimal runtime.
+            pass
+
+    visible = [
+        _chat_visible_message_for_estimate(
+            msg,
+            provider=provider,
+            model=model,
+            base_url=base_url,
+        )
+        for msg in messages
+    ]
+    return int(estimate_messages_tokens_rough(visible))
+
+
+def _estimate_provider_visible_request_tokens_rough(
+    messages: List[Dict[str, Any]],
+    *,
+    system_prompt: str = "",
+    tools: Optional[List[Dict[str, Any]]] = None,
+    api_mode: Any = "",
+    provider: Any = "",
+    model: Any = "",
+    base_url: Any = "",
+) -> int:
+    total = _estimate_provider_visible_messages_tokens_rough(
+        messages,
+        api_mode=api_mode,
+        provider=provider,
+        model=model,
+        base_url=base_url,
+    )
+    if system_prompt:
+        total += (len(system_prompt) + 3) // _CHARS_PER_TOKEN
+    if tools:
+        total += (len(str(tools)) + 3) // _CHARS_PER_TOKEN
+    return int(total)
+
+
+def _field_token_estimate(value: Any) -> int:
+    if value in (None, "", [], {}):
+        return 0
+    return (len(str(value)) + 3) // _CHARS_PER_TOKEN
+
+
+def _metadata_bound_field_saved_estimates(
+    before: List[Dict[str, Any]],
+    after: List[Dict[str, Any]],
+    *,
+    api_mode: Any = "",
+    provider: Any = "",
+    model: Any = "",
+    base_url: Any = "",
+) -> dict[str, dict[str, int]]:
+    """Classify metadata-bound savings by whether the field is provider-visible.
+
+    The totals are field-local approximations; the authoritative provider-visible
+    total for the step is the before/after provider-payload estimate.
+    """
+    keys = [
+        "codex_reasoning_items",
+        "codex_message_items",
+        "reasoning",
+        "reasoning_content",
+        "tool_call_arguments",
+    ]
+    out = {
+        "provider_visible": {key: 0 for key in keys},
+        "storage_internal": {key: 0 for key in keys},
+    }
+    codex_visible = _api_mode_uses_codex_responses(api_mode)
+    reasoning_content_visible = _provider_needs_reasoning_content_for_budget(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+    )
+
+    for old_msg, new_msg in zip(before, after):
+        if not isinstance(old_msg, dict) or not isinstance(new_msg, dict):
+            continue
+        if old_msg.get("role") != "assistant":
+            continue
+        for key in ("codex_reasoning_items", "codex_message_items"):
+            saved = max(
+                0,
+                _field_token_estimate(old_msg.get(key))
+                - _field_token_estimate(new_msg.get(key)),
+            )
+            bucket = "provider_visible" if codex_visible else "storage_internal"
+            out[bucket][key] += saved
+        saved_reasoning = max(
+            0,
+            _field_token_estimate(old_msg.get("reasoning"))
+            - _field_token_estimate(new_msg.get("reasoning")),
+        )
+        out["storage_internal"]["reasoning"] += saved_reasoning
+        saved_reasoning_content = max(
+            0,
+            _field_token_estimate(old_msg.get("reasoning_content"))
+            - _field_token_estimate(new_msg.get("reasoning_content")),
+        )
+        bucket = "provider_visible" if reasoning_content_visible else "storage_internal"
+        out[bucket]["reasoning_content"] += saved_reasoning_content
+
+        old_calls_raw = old_msg.get("tool_calls")
+        new_calls_raw = new_msg.get("tool_calls")
+        old_calls = old_calls_raw if isinstance(old_calls_raw, list) else []
+        new_calls = new_calls_raw if isinstance(new_calls_raw, list) else []
+        for old_tc, new_tc in zip(old_calls, new_calls):
+            if not isinstance(old_tc, dict) or not isinstance(new_tc, dict):
+                continue
+            old_args = (old_tc.get("function") or {}).get("arguments")
+            new_args = (new_tc.get("function") or {}).get("arguments")
+            out["provider_visible"]["tool_call_arguments"] += max(
+                0,
+                _field_token_estimate(old_args) - _field_token_estimate(new_args),
+            )
+    return out
 
 
 def _retained_provider_payload_message_for_budget(
@@ -1271,6 +1523,34 @@ class ContextCompressor(ContextEngine):
     def bind_summary_runtime_factory(self, factory: Any) -> None:
         """Bind a request-local main-runtime bridge used by append_cached summaries."""
         self._summary_runtime_factory = factory
+
+    def estimate_provider_messages_tokens(self, messages: List[Dict[str, Any]]) -> int:
+        """Estimate only provider-visible message payload for this compressor route."""
+        return _estimate_provider_visible_messages_tokens_rough(
+            messages,
+            api_mode=getattr(self, "api_mode", ""),
+            provider=getattr(self, "provider", ""),
+            model=getattr(self, "model", ""),
+            base_url=getattr(self, "base_url", ""),
+        )
+
+    def estimate_provider_request_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        system_prompt: str = "",
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> int:
+        """Estimate provider-visible request payload (messages + system + tools)."""
+        return _estimate_provider_visible_request_tokens_rough(
+            messages,
+            system_prompt=system_prompt,
+            tools=tools,
+            api_mode=getattr(self, "api_mode", ""),
+            provider=getattr(self, "provider", ""),
+            model=getattr(self, "model", ""),
+            base_url=getattr(self, "base_url", ""),
+        )
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
@@ -2156,10 +2436,99 @@ class ContextCompressor(ContextEngine):
             "token_threshold_and_message_count_hard_limit",
         }:
             return False
-        post_tokens = cleanup_result.post_tokens_estimate
-        if post_tokens is None:
-            return False
+        post_tokens = self.estimate_provider_messages_tokens(cleanup_result.messages)
         return int(post_tokens) < int(getattr(self, "threshold_tokens", 0) or 0)
+
+    def _run_cleanup_only_post_pipeline(
+        self,
+        *,
+        input_messages: List[Dict[str, Any]],
+        after_tool_result_cleanup_messages: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], dict[str, Any], int, int]:
+        """Run deterministic post-cleanup hygiene and return provider-visible audit.
+
+        The returned token estimates deliberately use provider-visible message
+        shapes, while raw_storage_* fields expose DB/internal shrinkage separately
+        so storage-only metadata cannot masquerade as context savings.
+        """
+        provider_est = self.estimate_provider_messages_tokens
+        storage_est = lambda msgs: int(estimate_messages_tokens_rough(msgs))
+
+        provider_input = int(provider_est(input_messages))
+        storage_input = int(storage_est(input_messages))
+        after_tool_provider = int(provider_est(after_tool_result_cleanup_messages))
+        after_tool_storage = int(storage_est(after_tool_result_cleanup_messages))
+
+        cheap_messages = self._sanitize_tool_pairs(after_tool_result_cleanup_messages)
+        after_tool_pair_provider = int(provider_est(cheap_messages))
+        after_tool_pair_storage = int(storage_est(cheap_messages))
+
+        cheap_messages = _strip_historical_media(cheap_messages)
+        after_media_provider = int(provider_est(cheap_messages))
+        after_media_storage = int(storage_est(cheap_messages))
+
+        before_metadata_bound = cheap_messages
+        cheap_messages, metadata_bounded = _bound_retained_nonvisible_metadata(cheap_messages)
+        after_metadata_provider = int(provider_est(cheap_messages))
+        after_metadata_storage = int(storage_est(cheap_messages))
+
+        _strip_persistence_markers(cheap_messages)
+        final_provider = int(provider_est(cheap_messages))
+        final_storage = int(storage_est(cheap_messages))
+
+        provider_steps = {
+            "tool_result_cleanup": max(0, provider_input - after_tool_provider),
+            "tool_pair_sanitize": max(0, after_tool_provider - after_tool_pair_provider),
+            "historical_media_strip": max(0, after_tool_pair_provider - after_media_provider),
+            "nonvisible_metadata_bound": max(0, after_media_provider - after_metadata_provider),
+            "persistence_marker_strip": max(0, after_metadata_provider - final_provider),
+        }
+        storage_steps = {
+            "tool_result_cleanup": max(0, storage_input - after_tool_storage),
+            "tool_pair_sanitize": max(0, after_tool_storage - after_tool_pair_storage),
+            "historical_media_strip": max(0, after_tool_pair_storage - after_media_storage),
+            "nonvisible_metadata_bound": max(0, after_media_storage - after_metadata_storage),
+            "persistence_marker_strip": max(0, after_metadata_storage - final_storage),
+        }
+        storage_internal_steps = {
+            key: max(0, storage_steps.get(key, 0) - provider_steps.get(key, 0))
+            for key in provider_steps
+        }
+        field_saved = _metadata_bound_field_saved_estimates(
+            before_metadata_bound,
+            cheap_messages,
+            api_mode=getattr(self, "api_mode", ""),
+            provider=getattr(self, "provider", ""),
+            model=getattr(self, "model", ""),
+            base_url=getattr(self, "base_url", ""),
+        )
+        audit = {
+            "estimate_scope": "provider_visible_messages",
+            "input_tokens_estimate": provider_input,
+            "after_tool_result_cleanup_tokens_estimate": after_tool_provider,
+            "after_tool_pair_sanitize_tokens_estimate": after_tool_pair_provider,
+            "after_historical_media_strip_tokens_estimate": after_media_provider,
+            "after_nonvisible_metadata_bound_tokens_estimate": after_metadata_provider,
+            "after_persistence_marker_strip_tokens_estimate": final_provider,
+            "metadata_bounded_count": int(metadata_bounded),
+            "total_saved_estimate": provider_input - final_provider,
+            "additional_saved_after_tool_result_cleanup_estimate": after_tool_provider - final_provider,
+            "step_saved_estimates": provider_steps,
+            "storage_internal_step_saved_estimates": storage_internal_steps,
+            "raw_storage_estimates": {
+                "input_tokens_estimate": storage_input,
+                "after_tool_result_cleanup_tokens_estimate": after_tool_storage,
+                "after_tool_pair_sanitize_tokens_estimate": after_tool_pair_storage,
+                "after_historical_media_strip_tokens_estimate": after_media_storage,
+                "after_nonvisible_metadata_bound_tokens_estimate": after_metadata_storage,
+                "after_persistence_marker_strip_tokens_estimate": final_storage,
+                "step_saved_estimates": storage_steps,
+                "total_saved_estimate": storage_input - final_storage,
+                "additional_saved_after_tool_result_cleanup_estimate": after_tool_storage - final_storage,
+            },
+            "nonvisible_metadata_bound_field_saved_estimates": field_saved,
+        }
+        return cheap_messages, audit, final_provider, int(metadata_bounded)
 
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
@@ -5142,7 +5511,12 @@ Use this exact structure:
         entrypoint = "manual" if force else "auto"
         n_messages = len(messages)
         original_messages = messages
-        display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
+        display_tokens = (
+            current_tokens
+            if current_tokens
+            else self.last_prompt_tokens
+            or self.estimate_provider_messages_tokens(messages)
+        )
         if trigger_reason is None:
             trigger_reason = (
                 "manual"
@@ -5223,47 +5597,22 @@ Use this exact structure:
                 focus_topic=focus_topic,
                 cleanup_result=empty_cleanup_result,
             ):
-                pipeline_input_tokens = int(display_tokens)
-                after_tool_result_cleanup = int(
-                    empty_cleanup_result.post_tokens_estimate
-                    if empty_cleanup_result.post_tokens_estimate is not None
-                    else estimate_messages_tokens_rough(empty_cleanup_result.messages)
+                cheap_messages, pipeline_audit, cheap_estimate, metadata_bounded = (
+                    self._run_cleanup_only_post_pipeline(
+                        input_messages=messages,
+                        after_tool_result_cleanup_messages=empty_cleanup_result.messages,
+                    )
                 )
-                cheap_messages = self._sanitize_tool_pairs(empty_cleanup_result.messages)
-                after_tool_pair_sanitize = int(estimate_messages_tokens_rough(cheap_messages))
-                cheap_messages = _strip_historical_media(cheap_messages)
-                after_historical_media_strip = int(estimate_messages_tokens_rough(cheap_messages))
-                cheap_messages, metadata_bounded = _bound_retained_nonvisible_metadata(cheap_messages)
-                after_nonvisible_metadata_bound = int(estimate_messages_tokens_rough(cheap_messages))
                 if metadata_bounded and not self.quiet_mode:
                     logger.info(
                         "Compression: bounded non-visible metadata on %d retained message(s)",
                         metadata_bounded,
                     )
-                _strip_persistence_markers(cheap_messages)
-                cheap_estimate = int(estimate_messages_tokens_rough(cheap_messages))
                 cheap_audit = dict(self._last_cheap_tool_cleanup_audit)
                 cheap_audit["result"] = "cheap_cleanup_only"
                 cheap_audit["llm_summary_skipped_after_cleanup"] = True
                 cheap_audit["llm_summary_ran_on_cleaned_view"] = False
-                cheap_audit["post_cleanup_pipeline"] = {
-                    "input_tokens_estimate": pipeline_input_tokens,
-                    "after_tool_result_cleanup_tokens_estimate": after_tool_result_cleanup,
-                    "after_tool_pair_sanitize_tokens_estimate": after_tool_pair_sanitize,
-                    "after_historical_media_strip_tokens_estimate": after_historical_media_strip,
-                    "after_nonvisible_metadata_bound_tokens_estimate": after_nonvisible_metadata_bound,
-                    "after_persistence_marker_strip_tokens_estimate": cheap_estimate,
-                    "metadata_bounded_count": int(metadata_bounded),
-                    "total_saved_estimate": pipeline_input_tokens - cheap_estimate,
-                    "additional_saved_after_tool_result_cleanup_estimate": after_tool_result_cleanup - cheap_estimate,
-                    "step_saved_estimates": {
-                        "tool_result_cleanup": max(0, pipeline_input_tokens - after_tool_result_cleanup),
-                        "tool_pair_sanitize": max(0, after_tool_result_cleanup - after_tool_pair_sanitize),
-                        "historical_media_strip": max(0, after_tool_pair_sanitize - after_historical_media_strip),
-                        "nonvisible_metadata_bound": max(0, after_historical_media_strip - after_nonvisible_metadata_bound),
-                        "persistence_marker_strip": max(0, after_nonvisible_metadata_bound - cheap_estimate),
-                    },
-                }
+                cheap_audit["post_cleanup_pipeline"] = pipeline_audit
                 self._last_cheap_tool_cleanup_audit = cheap_audit
                 retained_tail_output_count = max(0, n_messages - compress_end)
                 tail_output_start = max(0, len(cheap_messages) - retained_tail_output_count)
@@ -5408,47 +5757,22 @@ Use this exact structure:
             focus_topic=focus_topic,
             cleanup_result=cleanup_result,
         ):
-            pipeline_input_tokens = int(display_tokens)
-            after_tool_result_cleanup = int(
-                cleanup_result.post_tokens_estimate
-                if cleanup_result.post_tokens_estimate is not None
-                else estimate_messages_tokens_rough(messages)
+            cheap_messages, pipeline_audit, cheap_estimate, metadata_bounded = (
+                self._run_cleanup_only_post_pipeline(
+                    input_messages=original_messages,
+                    after_tool_result_cleanup_messages=messages,
+                )
             )
-            cheap_messages = self._sanitize_tool_pairs(messages)
-            after_tool_pair_sanitize = int(estimate_messages_tokens_rough(cheap_messages))
-            cheap_messages = _strip_historical_media(cheap_messages)
-            after_historical_media_strip = int(estimate_messages_tokens_rough(cheap_messages))
-            cheap_messages, metadata_bounded = _bound_retained_nonvisible_metadata(cheap_messages)
-            after_nonvisible_metadata_bound = int(estimate_messages_tokens_rough(cheap_messages))
             if metadata_bounded and not self.quiet_mode:
                 logger.info(
                     "Compression: bounded non-visible metadata on %d retained message(s)",
                     metadata_bounded,
                 )
-            _strip_persistence_markers(cheap_messages)
-            cheap_estimate = int(estimate_messages_tokens_rough(cheap_messages))
             cheap_audit = dict(self._last_cheap_tool_cleanup_audit)
             cheap_audit["result"] = "cheap_cleanup_only"
             cheap_audit["llm_summary_skipped_after_cleanup"] = True
             cheap_audit["llm_summary_ran_on_cleaned_view"] = False
-            cheap_audit["post_cleanup_pipeline"] = {
-                "input_tokens_estimate": pipeline_input_tokens,
-                "after_tool_result_cleanup_tokens_estimate": after_tool_result_cleanup,
-                "after_tool_pair_sanitize_tokens_estimate": after_tool_pair_sanitize,
-                "after_historical_media_strip_tokens_estimate": after_historical_media_strip,
-                "after_nonvisible_metadata_bound_tokens_estimate": after_nonvisible_metadata_bound,
-                "after_persistence_marker_strip_tokens_estimate": cheap_estimate,
-                "metadata_bounded_count": int(metadata_bounded),
-                "total_saved_estimate": pipeline_input_tokens - cheap_estimate,
-                "additional_saved_after_tool_result_cleanup_estimate": after_tool_result_cleanup - cheap_estimate,
-                "step_saved_estimates": {
-                    "tool_result_cleanup": max(0, pipeline_input_tokens - after_tool_result_cleanup),
-                    "tool_pair_sanitize": max(0, after_tool_result_cleanup - after_tool_pair_sanitize),
-                    "historical_media_strip": max(0, after_tool_pair_sanitize - after_historical_media_strip),
-                    "nonvisible_metadata_bound": max(0, after_historical_media_strip - after_nonvisible_metadata_bound),
-                    "persistence_marker_strip": max(0, after_nonvisible_metadata_bound - cheap_estimate),
-                },
-            }
+            cheap_audit["post_cleanup_pipeline"] = pipeline_audit
             self._last_cheap_tool_cleanup_audit = cheap_audit
             retained_tail_output_count = max(0, n_messages - compress_end)
             tail_output_start = max(0, len(cheap_messages) - retained_tail_output_count)

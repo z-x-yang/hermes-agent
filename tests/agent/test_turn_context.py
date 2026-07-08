@@ -474,7 +474,7 @@ def test_preflight_skips_when_persisted_cooldown_survives_restart(tmp_path):
     )
 
     with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
-         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
+         patch.object(agent.context_compressor, "estimate_provider_request_tokens", return_value=999_999):
         ctx = _build(agent)
 
     assert isinstance(ctx, TurnContext)
@@ -492,7 +492,7 @@ def test_preflight_still_runs_for_other_session_with_same_db(tmp_path):
     agent = _make_agent_with_cooldown(db_path, "sess-2")
 
     with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
-         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
+         patch.object(agent.context_compressor, "estimate_provider_request_tokens", return_value=999_999):
         ctx = _build(agent)
 
     assert isinstance(ctx, TurnContext)
@@ -508,7 +508,7 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     )
 
     with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
-         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
+         patch.object(agent.context_compressor, "estimate_provider_request_tokens", return_value=999_999):
         ctx = _build(agent)
 
     assert isinstance(ctx, TurnContext)
