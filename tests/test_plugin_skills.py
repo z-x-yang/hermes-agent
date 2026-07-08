@@ -195,6 +195,33 @@ class TestSkillViewQualifiedName:
         assert result["name"] == "superpowers:writing-plans"
         assert "writing-plans body." in result["content"]
 
+    def test_plugin_skill_lists_and_reads_linked_files(self, tmp_path):
+        from tools.skills_tool import skill_view
+
+        md = self._register_skill(tmp_path)
+        refs = md.parent / "references"
+        refs.mkdir()
+        (refs / "api.md").write_text("API details.\n")
+
+        main = json.loads(skill_view("superpowers:writing-plans"))
+        assert main["success"] is True
+        assert main["linked_files"]["references"] == ["references/api.md"]
+
+        linked = json.loads(skill_view("superpowers:writing-plans", file_path="references/api.md"))
+        assert linked["success"] is True
+        assert linked["name"] == "superpowers:writing-plans"
+        assert linked["file"] == "references/api.md"
+        assert linked["content"] == "API details.\n"
+
+    def test_plugin_skill_file_path_rejects_traversal(self, tmp_path):
+        from tools.skills_tool import skill_view
+
+        self._register_skill(tmp_path)
+        result = json.loads(skill_view("superpowers:writing-plans", file_path="../secret.md"))
+
+        assert result["success"] is False
+        assert "Path traversal" in result["error"]
+
     def test_invalid_namespace_returns_error(self, tmp_path):
         from tools.skills_tool import skill_view
 

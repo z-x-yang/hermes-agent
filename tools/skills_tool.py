@@ -757,15 +757,51 @@ def skills_list(category: str = None, task_id: str = None) -> str:
 # ── Plugin skill serving ──────────────────────────────────────────────────
 
 
+def _collect_skill_linked_files(skill_dir: Path) -> Dict[str, List[str]]:
+    """Return linked support files for a directory-based skill."""
+    linked_files: Dict[str, List[str]] = {}
+
+    references_dir = skill_dir / "references"
+    if references_dir.exists():
+        refs = sorted(str(f.relative_to(skill_dir)) for f in references_dir.glob("*.md"))
+        if refs:
+            linked_files["references"] = refs
+
+    templates_dir = skill_dir / "templates"
+    if templates_dir.exists():
+        templates: List[str] = []
+        for ext in ["*.md", "*.py", "*.yaml", "*.yml", "*.json", "*.tex", "*.sh"]:
+            templates.extend(str(f.relative_to(skill_dir)) for f in templates_dir.rglob(ext))
+        if templates:
+            linked_files["templates"] = sorted(templates)
+
+    assets_dir = skill_dir / "assets"
+    if assets_dir.exists():
+        assets = sorted(str(f.relative_to(skill_dir)) for f in assets_dir.rglob("*") if f.is_file())
+        if assets:
+            linked_files["assets"] = assets
+
+    scripts_dir = skill_dir / "scripts"
+    if scripts_dir.exists():
+        scripts: List[str] = []
+        for ext in ["*.py", "*.sh", "*.bash", "*.js", "*.ts", "*.rb"]:
+            scripts.extend(str(f.relative_to(skill_dir)) for f in scripts_dir.glob(ext))
+        if scripts:
+            linked_files["scripts"] = sorted(scripts)
+
+    return linked_files
+
+
 def _serve_plugin_skill(
     skill_md: Path,
     namespace: str,
     bare: str,
     *,
+    file_path: str | None = None,
     preprocess: bool = True,
     session_id: str | None = None,
 ) -> str:
-    """Read a plugin-provided skill, apply guards, return JSON."""
+    """Read a plugin-provided skill or linked support file, apply guards, return JSON."""
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
 
     if namespace in _get_disabled_plugins():
@@ -811,6 +847,75 @@ def _serve_plugin_skill(
             namespace, bare,
         )
 
+    skill_dir = skill_md.parent
+    if file_path:
+        from tools.path_security import has_traversal_component, validate_within_dir
+
+        if has_traversal_component(file_path):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "Path traversal ('..') is not allowed.",
+                    "hint": "Use a relative path within the skill directory",
+                },
+                ensure_ascii=False,
+            )
+
+        target_file = skill_dir / file_path
+        traversal_error = validate_within_dir(target_file, skill_dir)
+        if traversal_error:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": traversal_error,
+                    "hint": "Use a relative path within the skill directory",
+                },
+                ensure_ascii=False,
+            )
+        if not target_file.exists():
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"File '{file_path}' not found in skill '{namespace}:{bare}'.",
+                    "available_files": _collect_skill_linked_files(skill_dir),
+                    "hint": "Use one of the available file paths listed above",
+                },
+                ensure_ascii=False,
+            )
+
+        try:
+            linked_content = target_file.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return json.dumps(
+                {
+                    "success": True,
+                    "name": f"{namespace}:{bare}",
+                    "file": file_path,
+                    "content": f"[Binary file: {target_file.name}, size: {target_file.stat().st_size} bytes]",
+                    "is_binary": True,
+                },
+                ensure_ascii=False,
+            )
+        except Exception as e:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Failed to read file '{file_path}' in skill '{namespace}:{bare}': {e}",
+                },
+                ensure_ascii=False,
+            )
+
+        return json.dumps(
+            {
+                "success": True,
+                "name": f"{namespace}:{bare}",
+                "file": file_path,
+                "content": linked_content,
+                "file_type": target_file.suffix,
+            },
+            ensure_ascii=False,
+        )
+
     description = str(parsed_frontmatter.get("description", ""))
     if len(description) > MAX_DESCRIPTION_LENGTH:
         description = description[: MAX_DESCRIPTION_LENGTH - 3] + "..."
@@ -854,7 +959,7 @@ def _serve_plugin_skill(
             "name": f"{namespace}:{bare}",
             "content": f"{banner}{rendered_content}" if banner else rendered_content,
             "description": description,
-            "linked_files": None,
+            "linked_files": _collect_skill_linked_files(skill_md.parent),
             "readiness_status": SkillReadinessStatus.AVAILABLE.value,
         },
         ensure_ascii=False,
@@ -943,6 +1048,7 @@ def skill_view(
                     plugin_skill_md,
                     namespace,
                     bare,
+                    file_path=file_path,
                     preprocess=preprocess,
                     session_id=task_id,
                 )
