@@ -3942,33 +3942,39 @@ class ContextCompressor(ContextEngine):
         summary = str(previous_summary)
         section = cls._extract_all_user_messages_section(summary)
         if section:
+            previous_entries = cls._parse_previous_user_ledger_entries(summary)
             kept_entries = [
                 entry
-                for entry in cls._parse_previous_user_ledger_entries(summary)
+                for entry in previous_entries
                 if not cls._user_ledger_entry_matches_any_text(
                     str(entry.get("text") or ""),
                     disallowed,
                 )
             ]
-            rendered = cls._render_user_message_ledger(kept_entries) if kept_entries else "None."
-            heading_re = rf"(?m)^{re.escape(_USER_LEDGER_HEADING)}\s*$"
-            heading_match = next(
-                (
-                    match
-                    for match in re.finditer(heading_re, summary)
-                    if not cls._is_inside_fenced_code_block(summary, match.start())
-                ),
-                None,
-            )
-            if heading_match is not None:
-                body_start = heading_match.end()
-                body_end = len(summary)
-                for match in re.finditer(r"(?m)^## .+\s*$", summary[body_start:]):
-                    absolute = body_start + match.start()
-                    if not cls._is_inside_fenced_code_block(summary, absolute):
-                        body_end = absolute
-                        break
-                summary = summary[:body_start].rstrip() + "\n" + rendered + "\n" + summary[body_end:].lstrip("\n")
+            # Preserve byte-for-byte identity when no retained-tail entry was
+            # actually removed. Re-rendering an unchanged legacy ledger changes
+            # the previous-summary string and falsely makes a cached prefix look
+            # stale, causing the full summary to be embedded again.
+            if len(kept_entries) < len(previous_entries):
+                rendered = cls._render_user_message_ledger(kept_entries) if kept_entries else "None."
+                heading_re = rf"(?m)^{re.escape(_USER_LEDGER_HEADING)}\s*$"
+                heading_match = next(
+                    (
+                        match
+                        for match in re.finditer(heading_re, summary)
+                        if not cls._is_inside_fenced_code_block(summary, match.start())
+                    ),
+                    None,
+                )
+                if heading_match is not None:
+                    body_start = heading_match.end()
+                    body_end = len(summary)
+                    for match in re.finditer(r"(?m)^## .+\s*$", summary[body_start:]):
+                        absolute = body_start + match.start()
+                        if not cls._is_inside_fenced_code_block(summary, absolute):
+                            body_end = absolute
+                            break
+                    summary = summary[:body_start].rstrip() + "\n" + rendered + "\n" + summary[body_end:].lstrip("\n")
 
         for text in sorted(disallowed, key=len, reverse=True):
             if len(text.strip()) < 32:

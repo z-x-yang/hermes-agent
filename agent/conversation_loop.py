@@ -4878,11 +4878,13 @@ def run_conversation(
                     # inflate completion_tokens with reasoning,
                     # causing premature compression.  (#12026)
                     _real_tokens = _compressor.last_prompt_tokens
+                    _trigger_token_source = "provider_actual"
                 elif _compressor.last_prompt_tokens == -1:
                     # Compression just ran and no API-reported prompt count
                     # has arrived yet. Avoid treating a schema-heavy rough
                     # post-compression estimate as real context pressure.
                     _real_tokens = 0
+                    _trigger_token_source = "post_compression_sentinel"
                 else:
                     # Include tool schemas — with 50+ tools enabled
                     # these add 20-30K tokens the messages-only
@@ -4891,13 +4893,25 @@ def run_conversation(
                     _real_tokens = estimate_request_tokens_rough(
                         messages, tools=agent.tools or None
                     )
+                    _trigger_token_source = "rough_estimate_fallback"
 
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
+                    _compression_ctx = getattr(
+                        _compressor,
+                        "compression_context_length",
+                        _compressor.context_length,
+                    )
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
-                        approx_tokens=agent.context_compressor.last_prompt_tokens,
+                        approx_tokens=_real_tokens,
                         task_id=effective_task_id,
+                        trigger_reason="token_threshold",
+                        trigger_token_source=_trigger_token_source,
+                        trigger_tokens=_real_tokens,
+                        trigger_threshold_tokens=_compressor.threshold_tokens,
+                        trigger_context_length=_compression_ctx,
+                        trigger_message_count=len(messages),
                     )
                     conversation_history = conversation_history_after_compression(
                         agent, messages

@@ -4076,6 +4076,45 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_post_tool_provider_usage_compression_audits_internal_context_window(self, agent):
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+        compressor = agent.context_compressor
+        compressor.context_length = 1_000_000
+        compressor.compression_context_length = 272_000
+        compressor.threshold_tokens = 258_400
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[tc],
+            usage={"prompt_tokens": 280_000, "completion_tokens": 10, "total_tokens": 280_010},
+        )
+        resp2 = _mock_response(content="Done searching", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        def _compress_once(messages, system_message, **kwargs):
+            agent.compression_enabled = False
+            return messages, system_message
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_compress_context", side_effect=_compress_once) as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert result["final_response"] == "Done searching"
+        trigger = mock_compress.call_args.kwargs
+        assert trigger["trigger_reason"] == "token_threshold"
+        assert trigger["trigger_token_source"] == "provider_actual"
+        assert trigger["trigger_tokens"] == 280_000
+        assert trigger["trigger_threshold_tokens"] == 258_400
+        assert trigger["trigger_context_length"] == 272_000
+
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

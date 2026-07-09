@@ -345,6 +345,50 @@ def test_append_cached_does_not_reembed_previous_summary_when_visible_in_cached_
     assert request_audit["previous_summary_chars_in_instruction"] == 0
 
 
+def test_append_cached_keeps_unrelated_legacy_previous_summary_cache_visible():
+    runtime = CapturingRuntime()
+    with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+        compressor = ContextCompressor(
+            model="gpt-5.5",
+            quiet_mode=True,
+            summary_call_mode="append_cached",
+            append_cached_summary={"fallback_to_serialized_prompt": False},
+        )
+    compressor.bind_summary_runtime_factory(lambda: runtime)
+    previous_summary = (
+        "## Primary Request and Intent\n"
+        "LEGACY_PREVIOUS_SUMMARY_MUST_REMAIN_CACHE_VISIBLE\n\n"
+        "## All User Messages\n"
+        '1. "older compacted request" — prior user request.\n\n'
+        "## Pending Tasks\nContinue."
+    )
+    compressor._previous_summary = previous_summary
+    messages = [
+        {"role": "assistant", "content": f"[CONTEXT COMPACTION]\n{previous_summary}"},
+        {"role": "assistant", "content": "new delta to summarize"},
+        {
+            "role": "user",
+            "content": "an unrelated retained-tail user message that is absent from the previous summary",
+        },
+    ]
+
+    summary = compressor._generate_summary(
+        messages[1:2],
+        source_messages=messages,
+        summarize_start=1,
+        compress_end=2,
+        focus_topic=None,
+    )
+
+    assert summary is not None
+    assert runtime.captured_messages is not None
+    instruction = runtime.captured_messages[-1]["content"]
+    assert "LEGACY_PREVIOUS_SUMMARY_MUST_REMAIN_CACHE_VISIBLE" not in instruction
+    request_audit = compressor._last_summary_call_audit["request"]
+    assert request_audit["previous_summary_in_cached_prefix"] is True
+    assert request_audit["previous_summary_chars_in_instruction"] == 0
+
+
 def test_append_cached_request_uses_prefix_to_compress_end_and_excludes_tail_marker():
     runtime = CapturingRuntime()
     with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
