@@ -1,29 +1,20 @@
-"""Regression: compression must bound non-visible assistant metadata in the
-retained tail.
+"""Retained tail provider replay metadata is not a cheap-cleanup target.
 
-Background — session 20260625_203248_3e59f9 wedged at 227,110 tokens with
-"Cannot compress further" even though its *visible* content was small. The
-weight lived in non-visible provider metadata that the compressor copied into
-the protected tail verbatim and never bounded:
-
-    codex_reasoning_items : 412,828 chars   (encrypted reasoning replay)
-    tool_calls            : 154,482 chars   (assistant tool-call arguments)
-    reasoning             :  52,778 chars
-    reasoning_content     :  52,778 chars
-    codex_message_items   :  67,405 chars
-
-The pre-existing tail compaction pass only shrinks ``role=tool`` *result*
-bodies, so this metadata survived compression and kept every retried request
-over the provider's context window.
-
-These tests pin the tail boundary (mirroring TestTailToolOutputCompaction in
-test_context_compressor.py) so the assertions exercise the retained-tail
-handling deterministically, independent of the token-budget boundary math.
+Claude-like cheap cleanup only clears old eligible tool-result bodies.  It does
+not clear signed/encrypted reasoning replay, assistant message replay items, or
+assistant tool-call arguments.  Hermes used to run an extra Stage-1b hygiene pass
+after cleanup/compaction that bounded these fields; that saved storage-looking
+tokens but diverged from Claude Code and could remove provider-visible replay
+state.  These tests pin the boundary so retained-tail behavior is deterministic.
 """
 
 from unittest.mock import patch
 
-from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX
+from agent.context_compressor import (
+    ContextCompressor,
+    SUMMARY_PREFIX,
+    _estimate_msg_budget_tokens,
+)
 from agent.model_metadata import estimate_messages_tokens_rough
 
 
@@ -104,25 +95,33 @@ def _compress(c, msgs):
 
 
 class TestRetainedTailHiddenMetadata:
-    def test_drops_encrypted_reasoning_and_message_items_in_tail(self):
+    def test_tail_budget_counts_unbounded_replay_metadata(self):
+        msg = _heavy_assistant_tool_call("call_budget")
+
+        budget_tokens = _estimate_msg_budget_tokens(msg)
+
+        assert budget_tokens > 10_000
+
+    def test_preserves_encrypted_reasoning_and_message_items_in_tail(self):
         c = _make_compressor()
         result = _compress(c, _build_history())
 
+        seen_reasoning = False
+        seen_message_items = False
         for m in result:
             if m.get("role") == "assistant":
-                assert not m.get("codex_reasoning_items"), (
-                    "encrypted reasoning replay must not survive compression in the "
-                    "retained tail"
-                )
-                assert not m.get("codex_message_items")
+                if m.get("codex_reasoning_items"):
+                    seen_reasoning = True
+                if m.get("codex_message_items"):
+                    seen_message_items = True
+        assert seen_reasoning
+        assert seen_message_items
 
-    def test_bounds_reasoning_text_but_keeps_field_present(self):
-        """reasoning_content must stay present + non-empty (DeepSeek-v4 / Kimi /
-        Moonshot thinking-mode replay requires it) but lose its bulk."""
+    def test_preserves_reasoning_text_fields(self):
         c = _make_compressor()
         result = _compress(c, _build_history())
 
-        bounded_any = False
+        preserved_any = False
         for m in result:
             if m.get("role") != "assistant":
                 continue
@@ -131,13 +130,13 @@ class TestRetainedTailHiddenMetadata:
                 if v is None:
                     continue
                 assert isinstance(v, str)
-                assert len(v) < 8_000, f"{key} still carries its original bulk"
+                assert len(v) == 8_000
                 if key == "reasoning_content":
                     assert v.strip(), "reasoning_content must remain non-empty"
-                bounded_any = True
-        assert bounded_any, "expected the heavy tail reasoning fields to be bounded"
+                preserved_any = True
+        assert preserved_any, "expected the heavy tail reasoning fields to be retained"
 
-    def test_bounds_oversized_tool_args_but_preserves_id_and_name(self):
+    def test_preserves_oversized_tool_args_and_tool_pairing(self):
         c = _make_compressor()
         result = _compress(c, _build_history())
 
@@ -149,7 +148,7 @@ class TestRetainedTailHiddenMetadata:
                 tool_call_ids.add(tc["id"])
                 assert tc["function"]["name"] == "terminal"
                 args = tc["function"]["arguments"]
-                assert len(args) < 5_000, "oversized tool-call args must be bounded"
+                assert len(args) > 20_000
 
         # tool-result pairing stays valid: every tool result still has a
         # matching assistant tool_call id, and both heavy calls survive.
@@ -158,20 +157,17 @@ class TestRetainedTailHiddenMetadata:
             if m.get("role") == "tool":
                 assert m["tool_call_id"] in tool_call_ids
 
-    def test_compression_actually_frees_space(self):
+    def test_compression_does_not_claim_stage1b_storage_savings(self):
         c = _make_compressor()
         msgs = _build_history()
         pre = estimate_messages_tokens_rough(msgs)
         result = _compress(c, msgs)
         post = estimate_messages_tokens_rough(result)
 
-        # The retained tail held >400K chars of hidden metadata pre-fix; after
-        # bounding it the whole transcript must drop well under the model's
-        # compression threshold instead of staying pinned over budget.
-        assert post < pre // 4, (
-            f"compression freed too little space: {pre:,} -> {post:,} tokens"
+        assert post > pre // 2, (
+            "retained reasoning/tool-call replay metadata should remain in the "
+            f"rough storage estimate: {pre:,} -> {post:,} tokens"
         )
-        assert post < c.threshold_tokens
 
     def test_no_orphan_tool_results(self):
         """Bounding metadata must not break tool_call/tool_result structure."""
@@ -192,9 +188,8 @@ class TestRetainedTailHiddenMetadata:
 
 
 class TestEndToEndFreesSpaceWithRealBoundary:
-    """No pinned boundary — exercises the real tail-cut + assembly path so the
-    revert (always-a-compressible-middle) and the metadata bounding are verified
-    together against the wedge shape of session 20260625_203248_3e59f9."""
+    """No pinned boundary — exercises the real tail-cut + assembly path while
+    preserving provider replay metadata in retained assistant messages."""
 
     def _long_history(self, n_turns=14):
         msgs = [
@@ -218,15 +213,11 @@ class TestEndToEndFreesSpaceWithRealBoundary:
             result = c.compress(msgs, current_tokens=pre)
 
         post = estimate_messages_tokens_rough(result)
-        # Pre-fix this stayed pinned near `pre` (encrypted reasoning replay kept
-        # in the tail); the wedge fired because the request never dropped under
-        # the window. The fix must take it well under the compression threshold.
-        assert post < c.threshold_tokens
-        assert post < pre // 3
         # Progress signal the conversation loop relies on (len < original_len).
         assert len(result) < len(msgs)
-        # No encrypted reasoning replay survived anywhere in the result.
-        assert not any(
+        assert post > pre // 3
+        # Encrypted reasoning replay survives in retained assistant messages.
+        assert any(
             m.get("codex_reasoning_items") or m.get("codex_message_items")
             for m in result
             if m.get("role") == "assistant"

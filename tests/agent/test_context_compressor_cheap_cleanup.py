@@ -559,7 +559,7 @@ def test_audit_records_cleanup_block_for_disabled_feature():
     assert block["llm_summary_ran_on_cleaned_view"] is False
 
 
-def test_summary_source_uses_cleaned_tool_result_when_cleanup_applies(monkeypatch):
+def test_summary_source_stays_raw_when_cleanup_would_not_avoid_llm_summary(monkeypatch):
     cfg = CheapToolResultCleanupConfig(
         enabled=True,
         keep_recent=0,
@@ -591,19 +591,20 @@ def test_summary_source_uses_cleaned_tool_result_when_cleanup_applies(monkeypatc
     out = c.compress(messages, current_tokens=90_000, force=False, trigger_reason="token_threshold")
 
     serialized_turns = str(captured["turns"])
-    assert "RAW_TOOL_OUTPUT_SHOULD_NOT_REACH_SUMMARY" not in serialized_turns
-    assert "RAW_TOOL_OUTPUT_SHOULD_NOT_REACH_SUMMARY" not in captured["serialized"]
-    assert "[Old tool result content cleared]" in serialized_turns
-    assert "[Old tool result content cleared]" in captured["serialized"]
-    assert any("[Old tool result content cleared]" in str(msg.get("content")) for msg in out)
-    assert c._last_cheap_tool_cleanup_audit["applied"] is True
-    assert c._last_cheap_tool_cleanup_audit["result"] == "summary_on_cleaned_view"
-    assert c._last_cheap_tool_cleanup_audit["raw_tool_results_restored_for_summary"] is False
-    assert c._last_summary_source_audit["view"] == "cleaned_after_cheap_tool_result_cleanup"
-    assert c._last_summary_source_audit["raw_tool_results_restored_for_summary"] is False
+    assert "RAW_TOOL_OUTPUT_SHOULD_NOT_REACH_SUMMARY" in serialized_turns
+    assert "RAW_TOOL_OUTPUT_SHOULD_NOT_REACH_SUMMARY" in captured["serialized"]
+    assert "[Old tool result content cleared]" not in serialized_turns
+    assert "[Old tool result content cleared]" not in captured["serialized"]
+    assert not any("[Old tool result content cleared]" in str(msg.get("content")) for msg in out)
+    assert c._last_cheap_tool_cleanup_audit["applied"] is False
+    assert c._last_cheap_tool_cleanup_audit["would_have_applied"] is True
+    assert c._last_cheap_tool_cleanup_audit["result"] == "skipped_llm_summary_required"
+    assert c._last_cheap_tool_cleanup_audit["raw_tool_results_restored_for_summary"] is True
+    assert c._last_summary_source_audit["view"] == "raw"
+    assert c._last_summary_source_audit["raw_tool_results_restored_for_summary"] is None
 
 
-def test_audit_records_no_tail_clearing_after_applied_cleanup(monkeypatch):
+def test_audit_records_cleanup_deferred_when_summary_still_runs(monkeypatch):
     cfg = CheapToolResultCleanupConfig(
         enabled=True,
         keep_recent=0,
@@ -628,12 +629,14 @@ def test_audit_records_no_tail_clearing_after_applied_cleanup(monkeypatch):
 
     assert c._last_compression_audit_record is not None
     block = c._last_compression_audit_record["cheap_tool_result_cleanup"]
-    assert block["applied"] is True
-    assert block["result"] == "summary_on_cleaned_view"
+    assert block["applied"] is False
+    assert block["would_have_applied"] is True
+    assert block["result"] == "skipped_llm_summary_required"
     assert block["tail_tool_count"] == block["tail_tool_result_count"]
     assert block["tokens_saved"] == block["tokens_saved_estimate"]
     assert block["protected_tail_cleared_count"] == 0
-    assert block["raw_tool_results_restored_for_summary"] is False
+    assert block["raw_tool_results_restored_for_summary"] is True
+    assert block["llm_summary_ran_on_cleaned_view"] is False
 
 
 def test_cleanup_abort_preserves_raw_transcript_when_summary_generation_fails(monkeypatch):
@@ -670,9 +673,11 @@ def test_cleanup_abort_preserves_raw_transcript_when_summary_generation_fails(mo
     out = c.compress(messages, current_tokens=90_000, force=False, trigger_reason="token_threshold")
 
     summary_source = str(captured["turns"])
-    assert "[Old tool result content cleared]" in summary_source
-    assert "RAW_TOOL_OUTPUT_MUST_SURVIVE_ABORT" not in summary_source
-    assert c._last_cheap_tool_cleanup_audit["applied"] is True
+    assert "[Old tool result content cleared]" not in summary_source
+    assert "RAW_TOOL_OUTPUT_MUST_SURVIVE_ABORT" in summary_source
+    assert c._last_cheap_tool_cleanup_audit["applied"] is False
+    assert c._last_cheap_tool_cleanup_audit["would_have_applied"] is True
+    assert c._last_cheap_tool_cleanup_audit["result"] == "skipped_llm_summary_required"
     assert c._last_compress_aborted is True
     assert out is messages
     assert any("RAW_TOOL_OUTPUT_MUST_SURVIVE_ABORT" in str(msg.get("content")) for msg in out)
@@ -797,20 +802,11 @@ def test_auto_cleanup_only_skips_summary_when_below_threshold(monkeypatch):
     assert audit["result"] == "cheap_cleanup_only"
     assert audit["cheap_tool_result_cleanup"]["result"] == "cheap_cleanup_only"
     assert audit["cheap_tool_result_cleanup"]["llm_summary_skipped_after_cleanup"] is True
-    breakdown = audit["cheap_tool_result_cleanup"]["post_cleanup_pipeline"]
-    assert breakdown["estimate_scope"] == "provider_visible_messages"
-    assert breakdown["input_tokens_estimate"] <= audit["tokens"]["before_estimate"]
-    assert breakdown["after_tool_result_cleanup_tokens_estimate"] is not None
-    assert breakdown["after_persistence_marker_strip_tokens_estimate"] == audit["tokens"]["after_estimate"]
-    assert breakdown["total_saved_estimate"] == (
-        breakdown["input_tokens_estimate"]
-        - breakdown["after_persistence_marker_strip_tokens_estimate"]
-    )
-    assert breakdown["additional_saved_after_tool_result_cleanup_estimate"] >= 0
-    assert breakdown["step_saved_estimates"]["tool_result_cleanup"] >= 0
+    assert "post_cleanup_pipeline" not in audit["cheap_tool_result_cleanup"]
+    assert audit["tokens"]["after_estimate"] == c.estimate_provider_messages_tokens(out)
 
 
-def test_cleanup_only_audit_separates_provider_visible_from_storage_internal_metadata(monkeypatch):
+def test_cleanup_only_preserves_reasoning_replay_and_tool_call_arguments(monkeypatch):
     cfg = CheapToolResultCleanupConfig(
         enabled=True,
         keep_recent=0,
@@ -865,22 +861,18 @@ def test_cleanup_only_audit_separates_provider_visible_from_storage_internal_met
     )
 
     assert any("[Old tool result content cleared]" in str(msg.get("content")) for msg in out)
-    breakdown = c._last_compression_audit_record["cheap_tool_result_cleanup"]["post_cleanup_pipeline"]
-    provider_steps = breakdown["step_saved_estimates"]
-    storage_only = breakdown["storage_internal_step_saved_estimates"]
-    fields = breakdown["nonvisible_metadata_bound_field_saved_estimates"]
-
-    assert provider_steps["nonvisible_metadata_bound"] > 0
-    assert fields["provider_visible"]["tool_call_arguments"] > 0
-    assert fields["provider_visible"]["codex_reasoning_items"] == 0
-    assert fields["provider_visible"]["codex_message_items"] == 0
-    assert fields["provider_visible"]["reasoning"] == 0
-    assert fields["provider_visible"]["reasoning_content"] == 0
-    assert storage_only["nonvisible_metadata_bound"] > provider_steps["nonvisible_metadata_bound"]
-    assert fields["storage_internal"]["codex_reasoning_items"] > 0
-    assert fields["storage_internal"]["codex_message_items"] > 0
-    assert fields["storage_internal"]["reasoning"] > 0
-    assert fields["storage_internal"]["reasoning_content"] > 0
+    retained_assistant = next(
+        msg for msg in out
+        if isinstance(msg, dict) and msg.get("content") == "tail assistant with small visible text"
+    )
+    assert retained_assistant.get("codex_reasoning_items") is not None
+    assert retained_assistant.get("codex_message_items") is not None
+    assert retained_assistant["tool_calls"][0]["function"]["arguments"] == huge_args
+    assert retained_assistant["reasoning"] == "R" * 20_000
+    assert retained_assistant["reasoning_content"] == "C" * 20_000
+    assert retained_assistant["codex_reasoning_items"][0]["encrypted_content"] == "E" * 40_000
+    assert retained_assistant["codex_message_items"][0]["content"][0]["text"] == "M" * 8_000
+    assert "post_cleanup_pipeline" not in c._last_compression_audit_record["cheap_tool_result_cleanup"]
 
 
 def test_auto_cleanup_only_runs_when_tail_floor_leaves_no_summary_window(monkeypatch):
@@ -975,7 +967,8 @@ def test_hard_message_limit_triggers_do_not_use_cleanup_only(monkeypatch, trigge
     audit = c._last_compression_audit_record
     assert audit is not None
     assert audit["result"] != "cheap_cleanup_only"
-    assert audit["cheap_tool_result_cleanup"]["result"] == "summary_on_cleaned_view"
+    assert audit["cheap_tool_result_cleanup"]["result"] == "skipped_llm_summary_required"
+    assert audit["cheap_tool_result_cleanup"]["would_have_applied"] is True
     assert audit["cheap_tool_result_cleanup"]["llm_summary_skipped_after_cleanup"] is False
 
 
@@ -1027,13 +1020,14 @@ def test_manual_compress_resolves_missing_row_ids_to_persisted_handles(monkeypat
     c.compress(messages, current_tokens=80_000, force=True, trigger_reason="manual")
 
     persisted_uri = f"hermes://session/{session_id}/message/{persisted_tool_row['id']}"
-    assert persisted_uri in captured["serialized"]
-    assert "MANUAL_RAW_TOOL_OUTPUT_SHOULD_BE_HANDLE" not in captured["serialized"]
+    assert persisted_uri not in captured["serialized"]
+    assert "MANUAL_RAW_TOOL_OUTPUT_SHOULD_BE_HANDLE" in captured["serialized"]
     audit = c._last_compression_audit_record
     assert audit is not None
     assert audit["result"] != "cheap_cleanup_only"
     block = audit["cheap_tool_result_cleanup"]
-    assert block["result"] == "summary_on_cleaned_view"
+    assert block["result"] == "skipped_llm_summary_required"
+    assert block["would_have_applied"] is True
     assert block["replacement_counts"] == {"persisted_handle": 1, "sentinel": 0}
     assert block["sentinel_fallback_reasons"] == {}
-    assert block["raw_tool_results_restored_for_summary"] is False
+    assert block["raw_tool_results_restored_for_summary"] is True

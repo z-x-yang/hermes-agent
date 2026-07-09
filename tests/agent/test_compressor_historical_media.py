@@ -1,10 +1,9 @@
-"""Tests for post-compression historical-media stripping.
+"""Tests for historical-media stripping helpers and emergency guard.
 
-Port of Kilo-Org/kilocode#9434 (adapted for OpenAI-style message lists).
-Without this pass, tail messages keep their original multi-MB base-64 image
-payloads after context compression, and every subsequent request re-ships
-them — sometimes breaching provider body-size limits and wedging the
-session.
+The helper itself is retained for body-size emergencies.  It is not part of
+strict Claude-like cheap cleanup or default LLM compaction; normal compaction
+preserves retained user/context media unless the already-compacted transcript
+would keep re-shipping a multi-MB request body.
 """
 
 from __future__ import annotations
@@ -219,7 +218,7 @@ class TestStripHistoricalMedia:
 
 
 class TestCompressIntegration:
-    """Verify the stripping runs inside ContextCompressor.compress()."""
+    """Verify historical media stripping is not part of default compression."""
 
     @pytest.fixture
     def compressor(self):
@@ -233,7 +232,7 @@ class TestCompressIntegration:
             )
             return c
 
-    def test_compress_strips_historical_images(self, compressor):
+    def test_compress_preserves_retained_historical_images_by_default(self, compressor):
         # Enough messages to trigger the summarize path. protect_first_n=1 +
         # protect_last_n=2 + a middle window of at least 3 with a summary.
         msgs = [
@@ -251,16 +250,40 @@ class TestCompressIntegration:
         with patch.object(compressor, "_generate_summary", return_value="SUMMARY TEXT"):
             out = compressor.compress(msgs, current_tokens=60_000)
 
-        # Newest user turn with image should still have it (it's in the tail).
+        # Both retained image-bearing user turns survive by default: the helper
+        # remains available for an explicit emergency guard, but it is no longer
+        # part of Claude-like cheap cleanup or normal LLM compaction.
         user_imgs = [m for m in out if m.get("role") == "user" and _content_has_images(m.get("content"))]
-        assert len(user_imgs) == 1, (
-            "Expected exactly one user message with images after compression "
-            f"(the newest one); got {len(user_imgs)}"
+        assert len(user_imgs) == 2
+
+    def test_compress_strips_historical_images_only_as_body_emergency(
+        self, compressor, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "agent.context_compressor._COMPACTED_MEDIA_EMERGENCY_SERIALIZED_BYTES",
+            1_000,
         )
-        # No assistant or tool messages should carry images either.
-        for m in out:
-            if m is user_imgs[0]:
-                continue
-            assert not _content_has_images(m.get("content")), (
-                f"Stale image in {m.get('role')!r} message after compression"
-            )
+        big_img = {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64," + ("Z" * 2_000)},
+        }
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": [TEXT, big_img]},
+            {"role": "assistant", "content": "looked at it"},
+            {"role": "user", "content": "middle"},
+            {"role": "assistant", "content": "ack"},
+            {"role": "user", "content": "more"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": [TEXT, big_img]},
+            {"role": "assistant", "content": "done"},
+        ]
+        with patch.object(compressor, "_generate_summary", return_value="SUMMARY TEXT"):
+            out = compressor.compress(msgs, current_tokens=60_000)
+
+        user_imgs = [m for m in out if m.get("role") == "user" and _content_has_images(m.get("content"))]
+        assert len(user_imgs) == 1
+        guard = compressor._last_compression_audit_record["emergency_hygiene"]
+        assert guard["result"] == "applied"
+        assert guard["scope"] == "llm_compaction_emergency_only"
+        assert guard["bytes_saved_estimate"] > 0

@@ -291,6 +291,11 @@ _CLAUDE_CODE_CHEAP_CLEANUP_TOOL_NAMES = frozenset(
         "write_file",  # Claude Write
     }
 )
+# Separate LLM-compaction emergency guard for retained user/context media.
+# This is not part of Claude-like cheap cleanup; it only strips historical image
+# payloads when the already-compacted transcript would otherwise keep a multi-MB
+# request body alive.
+_COMPACTED_MEDIA_EMERGENCY_SERIALIZED_BYTES = 12 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -714,87 +719,6 @@ def _estimate_provider_visible_request_tokens_rough(
     return int(total)
 
 
-def _field_token_estimate(value: Any) -> int:
-    if value in (None, "", [], {}):
-        return 0
-    return (len(str(value)) + 3) // _CHARS_PER_TOKEN
-
-
-def _metadata_bound_field_saved_estimates(
-    before: List[Dict[str, Any]],
-    after: List[Dict[str, Any]],
-    *,
-    api_mode: Any = "",
-    provider: Any = "",
-    model: Any = "",
-    base_url: Any = "",
-) -> dict[str, dict[str, int]]:
-    """Classify metadata-bound savings by whether the field is provider-visible.
-
-    The totals are field-local approximations; the authoritative provider-visible
-    total for the step is the before/after provider-payload estimate.
-    """
-    keys = [
-        "codex_reasoning_items",
-        "codex_message_items",
-        "reasoning",
-        "reasoning_content",
-        "tool_call_arguments",
-    ]
-    out = {
-        "provider_visible": {key: 0 for key in keys},
-        "storage_internal": {key: 0 for key in keys},
-    }
-    codex_visible = _api_mode_uses_codex_responses(api_mode)
-    reasoning_content_visible = _provider_needs_reasoning_content_for_budget(
-        provider=provider,
-        model=model,
-        base_url=base_url,
-    )
-
-    for old_msg, new_msg in zip(before, after):
-        if not isinstance(old_msg, dict) or not isinstance(new_msg, dict):
-            continue
-        if old_msg.get("role") != "assistant":
-            continue
-        for key in ("codex_reasoning_items", "codex_message_items"):
-            saved = max(
-                0,
-                _field_token_estimate(old_msg.get(key))
-                - _field_token_estimate(new_msg.get(key)),
-            )
-            bucket = "provider_visible" if codex_visible else "storage_internal"
-            out[bucket][key] += saved
-        saved_reasoning = max(
-            0,
-            _field_token_estimate(old_msg.get("reasoning"))
-            - _field_token_estimate(new_msg.get("reasoning")),
-        )
-        out["storage_internal"]["reasoning"] += saved_reasoning
-        saved_reasoning_content = max(
-            0,
-            _field_token_estimate(old_msg.get("reasoning_content"))
-            - _field_token_estimate(new_msg.get("reasoning_content")),
-        )
-        bucket = "provider_visible" if reasoning_content_visible else "storage_internal"
-        out[bucket]["reasoning_content"] += saved_reasoning_content
-
-        old_calls_raw = old_msg.get("tool_calls")
-        new_calls_raw = new_msg.get("tool_calls")
-        old_calls = old_calls_raw if isinstance(old_calls_raw, list) else []
-        new_calls = new_calls_raw if isinstance(new_calls_raw, list) else []
-        for old_tc, new_tc in zip(old_calls, new_calls):
-            if not isinstance(old_tc, dict) or not isinstance(new_tc, dict):
-                continue
-            old_args = (old_tc.get("function") or {}).get("arguments")
-            new_args = (new_tc.get("function") or {}).get("arguments")
-            out["provider_visible"]["tool_call_arguments"] += max(
-                0,
-                _field_token_estimate(old_args) - _field_token_estimate(new_args),
-            )
-    return out
-
-
 def _retained_provider_payload_message_for_budget(
     msg: dict,
     *,
@@ -802,31 +726,15 @@ def _retained_provider_payload_message_for_budget(
 ) -> dict:
     """Return the retained-tail message shape we expect the next API call to carry.
 
-    Tail budgeting should be based on the payload that survives compression and
-    provider-facing request assembly, not on internal session-store metadata.  The
-    full request builder is provider-specific and lives on ``AIAgent``; the
-    compressor only needs the stable retained-message subset:
-
-    * Bound non-visible retained metadata exactly like ``compress()`` does before
-      persistence (Codex replay blobs, bulky reasoning text, oversized tool-call
-      arguments).
-    * Drop fields that the chat-completions/Responses request paths strip or use
-      only internally: persistence markers, timestamps, finish reasons, FTS-only
-      ``tool_name``, and storage-only ``reasoning``.
-    * Preserve provider-visible conversation payload: role/content, assistant
-      ``tool_calls`` with bounded JSON arguments, tool_call_id, and any
-      ``reasoning_content`` placeholder required by thinking providers.
+    Tail budgeting must not assume retained replay metadata will be stripped: in
+    strict Claude-like mode, signed/encrypted reasoning replay and full tool-call
+    arguments survive compaction.  Use a conservative retained-message shape so
+    the tail boundary is chosen against the payload we may actually keep.
     """
     if not isinstance(msg, dict):
         return msg
 
     working = _fresh_compaction_message_copy(msg)
-    try:
-        bounded, _bounded_count = _bound_retained_nonvisible_metadata([working])
-        if bounded and isinstance(bounded[0], dict):
-            working = dict(bounded[0])
-    except Exception:
-        working = dict(working)
 
     for key in [k for k in working if isinstance(k, str) and k.startswith("_")]:
         working.pop(key, None)
@@ -834,9 +742,6 @@ def _retained_provider_payload_message_for_budget(
         "finish_reason",
         "timestamp",
         "tool_name",
-        "reasoning",  # storage-only; request assembly promotes/strips separately
-        "codex_reasoning_items",
-        "codex_message_items",
     ):
         working.pop(key, None)
 
@@ -1156,16 +1061,70 @@ def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, An
     return result if changed else messages
 
 
+def _estimate_serialized_message_bytes(messages: List[Dict[str, Any]]) -> int:
+    try:
+        return len(
+            json.dumps(messages, ensure_ascii=False, separators=(",", ":"), default=str)
+        )
+    except Exception:
+        return len(str(messages).encode("utf-8", errors="replace"))
+
+
+def _strip_historical_media_emergency_if_needed(
+    messages: List[Dict[str, Any]],
+    *,
+    max_serialized_bytes: int | None = None,
+) -> tuple[List[Dict[str, Any]], dict[str, Any]]:
+    """Emergency-only body-size guard for already-compacted transcripts.
+
+    Strict Claude-like cheap cleanup does not strip user/context media.  This
+    guard is intentionally outside that stage: after an LLM summary has already
+    removed the middle, strip only historical image payloads if the retained
+    head/tail would still keep a multi-MB serialized request alive.  It never
+    touches reasoning/thinking replay or tool-call arguments.
+    """
+    if max_serialized_bytes is None:
+        max_serialized_bytes = _COMPACTED_MEDIA_EMERGENCY_SERIALIZED_BYTES
+    before = _estimate_serialized_message_bytes(messages)
+    audit = {
+        "name": "historical_media_request_body_guard",
+        "applied": False,
+        "threshold_bytes": int(max_serialized_bytes),
+        "before_serialized_bytes": int(before),
+        "after_serialized_bytes": int(before),
+        "bytes_saved_estimate": 0,
+        "scope": "llm_compaction_emergency_only",
+    }
+    if max_serialized_bytes <= 0 or before <= max_serialized_bytes:
+        audit["result"] = "not_needed"
+        return messages, audit
+
+    stripped = _strip_historical_media(messages)
+    if stripped is messages:
+        audit["result"] = "no_historical_media_to_strip"
+        return messages, audit
+
+    after = _estimate_serialized_message_bytes(stripped)
+    audit.update(
+        {
+            "applied": True,
+            "result": "applied",
+            "after_serialized_bytes": int(after),
+            "bytes_saved_estimate": max(0, int(before) - int(after)),
+        }
+    )
+    return stripped, audit
+
+
 def _bound_retained_nonvisible_metadata(
     messages: List[Dict[str, Any]],
 ) -> tuple[List[Dict[str, Any]], int]:
-    """Strip/bound bulky non-visible assistant metadata on retained messages.
+    """Legacy helper that bounds bulky retained assistant metadata.
 
-    Runs over the assembled compressed list (protected head + summary +
-    protected tail). The middle has already been replaced by the summary, so
-    this only touches messages kept verbatim *outside* the summarized region —
-    mirroring how Claude Code / Codex keep a lean post-compaction continuation
-    instead of carrying per-turn reasoning scratch forward.
+    This helper is intentionally *not* part of strict Claude-like cheap cleanup
+    and is no longer run by default LLM compaction: signed/encrypted reasoning
+    replay and tool-call arguments may be provider-visible continuation state and
+    should survive unless a caller explicitly opts into this lossy guard.
 
     For each retained assistant message:
 
@@ -1423,8 +1382,35 @@ class ContextCompressor(ContextEngine):
             "raw_tool_results_restored_for_summary": False,
             "llm_summary_skipped_after_cleanup": False,
             "llm_summary_ran_on_cleaned_view": False,
+            "would_have_applied": False,
             "cleared_tool_call_id_hashes": [],
         }
+
+    def _mark_cheap_cleanup_deferred_for_llm_summary(
+        self,
+        cleanup_result: CheapToolResultCleanupResult,
+        *,
+        reason: str = "skipped_llm_summary_required",
+    ) -> dict[str, Any]:
+        """Audit a strict Stage-1 cleanup that was not persisted.
+
+        Claude-like cheap cleanup is a separate deterministic relief stage.  If
+        that stage cannot avoid the LLM summary stage (or the entrypoint is
+        already an explicit summary request), the raw transcript must feed the
+        summarizer; otherwise old tool-result clearing mutates the append-cached
+        prefix and mixes Stage 1 into Stage 2.  Keep the would-have-cleared
+        counts for diagnostics, but mark the cleanup as not applied because the
+        returned transcript remains raw until LLM compaction assembles it.
+        """
+        audit = dict(cleanup_result.audit)
+        audit["would_have_applied"] = bool(cleanup_result.applied)
+        audit["applied"] = False
+        audit["result"] = reason
+        audit["summary_source_view"] = "raw"
+        audit["raw_tool_results_restored_for_summary"] = bool(cleanup_result.applied)
+        audit["llm_summary_skipped_after_cleanup"] = False
+        audit["llm_summary_ran_on_cleaned_view"] = False
+        return audit
 
     def _reset_cheap_tool_cleanup_audit(self) -> None:
         self._last_cheap_tool_cleanup_audit = self._empty_cheap_tool_cleanup_audit()
@@ -1440,6 +1426,7 @@ class ContextCompressor(ContextEngine):
         self._summary_failure_cooldown_error = None
         self._summary_skipped_for_cooldown = False
         self._last_summary_source_audit = {}
+        self._last_emergency_hygiene_audit = {}
         self._compression_audit_session_id = None
         self._last_compression_audit_record = None
         self._last_summary_user_message_ground_truth = None
@@ -1478,7 +1465,7 @@ class ContextCompressor(ContextEngine):
 
         Deliberately NOT cleared here (fork-only compression-audit sidecar):
         ``_compression_audit_session_id``, ``_last_summary_source_audit``,
-        ``_last_compression_audit_record``,
+        ``_last_compression_audit_record``, ``_last_emergency_hygiene_audit``,
         ``_last_summary_user_message_ground_truth``,
         ``_summary_failure_cooldown_error`` and ``_summary_skipped_for_cooldown``.
         The gateway can fire ``on_session_end`` while ``compress()`` is still
@@ -1892,6 +1879,7 @@ class ContextCompressor(ContextEngine):
         self._last_summary_fail_closed_reason: str | None = None
         self._compression_audit_session_id: Optional[str] = None
         self._last_compression_audit_record: dict[str, Any] | None = None
+        self._last_emergency_hygiene_audit: dict[str, Any] = {}
         # Verbatim real-user messages of the window the LLM just summarized —
         # ground truth for auditing the LLM-written ## All User Messages
         # section. Set only on LLM summary success; consumed by the sidecar
@@ -2438,97 +2426,6 @@ class ContextCompressor(ContextEngine):
             return False
         post_tokens = self.estimate_provider_messages_tokens(cleanup_result.messages)
         return int(post_tokens) < int(getattr(self, "threshold_tokens", 0) or 0)
-
-    def _run_cleanup_only_post_pipeline(
-        self,
-        *,
-        input_messages: List[Dict[str, Any]],
-        after_tool_result_cleanup_messages: List[Dict[str, Any]],
-    ) -> tuple[List[Dict[str, Any]], dict[str, Any], int, int]:
-        """Run deterministic post-cleanup hygiene and return provider-visible audit.
-
-        The returned token estimates deliberately use provider-visible message
-        shapes, while raw_storage_* fields expose DB/internal shrinkage separately
-        so storage-only metadata cannot masquerade as context savings.
-        """
-        provider_est = self.estimate_provider_messages_tokens
-        storage_est = lambda msgs: int(estimate_messages_tokens_rough(msgs))
-
-        provider_input = int(provider_est(input_messages))
-        storage_input = int(storage_est(input_messages))
-        after_tool_provider = int(provider_est(after_tool_result_cleanup_messages))
-        after_tool_storage = int(storage_est(after_tool_result_cleanup_messages))
-
-        cheap_messages = self._sanitize_tool_pairs(after_tool_result_cleanup_messages)
-        after_tool_pair_provider = int(provider_est(cheap_messages))
-        after_tool_pair_storage = int(storage_est(cheap_messages))
-
-        cheap_messages = _strip_historical_media(cheap_messages)
-        after_media_provider = int(provider_est(cheap_messages))
-        after_media_storage = int(storage_est(cheap_messages))
-
-        before_metadata_bound = cheap_messages
-        cheap_messages, metadata_bounded = _bound_retained_nonvisible_metadata(cheap_messages)
-        after_metadata_provider = int(provider_est(cheap_messages))
-        after_metadata_storage = int(storage_est(cheap_messages))
-
-        _strip_persistence_markers(cheap_messages)
-        final_provider = int(provider_est(cheap_messages))
-        final_storage = int(storage_est(cheap_messages))
-
-        provider_steps = {
-            "tool_result_cleanup": max(0, provider_input - after_tool_provider),
-            "tool_pair_sanitize": max(0, after_tool_provider - after_tool_pair_provider),
-            "historical_media_strip": max(0, after_tool_pair_provider - after_media_provider),
-            "nonvisible_metadata_bound": max(0, after_media_provider - after_metadata_provider),
-            "persistence_marker_strip": max(0, after_metadata_provider - final_provider),
-        }
-        storage_steps = {
-            "tool_result_cleanup": max(0, storage_input - after_tool_storage),
-            "tool_pair_sanitize": max(0, after_tool_storage - after_tool_pair_storage),
-            "historical_media_strip": max(0, after_tool_pair_storage - after_media_storage),
-            "nonvisible_metadata_bound": max(0, after_media_storage - after_metadata_storage),
-            "persistence_marker_strip": max(0, after_metadata_storage - final_storage),
-        }
-        storage_internal_steps = {
-            key: max(0, storage_steps.get(key, 0) - provider_steps.get(key, 0))
-            for key in provider_steps
-        }
-        field_saved = _metadata_bound_field_saved_estimates(
-            before_metadata_bound,
-            cheap_messages,
-            api_mode=getattr(self, "api_mode", ""),
-            provider=getattr(self, "provider", ""),
-            model=getattr(self, "model", ""),
-            base_url=getattr(self, "base_url", ""),
-        )
-        audit = {
-            "estimate_scope": "provider_visible_messages",
-            "input_tokens_estimate": provider_input,
-            "after_tool_result_cleanup_tokens_estimate": after_tool_provider,
-            "after_tool_pair_sanitize_tokens_estimate": after_tool_pair_provider,
-            "after_historical_media_strip_tokens_estimate": after_media_provider,
-            "after_nonvisible_metadata_bound_tokens_estimate": after_metadata_provider,
-            "after_persistence_marker_strip_tokens_estimate": final_provider,
-            "metadata_bounded_count": int(metadata_bounded),
-            "total_saved_estimate": provider_input - final_provider,
-            "additional_saved_after_tool_result_cleanup_estimate": after_tool_provider - final_provider,
-            "step_saved_estimates": provider_steps,
-            "storage_internal_step_saved_estimates": storage_internal_steps,
-            "raw_storage_estimates": {
-                "input_tokens_estimate": storage_input,
-                "after_tool_result_cleanup_tokens_estimate": after_tool_storage,
-                "after_tool_pair_sanitize_tokens_estimate": after_tool_pair_storage,
-                "after_historical_media_strip_tokens_estimate": after_media_storage,
-                "after_nonvisible_metadata_bound_tokens_estimate": after_metadata_storage,
-                "after_persistence_marker_strip_tokens_estimate": final_storage,
-                "step_saved_estimates": storage_steps,
-                "total_saved_estimate": storage_input - final_storage,
-                "additional_saved_after_tool_result_cleanup_estimate": after_tool_storage - final_storage,
-            },
-            "nonvisible_metadata_bound_field_saved_estimates": field_saved,
-        }
-        return cheap_messages, audit, final_provider, int(metadata_bounded)
 
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
@@ -3321,6 +3218,7 @@ class ContextCompressor(ContextEngine):
             "summary_source": dict(self._last_summary_source_audit or {}),
             "summary_call": dict(self._last_summary_call_audit or {}),
             "cheap_tool_result_cleanup": cheap_cleanup_audit,
+            "emergency_hygiene": dict(getattr(self, "_last_emergency_hygiene_audit", {}) or {}),
             "summary_dropped_count": int(self._last_summary_dropped_count or 0),
             "summary_fallback_used": bool(self._last_summary_fallback_used),
             "abort_reason": abort_reason,
@@ -5501,8 +5399,8 @@ Use this exact structure:
           2. Find tail boundary using continuation-payload token target plus a
              user/assistant message floor
           3. Summarize raw source turns with structured LLM prompt
-          4. Assemble head + summary + raw tail and bound retained non-visible
-             metadata before persistence
+          4. Assemble head + summary + raw tail; run only protocol/internal
+             sanitization plus an emergency historical-media body-size guard
           5. On re-compression, iteratively update the previous summary
 
         After compression, orphaned tool_call / tool_result pairs are cleaned
@@ -5527,6 +5425,7 @@ Use this exact structure:
         self._last_summary_sample = None
         self._last_summary_fail_closed_reason = None
         self._last_tail_boundary_audit = {}
+        self._last_emergency_hygiene_audit = {}
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._reset_cheap_tool_cleanup_audit()
@@ -5637,22 +5536,16 @@ Use this exact structure:
                 focus_topic=focus_topic,
                 cleanup_result=empty_cleanup_result,
             ):
-                cheap_messages, pipeline_audit, cheap_estimate, metadata_bounded = (
-                    self._run_cleanup_only_post_pipeline(
-                        input_messages=messages,
-                        after_tool_result_cleanup_messages=empty_cleanup_result.messages,
-                    )
-                )
-                if metadata_bounded and not self.quiet_mode:
-                    logger.info(
-                        "Compression: bounded non-visible metadata on %d retained message(s)",
-                        metadata_bounded,
-                    )
-                cheap_audit = dict(self._last_cheap_tool_cleanup_audit)
+                cheap_messages = [
+                    m.copy() if isinstance(m, dict) else m
+                    for m in empty_cleanup_result.messages
+                ]
+                _strip_persistence_markers(cheap_messages)
+                cheap_estimate = int(self.estimate_provider_messages_tokens(cheap_messages))
+                cheap_audit = dict(empty_cleanup_result.audit)
                 cheap_audit["result"] = "cheap_cleanup_only"
                 cheap_audit["llm_summary_skipped_after_cleanup"] = True
                 cheap_audit["llm_summary_ran_on_cleaned_view"] = False
-                cheap_audit["post_cleanup_pipeline"] = pipeline_audit
                 self._last_cheap_tool_cleanup_audit = cheap_audit
                 retained_tail_output_count = max(0, n_messages - compress_end)
                 tail_output_start = max(0, len(cheap_messages) - retained_tail_output_count)
@@ -5784,12 +5677,7 @@ Use this exact structure:
             compress_end=compress_end,
         )
         self._last_cheap_tool_cleanup_audit = dict(cleanup_result.audit)
-        if cleanup_result.applied:
-            messages = cleanup_result.messages
-            raw_messages = [m.copy() if isinstance(m, dict) else m for m in messages]
-            turns_to_summarize = raw_messages[summarize_start:compress_end]
-        else:
-            turns_to_summarize = list(turns_to_summarize)
+        turns_to_summarize = list(turns_to_summarize)
 
         if self._cheap_cleanup_only_allowed(
             entrypoint=entrypoint,
@@ -5797,22 +5685,16 @@ Use this exact structure:
             focus_topic=focus_topic,
             cleanup_result=cleanup_result,
         ):
-            cheap_messages, pipeline_audit, cheap_estimate, metadata_bounded = (
-                self._run_cleanup_only_post_pipeline(
-                    input_messages=original_messages,
-                    after_tool_result_cleanup_messages=messages,
-                )
-            )
-            if metadata_bounded and not self.quiet_mode:
-                logger.info(
-                    "Compression: bounded non-visible metadata on %d retained message(s)",
-                    metadata_bounded,
-                )
-            cheap_audit = dict(self._last_cheap_tool_cleanup_audit)
+            cheap_messages = [
+                m.copy() if isinstance(m, dict) else m
+                for m in cleanup_result.messages
+            ]
+            _strip_persistence_markers(cheap_messages)
+            cheap_estimate = int(self.estimate_provider_messages_tokens(cheap_messages))
+            cheap_audit = dict(cleanup_result.audit)
             cheap_audit["result"] = "cheap_cleanup_only"
             cheap_audit["llm_summary_skipped_after_cleanup"] = True
             cheap_audit["llm_summary_ran_on_cleaned_view"] = False
-            cheap_audit["post_cleanup_pipeline"] = pipeline_audit
             self._last_cheap_tool_cleanup_audit = cheap_audit
             retained_tail_output_count = max(0, n_messages - compress_end)
             tail_output_start = max(0, len(cheap_messages) - retained_tail_output_count)
@@ -5844,11 +5726,9 @@ Use this exact structure:
             return cheap_messages
 
         if cleanup_result.applied:
-            cleanup_audit = dict(self._last_cheap_tool_cleanup_audit)
-            cleanup_audit["result"] = "summary_on_cleaned_view"
-            cleanup_audit["llm_summary_skipped_after_cleanup"] = False
-            cleanup_audit["llm_summary_ran_on_cleaned_view"] = True
-            self._last_cheap_tool_cleanup_audit = cleanup_audit
+            self._last_cheap_tool_cleanup_audit = (
+                self._mark_cheap_cleanup_deferred_for_llm_summary(cleanup_result)
+            )
 
         if not self.quiet_mode:
             logger.info(
@@ -6138,29 +6018,9 @@ Use this exact structure:
         self.compression_count += 1
 
         compressed = self._sanitize_tool_pairs(compressed)
-
-        # Replace image parts in all compressed messages before the newest
-        # image-bearing user turn with a short text placeholder. Without
-        # this, tail messages keep their original multi-MB base-64 image
-        # payloads forever, which can push every subsequent API request
-        # past the provider's body-size limit and wedge the session.
-        # Port of Kilo-Org/kilocode#9434.
-        compressed = _strip_historical_media(compressed)
-
-        # Bound bulky non-visible assistant metadata (encrypted reasoning replay,
-        # chain-of-thought text, oversized tool-call args) on the messages kept
-        # verbatim outside the summarized middle. Without this the protected
-        # head/tail re-ships hundreds of KB of provider scratch on every request,
-        # so a session can stay over the context window even after the middle is
-        # summarized — the explicit-compress wedge in session
-        # 20260625_203248_3e59f9. Mirrors the lean post-compaction continuation
-        # Claude Code / Codex keep.
-        compressed, metadata_bounded = _bound_retained_nonvisible_metadata(compressed)
-        if metadata_bounded and not self.quiet_mode:
-            logger.info(
-                "Compression: bounded non-visible metadata on %d retained message(s)",
-                metadata_bounded,
-            )
+        compressed, self._last_emergency_hygiene_audit = (
+            _strip_historical_media_emergency_if_needed(compressed)
+        )
 
         retained_tail_output_count = max(
             0,
