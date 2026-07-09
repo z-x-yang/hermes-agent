@@ -1228,7 +1228,7 @@ class TestRetainedTailBudgeting:
         ]
         captured: dict[str, list[dict]] = {}
 
-        def fake_summary(turns, focus_topic=None):
+        def fake_summary(turns, focus_topic=None, **_kwargs):
             captured["turns"] = [m.copy() for m in turns]
             return f"{SUMMARY_PREFIX}\nsummary"
 
@@ -2065,7 +2065,7 @@ class TestCompressionAuditLog:
         ]
         records: list[dict] = []
 
-        def fake_summary(turns, focus_topic=None):
+        def fake_summary(turns, focus_topic=None, **_kwargs):
             c._last_summary_source_audit = {
                 "budget_chars": 180_000,
                 "raw_chars": 1234,
@@ -2473,6 +2473,84 @@ None."""
         assert "Your active task list was preserved" not in section
         assert "task3-verify" not in section
         assert "verify-commit-2" not in section
+
+    def test_previous_summary_user_ledger_drops_retained_tail_messages(self):
+        tail_text = "最新用户tail问题，需要留在retained tail里，不应该进入新的压缩摘要"
+        previous_summary = f"""## Primary Request and Intent
+Earlier state mentions the retained tail quote: {tail_text}
+
+## All User Messages
+1. “old compacted question” — old entry.
+2. “{tail_text}” — this user message is still retained verbatim.
+
+## Pending Tasks
+Continue."""
+        retained_tail = [
+            {"role": "assistant", "content": "answer before tail"},
+            {"role": "user", "content": tail_text},
+        ]
+
+        sanitized = ContextCompressor._sanitize_previous_summary_for_retained_tail_user_messages(
+            previous_summary,
+            retained_tail,
+        )
+
+        assert sanitized is not None
+        assert "old compacted question" in sanitized
+        assert tail_text not in sanitized
+        assert "retained tail user message omitted" in sanitized
+
+    def test_previous_summary_retained_tail_sanitizer_does_not_global_replace_short_text(self):
+        previous_summary = """## Primary Request and Intent
+ok appears in unrelated prose.
+
+## All User Messages
+1. “ok” — short retained-tail reply.
+2. “older question” — old entry.
+"""
+        retained_tail = [{"role": "user", "content": "ok"}]
+
+        sanitized = ContextCompressor._sanitize_previous_summary_for_retained_tail_user_messages(
+            previous_summary,
+            retained_tail,
+        )
+
+        assert sanitized is not None
+        assert "ok appears in unrelated prose" in sanitized
+        assert "older question" in sanitized
+        assert "“ok”" not in sanitized
+
+    def test_append_cached_instruction_omits_retained_tail_user_text_from_previous_summary(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+        tail_text = "tail-only request that is retained verbatim and must not enter the new summary"
+        c._previous_summary = f"""## Primary Request and Intent
+Latest user says: {tail_text}
+
+## All User Messages
+1. “{tail_text}” — should stay in retained tail only.
+"""
+        rules = c._build_summary_rules(
+            [{"role": "user", "content": "older summarized request"}],
+            summary_budget=1000,
+        )
+        previous_for_prompt = c._previous_summary_for_summary_prompt(
+            source_messages=[
+                {"role": "assistant", "content": "older assistant"},
+                {"role": "user", "content": "older summarized request"},
+                {"role": "user", "content": tail_text},
+            ],
+            compress_end=2,
+        )
+
+        instruction = c._build_append_cached_summary_instruction(
+            rules,
+            previous_summary=previous_for_prompt,
+        )
+
+        assert "older summarized request" not in previous_for_prompt
+        assert tail_text not in instruction
+        assert "retained tail user message omitted" in instruction
 
     def test_user_ledger_skips_sender_only_gateway_prefix_rows(self):
         turns = [

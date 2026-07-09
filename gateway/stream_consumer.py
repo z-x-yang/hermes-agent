@@ -34,7 +34,9 @@ from gateway.config import (
     DEFAULT_STREAMING_CURSOR as _DEFAULT_STREAMING_CURSOR,
 )
 from gateway.response_filters import (
+    is_context_compaction_response as _is_context_compaction_response,
     is_intentional_silence_response as _is_intentional_silence_response,
+    is_partial_context_compaction_response as _is_partial_context_compaction_response,
     is_partial_silence_marker as _is_partial_silence_marker,
 )
 
@@ -724,10 +726,21 @@ class GatewayStreamConsumer:
                     and not got_done
                     and not got_segment_break
                     and commentary_text is None
-                    and _is_partial_silence_marker(
-                        self._clean_for_display(self._accumulated)
+                    and (
+                        _is_partial_silence_marker(
+                            self._clean_for_display(self._accumulated)
+                        )
+                        or _is_partial_context_compaction_response(self._accumulated)
                     )
                 ):
+                    should_edit = False
+                if should_edit and self._accumulated and _is_context_compaction_response(self._accumulated):
+                    self._accumulated = ""
+                    self._last_sent_text = ""
+                    if got_done:
+                        self._final_response_sent = False
+                        self._final_content_delivered = False
+                        return
                     should_edit = False
                 if should_edit and self._accumulated:
                     # Split overflow: if accumulated text exceeds the platform
@@ -1047,6 +1060,8 @@ class GatewayStreamConsumer:
         stream finishes — we just need to hide the raw directives from the
         user.
         """
+        if _is_context_compaction_response(text):
+            return ""
         return _BasePlatformAdapter.strip_media_directives_for_display(text)
 
     async def _send_new_chunk(

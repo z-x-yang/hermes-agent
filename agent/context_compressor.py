@@ -3669,6 +3669,107 @@ class ContextCompressor(ContextEngine):
         kept, omitted_count = cls._cap_user_ledger_entries(entries)
         return cls._render_user_message_ledger(kept, omitted_count=omitted_count), kept, omitted_count
 
+    @classmethod
+    def _user_ledger_entry_matches_any_text(
+        cls,
+        entry_text: str,
+        candidate_texts: list[str],
+    ) -> bool:
+        entry = entry_text.strip()
+        if not entry:
+            return False
+        for candidate in candidate_texts:
+            text = candidate.strip()
+            if not text:
+                continue
+            if entry == text:
+                return True
+            if entry.startswith(f"“{text}”") or entry.startswith(f'"{text}"'):
+                return True
+            if entry.startswith(text) and (
+                len(entry) == len(text) or entry[len(text)] in {" ", "\n", "—", ":"}
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _sanitize_previous_summary_for_retained_tail_user_messages(
+        cls,
+        previous_summary: str | None,
+        retained_tail_messages: List[Dict[str, Any]],
+    ) -> str | None:
+        """Remove retained-tail user text from a previous summary before prompting.
+
+        The summary model should update only the compacted prefix; retained tail
+        messages remain verbatim after the new summary. If an older in-memory
+        previous summary already mentions a now-retained user turn, do not feed
+        that tail text back to the summarizer and duplicate it into the new
+        ``## All User Messages`` section.
+        """
+        if not previous_summary:
+            return previous_summary
+        disallowed = [
+            entry["text"]
+            for entry in cls._extract_current_user_ledger_entries(retained_tail_messages)
+        ]
+        disallowed = [text for text in disallowed if text]
+        if not disallowed:
+            return previous_summary
+
+        summary = str(previous_summary)
+        section = cls._extract_all_user_messages_section(summary)
+        if section:
+            kept_entries = [
+                entry
+                for entry in cls._parse_previous_user_ledger_entries(summary)
+                if not cls._user_ledger_entry_matches_any_text(
+                    str(entry.get("text") or ""),
+                    disallowed,
+                )
+            ]
+            rendered = cls._render_user_message_ledger(kept_entries) if kept_entries else "None."
+            heading_re = rf"(?m)^{re.escape(_USER_LEDGER_HEADING)}\s*$"
+            heading_match = next(
+                (
+                    match
+                    for match in re.finditer(heading_re, summary)
+                    if not cls._is_inside_fenced_code_block(summary, match.start())
+                ),
+                None,
+            )
+            if heading_match is not None:
+                body_start = heading_match.end()
+                body_end = len(summary)
+                for match in re.finditer(r"(?m)^## .+\s*$", summary[body_start:]):
+                    absolute = body_start + match.start()
+                    if not cls._is_inside_fenced_code_block(summary, absolute):
+                        body_end = absolute
+                        break
+                summary = summary[:body_start].rstrip() + "\n" + rendered + "\n" + summary[body_end:].lstrip("\n")
+
+        for text in sorted(disallowed, key=len, reverse=True):
+            if len(text.strip()) < 32:
+                continue
+            summary = summary.replace(
+                text,
+                "[retained tail user message omitted from previous summary]",
+            )
+        return summary
+
+    def _previous_summary_for_summary_prompt(
+        self,
+        *,
+        source_messages: Optional[List[Dict[str, Any]]] = None,
+        compress_end: Optional[int] = None,
+    ) -> str | None:
+        previous = self._previous_summary
+        if previous and source_messages is not None and compress_end is not None:
+            previous = self._sanitize_previous_summary_for_retained_tail_user_messages(
+                previous,
+                list(source_messages[int(compress_end):]),
+            )
+        return previous
+
     def _serialize_for_summary(self, turns: List[Dict[str, Any]]) -> str:
         """Serialize conversation turns into labeled text for the summarizer.
 
@@ -4187,10 +4288,11 @@ This compaction should PRIORITISE preserving all information related to the focu
         rules: SummaryRules,
         content_to_summarize: str,
         focus_topic: Optional[str] = None,
+        previous_summary: Optional[str] = None,
     ) -> str:
         """Build the legacy serialized-source summary prompt."""
-        if self._previous_summary:
-            previous_summary_for_prompt = self._previous_summary
+        previous_summary_for_prompt = previous_summary if previous_summary is not None else self._previous_summary
+        if previous_summary_for_prompt:
             prompt = f"""{rules.preamble}
 
 You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
@@ -4284,9 +4386,13 @@ Use this exact structure:
             AppendCachedSummaryConfig.normalized(None),
         )
         rules = self._build_summary_rules(turns_to_summarize, summary_budget)
+        previous_summary_for_prompt = self._previous_summary_for_summary_prompt(
+            source_messages=source_messages,
+            compress_end=compress_end,
+        )
         instruction = self._build_append_cached_summary_instruction(
             rules,
-            previous_summary=self._previous_summary,
+            previous_summary=previous_summary_for_prompt,
             focus_topic=focus_topic,
         )
         base_audit: dict[str, Any] = {
@@ -4540,6 +4646,10 @@ Use this exact structure:
             rules,
             content_to_summarize,
             focus_topic=focus_topic,
+            previous_summary=self._previous_summary_for_summary_prompt(
+                source_messages=source_messages,
+                compress_end=compress_end,
+            ),
         )
         self._last_summary_call_audit = {
             "mode": "serialized_prompt",
@@ -5767,6 +5877,9 @@ Use this exact structure:
             summary = self._generate_summary(
                 turns_to_summarize,
                 focus_topic=summary_focus_topic,
+                source_messages=messages,
+                summarize_start=summarize_start,
+                compress_end=compress_end,
             )
 
         # If summary generation failed, behavior splits on

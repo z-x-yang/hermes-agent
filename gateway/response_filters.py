@@ -22,6 +22,12 @@ LIVE_GATEWAY_SILENT_MARKERS = frozenset({
     "NO REPLY",
 })
 
+_CONTEXT_COMPACTION_BODY_MARKERS = (
+    "## Primary Request and Intent",
+    "## All User Messages",
+    "## Current Work",
+)
+
 
 def _canonical_silence_candidate(text: str) -> str:
     return " ".join(text.strip().upper().split())
@@ -51,6 +57,46 @@ def is_intentional_silence_agent_result(agent_result: dict | None, response: Any
     if agent_result.get("failed"):
         return False
     return is_intentional_silence_response(response)
+
+
+def is_context_compaction_response(response: Any) -> bool:
+    """Return True for internal context-compaction summaries.
+
+    These summaries are provider-visible recovery state, not a user-facing
+    assistant reply.  A live Discord incident showed that a compacted summary
+    can enter the normal streaming/final-delivery path either with the banner or
+    after a boundary stripped it, so detect both the explicit prefix and the
+    canonical nine-section body shape.
+    """
+    if not isinstance(response, str):
+        return False
+    text = response.strip()
+    if not text:
+        return False
+    if text.startswith("[CONTEXT COMPACTION"):
+        return True
+    if "--- END OF COMPACTED CONTEXT ---" not in text:
+        return False
+    head = text[:4096]
+    return all(marker in head or marker in text for marker in _CONTEXT_COMPACTION_BODY_MARKERS)
+
+
+def is_partial_context_compaction_response(response: Any) -> bool:
+    """Return True while a stream buffer still looks like a compaction summary.
+
+    Streaming paths may see only the leading ``## Primary Request and Intent``
+    body before the end marker arrives. Hold those buffers until completion, at
+    which point :func:`is_context_compaction_response` either suppresses the
+    internal summary or ordinary prose flushes normally.
+    """
+    if not isinstance(response, str):
+        return False
+    text = response.lstrip()
+    if not text:
+        return False
+    if text.startswith("[CONTEXT COMPACTION"):
+        return True
+    return text.startswith("## Primary Request and Intent")
 
 
 def is_partial_silence_marker(text: Any) -> bool:

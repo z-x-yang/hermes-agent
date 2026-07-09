@@ -68,6 +68,36 @@ def test_programmatic_surfaces_keep_raw_status():
         )
 
 
+def test_chat_final_response_suppresses_context_compaction_summary():
+    raw = (
+        "[CONTEXT COMPACTION] Earlier turns were compacted.\n"
+        "## Primary Request and Intent\n"
+        "Internal state.\n"
+        "## All User Messages\n"
+        "1. User asked.\n"
+        "## Current Work\n"
+        "Continue internally.\n"
+        "--- END OF COMPACTED CONTEXT ---"
+    )
+
+    assert _sanitize_gateway_final_response(Platform.DISCORD, raw) == ""
+
+
+def test_programmatic_final_response_keeps_context_compaction_for_debug():
+    raw = (
+        "[CONTEXT COMPACTION] Earlier turns were compacted.\n"
+        "## Primary Request and Intent\n"
+        "Internal state.\n"
+        "## All User Messages\n"
+        "1. User asked.\n"
+        "## Current Work\n"
+        "Continue internally.\n"
+        "--- END OF COMPACTED CONTEXT ---"
+    )
+
+    assert _sanitize_gateway_final_response("local", raw) == raw
+
+
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)
 @pytest.mark.parametrize("message", NOISY_STATUS_MESSAGES)
 def test_all_chat_gateways_suppress_noise(platform, message):

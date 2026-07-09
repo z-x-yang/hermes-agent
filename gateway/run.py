@@ -634,6 +634,13 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
         return text
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
+    try:
+        from gateway.response_filters import is_context_compaction_response
+
+        if is_context_compaction_response(redacted):
+            return ""
+    except Exception:
+        pass
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted

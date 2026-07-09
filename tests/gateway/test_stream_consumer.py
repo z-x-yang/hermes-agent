@@ -68,6 +68,23 @@ class TestCleanForDisplay:
         result = GatewayStreamConsumer._clean_for_display(text)
         assert result.strip() == ""
 
+    def test_context_compaction_summary_response_is_suppressed(self):
+        """Internal compaction summaries must never stream into chat."""
+        text = (
+            "[CONTEXT COMPACTION] Earlier turns were compacted.\n"
+            "## Primary Request and Intent\n"
+            "Internal state.\n"
+            "## All User Messages\n"
+            "1. User asked.\n"
+            "## Current Work\n"
+            "Internal continuation.\n"
+            "--- END OF COMPACTED CONTEXT ---"
+        )
+
+        result = GatewayStreamConsumer._clean_for_display(text)
+
+        assert result == ""
+
     def test_media_mid_sentence(self):
         """MEDIA: tag embedded in prose is stripped cleanly."""
         text = "I generated this image MEDIA:/tmp/art.png for you."
@@ -359,6 +376,33 @@ class TestStreamRunMediaStripping:
             assert "MEDIA:" not in sent_text, f"MEDIA: leaked into display: {sent_text!r}"
 
         assert consumer.already_sent
+
+    @pytest.mark.asyncio
+    async def test_stream_holds_and_suppresses_bannerless_compaction_summary(self):
+        """A bannerless compaction body must not leak in early stream edits."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="msg_1"))
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=20),
+        )
+        consumer.on_delta("## Primary Request and Intent\nInternal state.\n")
+        await asyncio.sleep(0.03)
+        consumer.on_delta("## All User Messages\n1. User asked.\n")
+        await asyncio.sleep(0.03)
+        consumer.on_delta("## Current Work\nInternal continuation.\n")
+        consumer.on_delta("--- END OF COMPACTED CONTEXT ---")
+        consumer.finish()
+
+        await consumer.run()
+
+        assert adapter.send.call_count == 0
+        assert adapter.edit_message.call_count == 0
+        assert not consumer.already_sent
 
 
 class TestBeforeFinalizeHook:
