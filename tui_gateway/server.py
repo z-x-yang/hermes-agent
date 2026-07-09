@@ -3096,7 +3096,11 @@ def _get_usage(agent) -> dict:
         last_prompt = getattr(comp, "last_prompt_tokens", 0) or 0
         if last_prompt < 0:
             last_prompt = 0
-        ctx_max = getattr(comp, "context_length", 0) or 0
+        ctx_max = getattr(
+            comp,
+            "compression_context_length",
+            getattr(comp, "context_length", 0),
+        ) or 0
         if ctx_max and last_prompt:
             usage["context_used"] = last_prompt
             usage["context_max"] = ctx_max
@@ -8653,6 +8657,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         agent, "_config_context_length", None
                     ),
                 )
+                _compressor = getattr(agent, "context_compressor", None)
+                if _compressor is not None:
+                    ctx_len = getattr(
+                        _compressor,
+                        "compression_context_length",
+                        getattr(_compressor, "context_length", ctx_len),
+                    ) or ctx_len
                 ctx = preprocess_context_references(
                     prompt,
                     cwd=cwd,

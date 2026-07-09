@@ -301,7 +301,10 @@ class TestSessionOps:
     def test_build_usage_update_for_zed_context_indicator(self, agent, mock_manager):
         state = mock_manager.create_session(cwd="/tmp")
         state.history = [{"role": "user", "content": "hello"}]
-        state.agent.context_compressor = MagicMock(context_length=100_000)
+        state.agent.context_compressor = MagicMock(
+            context_length=1_000_000,
+            compression_context_length=100_000,
+        )
         state.agent._cached_system_prompt = "system"
         state.agent.tools = [{"type": "function", "function": {"name": "demo"}}]
 
@@ -319,7 +322,10 @@ class TestSessionOps:
     @pytest.mark.asyncio
     async def test_send_usage_update_to_client(self, agent, mock_manager):
         state = mock_manager.create_session(cwd="/tmp")
-        state.agent.context_compressor = MagicMock(context_length=100_000)
+        state.agent.context_compressor = MagicMock(
+            context_length=1_000_000,
+            compression_context_length=100_000,
+        )
         mock_conn = MagicMock(spec=acp.Client)
         mock_conn.session_update = AsyncMock()
         agent._conn = mock_conn

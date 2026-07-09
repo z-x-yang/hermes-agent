@@ -4025,6 +4025,10 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
         model = "test/model"
         base_url = ""
         api_key = ""
+        context_compressor = types.SimpleNamespace(
+            context_length=1_000_000,
+            compression_context_length=272_000,
+        )
 
         def run_conversation(
             self, prompt, conversation_history=None, stream_callback=None
@@ -4042,16 +4046,18 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
         def start(self):
             self._target()
 
-    fake_ctx = types.ModuleType("agent.context_references")
-    fake_ctx.preprocess_context_references = (
-        lambda message, **kwargs: types.SimpleNamespace(
+    def _fake_preprocess(message, **kwargs):
+        captured["context_length"] = kwargs.get("context_length")
+        return types.SimpleNamespace(
             blocked=False,
             message="expanded prompt",
             warnings=[],
             references=[],
             injected_tokens=0,
         )
-    )
+
+    fake_ctx = types.ModuleType("agent.context_references")
+    fake_ctx.preprocess_context_references = _fake_preprocess
     fake_meta = types.ModuleType("agent.model_metadata")
     fake_meta.get_model_context_length = lambda *args, **kwargs: 100000
 
@@ -4072,6 +4078,7 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
     )
 
     assert captured["prompt"] == "expanded prompt"
+    assert captured["context_length"] == 272_000
 
 
 def test_image_attach_appends_local_image(monkeypatch):

@@ -27,13 +27,14 @@ import tui_gateway.server as server
 from tui_gateway.server import _session_info
 
 
-def _agent(reasoning_config):
+def _agent(reasoning_config, context_compressor=None):
     return SimpleNamespace(
         reasoning_config=reasoning_config,
         service_tier=None,
         model="glm-5",
         provider="zai",
         session_id="sess-key",
+        context_compressor=context_compressor,
     )
 
 
@@ -51,6 +52,17 @@ class TestSessionInfoReasoningEffort:
     def test_unset_reports_empty(self) -> None:
         info = _session_info(_agent(None))
         assert info["reasoning_effort"] == ""
+
+    def test_usage_context_max_uses_internal_context_window(self) -> None:
+        compressor = SimpleNamespace(
+            context_length=1_000_000,
+            compression_context_length=272_000,
+            last_prompt_tokens=73_918,
+            compression_count=0,
+        )
+        info = _session_info(_agent(None, context_compressor=compressor))
+        assert info["usage"]["context_used"] == 73_918
+        assert info["usage"]["context_max"] == 272_000
 
 
 class TestConfigSetReasoningSessionScope:

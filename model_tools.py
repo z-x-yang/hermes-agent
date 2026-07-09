@@ -565,13 +565,15 @@ def _compute_tool_definitions(
 
 
 def _resolve_active_context_length() -> int:
-    """Look up the active model's context length for the tool-search gate.
+    """Look up the active internal context length for the tool-search gate.
 
-    The gate must honor the same explicit config override used by the context
-    compressor.  Otherwise a provider-specific cap such as ``model.context_length:
-    272000`` can be ignored and broad catalog fallbacks (for example direct-API
-    GPT-5.5 at 1.05M) make the tool-search threshold so large that MCP schemas
-    stay fully visible.
+    Tool-search activation is a prompt/tool-schema budget decision, so it should
+    follow Hermes' compression window (``compression.internal_context_length``)
+    when configured, capped by the resolved provider/runtime context.  The
+    provider/runtime value remains relevant only as an upper bound; otherwise a
+    1M-route model would make the auto threshold so large that broad MCP schemas
+    stay fully visible even though Hermes will compress around the 272K internal
+    window.
 
     Returns 0 when the model can't be resolved — ``should_activate`` falls
     back to a fixed token cutoff in that case.
@@ -585,6 +587,14 @@ def _resolve_active_context_length() -> int:
         model_id = (model_cfg.get("model") or model_cfg.get("default") or "").strip()
         if not model_id:
             return 0
+
+        compression_cfg = (
+            cfg.get("compression")
+            if isinstance(cfg.get("compression"), dict)
+            else {}
+        )
+        if not isinstance(compression_cfg, dict):
+            compression_cfg = {}
 
         config_context_length = None
         raw_context_length = model_cfg.get("context_length")
@@ -600,13 +610,33 @@ def _resolve_active_context_length() -> int:
                     raw_context_length,
                 )
 
+        internal_context_length = None
+        raw_internal_context_length = compression_cfg.get(
+            "internal_context_length",
+            compression_cfg.get("trigger_context_length"),
+        )
+        if raw_internal_context_length is not None:
+            try:
+                parsed_internal_context_length = int(raw_internal_context_length)
+                if parsed_internal_context_length > 0:
+                    internal_context_length = parsed_internal_context_length
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid compression.internal_context_length for tool-search gate: %r — "
+                    "falling back to model context",
+                    raw_internal_context_length,
+                )
+
         from agent.model_metadata import get_model_context_length
-        return int(get_model_context_length(
+        runtime_context_length = int(get_model_context_length(
             model_id,
             base_url=str(model_cfg.get("base_url") or ""),
             config_context_length=config_context_length,
             provider=str(model_cfg.get("provider") or ""),
         ) or 0)
+        if internal_context_length and runtime_context_length:
+            return min(internal_context_length, runtime_context_length)
+        return internal_context_length or runtime_context_length
     except Exception as e:
         logger.debug("Could not resolve active context length: %s", e)
         return 0

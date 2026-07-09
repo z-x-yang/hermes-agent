@@ -419,7 +419,7 @@ def load_cli_config() -> Dict[str, Any]:
         },
         "compression": {
             "enabled": True,      # Auto-compress when approaching context limit
-            "threshold": 0.50,    # Compress at 50% of model's context limit
+            "threshold": 0.50,    # Compress at 50% of compression window
         },
         "agent": {
             "max_turns": 90,  # Default max tool-calling iterations (shared with subagents)
@@ -7821,7 +7821,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 config_context_length=getattr(self.agent, "_config_context_length", None) if self.agent else None,
             )
             if ctx:
-                _cprint(f"    Context: {ctx:,} tokens")
+                _cprint(f"    Runtime context: {ctx:,} tokens")
         except Exception:
             pass
         if mi:
@@ -8129,7 +8129,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             config_context_length=getattr(self.agent, "_config_context_length", None) if self.agent else None,
         )
         if ctx:
-            _cprint(f"    Context: {ctx:,} tokens")
+            _cprint(f"    Runtime context: {ctx:,} tokens")
         if mi:
             if mi.max_output:
                 _cprint(f"    Max output: {mi.max_output:,} tokens")
@@ -12058,8 +12058,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 from agent.context_references import preprocess_context_references
                 from agent.model_metadata import get_model_context_length
                 _ctx_len = get_model_context_length(
-                    self.model, base_url=self.base_url or "", api_key=self.api_key or "",
-                    config_context_length=getattr(self.agent, "_config_context_length", None) if self.agent else None)
+                    self.model,
+                    base_url=self.base_url or "",
+                    api_key=self.api_key or "",
+                    config_context_length=(
+                        getattr(self.agent, "_config_context_length", None)
+                        if self.agent
+                        else None
+                    ),
+                )
+                _compressor = (
+                    getattr(self.agent, "context_compressor", None)
+                    if self.agent
+                    else None
+                )
+                if _compressor is not None:
+                    _ctx_len = getattr(
+                        _compressor,
+                        "compression_context_length",
+                        getattr(_compressor, "context_length", _ctx_len),
+                    ) or _ctx_len
                 _ctx_result = preprocess_context_references(
                     message, cwd=os.getcwd(), context_length=_ctx_len)
                 if _ctx_result.expanded or _ctx_result.blocked:

@@ -55,8 +55,10 @@ model:
 
   # ── Token limits — two settings, easy to confuse ──────────────────────────
   #
-  # context_length: TOTAL context window (input + output tokens combined).
-  #   Controls when Hermes compresses history and validates requests.
+  # context_length: provider/runtime context window (input + output tokens combined).
+  #   Used for API request validation/preflight and true provider overflow checks.
+  #   It does NOT by itself control Hermes' compression trigger or status-window
+  #   percentages when compression.internal_context_length is configured.
   #   Leave unset — Hermes auto-detects the correct value from the provider.
   #   Set manually only when auto-detection is wrong (e.g. a local server with
   #   a custom num_ctx, or a proxy that doesn't expose /v1/models).
@@ -387,34 +389,43 @@ tool_loop_guardrails:
 # =============================================================================
 # Context Compression (Auto-shrinks long conversations)
 # =============================================================================
-# When conversation approaches model's context limit, middle turns are
+# When conversation approaches Hermes' compression window, middle turns are
 # automatically summarized to free up space while preserving important context.
+# The compression window defaults to the provider/runtime context, but can be
+# set independently with compression.internal_context_length for large-runtime
+# models where Hermes should still roll memory on a smaller internal budget.
 #
 # HOW IT WORKS:
 # 1. Tracks actual token usage from API responses (not estimates)
-# 2. When prompt_tokens >= threshold% of model's context_length, triggers compression
+# 2. When prompt_tokens >= threshold% of the compression window, triggers compression
 # 3. Protects first 3 turns (system prompt, initial request, first response)
 # 4. Protects last N turns (default 20 messages = ~10 full turns of recent context)
 # 5. Summarizes middle turns using a fast/cheap model
 # 6. Inserts summary as a user message, continues conversation seamlessly
 #
-# Post-compression tail budget is target_ratio × threshold × context_length:
-#   200K context, threshold 0.50, ratio 0.20 → 20K tokens of recent tail preserved
-#   1M   context, threshold 0.50, ratio 0.20 → 100K tokens of recent tail preserved
+# Post-compression tail budget is target_ratio × compression window:
+#   272K internal window, ratio 0.073529 → 20K tokens of recent tail preserved
+#   1M runtime model can still use a 272K internal window for rolling memory
 #
 compression:
   # Enable automatic context compression (default: true)
   # Set to false if you prefer to manage context manually or want errors on overflow
   enabled: true
   
-  # Trigger compression at this % of model's context limit (default: 0.50 = 50%)
+  # Trigger compression at this % of the compression window (default: 0.50 = 50%)
   # Lower values = more aggressive compression, higher values = compress later
   threshold: 0.50
+
+  # Optional internal Hermes compression/status/budget window. Leave unset to
+  # follow the provider/runtime context_length. Set when the provider supports a
+  # very large request window but Hermes should still compress and display usage
+  # against a smaller rolling-memory budget.
+  # internal_context_length: 272000
   
-  # Fraction of the threshold to preserve as recent tail (default: 0.20 = 20%)
-  # e.g. 20% of 50% threshold = 10% of total context kept as recent messages.
+  # Fraction of the compression window to preserve as recent tail (default: 0.20 = 20%)
+  # e.g. 272K internal window × 0.073529 ≈ 20K recent-tail tokens.
   # Summary output is separately capped at 12K tokens (Gemini output limit).
-  # Range: 0.10 - 0.80
+  # Range: 0.01 - 0.80
   target_ratio: 0.20
 
   # Number of most-recent messages to always preserve (default: 20 ≈ 10 full turns)

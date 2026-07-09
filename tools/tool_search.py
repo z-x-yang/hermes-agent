@@ -10,8 +10,8 @@ for the full rationale):
 * Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
   Always-load means always-load. No exceptions.
 * The threshold gate runs every assembly: when deferrable tools would consume
-  less than ``threshold_pct`` of the model's context window (default 10%),
-  tool search is a no-op and the tools array passes through unchanged.
+  less than ``threshold_pct`` of the active internal context window (default
+  10%), tool search is a no-op and the tools array passes through unchanged.
 * The catalog is stateless across turns and tools-array assemblies. It is
   rebuilt from the current tool-defs list every time. This is the lesson
   from OpenClaw's cron regression (openclaw/openclaw#84141): a session-keyed

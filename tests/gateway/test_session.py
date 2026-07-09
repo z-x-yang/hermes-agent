@@ -2,6 +2,7 @@
 import json
 import pytest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
 from gateway.platforms.base import MessageEvent
@@ -588,6 +589,47 @@ class TestSenderPrefixWithBackfill:
         assert "[Alice] [Bob]" not in result
         assert "[Alice] [Charlie" not in result
         assert "[Alice] [Recent" not in result
+
+    @pytest.mark.asyncio
+    async def test_gateway_context_refs_use_internal_context_window(self, runner, source, monkeypatch):
+        """Gateway @-reference expansion should budget against Hermes' internal window, not runtime."""
+        seen = {}
+
+        async def fake_get_model_context_length_async(*_args, **_kwargs):
+            return 1_000_000
+
+        async def fake_preprocess(message, *, cwd, context_length, allowed_root):
+            seen["message"] = message
+            seen["context_length"] = context_length
+            return SimpleNamespace(blocked=False, expanded=False, message=message, warnings=[])
+
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: {
+                "model": {"context_length": 1_000_000},
+                "compression": {"internal_context_length": 272_000},
+            },
+        )
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {"base_url": "", "api_key": ""},
+        )
+        monkeypatch.setattr(
+            "agent.model_metadata.get_model_context_length_async",
+            fake_get_model_context_length_async,
+        )
+        monkeypatch.setattr(
+            "agent.context_references.preprocess_context_references_async",
+            fake_preprocess,
+        )
+
+        event = MessageEvent(text="use @file:notes.md", source=source)
+        result = await runner._prepare_inbound_message_text(
+            event=event, source=source, history=[],
+        )
+
+        assert result == "[Alice] use @file:notes.md"
+        assert seen["context_length"] == 272_000
 
 
 class TestSessionStoreRewriteTranscript:

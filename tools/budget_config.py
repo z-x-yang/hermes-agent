@@ -67,8 +67,8 @@ DEFAULT_BUDGET = BudgetConfig()
 # rough 4-chars-per-token ratio the estimator uses (agent/model_metadata.py).
 _CHARS_PER_TOKEN: int = 4
 
-# Fraction of a model's context window we allow a SINGLE tool result to occupy
-# before persisting/truncating it, and the fraction the WHOLE turn's tool
+# Fraction of the active internal context window we allow a SINGLE tool result to
+# occupy before persisting/truncating it, and the fraction the WHOLE turn's tool
 # output may occupy. Tool output is not the only thing in the window (system
 # prompt, tool schemas, conversation history, the model's own reply all
 # compete), so these stay well under 1.0.
@@ -82,7 +82,7 @@ _MIN_TURN_BUDGET_CHARS: int = 16_000
 
 
 def budget_for_context_window(context_length: int | None) -> BudgetConfig:
-    """Return a BudgetConfig scaled to the active model's context window.
+    """Return a BudgetConfig scaled to the active internal context window.
 
     The fixed defaults (100K result / 200K turn chars) are correct for large
     (200K+ token) models but blind to small ones: on a 65K-token model a single

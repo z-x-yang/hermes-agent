@@ -10697,6 +10697,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _msg_cwd = os.environ.get("TERMINAL_CWD", os.path.expanduser("~"))
                 _msg_runtime = _resolve_runtime_agent_kwargs()
                 _msg_config_ctx = None
+                _msg_internal_ctx = None
                 try:
                     _msg_cfg = _load_gateway_config()
                     _msg_model_cfg = _msg_cfg.get("model", {})
@@ -10704,14 +10705,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _msg_raw_ctx = _msg_model_cfg.get("context_length")
                         if _msg_raw_ctx is not None:
                             _msg_config_ctx = int(_msg_raw_ctx)
+                    _msg_compression_cfg = _msg_cfg.get("compression", {})
+                    if isinstance(_msg_compression_cfg, dict):
+                        _msg_raw_internal_ctx = _msg_compression_cfg.get(
+                            "internal_context_length",
+                            _msg_compression_cfg.get("trigger_context_length"),
+                        )
+                        if _msg_raw_internal_ctx is not None:
+                            _msg_internal_ctx = int(_msg_raw_internal_ctx)
                 except Exception:
                     pass
-                _msg_ctx_len = await get_model_context_length_async(
+                _msg_runtime_ctx_len = await get_model_context_length_async(
                     self._model,
                     base_url=self._base_url or _msg_runtime.get("base_url") or "",
                     api_key=_msg_runtime.get("api_key") or "",
                     config_context_length=_msg_config_ctx,
                 )
+                _msg_ctx_len = _msg_runtime_ctx_len
+                if _msg_internal_ctx and _msg_internal_ctx > 0:
+                    _msg_ctx_len = (
+                        min(_msg_internal_ctx, _msg_runtime_ctx_len)
+                        if _msg_runtime_ctx_len
+                        else _msg_internal_ctx
+                    )
                 _ctx_result = await preprocess_context_references_async(
                     message_text,
                     cwd=_msg_cwd,

@@ -1685,7 +1685,11 @@ def _parent_summary_char_budget(parent_agent, n_summaries: int) -> Optional[int]
     """
     try:
         compressor = getattr(parent_agent, "context_compressor", None)
-        context_length = getattr(compressor, "context_length", None)
+        context_length = getattr(
+            compressor,
+            "compression_context_length",
+            getattr(compressor, "context_length", None),
+        )
         if not isinstance(context_length, int) or context_length <= 0:
             return None
 

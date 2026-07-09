@@ -16,14 +16,20 @@ import tools.delegate_tool as dt
 
 
 class _FakeCompressor:
-    def __init__(self, context_length, max_tokens):
+    def __init__(self, context_length, max_tokens, compression_context_length=None):
         self.context_length = context_length
+        if compression_context_length is not None:
+            self.compression_context_length = compression_context_length
         self.max_tokens = max_tokens
 
 
 class _FakeParent:
-    def __init__(self, context_length, used_tokens, max_tokens):
-        self.context_compressor = _FakeCompressor(context_length, max_tokens)
+    def __init__(self, context_length, used_tokens, max_tokens, compression_context_length=None):
+        self.context_compressor = _FakeCompressor(
+            context_length,
+            max_tokens,
+            compression_context_length=compression_context_length,
+        )
         self.session_prompt_tokens = used_tokens
 
 
@@ -79,6 +85,21 @@ def test_dynamic_budget_shrinks_as_batch_grows():
     assert c1 is not None and c5 is not None and c20 is not None
     # More children → smaller per-summary slice of the same headroom.
     assert c1 > c5 > c20
+
+
+def test_dynamic_budget_uses_internal_compression_window():
+    runtime_parent = _FakeParent(
+        context_length=1_000_000,
+        used_tokens=250_000,
+        max_tokens=8_000,
+        compression_context_length=272_000,
+    )
+    internal_budget = dt._parent_summary_char_budget(runtime_parent, 1)
+
+    matching_parent = _FakeParent(272_000, 250_000, 8_000)
+    matching_budget = dt._parent_summary_char_budget(matching_parent, 1)
+
+    assert internal_budget == matching_budget
 
 
 def test_floor_enforced_when_parent_over_budget():

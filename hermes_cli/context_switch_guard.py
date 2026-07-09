@@ -80,8 +80,11 @@ def merge_preflight_compression_warning(
     if cc is None:
         return
 
-    old_ctx = int(getattr(cc, "context_length", 0) or 0)
-    new_ctx = resolve_display_context_length(
+    old_runtime_ctx = int(getattr(cc, "context_length", 0) or 0)
+    old_compression_ctx = int(
+        getattr(cc, "compression_context_length", old_runtime_ctx) or old_runtime_ctx
+    )
+    new_runtime_ctx = resolve_display_context_length(
         result.new_model,
         result.target_provider,
         base_url=result.base_url or getattr(agent, "base_url", "") or "",
@@ -90,15 +93,16 @@ def merge_preflight_compression_warning(
         custom_providers=custom_providers,
         config_context_length=config_context_length,
     )
-    if not new_ctx:
+    if not new_runtime_ctx:
         return
+    new_compression_ctx = min(old_compression_ctx, new_runtime_ctx)
 
     estimate = _estimate_tokens(agent, messages)
     if estimate is None:
         return
 
     pct = float(getattr(cc, "threshold_percent", 0.5))
-    new_threshold = _threshold_tokens(new_ctx, pct)
+    new_threshold = _threshold_tokens(new_compression_ctx, pct)
     if estimate < new_threshold:
         return
 
@@ -106,13 +110,13 @@ def merge_preflight_compression_warning(
         return
 
     parts: list[str] = []
-    if old_ctx and new_ctx < old_ctx:
+    if old_runtime_ctx and new_runtime_ctx < old_runtime_ctx:
         parts.append(
-            f"Context window shrinks ({old_ctx:,} → {new_ctx:,}). "
+            f"Runtime context window shrinks ({old_runtime_ctx:,} → {new_runtime_ctx:,}). "
         )
     parts.append(
         f"Session is ~{estimate:,} tokens; "
-        f"{result.new_model} allows {new_ctx:,} "
+        f"{result.new_model} compression window is {new_compression_ctx:,} "
         f"(auto-compress at ~{new_threshold:,}). "
         f"Your next message will run preflight compression before the model replies."
     )

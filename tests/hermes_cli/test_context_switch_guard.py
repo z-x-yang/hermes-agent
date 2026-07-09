@@ -22,7 +22,12 @@ def _result(*, model: str = "small-model") -> ModelSwitchResult:
     )
 
 
-def _compressor(monkeypatch, *, context_length: int = 200_000):
+def _compressor(
+    monkeypatch,
+    *,
+    context_length: int = 200_000,
+    compression_context_length: int | None = None,
+):
     from agent.context_compressor import ContextCompressor
 
     monkeypatch.setattr(
@@ -36,6 +41,7 @@ def _compressor(monkeypatch, *, context_length: int = 200_000):
         protect_last_n=20,
         quiet_mode=True,
         config_context_length=context_length,
+        compression_context_length=compression_context_length,
     )
 
 
@@ -80,6 +86,34 @@ def test_warns_when_estimate_exceeds_new_threshold(monkeypatch):
     assert result.warning_message
     assert "preflight compression" in result.warning_message
     assert "shrinks" in result.warning_message
+
+
+def test_warns_against_internal_window_when_runtime_is_large(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.context_switch_guard.resolve_display_context_length",
+        lambda *a, **k: 1_000_000,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.context_switch_guard._estimate_tokens",
+        lambda *a, **k: 300_000,
+    )
+    cc = _compressor(
+        monkeypatch,
+        context_length=1_000_000,
+        compression_context_length=272_000,
+    )
+    agent = SimpleNamespace(
+        context_compressor=cc,
+        compression_enabled=True,
+        conversation_history=[],
+        base_url="",
+        api_key="",
+    )
+    result = _result(model="gpt-5.5")
+    merge_preflight_compression_warning(result, agent=agent)
+    assert result.warning_message
+    assert "preflight compression" in result.warning_message
+    assert "272,000" in result.warning_message
 
 
 def test_merge_appends_to_existing_warning(monkeypatch):

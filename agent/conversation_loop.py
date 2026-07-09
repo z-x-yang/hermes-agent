@@ -3210,7 +3210,11 @@ def run_conversation(
                             trigger_token_source="api_error_recovery",
                             trigger_tokens=approx_tokens,
                             trigger_threshold_tokens=getattr(compressor, "threshold_tokens", None),
-                            trigger_context_length=getattr(compressor, "context_length", None),
+                            trigger_context_length=getattr(
+                                compressor,
+                                "compression_context_length",
+                                getattr(compressor, "context_length", None),
+                            ),
                             trigger_message_count=len(messages),
                         )
                         conversation_history = conversation_history_after_compression(

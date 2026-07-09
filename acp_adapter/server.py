@@ -666,14 +666,19 @@ class HermesACPAgent(acp.Agent):
         """Build ACP native context-usage data for clients like Zed.
 
         Zed's circular context indicator is driven by ACP ``usage_update``
-        session updates: ``size`` is the model context window and ``used`` is
-        the current request pressure.  Hermes estimates ``used`` from the same
-        buckets it sends to providers: system prompt, conversation history, and
-        tool schemas.
+        session updates: ``size`` is Hermes' user-visible compression context
+        window. ``used`` is estimated from the same buckets Hermes sends to
+        providers: system prompt, conversation history, and tool schemas.
         """
         agent = state.agent
         compressor = getattr(agent, "context_compressor", None)
-        size = int(getattr(compressor, "context_length", 0) or 0)
+        size = int(
+            getattr(
+                compressor,
+                "compression_context_length",
+                getattr(compressor, "context_length", 0),
+            ) or 0
+        )
         if size <= 0:
             return None
 

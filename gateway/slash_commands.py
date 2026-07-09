@@ -599,9 +599,12 @@ class GatewaySlashCommandsMixin:
             try:
                 get_count = getattr(session_db, "get_session_compression_count", None)
                 if callable(get_count):
+                    _raw_count = get_count(session_entry.session_id)
+                    if inspect.isawaitable(_raw_count):
+                        _raw_count = await _raw_count
                     compression_count = max(
                         compression_count,
-                        _int_value(get_count(session_entry.session_id)),
+                        _int_value(_raw_count),
                     )
                 else:
                     compression_count = max(
@@ -1744,7 +1747,7 @@ class GatewaySlashCommandsMixin:
                             config_context_length=_sw_config_ctx,
                         )
                         if ctx:
-                            lines.append(t("gateway.model.context_label", tokens=f"{ctx:,}"))
+                            lines.append(f"Runtime context: {ctx:,} tokens")
                         if mi:
                             if mi.max_output:
                                 lines.append(t("gateway.model.max_output_label", tokens=f"{mi.max_output:,}"))
@@ -2001,7 +2004,7 @@ class GatewaySlashCommandsMixin:
                 config_context_length=_sw2_config_ctx,
             )
             if ctx:
-                lines.append(t("gateway.model.context_label", tokens=f"{ctx:,}"))
+                lines.append(f"Runtime context: {ctx:,} tokens")
             if mi:
                 if mi.max_output:
                     lines.append(t("gateway.model.max_output_label", tokens=f"{mi.max_output:,}"))
