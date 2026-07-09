@@ -74,6 +74,51 @@ logger = logging.getLogger(__name__)
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
+def _format_truncated_response_for_user(
+    agent,
+    *,
+    approx_tokens: Optional[int] = None,
+    finish_reason: Optional[str] = None,
+    has_tool_calls: bool = False,
+) -> str:
+    """Return an actionable user-facing message for incomplete model output.
+
+    The old bare string ("Response truncated due to output length limit")
+    misattributed high-context/tool-call truncation to a provider length cap.
+    Keep the fail-closed behavior, but tell the user what was protected and how
+    to recover.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    context_length = getattr(compressor, "context_length", None)
+    if not context_length:
+        context_length = getattr(agent, "_config_context_length", None)
+
+    context_note = ""
+    if isinstance(approx_tokens, (int, float)) and isinstance(context_length, (int, float)) and context_length > 0:
+        pct = max(0.0, min(float(approx_tokens) / float(context_length), 9.99))
+        if pct >= 0.90:
+            context_note = (
+                f" Current request context was {int(approx_tokens):,} / "
+                f"{int(context_length):,} tokens ({pct:.0%}), leaving too little "
+                "headroom for the next response/tool-call arguments."
+            )
+        else:
+            context_note = (
+                f" Current request context was {int(approx_tokens):,} / "
+                f"{int(context_length):,} tokens ({pct:.0%})."
+            )
+
+    tool_note = " The incomplete output included a tool call." if has_tool_calls else ""
+    finish_note = f" (finish_reason={finish_reason!r})" if finish_reason else ""
+    return (
+        "⚠️ Hermes stopped this turn safely because the model returned an "
+        f"incomplete response{finish_note}."
+        f"{context_note}{tool_note}\n\n"
+        "No partial tool call was executed. Run `/compress` and retry this step, "
+        "or start a fresh `/new` session and resume from the task ledger/artifacts."
+    )
+
+
 def _should_self_heal_persistent_overload(
     *,
     reason,
@@ -1960,7 +2005,12 @@ def run_conversation(
                                 "Stream repeatedly dropped mid tool-call (network); "
                                 "the tool was not executed"
                                 if _is_stub_stall
-                                else "Response truncated due to output length limit"
+                                else _format_truncated_response_for_user(
+                                    agent,
+                                    approx_tokens=approx_tokens,
+                                    finish_reason=finish_reason,
+                                    has_tool_calls=True,
+                                )
                             )
                             return {
                                 "final_response": _final_response,
@@ -1979,26 +2029,38 @@ def run_conversation(
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
 
+                        _final_response = _format_truncated_response_for_user(
+                            agent,
+                            approx_tokens=approx_tokens,
+                            finish_reason=finish_reason,
+                            has_tool_calls=_trunc_has_tool_calls,
+                        )
                         return {
-                            "final_response": "Response truncated due to output length limit",
+                            "final_response": _final_response,
                             "messages": rolled_back_messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
-                            "error": "Response truncated due to output length limit"
+                            "error": _final_response,
                         }
                     else:
                         # First message was truncated - mark as failed
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ First response truncated - cannot recover", force=True)
                         agent._persist_session(messages, conversation_history)
+                        _final_response = _format_truncated_response_for_user(
+                            agent,
+                            approx_tokens=approx_tokens,
+                            finish_reason=finish_reason,
+                            has_tool_calls=_trunc_has_tool_calls,
+                        )
                         return {
-                            "final_response": "First response truncated due to output length limit",
+                            "final_response": _final_response,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "failed": True,
-                            "error": "First response truncated due to output length limit"
+                            "error": _final_response,
                         }
                 
                 # Track actual token usage from response for context management
@@ -4535,13 +4597,19 @@ def run_conversation(
                         agent._invalid_json_retries = 0
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
+                        _final_response = _format_truncated_response_for_user(
+                            agent,
+                            approx_tokens=approx_tokens,
+                            finish_reason=finish_reason,
+                            has_tool_calls=True,
+                        )
                         return {
-                            "final_response": "Response truncated due to output length limit",
+                            "final_response": _final_response,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
-                            "error": "Response truncated due to output length limit",
+                            "error": _final_response,
                         }
 
                     # Track retries for invalid JSON arguments
