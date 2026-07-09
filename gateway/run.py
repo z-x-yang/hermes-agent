@@ -42,6 +42,7 @@ import time
 import sqlite3
 from collections import OrderedDict
 from contextvars import copy_context
+from copy import deepcopy
 from pathlib import Path
 from datetime import datetime
 from typing import Callable, Dict, Optional, Any, List, Union
@@ -98,6 +99,98 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
 _GATEWAY_RAW_TEXT_PLATFORMS = frozenset(
     {"local", "api_server", "webhook", "msgraph_webhook"}
 )
+
+_HYGIENE_COMPRESSION_MESSAGE_KEYS = (
+    "content",
+    "tool_calls",
+    "tool_call_id",
+    "tool_name",
+    "name",
+    "finish_reason",
+    "reasoning",
+    "reasoning_content",
+    "reasoning_details",
+    "codex_reasoning_items",
+    "codex_message_items",
+    "anthropic_content_blocks",
+    "_anthropic_content_blocks",
+)
+
+
+def _build_hygiene_compression_history(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return the replayable transcript shape for pre-turn Gateway hygiene compression.
+
+    This path runs before a Gateway turn starts.  It must preserve the same
+    provider-visible conversation rows that the normal main agent would replay:
+    assistant tool calls, tool results, and replay metadata are part of the cache
+    prefix and the summary source.  System prompts are rebuilt by the temporary
+    agent, not loaded from the transcript rows.
+    """
+    prepared: List[Dict[str, Any]] = []
+    for msg in history or []:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "system":
+            continue
+        if role not in {"user", "assistant", "tool"}:
+            continue
+
+        cleaned: Dict[str, Any] = {"role": role}
+        for key in _HYGIENE_COMPRESSION_MESSAGE_KEYS:
+            if key in msg and msg.get(key) is not None:
+                cleaned[key] = deepcopy(msg.get(key))
+
+        has_content = cleaned.get("content") not in (None, "", [])
+        has_tool_calls = bool(cleaned.get("tool_calls"))
+        has_tool_result_binding = role == "tool" and bool(cleaned.get("tool_call_id"))
+        has_replay_metadata = bool(
+            cleaned.get("codex_reasoning_items")
+            or cleaned.get("codex_message_items")
+            or cleaned.get("reasoning_details")
+        )
+        if not (has_content or has_tool_calls or has_tool_result_binding or has_replay_metadata):
+            continue
+        prepared.append(cleaned)
+    return prepared
+
+
+def _estimate_hygiene_compressed_request_tokens(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    *,
+    system_prompt: str = "",
+) -> int:
+    """Estimate the post-compression request, not just message-body tokens."""
+    compressor = getattr(agent, "context_compressor", None)
+    estimator = getattr(compressor, "estimate_provider_request_tokens", None)
+    tools = getattr(agent, "tools", None) or None
+    if callable(estimator):
+        try:
+            return int(
+                estimator(
+                    list(messages or []),
+                    system_prompt=system_prompt or "",
+                    tools=tools,
+                )
+            )
+        except Exception:
+            logger.debug("Gateway hygiene request-token estimate failed", exc_info=True)
+
+    try:
+        from agent.model_metadata import estimate_request_tokens_rough
+
+        return int(
+            estimate_request_tokens_rough(
+                list(messages or []),
+                system_prompt=system_prompt or "",
+                tools=tools,
+            )
+        )
+    except Exception:
+        from agent.model_metadata import estimate_messages_tokens_rough
+
+        return int(estimate_messages_tokens_rough(list(messages or [])))
 
 
 def _streamed_final_matches_response(stream_consumer: Any, final_response: str) -> bool:
@@ -11159,23 +11252,61 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
                         )
                         if _hyg_runtime.get("api_key"):
-                            _hyg_msgs = [
-                                {"role": m.get("role"), "content": m.get("content")}
-                                for m in history
-                                if m.get("role") in {"user", "assistant"}
-                                and m.get("content")
-                            ]
+                            _hyg_msgs = _build_hygiene_compression_history(history)
 
                             if len(_hyg_msgs) >= 4:
+                                _hyg_platform_key = _platform_config_key(source.platform)
+                                from hermes_cli.tools_config import _get_platform_tools
+
+                                _hyg_enabled_toolsets = sorted(
+                                    _get_platform_tools(_hyg_data, _hyg_platform_key)
+                                )
+                                _hyg_agent_cfg = _hyg_data.get("agent") or {}
+                                _hyg_disabled_toolsets = (
+                                    _hyg_agent_cfg.get("disabled_toolsets")
+                                    if isinstance(_hyg_agent_cfg, dict)
+                                    else None
+                                )
+                                _hyg_reasoning_config = self._resolve_session_reasoning_config(
+                                    source=source
+                                )
+                                self._reasoning_config = _hyg_reasoning_config
+                                self._service_tier = self._load_service_tier()
+                                _hyg_pr = getattr(self, "_provider_routing", {}) or {}
+                                _hyg_turn_route = self._resolve_turn_agent_config(
+                                    event.text or "",
+                                    _hyg_model,
+                                    _hyg_runtime,
+                                )
                                 _hyg_agent = AIAgent(
-                                    **_hyg_runtime,
-                                    model=_hyg_model,
+                                    model=_hyg_turn_route["model"],
+                                    **_hyg_turn_route["runtime"],
                                     max_iterations=4,
                                     quiet_mode=True,
-                                    skip_memory=True,
-                                    enabled_toolsets=["memory"],
+                                    verbose_logging=False,
+                                    enabled_toolsets=_hyg_enabled_toolsets,
+                                    disabled_toolsets=_hyg_disabled_toolsets,
+                                    reasoning_config=_hyg_reasoning_config,
+                                    service_tier=self._service_tier,
+                                    request_overrides=_hyg_turn_route.get("request_overrides"),
+                                    providers_allowed=_hyg_pr.get("only"),
+                                    providers_ignored=_hyg_pr.get("ignore"),
+                                    providers_order=_hyg_pr.get("order"),
+                                    provider_sort=_hyg_pr.get("sort"),
+                                    provider_require_parameters=_hyg_pr.get("require_parameters", False),
+                                    provider_data_collection=_hyg_pr.get("data_collection"),
                                     session_id=session_entry.session_id,
+                                    platform=_hyg_platform_key,
+                                    user_id=source.user_id,
+                                    user_id_alt=source.user_id_alt,
+                                    user_name=source.user_name,
+                                    chat_id=source.chat_id,
+                                    chat_name=source.chat_name,
+                                    chat_type=source.chat_type,
+                                    thread_id=source.thread_id,
+                                    gateway_session_key=session_key,
                                     session_db=getattr(self._session_db, "_db", self._session_db),
+                                    fallback_model=getattr(self, "_fallback_model", None),
                                 )
                                 try:
                                     # The hygiene agent rotates the session
@@ -11188,7 +11319,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_agent._print_fn = lambda *a, **kw: None
 
                                     loop = asyncio.get_running_loop()
-                                    _compressed, _ = await loop.run_in_executor(
+                                    _compressed, _hyg_new_system_prompt = await loop.run_in_executor(
                                         None,
                                         lambda: _hyg_agent._compress_context(
                                             _hyg_msgs, "",
@@ -11239,8 +11370,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         session_entry.last_prompt_tokens = 0
                                         history = _compressed
                                         _new_count = len(_compressed)
-                                        _new_tokens = estimate_messages_tokens_rough(
-                                            _compressed
+                                        _new_tokens = _estimate_hygiene_compressed_request_tokens(
+                                            _hyg_agent,
+                                            _compressed,
+                                            system_prompt=_hyg_new_system_prompt or "",
                                         )
                                     else:
                                         # No rewrite happened — transcript preserved
