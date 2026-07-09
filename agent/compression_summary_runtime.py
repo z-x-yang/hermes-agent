@@ -19,6 +19,8 @@ class SummaryRuntime:
     build_kwargs: Callable[[list[dict[str, Any]], int], dict[str, Any]]
     invoke: Callable[[dict[str, Any]], Any]
     estimate_request_tokens: Callable[[dict[str, Any]], int]
+    activate_fallback: Callable[[BaseException], bool] | None = None
+    fallback_attempt_budget: int = 0
 
 
 def make_summary_runtime(agent: Any) -> SummaryRuntime:
@@ -39,6 +41,31 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
     def _invoke(api_kwargs: dict[str, Any]) -> Any:
         return interruptible_api_call(agent, api_kwargs)
 
+    def _activate_fallback(exc: BaseException) -> bool:
+        activator = getattr(agent, "_try_activate_fallback", None)
+        if not callable(activator):
+            return False
+        reason = None
+        try:
+            from agent.error_classifier import classify_api_error
+
+            if isinstance(exc, Exception):
+                reason = classify_api_error(
+                    exc,
+                    provider=str(getattr(agent, "provider", "") or ""),
+                    model=str(getattr(agent, "model", "") or ""),
+                ).reason
+        except Exception:
+            reason = None
+        try:
+            return bool(activator(reason))
+        except Exception:
+            return False
+
+    fallback_chain = getattr(agent, "_fallback_chain", None) or []
+    fallback_index = int(getattr(agent, "_fallback_index", 0) or 0)
+    fallback_budget = max(0, len(fallback_chain) - fallback_index)
+
     return SummaryRuntime(
         provider=getattr(agent, "provider", "") or "",
         model=getattr(agent, "model", "") or "",
@@ -51,6 +78,8 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
         build_kwargs=_build_kwargs,
         invoke=_invoke,
         estimate_request_tokens=estimate_request_context_tokens,
+        activate_fallback=_activate_fallback,
+        fallback_attempt_budget=fallback_budget,
     )
 
 

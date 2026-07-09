@@ -160,6 +160,27 @@ def test_make_summary_runtime_forwards_ephemeral_output_tokens_to_codex_build_kw
     assert getattr(runtime, "main_api_calls_in_process") == 7
 
 
+def test_make_summary_runtime_exposes_agent_fallback_activation():
+    agent = FakeCodexAgentForSummaryRuntime()
+    setattr(agent, "_fallback_chain", [{"provider": "openrouter", "model": "fallback/model"}])
+    setattr(agent, "_fallback_index", 0)
+    seen_reasons: list[Any] = []
+
+    def _activate(reason: Any) -> bool:
+        seen_reasons.append(reason)
+        return True
+
+    setattr(agent, "_try_activate_fallback", _activate)
+    runtime = make_summary_runtime(agent)
+    exc = RuntimeError("HTTP 429: primary quota exhausted")
+    setattr(exc, "status_code", 429)
+
+    assert runtime.fallback_attempt_budget == 1
+    assert runtime.activate_fallback is not None
+    assert runtime.activate_fallback(exc) is True
+    assert seen_reasons
+
+
 def test_context_compressor_accepts_summary_call_mode_without_changing_default_behavior():
     with patch("agent.context_compressor.get_model_context_length", return_value=100000):
         compressor = ContextCompressor(model="test/model", quiet_mode=True)
@@ -311,6 +332,42 @@ class ToolChoiceRejectRuntime(CapturingRuntime):
         raise RuntimeError("unsupported parameter: tool_choice")
 
 
+class FailingFallbackActivatingRuntime(CapturingRuntime):
+    provider: str = "openai-codex"
+    model: str = "gpt-5.5"
+    api_mode: str = "codex_responses"
+    fallback_attempt_budget: int = 1
+
+    def __init__(self, **kwargs: Any) -> None:
+        fallback_attempt_budget = int(kwargs.pop("fallback_attempt_budget", self.fallback_attempt_budget))
+        super().__init__(**kwargs)
+        self.fallback_attempt_budget = fallback_attempt_budget
+        self.activate_calls: list[BaseException] = []
+
+    def invoke(self, api_kwargs: dict[str, Any]) -> Any:
+        exc = RuntimeError("HTTP 429: primary quota exhausted")
+        setattr(exc, "status_code", 429)
+        raise exc
+
+    def activate_fallback(self, exc: BaseException) -> bool:
+        self.activate_calls.append(exc)
+        return True
+
+
+class FallbackSummaryRuntime(CapturingRuntime):
+    provider: str = "openrouter"
+    model: str = "fallback/model"
+    api_mode: str = "chat_completions"
+
+    def invoke(self, api_kwargs: dict[str, Any]) -> Any:
+        self.captured_kwargs = dict(api_kwargs)
+        message = SimpleNamespace(
+            content="## Primary Request and Intent\nFallback summary worked.\n\n## Key Technical Concepts\nNone.\n\n## Files and Code Sections\nNone.\n\n## Errors and Fixes\nNone.\n\n## Problem Solving\nNone.\n\n## All User Messages\n1. \"old prefix\" — User supplied source content.\n\n## Pending Tasks\nNone.\n\n## Current Work\nFallback provider generated the append-cached summary.\n\n## Optional Next Step\nNone.",
+            tool_calls=None,
+        )
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=None)
+
+
 def test_append_cached_rejects_tool_call_response_without_silent_success():
     runtime = ToolCallRuntime()
     with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
@@ -373,6 +430,84 @@ def test_append_cached_tool_choice_rejection_has_specific_reason():
     )
     assert summary is None
     assert compressor._last_summary_call_audit["fallback_reason"] == "provider_rejected_tool_choice_none"
+
+
+def test_append_cached_transport_error_tries_provider_fallback_before_serialized_prompt():
+    primary_runtime = FailingFallbackActivatingRuntime()
+    fallback_runtime = FallbackSummaryRuntime(
+        provider="openrouter",
+        model="fallback/model",
+        api_mode="chat_completions",
+    )
+    runtimes = [primary_runtime, fallback_runtime]
+    with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+        compressor = ContextCompressor(
+            model="gpt-5.5",
+            quiet_mode=True,
+            summary_call_mode="append_cached",
+            append_cached_summary={"fallback_to_serialized_prompt": True},
+        )
+    compressor.bind_summary_runtime_factory(lambda: runtimes.pop(0))
+
+    with patch(
+        "agent.context_compressor.call_llm",
+        side_effect=AssertionError("serialized prompt fallback should not run"),
+    ) as serialized_call:
+        summary = compressor._generate_summary(
+            [{"role": "user", "content": "old prefix"}],
+            source_messages=[{"role": "user", "content": "old prefix"}],
+            summarize_start=0,
+            compress_end=1,
+            focus_topic=None,
+        )
+
+    assert summary is not None
+    assert "Fallback summary worked" in summary
+    assert primary_runtime.activate_calls
+    assert serialized_call.call_count == 0
+    assert fallback_runtime.captured_messages is not None
+    assert compressor._last_summary_call_audit["mode"] == "append_cached"
+    assert compressor._last_summary_call_audit["cache_key_runtime"]["provider"] == "openrouter"
+
+
+def test_append_cached_provider_fallback_honors_full_configured_chain():
+    failing_runtimes = [
+        FailingFallbackActivatingRuntime(fallback_attempt_budget=9)
+        for _ in range(9)
+    ]
+    fallback_runtime = FallbackSummaryRuntime(
+        provider="openrouter",
+        model="ninth-fallback/model",
+        api_mode="chat_completions",
+    )
+    runtimes = [*failing_runtimes, fallback_runtime]
+    with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+        compressor = ContextCompressor(
+            model="gpt-5.5",
+            quiet_mode=True,
+            summary_call_mode="append_cached",
+            append_cached_summary={"fallback_to_serialized_prompt": True},
+        )
+    compressor.bind_summary_runtime_factory(lambda: runtimes.pop(0))
+
+    with patch(
+        "agent.context_compressor.call_llm",
+        side_effect=AssertionError("serialized prompt fallback should not run"),
+    ):
+        summary = compressor._generate_summary(
+            [{"role": "user", "content": "old prefix"}],
+            source_messages=[{"role": "user", "content": "old prefix"}],
+            summarize_start=0,
+            compress_end=1,
+            focus_topic=None,
+        )
+
+    assert summary is not None
+    assert "Fallback summary worked" in summary
+    assert sum(len(runtime.activate_calls) for runtime in failing_runtimes) == 9
+    assert fallback_runtime.captured_messages is not None
+    assert compressor._last_summary_call_audit["cache_key_runtime"]["model"] == "ninth-fallback/model"
+
 
 def test_compression_audit_contains_summary_call_without_summary_text(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

@@ -4369,6 +4369,8 @@ Use this exact structure:
         summarize_start: int,
         compress_end: int,
         focus_topic: Optional[str],
+        _fallback_depth: int = 0,
+        _fallback_limit: Optional[int] = None,
     ) -> Optional[str]:
         """Generate a summary by appending a final instruction to provider-visible history."""
         from agent.compression_summary_runtime import (
@@ -4505,6 +4507,44 @@ Use this exact structure:
             else:
                 base_audit["fallback_reason"] = "append_cached_transport_error"
             self._last_summary_error = str(exc)
+
+            activate_fallback = getattr(runtime, "activate_fallback", None)
+            fallback_budget = int(getattr(runtime, "fallback_attempt_budget", 0) or 0)
+            fallback_limit = fallback_budget if _fallback_limit is None else int(_fallback_limit)
+            if (
+                base_audit["fallback_reason"] == "append_cached_transport_error"
+                and callable(activate_fallback)
+                and fallback_budget > 0
+                and _fallback_depth < fallback_limit
+            ):
+                failed_attempt = {
+                    "provider": base_audit["cache_key_runtime"].get("provider", ""),
+                    "model": base_audit["cache_key_runtime"].get("model", ""),
+                    "api_mode": base_audit["cache_key_runtime"].get("api_mode", ""),
+                    "fallback_reason": base_audit["fallback_reason"],
+                    "error_type": exc.__class__.__name__,
+                }
+                try:
+                    fallback_activated = bool(activate_fallback(exc))
+                except Exception:
+                    fallback_activated = False
+                if fallback_activated:
+                    summary = self._generate_summary_append_cached(
+                        source_messages=source_messages,
+                        turns_to_summarize=turns_to_summarize,
+                        summarize_start=summarize_start,
+                        compress_end=compress_end,
+                        focus_topic=focus_topic,
+                        _fallback_depth=_fallback_depth + 1,
+                        _fallback_limit=fallback_limit,
+                    )
+                    final_audit = self._last_summary_call_audit
+                    if isinstance(final_audit, dict):
+                        attempts = list(final_audit.get("provider_fallback_attempts") or [])
+                        final_audit["provider_fallback_attempts"] = [failed_attempt] + attempts
+                        final_audit["provider_fallback_activated"] = True
+                    return summary
+
             return None
 
     def _generate_summary(
