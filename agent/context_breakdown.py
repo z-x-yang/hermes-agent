@@ -126,7 +126,13 @@ def compute_session_context_breakdown(
     ]
 
     comp = getattr(agent, "context_compressor", None)
-    context_max = int(getattr(comp, "context_length", 0) or 0) if comp else 0
+    context_max = int(
+        getattr(
+            comp,
+            "compression_context_length",
+            getattr(comp, "context_length", 0),
+        ) or 0
+    ) if comp else 0
     measured_used = int(getattr(comp, "last_prompt_tokens", 0) or 0) if comp else 0
     if measured_used > 0:
         # ``last_prompt_tokens`` is the provider-observed request size that

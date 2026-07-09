@@ -12,6 +12,7 @@ def _make_agent(
     volatile: str = "timestamp line",
     tools: list | None = None,
     context_length: int = 200_000,
+    compression_context_length: int | None = None,
     last_prompt_tokens: int = 0,
 ):
     agent = MagicMock()
@@ -26,6 +27,11 @@ def _make_agent(
     agent._user_profile_enabled = True
     agent.context_compressor = MagicMock(
         context_length=context_length,
+        compression_context_length=(
+            compression_context_length
+            if compression_context_length is not None
+            else context_length
+        ),
         last_prompt_tokens=last_prompt_tokens,
     )
     return agent, {"stable": stable, "context": context, "volatile": volatile}
@@ -58,6 +64,20 @@ def test_breakdown_uses_measured_context_when_available():
 
     assert data["context_used"] == 42_000
     assert data["context_percent"] == 21
+
+
+def test_breakdown_uses_internal_context_window():
+    agent, parts = _make_agent(
+        context_length=1_000_000,
+        compression_context_length=272_000,
+        last_prompt_tokens=68_000,
+    )
+
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        data = compute_session_context_breakdown(agent, [])
+
+    assert data["context_max"] == 272_000
+    assert data["context_percent"] == 25
 
 
 def test_breakdown_categories_do_not_exceed_measured_context():

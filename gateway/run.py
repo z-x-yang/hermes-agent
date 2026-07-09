@@ -2585,6 +2585,23 @@ def _load_gateway_runtime_config() -> dict:
     return expanded if isinstance(expanded, dict) else {}
 
 
+def _get_user_visible_context_length(compressor: Any) -> int:
+    """Return Hermes' active internal window for gauges and user-facing metadata."""
+    try:
+        runtime_context = int(getattr(compressor, "context_length", 0) or 0)
+    except (TypeError, ValueError):
+        runtime_context = 0
+    try:
+        internal_context = int(
+            getattr(compressor, "compression_context_length", runtime_context) or 0
+        )
+    except (TypeError, ValueError):
+        internal_context = runtime_context
+    if internal_context > 0 and runtime_context > 0:
+        return min(internal_context, runtime_context)
+    return max(internal_context, runtime_context, 0)
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -12397,21 +12414,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             custom_providers=custom_provs,
         )
 
+        # This banner is user-visible Hermes context pressure, not the provider's
+        # API capability. Keep it aligned with /status and cap the configured
+        # internal compression window by the actual runtime window.
+        display_context_length = context_length
+        internal_context_configured = False
+        if isinstance(data, dict):
+            compression_cfg = data.get("compression", {})
+            if isinstance(compression_cfg, dict):
+                raw_internal_context = compression_cfg.get(
+                    "internal_context_length",
+                    compression_cfg.get("trigger_context_length"),
+                )
+                if raw_internal_context is not None:
+                    try:
+                        internal_context = int(raw_internal_context)
+                        if internal_context > 0:
+                            display_context_length = min(
+                                internal_context,
+                                context_length,
+                            )
+                            internal_context_configured = True
+                    except (TypeError, ValueError):
+                        pass
+
         # Format context source hint
-        if config_context_length is not None:
+        if internal_context_configured or config_context_length is not None:
             ctx_source = "config"
         elif context_length == DEFAULT_FALLBACK_CONTEXT:
             ctx_source = "default — set model.context_length in config to override"
         else:
             ctx_source = "detected"
 
-        # Format context length for display
-        if context_length >= 1_000_000:
-            ctx_display = f"{context_length / 1_000_000:.1f}M"
-        elif context_length >= 1_000:
-            ctx_display = f"{context_length // 1_000}K"
+        # Format user-visible Hermes context length for display
+        if display_context_length >= 1_000_000:
+            ctx_display = f"{display_context_length / 1_000_000:.1f}M"
+        elif display_context_length >= 1_000:
+            ctx_display = f"{display_context_length // 1_000}K"
         else:
-            ctx_display = str(context_length)
+            ctx_display = str(display_context_length)
 
         lines = [
             f"◆ Model: `{model}`",
@@ -18930,10 +18971,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _context_length = 0
             _agent = agent_holder[0]
             if _agent and hasattr(_agent, "context_compressor"):
-                _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
+                _compressor = getattr(_agent, "context_compressor")
+                _last_prompt_toks = getattr(_compressor, "last_prompt_tokens", 0)
                 _input_toks = getattr(_agent, "session_prompt_tokens", 0)
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
-                _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
+                _context_length = _get_user_visible_context_length(_compressor)
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             # Sync session_id immediately after run_conversation(). Compression
