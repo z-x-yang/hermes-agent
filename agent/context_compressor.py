@@ -5863,7 +5863,11 @@ Use this exact structure:
             )
 
         # Phase 3: Generate structured summary
-        summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
+        # Auto-focus is part of the summarizer prompt, so it must be derived
+        # only from the window being summarized.  Retained-tail turns remain
+        # verbatim after the summary and must not leak back into the summary
+        # as a "recent focus" hint.
+        summary_focus_topic = focus_topic or self._derive_auto_focus_topic(turns_to_summarize)
         previous_summary_for_audit = self._previous_summary
         if getattr(self, "summary_call_mode", "serialized_prompt") == "append_cached":
             summary = self._generate_summary(

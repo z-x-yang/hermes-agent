@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 from typing import Any, Callable
 
 
@@ -38,8 +39,25 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
         finally:
             agent._ephemeral_max_output_tokens = old_ephemeral
 
+    @contextmanager
+    def _suppress_main_stream_callbacks():
+        """Keep internal summarizer deltas out of user-facing streams."""
+        stream_delta_callback = getattr(agent, "stream_delta_callback", None)
+        stream_callback = getattr(agent, "_stream_callback", None)
+        reasoning_callback = getattr(agent, "reasoning_callback", None)
+        try:
+            agent.stream_delta_callback = None
+            agent._stream_callback = None
+            agent.reasoning_callback = None
+            yield
+        finally:
+            agent.stream_delta_callback = stream_delta_callback
+            agent._stream_callback = stream_callback
+            agent.reasoning_callback = reasoning_callback
+
     def _invoke(api_kwargs: dict[str, Any]) -> Any:
-        return interruptible_api_call(agent, api_kwargs)
+        with _suppress_main_stream_callbacks():
+            return interruptible_api_call(agent, api_kwargs)
 
     def _activate_fallback(exc: BaseException) -> bool:
         activator = getattr(agent, "_try_activate_fallback", None)

@@ -1242,6 +1242,48 @@ class TestRetainedTailBudgeting:
         assert raw_sentinel in summarized_text
         assert "[read_file] read /tmp/raw-source.txt" not in summarized_text
 
+    def test_auto_focus_topic_excludes_retained_tail_user_messages(self):
+        """Retained-tail user text must not leak into the summary prompt via focus."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=2,
+                quiet_mode=True,
+            )
+        c.tail_token_budget = 500
+
+        tail_text = "TAIL_CURRENT_USER_SHOULD_NOT_REACH_SUMMARY_FOCUS_ZX_20260709"
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "initial answer"},
+            {"role": "user", "content": "older summarized ask"},
+            {"role": "assistant", "content": "older summarized answer"},
+            {"role": "user", "content": "middle summarized follow-up"},
+            {"role": "assistant", "content": "middle summarized answer"},
+            {"role": "assistant", "content": "tail assistant before user"},
+            {"role": "user", "content": tail_text},
+            {"role": "assistant", "content": "tail answer"},
+        ]
+        captured: dict[str, str | list[dict]] = {}
+
+        def fake_summary(turns, focus_topic=None, **_kwargs):
+            captured["turns"] = [m.copy() for m in turns]
+            captured["focus_topic"] = focus_topic or ""
+            return f"{SUMMARY_PREFIX}\nsummary"
+
+        with (
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=5),
+            patch.object(c, "_generate_summary", side_effect=fake_summary),
+        ):
+            c.compress(msgs, current_tokens=90_000)
+
+        assert tail_text not in _text_messages(captured["turns"])
+        assert tail_text not in str(captured["focus_topic"])
+        assert "older summarized ask" in str(captured["focus_topic"])
+
     def test_protected_tail_tool_outputs_remain_raw(self):
         """The protected tail no longer performs tool-output body compaction."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
