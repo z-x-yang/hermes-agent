@@ -300,6 +300,54 @@ async def test_compress_command_reports_provider_visible_token_estimates():
 
 
 @pytest.mark.asyncio
+async def test_compress_command_passes_fallback_chain_to_temp_agent():
+    """Manual /compress uses a temporary agent for the real compression call.
+
+    That agent must have the same fallback chain as a normal gateway turn so an
+    append-cached summary call can retry the equivalent fallback provider before
+    falling back to serialized prompting.
+    """
+    history = _make_history()
+    compressed = [
+        history[0],
+        {"role": "assistant", "content": "compressed summary"},
+        history[-1],
+    ]
+    runner = _make_runner(history)
+    runner._fallback_model = [{"provider": "gptcodex", "model": "gpt-5.5"}]
+
+    compression_agent = MagicMock()
+    compression_agent.shutdown_memory_provider = MagicMock()
+    compression_agent.close = MagicMock()
+    compression_agent._cached_system_prompt = "MEMORY ONLY SYSTEM"
+    compression_agent.tools = [{"type": "function", "function": {"name": "memory"}}]
+    compression_agent.context_compressor.has_content_to_compress.return_value = True
+    compression_agent.context_compressor._last_compress_aborted = False
+    compression_agent.context_compressor._last_aux_model_failure_model = None
+    compression_agent.session_id = "sess-1"
+    compression_agent._compress_context.return_value = (compressed, "MEMORY ONLY SYSTEM")
+
+    full_agent = MagicMock()
+    full_agent.close = MagicMock()
+    full_agent._cached_system_prompt = "FULL SYSTEM"
+    full_agent.tools = [{"type": "function", "function": {"name": "terminal"}}]
+    full_agent.context_compressor.estimate_provider_request_tokens.side_effect = [
+        400,
+        300,
+    ]
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", side_effect=[compression_agent, full_agent]) as cls,
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "Compressed:" in result
+    assert cls.call_args_list[0].kwargs["fallback_model"] == runner._fallback_model
+
+
+@pytest.mark.asyncio
 async def test_compress_command_estimates_full_next_turn_not_memory_only_agent():
     """Gateway /compress uses a memory-only temporary agent to run the
     summariser, but the displayed request size should describe the next normal

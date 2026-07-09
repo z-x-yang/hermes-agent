@@ -3255,16 +3255,21 @@ class GatewaySlashCommandsMixin:
             if platform_key is not None:
                 runtime_kwargs["platform"] = platform_key
             runtime_kwargs["gateway_session_key"] = session_key
-            tmp_agent = AIAgent(
+            _session_db = getattr(self, "_session_db", None)
+            _tmp_agent_kwargs = {
                 **runtime_kwargs,
-                model=model,
-                max_iterations=4,
-                quiet_mode=True,
-                skip_memory=True,
-                enabled_toolsets=["memory"],
-                session_id=session_entry.session_id,
-                session_db=getattr(self._session_db, "_db", self._session_db),
-            )
+                "model": model,
+                "max_iterations": 4,
+                "quiet_mode": True,
+                "skip_memory": True,
+                "enabled_toolsets": ["memory"],
+                "session_id": session_entry.session_id,
+                "session_db": getattr(_session_db, "_db", _session_db),
+            }
+            _fallback_model = getattr(self, "_fallback_model", None)
+            if _fallback_model:
+                _tmp_agent_kwargs["fallback_model"] = _fallback_model
+            tmp_agent = AIAgent(**_tmp_agent_kwargs)
             request_estimate_agent = tmp_agent
 
             def _restore_live_session_context() -> None:

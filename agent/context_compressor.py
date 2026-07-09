@@ -1427,13 +1427,35 @@ class ContextCompressor(ContextEngine):
         returned transcript remains raw until LLM compaction assembles it.
         """
         audit = dict(cleanup_result.audit)
+        would_replacement_counts = dict(audit.get("replacement_counts") or {})
+        would_cleared_hashes = list(audit.get("cleared_tool_call_id_hashes") or [])
         audit["would_have_applied"] = bool(cleanup_result.applied)
+        audit["would_clear_count"] = int(audit.get("cleared_count") or 0)
+        audit["would_protected_tail_cleared_count"] = int(
+            audit.get("protected_tail_cleared_count") or 0
+        )
+        audit["would_replacement_counts"] = would_replacement_counts
+        audit["would_cleared_tool_call_id_hashes"] = would_cleared_hashes
+        audit["would_tokens_saved_estimate"] = int(
+            audit.get("tokens_saved_estimate") or audit.get("tokens_saved") or 0
+        )
+        if "post_cleanup_tokens_estimate" in audit:
+            audit["would_post_cleanup_tokens_estimate"] = audit.get(
+                "post_cleanup_tokens_estimate"
+            )
+            audit["post_cleanup_tokens_estimate"] = None
         audit["applied"] = False
         audit["result"] = reason
         audit["summary_source_view"] = "raw"
         audit["raw_tool_results_restored_for_summary"] = bool(cleanup_result.applied)
         audit["llm_summary_skipped_after_cleanup"] = False
         audit["llm_summary_ran_on_cleaned_view"] = False
+        audit["cleared_count"] = 0
+        audit["protected_tail_cleared_count"] = 0
+        audit["tokens_saved_estimate"] = 0
+        audit["tokens_saved"] = 0
+        audit["replacement_counts"] = {"persisted_handle": 0, "sentinel": 0}
+        audit["cleared_tool_call_id_hashes"] = []
         return audit
 
     def _reset_cheap_tool_cleanup_audit(self) -> None:

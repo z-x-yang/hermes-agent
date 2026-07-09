@@ -571,7 +571,7 @@ def test_summary_source_stays_raw_when_cleanup_would_not_avoid_llm_summary(monke
     c.bind_session_state(session_db=None, session_id="sess-1")
     captured = {}
 
-    def fake_generate(turns, focus_topic=None):
+    def fake_generate(turns, focus_topic=None, **_kwargs):
         captured["turns"] = turns
         captured["serialized"] = c._serialize_for_summary(turns)
         return "## Current Work\n- compressed\n\n" + captured["serialized"]
@@ -614,7 +614,7 @@ def test_audit_records_cleanup_deferred_when_summary_still_runs(monkeypatch):
     c = _compressor(cheap_tool_result_cleanup=cfg)
     c.tail_token_budget = 1
     c.bind_session_state(session_db=None, session_id="sess-1")
-    monkeypatch.setattr(c, "_generate_summary", lambda turns, focus_topic=None: "## Current Work\n- compressed\n")
+    monkeypatch.setattr(c, "_generate_summary", lambda turns, focus_topic=None, **_kwargs: "## Current Work\n- compressed\n")
     messages = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "start"},
@@ -639,6 +639,54 @@ def test_audit_records_cleanup_deferred_when_summary_still_runs(monkeypatch):
     assert block["llm_summary_ran_on_cleaned_view"] is False
 
 
+def test_deferred_cleanup_audit_separates_actual_from_would_counts(monkeypatch):
+    cfg = CheapToolResultCleanupConfig(
+        enabled=True,
+        keep_recent=0,
+        min_tokens_saved=1,
+        skip_llm_summary_when_below_threshold=False,
+    )
+    c = _compressor(cheap_tool_result_cleanup=cfg)
+    c.tail_token_budget = 1
+    c.bind_session_state(session_db=None, session_id="sess-1")
+    monkeypatch.setattr(
+        c,
+        "_generate_summary",
+        lambda turns, focus_topic=None, **_kwargs: "## Current Work\n- compressed\n",
+    )
+    big = "RAW_TOOL_OUTPUT_SHOULD_REMAIN_RAW " * 300
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "start"},
+        _assistant_call("old-1"),
+        _tool("old-1", big, row_id=11),
+        {"role": "assistant", "content": "bridge before protected tail"},
+        _assistant_call("tail-1"),
+        _tool("tail-1", big, row_id=21),
+        {"role": "assistant", "content": "tail assistant"},
+    ]
+
+    out = c.compress(messages, current_tokens=90_000, force=False, trigger_reason="token_threshold")
+
+    assert c._last_compression_audit_record is not None
+    block = c._last_compression_audit_record["cheap_tool_result_cleanup"]
+    assert block["applied"] is False
+    assert block["would_have_applied"] is True
+    assert block["result"] == "skipped_llm_summary_required"
+    assert block["cleared_count"] == 0
+    assert block["protected_tail_cleared_count"] == 0
+    assert block["replacement_counts"] == {"persisted_handle": 0, "sentinel": 0}
+    assert block["cleared_tool_call_id_hashes"] == []
+    assert block["would_clear_count"] >= 1
+    assert block["would_protected_tail_cleared_count"] >= 1
+    assert sum(block["would_replacement_counts"].values()) == block["would_clear_count"]
+    assert block["would_cleared_tool_call_id_hashes"]
+    assert block["would_tokens_saved_estimate"] > 0
+    assert all("[Old tool result content cleared]" not in str(msg.get("content")) for msg in out)
+    assert all("hermes://session/" not in str(msg.get("content")) for msg in out)
+    assert any("RAW_TOOL_OUTPUT_SHOULD_REMAIN_RAW" in str(msg.get("content")) for msg in out)
+
+
 def test_cleanup_abort_preserves_raw_transcript_when_summary_generation_fails(monkeypatch):
     cfg = CheapToolResultCleanupConfig(
         enabled=True,
@@ -654,7 +702,7 @@ def test_cleanup_abort_preserves_raw_transcript_when_summary_generation_fails(mo
     c.bind_session_state(session_db=None, session_id="sess-1")
     captured = {}
 
-    def fake_generate(turns, focus_topic=None):
+    def fake_generate(turns, focus_topic=None, **_kwargs):
         captured["turns"] = turns
         return None
 
@@ -897,7 +945,7 @@ def test_auto_cleanup_only_runs_when_tail_floor_leaves_no_summary_window(monkeyp
     monkeypatch.setattr(
         c,
         "_generate_summary",
-        lambda turns, focus_topic=None: (_ for _ in ()).throw(
+        lambda turns, focus_topic=None, **_kwargs: (_ for _ in ()).throw(
             AssertionError("summary should not run for cleanup-only relief")
         ),
     )
@@ -945,7 +993,7 @@ def test_hard_message_limit_triggers_do_not_use_cleanup_only(monkeypatch, trigge
     c.bind_session_state(session_db=None, session_id="sess-1")
     called = {"summary": False}
 
-    def fake_generate(turns, focus_topic=None):
+    def fake_generate(turns, focus_topic=None, **_kwargs):
         called["summary"] = True
         return "## Current Work\n- hard-limit summary\n"
 
@@ -1001,7 +1049,7 @@ def test_manual_compress_resolves_missing_row_ids_to_persisted_handles(monkeypat
     c.bind_session_state(session_db=db, session_id=session_id)
     captured = {}
 
-    def fake_generate(turns, focus_topic=None):
+    def fake_generate(turns, focus_topic=None, **_kwargs):
         captured["serialized"] = c._serialize_for_summary(turns)
         return "## Current Work\n- manual summary\n"
 
@@ -1028,6 +1076,7 @@ def test_manual_compress_resolves_missing_row_ids_to_persisted_handles(monkeypat
     block = audit["cheap_tool_result_cleanup"]
     assert block["result"] == "skipped_llm_summary_required"
     assert block["would_have_applied"] is True
-    assert block["replacement_counts"] == {"persisted_handle": 1, "sentinel": 0}
+    assert block["replacement_counts"] == {"persisted_handle": 0, "sentinel": 0}
+    assert block["would_replacement_counts"] == {"persisted_handle": 1, "sentinel": 0}
     assert block["sentinel_fallback_reasons"] == {}
     assert block["raw_tool_results_restored_for_summary"] is True
