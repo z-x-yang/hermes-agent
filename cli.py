@@ -9371,8 +9371,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         original_count = len(self.conversation_history)
         with self._busy_command("Compressing context..."):
             try:
-                from agent.model_metadata import estimate_request_tokens_rough
                 from agent.manual_compression_feedback import (
+                    estimate_manual_compression_request_tokens,
                     materialize_manual_compression_system_prompt,
                     summarize_manual_compression,
                 )
@@ -9401,7 +9401,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     self.agent, None
                 )
                 _tools = getattr(self.agent, "tools", None) or None
-                approx_tokens = estimate_request_tokens_rough(
+                approx_tokens = estimate_manual_compression_request_tokens(
+                    self.agent,
                     original_history,
                     system_prompt=_sys_prompt,
                     tools=_tools,
@@ -9460,7 +9461,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     or _new_system_prompt
                     or _sys_prompt
                 )
-                new_tokens = estimate_request_tokens_rough(
+                new_tokens = estimate_manual_compression_request_tokens(
+                    self.agent,
                     self.conversation_history,
                     system_prompt=_sys_prompt_after,
                     tools=_tools,

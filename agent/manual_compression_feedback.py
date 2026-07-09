@@ -34,6 +34,43 @@ def materialize_manual_compression_system_prompt(
     return prompt
 
 
+def estimate_manual_compression_request_tokens(
+    agent: Any,
+    messages: Sequence[dict[str, Any]],
+    *,
+    system_prompt: str = "",
+    tools: list[dict[str, Any]] | None = None,
+) -> int:
+    """Estimate /compress request size using provider-visible accounting.
+
+    The user-facing number should describe the payload that can be replayed to
+    the provider, not raw DB/storage fields. Prefer the bound compressor's
+    provider-visible estimator so Codex Responses replay items, chat-completions
+    sanitization, and storage-only metadata match automatic compression audit
+    accounting.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    estimator = getattr(compressor, "estimate_provider_request_tokens", None)
+    if callable(estimator):
+        value = estimator(
+            list(messages),
+            system_prompt=system_prompt,
+            tools=tools,
+        )
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+
+    from agent.model_metadata import estimate_request_tokens_rough
+
+    return int(
+        estimate_request_tokens_rough(
+            list(messages),
+            system_prompt=system_prompt,
+            tools=tools,
+        )
+    )
+
+
 def summarize_manual_compression(
     before_messages: Sequence[dict[str, Any]],
     after_messages: Sequence[dict[str, Any]],

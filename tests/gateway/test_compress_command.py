@@ -232,6 +232,74 @@ async def test_compress_command_builds_prompt_before_estimating_tokens():
 
 
 @pytest.mark.asyncio
+async def test_compress_command_reports_provider_visible_token_estimates():
+    """Manual /compress feedback must use provider-visible request accounting,
+    not raw DB message accounting, for before/after token estimates.
+    """
+    history = _make_tool_history()
+    filtered_history = [
+        {"role": "user", "content": "run pwd"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": history[1]["tool_calls"],
+        },
+        {
+            "role": "tool",
+            "content": "/Users/zongxin/project",
+            "tool_call_id": "call_pwd",
+            "tool_name": "terminal",
+        },
+        {"role": "assistant", "content": "done"},
+    ]
+    compressed = [
+        {"role": "assistant", "content": "[summary]"},
+        history[-1],
+    ]
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = "SYSTEM"
+    agent_instance.tools = [{"type": "function", "function": {"name": "demo"}}]
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.context_compressor._last_compress_aborted = False
+    agent_instance.context_compressor._last_aux_model_failure_model = None
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (compressed, "SYSTEM")
+
+    estimate_calls = []
+
+    def _provider_visible_estimate(messages, **kwargs):
+        estimate_calls.append((messages, kwargs))
+        if messages == filtered_history:
+            return 90
+        if messages == compressed:
+            return 30
+        raise AssertionError(f"unexpected transcript: {messages!r}")
+
+    agent_instance.context_compressor.estimate_provider_request_tokens.side_effect = (
+        _provider_visible_estimate
+    )
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch(
+            "agent.model_metadata.estimate_request_tokens_rough",
+            side_effect=AssertionError("raw estimator must not be used"),
+        ),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "Compressed: 4 → 2 messages" in result
+    assert "Approx request size: ~90 → ~30 tokens" in result
+    assert estimate_calls[0][1]["system_prompt"] == "SYSTEM"
+    assert estimate_calls[0][1]["tools"] is agent_instance.tools
+
+
+@pytest.mark.asyncio
 async def test_compress_command_appends_warning_when_compression_aborts():
     """When the auxiliary summariser fails and the compressor ABORTS (returns
     messages unchanged), /compress must append a visible ⚠️ warning to its

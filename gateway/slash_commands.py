@@ -3150,10 +3150,10 @@ class GatewaySlashCommandsMixin:
         try:
             from run_agent import AIAgent
             from agent.manual_compression_feedback import (
+                estimate_manual_compression_request_tokens,
                 materialize_manual_compression_system_prompt,
                 summarize_manual_compression,
             )
-            from agent.model_metadata import estimate_request_tokens_rough
 
             session_key = self._session_key_for_source(source)
             # Preserve the same platform + stable gateway session identity that a
@@ -3269,8 +3269,11 @@ class GatewaySlashCommandsMixin:
                     tmp_agent, None
                 )
                 _tools = getattr(tmp_agent, "tools", None) or None
-                approx_tokens = estimate_request_tokens_rough(
-                    msgs, system_prompt=_sys_prompt, tools=_tools
+                approx_tokens = estimate_manual_compression_request_tokens(
+                    tmp_agent,
+                    msgs,
+                    system_prompt=_sys_prompt,
+                    tools=_tools,
                 )
 
                 compressor = tmp_agent.context_compressor
@@ -3379,8 +3382,11 @@ class GatewaySlashCommandsMixin:
                     or _new_system_prompt
                     or _sys_prompt
                 )
-                new_tokens = estimate_request_tokens_rough(
-                    compressed, system_prompt=_sys_prompt_after, tools=_tools
+                new_tokens = estimate_manual_compression_request_tokens(
+                    tmp_agent,
+                    compressed,
+                    system_prompt=_sys_prompt_after,
+                    tools=_tools,
                 )
                 summary = summarize_manual_compression(
                     msgs,
