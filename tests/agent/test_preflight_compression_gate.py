@@ -8,7 +8,9 @@ of huge messages would silently skip compression and eventually hit a
 hard context-overflow error.
 """
 
-from agent.turn_context import _should_run_preflight_estimate
+from types import SimpleNamespace
+
+from agent.turn_context import build_turn_context, _should_run_preflight_estimate
 
 
 # Protected-range counts mirror the compressor defaults. THRESHOLD_TOKENS is an
@@ -107,3 +109,129 @@ def test_large_base64_image_does_not_falsely_trip_gate():
     assert _should_run_preflight_estimate(
         messages, PROTECT_FIRST_N, PROTECT_LAST_N, THRESHOLD_TOKENS
     ) is False
+
+
+class _FakePreflightCompressor:
+    threshold_tokens = 85_000
+    protect_first_n = 3
+    protect_last_n = 20
+    last_prompt_tokens = 0
+    last_real_prompt_tokens = 50_000
+    compression_count = 0
+    context_length = 272_000
+
+    def __init__(self):
+        self.defer_fingerprint = ""
+
+    def estimate_provider_request_tokens(self, messages, *, system_prompt="", tools=None):
+        return 93_000
+
+    def preflight_request_fingerprint(self, *, system_prompt="", tools=None):
+        return "route-a"
+
+    def should_defer_preflight_to_real_usage(self, rough_tokens, *, fingerprint=""):
+        self.defer_fingerprint = fingerprint
+        return rough_tokens == 93_000 and fingerprint == "route-a"
+
+    def get_active_compression_failure_cooldown(self):
+        return None
+
+    def should_compress(self, prompt_tokens=None):
+        return (prompt_tokens or 0) >= self.threshold_tokens
+
+
+def _fake_agent(compressor):
+    return SimpleNamespace(
+        session_id="sess",
+        _memory_write_origin="assistant_tool",
+        _restore_primary_runtime=lambda: None,
+        provider="gptcodex",
+        model="gpt-5.5",
+        base_url="https://example.invalid",
+        api_key="",
+        api_mode="codex_responses",
+        _skip_mcp_refresh=True,
+        _stream_callback=None,
+        _persist_user_message_idx=None,
+        _persist_user_message_override=None,
+        _persist_user_message_timestamp=None,
+        _current_task_id="",
+        _current_turn_id="",
+        _current_api_request_id="",
+        _tool_guardrails=SimpleNamespace(reset_for_turn=lambda: None),
+        _memory_store=SimpleNamespace(reset_consolidation_failures=lambda: None),
+        _cleanup_dead_connections=lambda: False,
+        _emit_status=lambda _message: None,
+        _compression_warning=None,
+        _replay_compression_warning=lambda: None,
+        max_iterations=3,
+        platform="test",
+        _todo_store=SimpleNamespace(has_items=lambda: True),
+        _hydrate_todo_store=lambda _history: None,
+        _user_turn_count=1,
+        _memory_nudge_interval=0,
+        _turns_since_memory=0,
+        valid_tool_names=set(),
+        _stream_context_scrubber=None,
+        _stream_think_scrubber=None,
+        quiet_mode=True,
+        _safe_print=lambda _text: None,
+        _cached_system_prompt="system",
+        _ensure_db_session=lambda: None,
+        _persist_session=lambda _messages, _history: None,
+        compression_enabled=True,
+        context_compressor=compressor,
+        tools=[{"type": "function", "function": {"name": "demo"}}],
+        _runtime_context_status_mode="off",
+        _last_context_pressure_notice_compression_count=None,
+        _empty_content_retries=0,
+        _invalid_tool_retries=0,
+        _invalid_json_retries=0,
+        _incomplete_scratchpad_retries=0,
+        _codex_incomplete_retries=0,
+        _thinking_prefill_retries=0,
+        _post_tool_empty_retried=False,
+        _last_content_with_tools=None,
+        _last_content_tools_all_housekeeping=False,
+        _mute_post_response=False,
+        _unicode_sanitization_passes=0,
+        _tool_guardrail_halt_decision=None,
+        _turn_failed_file_mutations={},
+        _turn_file_mutation_paths=set(),
+        _verification_stop_nudges=0,
+        _pre_verify_nudges=0,
+        _execution_thread_id=None,
+        _interrupt_requested=False,
+        _interrupt_thread_signal_pending=False,
+        _interrupt_message=None,
+        _memory_manager=None,
+        _user_id="user",
+        _compress_context=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("preflight compression should have been deferred")
+        ),
+    )
+
+
+def test_build_turn_context_passes_preflight_fingerprint_to_defer_gate():
+    compressor = _FakePreflightCompressor()
+    agent = _fake_agent(compressor)
+
+    ctx = build_turn_context(
+        agent,
+        "x" * 380_000,
+        None,
+        [],
+        None,
+        None,
+        None,
+        restore_or_build_system_prompt=lambda *_args, **_kwargs: None,
+        install_safe_stdio=lambda: None,
+        sanitize_surrogates=lambda s: s,
+        summarize_user_message_for_log=lambda s: s[:20],
+        set_session_context=lambda _sid: None,
+        set_current_write_origin=lambda _origin: None,
+        ra=lambda: SimpleNamespace(_set_interrupt=lambda *_args, **_kwargs: None),
+    )
+
+    assert compressor.defer_fingerprint == "route-a"
+    assert ctx.active_system_prompt == "system"

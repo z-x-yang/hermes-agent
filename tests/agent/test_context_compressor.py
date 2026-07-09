@@ -121,6 +121,81 @@ class TestUpdateFromResponse:
 
 
 class TestPreflightDeferral:
+    def test_clears_accepted_request_baseline_when_response_has_no_pending_rough(self, compressor):
+        compressor.threshold_tokens = 85_000
+        compressor.last_accepted_request_real_prompt_tokens = 50_000
+        compressor.last_accepted_request_rough_tokens = 90_000
+        compressor.last_accepted_request_fingerprint = "route-a"
+
+        compressor.update_from_response({"prompt_tokens": 51_000, "completion_tokens": 123})
+
+        assert compressor.last_accepted_request_real_prompt_tokens == 0
+        assert compressor.last_accepted_request_rough_tokens == 0
+        assert compressor.last_accepted_request_fingerprint == ""
+
+    def test_records_accepted_request_rough_baseline_from_successful_response(self, compressor):
+        compressor.threshold_tokens = 85_000
+        compressor.record_pending_request_estimate(90_000, fingerprint="route-a")
+
+        compressor.update_from_response({"prompt_tokens": 50_000, "completion_tokens": 123})
+
+        assert compressor.last_accepted_request_real_prompt_tokens == 50_000
+        assert compressor.last_accepted_request_rough_tokens == 90_000
+        assert compressor.last_accepted_request_fingerprint == "route-a"
+
+    def test_does_not_defer_when_accepted_request_fingerprint_is_missing(self, compressor):
+        compressor.threshold_tokens = 85_000
+        compressor.last_accepted_request_real_prompt_tokens = 50_000
+        compressor.last_accepted_request_rough_tokens = 90_000
+        compressor.last_accepted_request_fingerprint = "route-a"
+
+        assert compressor.should_defer_preflight_to_real_usage(93_000) is False
+
+    def test_does_not_defer_when_accepted_request_fingerprint_mismatches(self, compressor):
+        compressor.threshold_tokens = 85_000
+        compressor.last_accepted_request_real_prompt_tokens = 50_000
+        compressor.last_accepted_request_rough_tokens = 90_000
+        compressor.last_accepted_request_fingerprint = "route-a"
+
+        assert compressor.should_defer_preflight_to_real_usage(
+            93_000,
+            fingerprint="route-b",
+        ) is False
+
+    def test_does_not_defer_when_accepted_request_rough_growth_is_large(self, compressor):
+        compressor.threshold_tokens = 85_000
+        compressor.last_accepted_request_real_prompt_tokens = 50_000
+        compressor.last_accepted_request_rough_tokens = 90_000
+        compressor.last_accepted_request_fingerprint = "route-a"
+
+        assert compressor.should_defer_preflight_to_real_usage(
+            100_000,
+            fingerprint="route-a",
+        ) is False
+
+    def test_does_not_defer_when_calibrated_estimate_crosses_threshold(self, compressor):
+        compressor.threshold_tokens = 85_000
+        compressor.last_accepted_request_real_prompt_tokens = 83_000
+        compressor.last_accepted_request_rough_tokens = 90_000
+        compressor.last_accepted_request_fingerprint = "route-a"
+
+        assert compressor.should_defer_preflight_to_real_usage(
+            94_000,
+            fingerprint="route-a",
+        ) is False
+
+    def test_defers_when_accepted_request_rough_baseline_matches(self, compressor):
+        compressor.threshold_tokens = 85_000
+        compressor.last_accepted_request_real_prompt_tokens = 50_000
+        compressor.last_accepted_request_rough_tokens = 90_000
+        compressor.last_accepted_request_fingerprint = "route-a"
+
+        assert compressor.should_defer_preflight_to_real_usage(
+            93_000,
+            fingerprint="route-a",
+        ) is True
+        assert compressor.last_accepted_request_rough_tokens == 93_000
+
     def test_defers_when_recent_real_usage_fit_and_rough_growth_is_small(self, compressor):
         compressor.threshold_tokens = 85_000
         compressor.last_real_prompt_tokens = 50_000

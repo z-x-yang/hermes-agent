@@ -1442,6 +1442,11 @@ class ContextCompressor(ContextEngine):
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
+        self.last_accepted_request_real_prompt_tokens = 0
+        self.last_accepted_request_rough_tokens = 0
+        self.last_accepted_request_fingerprint = ""
+        self._pending_request_rough_tokens = 0
+        self._pending_request_fingerprint = ""
         self.awaiting_real_usage_after_compression = False
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
@@ -1497,6 +1502,11 @@ class ContextCompressor(ContextEngine):
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
+        self.last_accepted_request_real_prompt_tokens = 0
+        self.last_accepted_request_rough_tokens = 0
+        self.last_accepted_request_fingerprint = ""
+        self._pending_request_rough_tokens = 0
+        self._pending_request_fingerprint = ""
         self.awaiting_real_usage_after_compression = False
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
@@ -1681,6 +1691,11 @@ class ContextCompressor(ContextEngine):
         self.last_real_prompt_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.last_compression_rough_tokens = 0
+        self.last_accepted_request_real_prompt_tokens = 0
+        self.last_accepted_request_rough_tokens = 0
+        self.last_accepted_request_fingerprint = ""
+        self._pending_request_rough_tokens = 0
+        self._pending_request_fingerprint = ""
         self.awaiting_real_usage_after_compression = False
         self._ineffective_compression_count = 0
 
@@ -1850,6 +1865,11 @@ class ContextCompressor(ContextEngine):
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
+        self.last_accepted_request_real_prompt_tokens = 0
+        self.last_accepted_request_rough_tokens = 0
+        self.last_accepted_request_fingerprint = ""
+        self._pending_request_rough_tokens = 0
+        self._pending_request_fingerprint = ""
         self.awaiting_real_usage_after_compression = False
 
         self.summary_model = summary_model_override or ""
@@ -1919,6 +1939,44 @@ class ContextCompressor(ContextEngine):
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
 
+    def preflight_request_fingerprint(self, *, system_prompt: str = "", tools: Any = None) -> str:
+        """Return a content-free fingerprint for preflight calibration validity.
+
+        The accepted-request rough baseline is only comparable while the route,
+        system-prompt shape, and tool schema are effectively unchanged.
+        """
+        try:
+            tools_blob = json.dumps(tools or [], sort_keys=True, default=str, ensure_ascii=False)
+        except Exception:
+            tools_blob = str(tools or [])
+        prompt_text = system_prompt or ""
+        payload = {
+            "model": self.model or "",
+            "provider": self.provider or "",
+            "base_url": self.base_url or "",
+            "api_mode": self.api_mode or "",
+            "context_length": int(self.context_length or 0),
+            "system_prompt_len": len(prompt_text),
+            "system_prompt_sha256": hashlib.sha256(prompt_text.encode("utf-8", "replace")).hexdigest(),
+            "tools_len": len(tools_blob),
+            "tools_sha256": hashlib.sha256(tools_blob.encode("utf-8", "replace")).hexdigest(),
+        }
+        blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[:24]
+
+    def record_pending_request_estimate(self, rough_tokens: int, *, fingerprint: str = "") -> None:
+        """Record the local rough estimate for the request about to be sent.
+
+        ``update_from_response()`` pairs this pending rough estimate with the
+        provider-reported real prompt tokens after a successful call, giving
+        preflight a calibrated accepted-request baseline for later turns.
+        """
+        try:
+            self._pending_request_rough_tokens = max(0, int(rough_tokens or 0))
+        except (TypeError, ValueError):
+            self._pending_request_rough_tokens = 0
+        self._pending_request_fingerprint = str(fingerprint or "")
+
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
@@ -1927,19 +1985,34 @@ class ContextCompressor(ContextEngine):
         if self.last_prompt_tokens > 0:
             self.last_real_prompt_tokens = self.last_prompt_tokens
             if self.last_prompt_tokens < self.threshold_tokens:
+                pending_rough = int(getattr(self, "_pending_request_rough_tokens", 0) or 0)
+                pending_fingerprint = str(getattr(self, "_pending_request_fingerprint", "") or "")
+                if pending_rough > 0:
+                    self.last_accepted_request_real_prompt_tokens = self.last_prompt_tokens
+                    self.last_accepted_request_rough_tokens = pending_rough
+                    self.last_accepted_request_fingerprint = pending_fingerprint
+                else:
+                    self.last_accepted_request_real_prompt_tokens = 0
+                    self.last_accepted_request_rough_tokens = 0
+                    self.last_accepted_request_fingerprint = ""
                 if self.awaiting_real_usage_after_compression and self.last_compression_rough_tokens > 0:
                     self.last_rough_tokens_when_real_prompt_fit = self.last_compression_rough_tokens
             else:
                 self.last_rough_tokens_when_real_prompt_fit = 0
+                self.last_accepted_request_real_prompt_tokens = 0
+                self.last_accepted_request_rough_tokens = 0
+                self.last_accepted_request_fingerprint = ""
+        self._pending_request_rough_tokens = 0
+        self._pending_request_fingerprint = ""
         self.awaiting_real_usage_after_compression = False
 
-    def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
+    def should_defer_preflight_to_real_usage(self, rough_tokens: int, *, fingerprint: str = "") -> bool:
         """Return True when a high rough preflight estimate is known-noisy.
 
         ``estimate_request_tokens_rough(..., tools=...)`` intentionally
         overestimates schema-heavy requests so Hermes compresses before a
-        provider rejects the payload. After a successful compressed API call,
-        though, provider ``prompt_tokens`` are a better signal than repeating
+        provider rejects the payload. After a successful API call, though,
+        provider ``prompt_tokens`` are a better signal than repeating
         compaction from the same rough schema overhead. Defer only while the
         rough estimate has grown modestly since a request the provider proved
         fit under the threshold.
@@ -1958,6 +2031,25 @@ class ContextCompressor(ContextEngine):
         # arrives.  (#36718)
         if self.awaiting_real_usage_after_compression:
             return True
+
+        accepted_real = int(getattr(self, "last_accepted_request_real_prompt_tokens", 0) or 0)
+        accepted_rough = int(getattr(self, "last_accepted_request_rough_tokens", 0) or 0)
+        accepted_fingerprint = str(getattr(self, "last_accepted_request_fingerprint", "") or "")
+        if accepted_real > 0 and accepted_rough > 0:
+            if accepted_real >= self.threshold_tokens:
+                return False
+            if accepted_fingerprint and fingerprint != accepted_fingerprint:
+                return False
+            growth = max(0, rough_tokens - accepted_rough)
+            tolerated_growth = max(4096, int(self.threshold_tokens * 0.05))
+            if growth > tolerated_growth:
+                return False
+            calibrated_tokens = accepted_real + growth
+            if calibrated_tokens >= self.threshold_tokens:
+                return False
+            self.last_accepted_request_rough_tokens = max(accepted_rough, rough_tokens)
+            return True
+
         if self.last_real_prompt_tokens <= 0:
             return False
         if self.last_real_prompt_tokens >= self.threshold_tokens:

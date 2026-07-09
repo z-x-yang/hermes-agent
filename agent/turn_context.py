@@ -394,12 +394,35 @@ def build_turn_context(
                 system_prompt=active_system_prompt or "",
                 tools=agent.tools or None,
             )
+        _preflight_fingerprint = ""
+        _make_preflight_fingerprint = getattr(
+            _compressor,
+            "preflight_request_fingerprint",
+            None,
+        )
+        if callable(_make_preflight_fingerprint):
+            try:
+                _preflight_fingerprint = str(
+                    _make_preflight_fingerprint(
+                        system_prompt=active_system_prompt or "",
+                        tools=agent.tools or None,
+                    )
+                    or ""
+                )
+            except Exception:
+                _preflight_fingerprint = ""
         _defer_preflight = getattr(
             _compressor,
             "should_defer_preflight_to_real_usage",
-            lambda _tokens: False,
+            lambda _tokens, **_kwargs: False,
         )
-        _preflight_deferred = _defer_preflight(_preflight_tokens)
+        try:
+            _preflight_deferred = _defer_preflight(
+                _preflight_tokens,
+                fingerprint=_preflight_fingerprint,
+            )
+        except TypeError:
+            _preflight_deferred = _defer_preflight(_preflight_tokens)
 
         if not _preflight_deferred:
             _last = _compressor.last_prompt_tokens

@@ -74,6 +74,51 @@ logger = logging.getLogger(__name__)
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
+def _record_pending_compression_request_estimate(
+    agent,
+    api_messages: List[Dict[str, Any]],
+    *,
+    active_system_prompt: str = "",
+) -> None:
+    """Pair the next provider call with its rough estimate for calibration.
+
+    This must be fail-open: calibration improves preflight decisions, but it
+    must never block a model request.
+    """
+    try:
+        compressor = getattr(agent, "context_compressor", None)
+        if compressor is None:
+            return
+        record_pending = getattr(compressor, "record_pending_request_estimate", None)
+        estimate_request = getattr(compressor, "estimate_provider_request_tokens", None)
+        if not callable(record_pending) or not callable(estimate_request):
+            return
+        tools = getattr(agent, "tools", None) or None
+        has_system_message = any(
+            isinstance(msg, dict) and msg.get("role") == "system"
+            for msg in api_messages
+        )
+        system_prompt_for_estimate = "" if has_system_message else (active_system_prompt or "")
+        rough_tokens = estimate_request(
+            api_messages,
+            system_prompt=system_prompt_for_estimate,
+            tools=tools,
+        )
+        fingerprint = ""
+        make_fingerprint = getattr(compressor, "preflight_request_fingerprint", None)
+        if callable(make_fingerprint):
+            fingerprint = str(
+                make_fingerprint(
+                    system_prompt=active_system_prompt or "",
+                    tools=tools,
+                )
+                or ""
+            )
+        record_pending(rough_tokens, fingerprint=fingerprint)
+    except Exception:
+        logger.debug("failed to record pending compression request estimate", exc_info=True)
+
+
 def _format_truncated_response_for_user(
     agent,
     *,
@@ -1205,6 +1250,12 @@ def run_conversation(
                 except Exception:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
+
+                _record_pending_compression_request_estimate(
+                    agent,
+                    api_messages,
+                    active_system_prompt=active_system_prompt or "",
+                )
 
                 try:
                     from hermes_cli.plugins import (
