@@ -17,6 +17,8 @@ class SummaryRuntime:
     context_limit_tokens: int | None
     tools_included: bool
     main_api_calls_in_process: int
+    summary_runtime_shape: str | None
+    summary_runtime_toolset_source: str | None
     build_kwargs: Callable[[list[dict[str, Any]], int], dict[str, Any]]
     invoke: Callable[[dict[str, Any]], Any]
     estimate_request_tokens: Callable[[dict[str, Any]], int]
@@ -93,6 +95,8 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
         context_limit_tokens=getattr(getattr(agent, "context_compressor", None), "context_length", None),
         tools_included=bool(getattr(agent, "tools", None)),
         main_api_calls_in_process=int(getattr(agent, "session_api_calls", 0) or 0),
+        summary_runtime_shape=getattr(agent, "_summary_runtime_shape", None),
+        summary_runtime_toolset_source=getattr(agent, "_summary_runtime_toolset_source", None),
         build_kwargs=_build_kwargs,
         invoke=_invoke,
         estimate_request_tokens=estimate_request_context_tokens,
@@ -189,7 +193,15 @@ def extract_summary_cache_stats(response: Any) -> dict[str, Any]:
     if usage is None and isinstance(response, dict):
         usage = response.get("usage")
     if usage is None:
-        return {"reported": False, "read_tokens": None, "write_tokens": None, "hit_rate_estimate": None}
+        return {
+            "reported": False,
+            "read_tokens": None,
+            "write_tokens": None,
+            "provider_input_tokens": None,
+            "provider_output_tokens": None,
+            "hit_rate_provider_actual": None,
+            "hit_rate_estimate": None,
+        }
 
     def _get(obj: Any, name: str) -> Any:
         if obj is None:
@@ -239,9 +251,14 @@ def extract_summary_cache_stats(response: Any) -> dict[str, Any]:
         (usage, "prompt_tokens"),
         (usage, "input_tokens"),
     )
+    output_tokens, _output_reported = _first_present(
+        (usage, "completion_tokens"),
+        (usage, "output_tokens"),
+    )
     read_int = _int_or_none(read_tokens) if read_reported else None
     write_int = _int_or_none(write_tokens) if write_reported else None
     prompt_int = _int_or_none(prompt_tokens)
+    output_int = _int_or_none(output_tokens)
     hit_rate = None
     if read_int is not None and prompt_int:
         hit_rate = round(read_int / max(prompt_int, 1), 4)
@@ -251,5 +268,11 @@ def extract_summary_cache_stats(response: Any) -> dict[str, Any]:
         "reported": read_int is not None or write_int is not None,
         "read_tokens": read_int,
         "write_tokens": write_int,
+        # New explicit provider-actual denominator fields. Keep the legacy
+        # hit_rate_estimate key for existing audit readers, but make the actual
+        # denominator available so callers do not divide by rough estimates.
+        "provider_input_tokens": prompt_int,
+        "provider_output_tokens": output_int,
+        "hit_rate_provider_actual": hit_rate,
         "hit_rate_estimate": hit_rate,
     }

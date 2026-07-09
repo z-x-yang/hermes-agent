@@ -291,6 +291,10 @@ def test_append_cached_request_uses_prefix_to_compress_end_and_excludes_tail_mar
     assert runtime.captured_messages[-1]["role"] == "user"
     assert "TAIL_MARKER_SHOULD_NOT_BE_SENT" not in runtime.captured_messages[-1]["content"]
     assert "TURNS TO SUMMARIZE" not in runtime.captured_messages[-1]["content"]
+    request_audit = compressor._last_summary_call_audit["request"]
+    assert request_audit["retained_tail_excluded"] is True
+    assert request_audit["rough_tokens_estimate"] == request_audit["tokens_estimate"]
+    assert request_audit["request_shape_estimate_tokens"] == request_audit["tokens_estimate"]
 
 
 def test_append_cached_uses_runtime_context_limit_not_threshold_tokens():

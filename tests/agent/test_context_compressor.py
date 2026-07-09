@@ -62,6 +62,46 @@ def _text_messages(messages):
     return "\n".join(str(m.get("content", "")) for m in messages)
 
 
+def test_tail_start_after_completed_tool_group_is_not_pulled_backward():
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "old_call",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "old_call", "content": "old result"},
+        {"role": "assistant", "content": "semantic tail starts here"},
+        {"role": "user", "content": "latest user"},
+    ]
+
+    assert ContextCompressor._align_tail_start_to_tool_group(messages, 2) == 2
+
+
+def test_tail_start_inside_tool_result_pulls_back_to_parent_assistant():
+    messages = [
+        {"role": "user", "content": "older"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "live_call",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "live_call", "content": "live result"},
+        {"role": "assistant", "content": "after tool"},
+    ]
+
+    assert ContextCompressor._align_tail_start_to_tool_group(messages, 2) == 1
+
+
 def _read_compression_audit_records(hermes_home: Path) -> list[dict]:
     path = hermes_home / "logs" / "compression_audit.jsonl"
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]

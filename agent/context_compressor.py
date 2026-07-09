@@ -750,10 +750,10 @@ def _retained_provider_payload_message_for_budget(
 ) -> dict:
     """Return the retained-tail message shape we expect the next API call to carry.
 
-    Tail budgeting must not assume retained replay metadata will be stripped: in
-    strict Claude-like mode, signed/encrypted reasoning replay and full tool-call
-    arguments survive compaction.  Use a conservative retained-message shape so
-    the tail boundary is chosen against the payload we may actually keep.
+    Post-summary compaction now bounds non-visible retained metadata before
+    persisting the live tail, so tail budgeting must use the same shaped message
+    rather than the raw DB row. Otherwise a tail selected against raw replay blobs
+    can land far below the configured budget after the persisted tail is bounded.
     """
     if not isinstance(msg, dict):
         return msg
@@ -786,7 +786,8 @@ def _retained_provider_payload_message_for_budget(
             cleaned_calls.append(cleaned)
         working["tool_calls"] = cleaned_calls
 
-    return working
+    bounded_messages, _bounded_count = _bound_retained_nonvisible_metadata([working])
+    return bounded_messages[0] if bounded_messages else working
 
 
 def _estimate_msg_budget_tokens(
@@ -1473,6 +1474,7 @@ class ContextCompressor(ContextEngine):
         self._summary_skipped_for_cooldown = False
         self._last_summary_source_audit = {}
         self._last_emergency_hygiene_audit = {}
+        self._last_retained_tail_metadata_bounded_count = 0
         self._compression_audit_session_id = None
         self._last_compression_audit_record = None
         self._last_summary_user_message_ground_truth = None
@@ -1946,6 +1948,7 @@ class ContextCompressor(ContextEngine):
         self._compression_audit_session_id: Optional[str] = None
         self._last_compression_audit_record: dict[str, Any] | None = None
         self._last_emergency_hygiene_audit: dict[str, Any] = {}
+        self._last_retained_tail_metadata_bounded_count = 0
         # Verbatim real-user messages of the window the LLM just summarized —
         # ground truth for auditing the LLM-written ## All User Messages
         # section. Set only on LLM summary success; consumed by the sidecar
@@ -3350,6 +3353,9 @@ class ContextCompressor(ContextEngine):
                 "tail_compacted_count": int(tail_compacted_count or 0),
             },
             "tail_boundary_promoted": bool(tail_boundary_promoted),
+            "retained_tail_metadata_bounded_count": int(
+                getattr(self, "_last_retained_tail_metadata_bounded_count", 0) or 0
+            ),
             "user_messages_in_window": (
                 len(_user_ground_truth) if _user_ground_truth is not None else None
             ),
@@ -4568,6 +4574,9 @@ Use this exact structure:
                 "reported": False,
                 "read_tokens": None,
                 "write_tokens": None,
+                "provider_input_tokens": None,
+                "provider_output_tokens": None,
+                "hit_rate_provider_actual": None,
                 "hit_rate_estimate": None,
             },
             "fallback_reason": None,
@@ -4605,6 +4614,8 @@ Use this exact structure:
             "reasoning_effort": getattr(runtime, "reasoning_effort", None),
             "tools_included": bool(getattr(runtime, "tools_included", False)),
             "tool_choice_none_requested": bool(tool_choice_requested),
+            "summary_runtime_shape": getattr(runtime, "summary_runtime_shape", None),
+            "summary_runtime_toolset_source": getattr(runtime, "summary_runtime_toolset_source", None),
             "main_api_calls_in_process": int(
                 getattr(runtime, "main_api_calls_in_process", 0) or 0
             ),
@@ -4613,7 +4624,10 @@ Use this exact structure:
             "message_count": len(request_messages),
             "prefix_message_count": len(prefix_messages),
             "instruction_chars": len(instruction),
-            "tokens_estimate": int(request_tokens),
+            "tokens_estimate": int(request_tokens),  # legacy compatibility
+            "rough_tokens_estimate": int(request_tokens),
+            "request_shape_estimate_tokens": int(request_tokens),
+            "retained_tail_excluded": True,
             "runtime_context_limit_tokens": int(runtime_limit) if runtime_limit else None,
             "requested_output_tokens": requested_output_tokens,
             "summarize_start": int(summarize_start),
@@ -5515,6 +5529,34 @@ Use this exact structure:
             idx = check
         return idx
 
+    @staticmethod
+    def _align_tail_start_to_tool_group(messages: List[Dict[str, Any]], idx: int) -> int:
+        """Pull a retained-tail start back only when it starts inside a tool group.
+
+        A tail boundary immediately *after* a complete assistant-tool/results
+        group is already protocol-valid: the whole group belongs to the
+        summarized prefix. The generic compress-end helper intentionally pulls
+        that shape backward, but doing so for retained-tail starts drags stale
+        completed tool groups into the live tail and inflates the token budget.
+        Only a boundary whose first retained row is itself ``role=tool`` needs
+        to move backward to include the parent assistant tool call.
+        """
+        if idx <= 0 or idx >= len(messages):
+            return idx
+        if messages[idx].get("role") != "tool":
+            return idx
+
+        check = idx
+        while check >= 0 and messages[check].get("role") == "tool":
+            check -= 1
+        if (
+            check >= 0
+            and messages[check].get("role") == "assistant"
+            and messages[check].get("tool_calls")
+        ):
+            return check
+        return idx
+
     # ------------------------------------------------------------------
     # Tail protection by token budget
     # ------------------------------------------------------------------
@@ -5555,7 +5597,7 @@ Use this exact structure:
 
         if count <= 0:
             return len(messages), 0
-        start = self._align_boundary_backward(messages, start)
+        start = self._align_tail_start_to_tool_group(messages, start)
         return max(start, head_end), count
 
     def _find_tail_cut_by_tokens(
@@ -5593,7 +5635,7 @@ Use this exact structure:
                     token_target_met = True
                     break
             if token_target_met:
-                token_start = self._align_boundary_backward(messages, token_start)
+                token_start = self._align_tail_start_to_tool_group(messages, token_start)
             else:
                 # Small/manual compressions often have less total suffix context
                 # than the configured target. In that shape, do not let the token
@@ -5603,7 +5645,7 @@ Use this exact structure:
 
         message_start, _floor_count_seen = self._tail_message_floor_start(messages, head_end)
         pre_align_final_start = min(token_start, message_start)
-        final_start = self._align_boundary_backward(messages, pre_align_final_start)
+        final_start = self._align_tail_start_to_tool_group(messages, pre_align_final_start)
         if final_start < head_end:
             final_start = head_end
 
@@ -5638,6 +5680,16 @@ Use this exact structure:
             "message_floor_met": message_floor_met,
             "selection_reason": selection_reason,
             "tool_boundary_adjusted": bool(final_start != pre_align_final_start),
+            "overshoot_tokens_estimate": int(max(0, final_tokens - token_budget_int)) if token_budget_int > 0 else 0,
+            "overshoot_reasons": [
+                reason
+                for reason, active in (
+                    ("token_atomic_group", token_budget_int > 0 and token_met_final and final_tokens > token_budget_int),
+                    ("message_floor", floor_needed > 0 and message_start < token_start),
+                    ("tool_boundary_alignment", final_start != pre_align_final_start),
+                )
+                if active
+            ],
         }
         return final_start
 
@@ -6307,6 +6359,19 @@ Use this exact structure:
         self.compression_count += 1
 
         compressed = self._sanitize_tool_pairs(compressed)
+        retained_tail_output_count = max(
+            0,
+            len(compressed) - compress_start - (0 if summary_was_merged_into_tail else 1),
+        )
+        tail_output_start = max(0, len(compressed) - retained_tail_output_count)
+        self._last_retained_tail_metadata_bounded_count = 0
+        if retained_tail_output_count > 0:
+            bounded_tail, bounded_count = _bound_retained_nonvisible_metadata(
+                compressed[tail_output_start:]
+            )
+            if bounded_count:
+                compressed = compressed[:tail_output_start] + bounded_tail
+                self._last_retained_tail_metadata_bounded_count = int(bounded_count)
         compressed, self._last_emergency_hygiene_audit = (
             _strip_historical_media_emergency_if_needed(compressed)
         )

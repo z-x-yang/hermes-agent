@@ -3308,7 +3308,11 @@ class GatewaySlashCommandsMixin:
                         "max_iterations": 1,
                         "quiet_mode": True,
                         "skip_memory": True,
-                        "session_id": f"{session_entry.session_id}:compress-estimate",
+                        # Keep the live session id for append-cached request
+                        # scope. Codex Responses includes this id in cache-scope
+                        # headers, so a suffixed estimate id would break the
+                        # server-side cache lineage we are trying to preserve.
+                        "session_id": session_entry.session_id,
                         "session_db": getattr(
                             getattr(self, "_session_db", None),
                             "_db",
@@ -3332,6 +3336,42 @@ class GatewaySlashCommandsMixin:
                         estimate_agent_err,
                     )
                     request_estimate_agent = tmp_agent
+
+                # Append-cached summaries are cache-friendly only when the
+                # summary call has the same provider-visible system/tool shape
+                # as a normal main request. The compression agent stays
+                # side-effect-light, but the internal summary runtime is bound
+                # to the full request-shape agent and still goes through
+                # make_summary_runtime(), which suppresses stream/reasoning
+                # callbacks and never uses the normal chat delivery path.
+                try:
+                    from agent.compression_summary_runtime import make_summary_runtime
+
+                    setattr(
+                        request_estimate_agent,
+                        "_summary_runtime_shape",
+                        "full_toolset_internal",
+                    )
+                    setattr(
+                        request_estimate_agent,
+                        "_summary_runtime_toolset_source",
+                        "manual_compress_request_shape_agent",
+                    )
+                    bind_summary_runtime_factory = getattr(
+                        tmp_agent.context_compressor,
+                        "bind_summary_runtime_factory",
+                        None,
+                    )
+                    if callable(bind_summary_runtime_factory):
+                        bind_summary_runtime_factory(
+                            lambda: make_summary_runtime(request_estimate_agent)
+                        )
+                except Exception as summary_runtime_err:
+                    logger.warning(
+                        "Manual /compress: full request-shape summary runtime unavailable "
+                        "(%s); append-cached may fall back to serialized summary",
+                        summary_runtime_err,
+                    )
 
                 # Estimate with system prompt + tool schemas included so the
                 # figure reflects real request pressure, not a transcript-only
