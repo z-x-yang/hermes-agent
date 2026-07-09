@@ -202,7 +202,8 @@ async def test_status_command_includes_live_agent_model_and_context():
         provider="openai",
         context_compressor=SimpleNamespace(
             last_prompt_tokens=12_345,
-            context_length=100_000,
+            context_length=1_000_000,
+            compression_context_length=272_000,
         ),
         interrupt=MagicMock(),
     )
@@ -211,7 +212,7 @@ async def test_status_command_includes_live_agent_model_and_context():
     result = await runner._handle_message(_make_event("/status"))
 
     assert "**Model:** `openai/gpt-test` (openai)" in result
-    assert "**Context:** 12,345 / 100,000 (12%)" in result
+    assert "**Context:** 12,345 / 272,000 (5%)" in result
     assert "**Cumulative API tokens (re-sent each call):** 1,250" in result
     assert "1,250 (cumulative)" not in result
 
@@ -239,7 +240,13 @@ async def test_status_command_includes_persisted_model_and_context_when_agent_no
         "billing_provider": "openai-codex",
         "billing_base_url": "https://example.invalid/v1",
     }
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"model": {"context_length": 272_000}})
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {
+            "model": {"context_length": 1_000_000},
+            "compression": {"internal_context_length": 272_000},
+        },
+    )
 
     result = await runner._handle_message(_make_event("/status"))
 
@@ -265,7 +272,8 @@ async def test_status_command_includes_cached_agent_model_and_context():
         provider="openrouter",
         context_compressor=SimpleNamespace(
             last_prompt_tokens=10_000,
-            context_length=200_000,
+            context_length=1_000_000,
+            compression_context_length=200_000,
         ),
     )
     runner._agent_cache = {session_entry.session_key: (cached_agent, time.time())}

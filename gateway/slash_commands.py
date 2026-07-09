@@ -491,6 +491,47 @@ class GatewaySlashCommandsMixin:
             except (TypeError, ValueError):
                 return 0
 
+        def _context_total_from_compressor(ctx: Any) -> int:
+            """Return user-visible context window for /status.
+
+            ``ctx.context_length`` is the provider/runtime window.  The status
+            total should show Hermes' internal compression window when one is
+            configured, matching the threshold/tail math users observe.
+            """
+            get_status = getattr(ctx, "get_status", None)
+            if callable(get_status):
+                try:
+                    status = get_status()
+                    if isinstance(status, dict):
+                        total = _int_value(
+                            status.get("context_length")
+                            or status.get("compression_context_length")
+                        )
+                        if total > 0:
+                            return total
+                except Exception:
+                    pass
+            total = _int_value(getattr(ctx, "compression_context_length", 0))
+            if total > 0:
+                return total
+            return _int_value(getattr(ctx, "context_length", 0))
+
+        def _context_total_from_config(config: dict[str, Any]) -> int:
+            model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+            compression_cfg = config.get("compression", {}) if isinstance(config, dict) else {}
+            runtime_total = 0
+            if isinstance(model_cfg, dict):
+                runtime_total = _int_value(model_cfg.get("context_length"))
+            internal_total = 0
+            if isinstance(compression_cfg, dict):
+                internal_total = _int_value(
+                    compression_cfg.get("internal_context_length")
+                    or compression_cfg.get("trigger_context_length")
+                )
+            if internal_total > 0 and runtime_total > 0:
+                return min(internal_total, runtime_total)
+            return internal_total or runtime_total
+
         title = None
         session_row: dict[str, Any] = {}
         # Pull token totals from the SQLite session DB rather than the
@@ -550,7 +591,7 @@ class GatewaySlashCommandsMixin:
             ctx = getattr(status_agent, "context_compressor", None)
             if ctx is not None:
                 context_used = _int_value(getattr(ctx, "last_prompt_tokens", 0))
-                context_total = _int_value(getattr(ctx, "context_length", 0))
+                context_total = _context_total_from_compressor(ctx)
                 compression_count = _int_value(getattr(ctx, "compression_count", 0))
 
         session_db = getattr(self, "_session_db", None)
@@ -597,10 +638,7 @@ class GatewaySlashCommandsMixin:
             if isinstance(model_cfg, dict):
                 provider_name = _clean_str(model_cfg.get("provider"))
         if not context_total:
-            model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
-            configured_context = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
-            if isinstance(configured_context, int) and configured_context > 0:
-                context_total = configured_context
+            context_total = _context_total_from_config(user_config)
 
         model_line = ""
         if model_name:
