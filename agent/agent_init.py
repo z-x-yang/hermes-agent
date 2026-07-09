@@ -1433,6 +1433,24 @@ def init_agent(
         pass
     compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
+    _compression_context_length_config = None
+    _raw_compression_context_length = _compression_cfg.get(
+        "internal_context_length",
+        _compression_cfg.get("trigger_context_length"),
+    )
+    if _raw_compression_context_length is not None:
+        try:
+            _compression_context_length_config = int(_raw_compression_context_length)
+            if _compression_context_length_config <= 0:
+                raise ValueError("internal_context_length must be positive")
+        except Exception as _comp_ctx_err:
+            _ra().logger.warning(
+                "Invalid compression.internal_context_length=%r — using model context (%s)",
+                _raw_compression_context_length,
+                _comp_ctx_err,
+            )
+            _compression_context_length_config = None
+    agent._compression_context_length_config = _compression_context_length_config
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
     # Consecutive origin-overload errors (502/503/524/529) before the retry
     # loop self-heals by compressing history + retrying.
@@ -1742,6 +1760,7 @@ def init_agent(
             base_url=agent.base_url,
             api_key=getattr(agent, "api_key", ""),
             config_context_length=_config_context_length,
+            compression_context_length=_compression_context_length_config,
             provider=agent.provider,
             api_mode=agent.api_mode,
             abort_on_summary_failure=compression_abort_on_summary_failure,
@@ -1869,7 +1888,11 @@ def init_agent(
                 hermes_home=str(get_hermes_home()),
                 platform=agent.platform or "cli",
                 model=agent.model,
-                context_length=getattr(agent.context_compressor, "context_length", 0),
+                context_length=getattr(
+                    agent.context_compressor,
+                    "compression_context_length",
+                    getattr(agent.context_compressor, "context_length", 0),
+                ),
                 conversation_id=getattr(agent, "_gateway_session_key", None),
             )
         except Exception as _ce_err:
@@ -1944,10 +1967,15 @@ def init_agent(
         )
 
     if not agent.quiet_mode:
+        _display_ctx = getattr(
+            agent.context_compressor,
+            "compression_context_length",
+            agent.context_compressor.context_length,
+        )
         if compression_enabled:
-            print(f"📊 Context limit: {agent.context_compressor.context_length:,} tokens (compress at {int(compression_threshold*100)}% = {agent.context_compressor.threshold_tokens:,})")
+            print(f"📊 Context limit: {_display_ctx:,} tokens (compress at {int(compression_threshold*100)}% = {agent.context_compressor.threshold_tokens:,})")
         else:
-            print(f"📊 Context limit: {agent.context_compressor.context_length:,} tokens (auto-compression disabled)")
+            print(f"📊 Context limit: {_display_ctx:,} tokens (auto-compression disabled)")
         # One-time notice when the Codex gpt-5.5 autoraise kicked in, with the
         # exact opt-back-out command. Printed inline at startup for CLI users;
         # gateway users get the same text replayed via _compression_warning on
@@ -1996,6 +2024,9 @@ def init_agent(
         "compressor_api_key": getattr(_cc, "api_key", ""),
         "compressor_provider": getattr(_cc, "provider", agent.provider),
         "compressor_context_length": _cc.context_length,
+        "compressor_compression_context_length": getattr(
+            _cc, "_compression_context_length_config", None
+        ),
         "compressor_threshold_tokens": _cc.threshold_tokens,
     }
     if agent.api_mode == "anthropic_messages":

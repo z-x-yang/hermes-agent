@@ -133,14 +133,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # we resolve through ``_ra()`` to honor those patches.
     _r = _ra()
 
-    # Resolve the model's context window once so context-file caps can scale
-    # to it (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
+    # Resolve Hermes' internal context window once so context-file caps scale
+    # to the same budget as compression/status, not necessarily the provider's
+    # full runtime window (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
     # None falls back to the historical flat default. This value is stable for
     # the life of the conversation, so it does not threaten prompt caching.
     _ctx_len: Optional[int] = None
     _cc = getattr(agent, "context_compressor", None)
     if _cc is not None:
-        _cc_len = getattr(_cc, "context_length", None)
+        _cc_len = getattr(_cc, "compression_context_length", getattr(_cc, "context_length", None))
         if isinstance(_cc_len, int) and _cc_len > 0:
             _ctx_len = _cc_len
 

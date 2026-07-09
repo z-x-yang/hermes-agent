@@ -3173,6 +3173,7 @@ def run_conversation(
                     _reduced_ctx = 200000
                     compressor = agent.context_compressor
                     old_ctx = compressor.context_length
+                    old_compression_ctx = getattr(compressor, "compression_context_length", old_ctx)
                     if old_ctx > _reduced_ctx:
                         compressor.update_model(
                             model=agent.model,
@@ -3181,6 +3182,7 @@ def run_conversation(
                             api_key=getattr(agent, "api_key", ""),
                             provider=agent.provider,
                             api_mode=agent.api_mode,
+                            compression_context_length=min(old_compression_ctx, _reduced_ctx),
                         )
                         # Context probing flags — only set on built-in
                         # compressor (plugin engines manage their own).
@@ -3257,7 +3259,11 @@ def run_conversation(
                         trigger_token_source="api_error_recovery",
                         trigger_tokens=approx_tokens,
                         trigger_threshold_tokens=getattr(agent.context_compressor, "threshold_tokens", None),
-                        trigger_context_length=getattr(agent.context_compressor, "context_length", None),
+                        trigger_context_length=getattr(
+                            agent.context_compressor,
+                            "compression_context_length",
+                            getattr(agent.context_compressor, "context_length", None),
+                        ),
                         trigger_message_count=len(messages),
                     )
                     # Compression created a new session — clear history so
@@ -3675,6 +3681,7 @@ def run_conversation(
                         and "context window exceeds limit (" in error_msg
                     )
 
+                    old_compression_ctx = getattr(compressor, "compression_context_length", old_ctx)
                     if new_ctx is not None:
                         agent._buffer_vprint(f"Context limit detected from API: {new_ctx:,} tokens (was {old_ctx:,})")
                         compressor.update_model(
@@ -3684,6 +3691,7 @@ def run_conversation(
                             api_key=getattr(agent, "api_key", ""),
                             provider=agent.provider,
                             api_mode=agent.api_mode,
+                            compression_context_length=min(old_compression_ctx, new_ctx),
                         )
                         # Context probing flags — only set on built-in
                         # compressor (plugin engines manage their own).  This

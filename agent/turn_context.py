@@ -452,12 +452,13 @@ def build_turn_context(
                 agent.session_id or "none",
             )
         elif _compressor.should_compress(_preflight_tokens):
+            _display_ctx = getattr(_compressor, "compression_context_length", _compressor.context_length)
             logger.info(
                 "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
                 f"{_preflight_tokens:,}",
                 f"{_compressor.threshold_tokens:,}",
                 agent.model,
-                f"{_compressor.context_length:,}",
+                f"{_display_ctx:,}",
             )
             agent._emit_status(
                 f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
@@ -474,7 +475,7 @@ def build_turn_context(
                     trigger_token_source="preflight_estimate",
                     trigger_tokens=_preflight_tokens,
                     trigger_threshold_tokens=_compressor.threshold_tokens,
-                    trigger_context_length=_compressor.context_length,
+                    trigger_context_length=_display_ctx,
                     trigger_message_count=len(messages),
                 )
                 # Re-estimate now so size-only compression (same row count,

@@ -1696,6 +1696,7 @@ class ContextCompressor(ContextEngine):
         provider: str = "",
         api_mode: str = "",
         max_tokens: int | None = None,
+        compression_context_length: int | None = None,
     ) -> None:
         """Update model info after a model switch or fallback activation."""
         self.model = model
@@ -1704,20 +1705,43 @@ class ContextCompressor(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.context_length = context_length
+        if compression_context_length is not None:
+            _desired_compression_context_length = self._coerce_context_length(
+                compression_context_length,
+                fallback=context_length,
+            )
+            self._compression_context_length_config = _desired_compression_context_length
+            self.compression_context_length = min(
+                _desired_compression_context_length,
+                int(context_length),
+            )
+            self._compression_context_length_override = True
+        elif getattr(self, "_compression_context_length_override", False):
+            _desired_compression_context_length = getattr(
+                self,
+                "_compression_context_length_config",
+                self.compression_context_length,
+            )
+            self.compression_context_length = min(
+                int(_desired_compression_context_length),
+                int(context_length),
+            )
+        else:
+            self.compression_context_length = context_length
         # max_tokens=None here means "caller didn't specify" → keep the existing
         # output reservation. A switch that genuinely changes the output budget
         # passes the new value explicitly. (#43547)
         if max_tokens is not None:
             self.max_tokens = self._coerce_max_tokens(max_tokens)
         self.threshold_tokens = self._compute_threshold_tokens(
-            context_length, self.threshold_percent, self.max_tokens,
+            self.compression_context_length, self.threshold_percent, self.max_tokens,
         )
-        # Recalculate token budgets for the new context length so the tail
-        # retention target stays calibrated after a model switch (e.g. 277K → 128K).
-        target_tokens = int(context_length * self.summary_target_ratio)
+        # Recalculate compression budgets from the internal compression window,
+        # which may intentionally be smaller than the model's runtime window.
+        target_tokens = int(self.compression_context_length * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
-            int(context_length * 0.05), _SUMMARY_TOKENS_CEILING,
+            int(self.compression_context_length * 0.05), _SUMMARY_TOKENS_CEILING,
         )
 
         # Reset cross-call calibration state captured under the PREVIOUS model.
@@ -1751,7 +1775,7 @@ class ContextCompressor(ContextEngine):
     # window, compacting at the percentage (50% → 32K of a 64K window) wastes
     # half the usable context. Trigger near the top of the window instead so a
     # minimum-context model uses most of its budget before compacting — same
-    # rationale as the gpt-5.5/Codex 85% autoraise.
+    # rationale as any deliberately high small-window trigger.
     _MIN_CTX_TRIGGER_RATIO = 0.85
 
     @staticmethod
@@ -1770,6 +1794,20 @@ class ContextCompressor(ContextEngine):
         except (TypeError, ValueError):
             return None
         return ivalue if ivalue > 0 else None
+
+    @staticmethod
+    def _coerce_context_length(value: Any, *, fallback: int) -> int:
+        """Normalize the internal compression context length.
+
+        Invalid/non-positive values fall back to the real runtime context window
+        so the split-window behavior is opt-in and historical defaults stay
+        unchanged.
+        """
+        try:
+            ivalue = int(value)
+        except (TypeError, ValueError):
+            return int(fallback)
+        return ivalue if ivalue > 0 else int(fallback)
 
     @staticmethod
     def _compute_threshold_tokens(
@@ -1825,6 +1863,7 @@ class ContextCompressor(ContextEngine):
         base_url: str = "",
         api_key: str = "",
         config_context_length: int | None = None,
+        compression_context_length: int | None = None,
         provider: str = "",
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
@@ -1875,6 +1914,15 @@ class ContextCompressor(ContextEngine):
             config_context_length=config_context_length,
             provider=provider,
         )
+        self._compression_context_length_override = compression_context_length is not None
+        self._compression_context_length_config = self._coerce_context_length(
+            compression_context_length,
+            fallback=self.context_length,
+        ) if self._compression_context_length_override else None
+        self.compression_context_length = min(
+            self._compression_context_length_config or self.context_length,
+            int(self.context_length),
+        )
         # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
         # the percentage would suggest a lower value.  This prevents premature
         # compression on large-context models at 50% while keeping the % sane
@@ -1882,28 +1930,28 @@ class ContextCompressor(ContextEngine):
         # guards the degenerate case where the floor would equal/exceed the
         # window (small models), so auto-compression can still fire (#14690).
         self.threshold_tokens = self._compute_threshold_tokens(
-            self.context_length, threshold_percent, self.max_tokens,
+            self.compression_context_length, threshold_percent, self.max_tokens,
         )
         self.compression_count = 0
 
-        # Derive token budgets: tail ratio is relative to the model's context
-        # window, not the auto-compression trigger threshold. A 277K model with
-        # compression.target_ratio=0.10 should retain ~27.7K continuation-payload
-        # tail tokens even if compression triggers at 95% of the window.
-        target_tokens = int(self.context_length * self.summary_target_ratio)
+        # Derive token budgets from Hermes' internal compression window, not
+        # necessarily the model's full runtime window. This separates "how much
+        # the provider can accept" from "how much raw conversation Hermes wants
+        # to keep before rolling it up".
+        target_tokens = int(self.compression_context_length * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
-            int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING,
+            int(self.compression_context_length * 0.05), _SUMMARY_TOKENS_CEILING,
         )
 
         if not quiet_mode:
             logger.info(
                 "Context compressor initialized: model=%s context_length=%d "
-                "threshold=%d (%.0f%%) target_ratio=%.0f%% tail_budget=%d "
-                "provider=%s base_url=%s",
-                model, self.context_length, self.threshold_tokens,
-                threshold_percent * 100, self.summary_target_ratio * 100,
-                self.tail_token_budget,
+                "compression_context_length=%d threshold=%d (%.0f%%) "
+                "target_ratio=%.0f%% tail_budget=%d provider=%s base_url=%s",
+                model, self.context_length, self.compression_context_length,
+                self.threshold_tokens, threshold_percent * 100,
+                self.summary_target_ratio * 100, self.tail_token_budget,
                 provider or "none", base_url or "none",
             )
         self._context_probed = False  # True after a step-down from context error
@@ -1987,6 +2035,29 @@ class ContextCompressor(ContextEngine):
         # succeeded.  Silent recovery would hide the broken config.
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
+
+    def get_status(self) -> Dict[str, Any]:
+        """Return status using Hermes' internal compression window for display.
+
+        UI/status surfaces should show the rolling-memory window and percentages
+        that decide compression (e.g. 272K), while runtime_context_length remains
+        available for request/preflight code that needs the provider's true
+        capacity (e.g. 1M append-cached summary calls).
+        """
+        last_prompt = self.last_prompt_tokens if self.last_prompt_tokens > 0 else 0
+        display_context = getattr(self, "compression_context_length", self.context_length)
+        return {
+            "last_prompt_tokens": last_prompt,
+            "threshold_tokens": self.threshold_tokens,
+            "context_length": display_context,
+            "runtime_context_length": self.context_length,
+            "compression_context_length": display_context,
+            "usage_percent": (
+                min(100, last_prompt / display_context * 100)
+                if display_context else 0
+            ),
+            "compression_count": self.compression_count,
+        }
 
     def preflight_request_fingerprint(self, *, system_prompt: str = "", tools: Any = None) -> str:
         """Return a content-free fingerprint for preflight calibration validity.
@@ -6071,7 +6142,8 @@ Use this exact structure:
                 self.threshold_tokens,
             )
             logger.info(
-                "Model context limit: %d tokens (%.0f%% = %d)",
+                "Compression context limit: %d tokens (runtime %d; %.0f%% = %d)",
+                self.compression_context_length,
                 self.context_length,
                 self.threshold_percent * 100,
                 self.threshold_tokens,

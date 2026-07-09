@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import run_agent
+from agent.codex_runtime import _record_codex_app_server_usage
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
 
 
@@ -133,6 +134,34 @@ class TestRunConversationCodexPath:
         assert agent.context_compressor.last_completion_tokens == 25
         assert agent.context_compressor.last_total_tokens == 130
         assert agent.context_compressor.context_length == 200000
+
+    def test_codex_context_window_refresh_preserves_pending_calibration(self):
+        agent = _make_codex_agent()
+        compressor = agent.context_compressor
+        compressor.record_pending_request_estimate(12_345, fingerprint="fp-codex")
+
+        turn = TurnResult(
+            final_text="done",
+            projected_messages=[{"role": "assistant", "content": "done"}],
+            turn_id="turn-usage-2",
+            thread_id="thread-usage-2",
+            token_usage_last={
+                "totalTokens": 130,
+                "inputTokens": 80,
+                "cachedInputTokens": 20,
+                "outputTokens": 25,
+                "reasoningOutputTokens": 5,
+            },
+            model_context_window=200000,
+        )
+
+        _record_codex_app_server_usage(agent, turn)
+
+        assert compressor.context_length == 200000
+        assert compressor.last_prompt_tokens == 100
+        assert compressor.last_accepted_request_real_prompt_tokens == 100
+        assert compressor.last_accepted_request_rough_tokens == 12_345
+        assert compressor.last_accepted_request_fingerprint == "fp-codex"
 
     def test_projected_messages_are_spliced(self, fake_session):
         agent = _make_codex_agent()

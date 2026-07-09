@@ -320,6 +320,61 @@ def test_append_cached_uses_runtime_context_limit_not_threshold_tokens():
     assert compressor._last_summary_call_audit["fallback_reason"] is None
 
 
+def test_runtime_context_and_internal_compression_window_are_decoupled():
+    runtime = CapturingRuntime(context_limit_tokens=1_000_000)
+    with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+        compressor = ContextCompressor(
+            model="gpt-5.5",
+            threshold_percent=0.95,
+            summary_target_ratio=(20_000 / 272_000),
+            compression_context_length=272_000,
+            quiet_mode=True,
+            summary_call_mode="append_cached",
+        )
+
+    assert compressor.context_length == 1_000_000
+    assert compressor.compression_context_length == 272_000
+    assert compressor.threshold_tokens == int(272_000 * 0.95)
+    assert compressor.tail_token_budget == 20_000
+    status = compressor.get_status()
+    assert status["context_length"] == 272_000
+    assert status["compression_context_length"] == 272_000
+    assert status["runtime_context_length"] == 1_000_000
+
+    compressor.update_model("gpt-5.6", context_length=1_500_000)
+    assert compressor.context_length == 1_500_000
+    assert compressor.compression_context_length == 272_000
+    assert compressor.threshold_tokens == int(272_000 * 0.95)
+    assert compressor.tail_token_budget == 20_000
+
+    compressor.update_model("small-runtime", context_length=200_000)
+    assert compressor.context_length == 200_000
+    assert compressor.compression_context_length == 200_000
+    assert compressor.threshold_tokens == int(200_000 * 0.95)
+
+    compressor.update_model("gpt-5.6", context_length=1_500_000)
+    assert compressor.context_length == 1_500_000
+    assert compressor.compression_context_length == 272_000
+
+    compressor.update_model("gpt-5.6", context_length=1_000_000, compression_context_length=272_000)
+    assert compressor.context_length == 1_000_000
+    assert compressor.compression_context_length == 272_000
+
+    compressor.bind_summary_runtime_factory(lambda: runtime)
+    summary = compressor._generate_summary(
+        [{"role": "user", "content": "old prefix"}],
+        source_messages=[{"role": "user", "content": "old prefix"}],
+        summarize_start=0,
+        compress_end=1,
+        focus_topic=None,
+    )
+
+    assert summary is not None
+    request_audit = compressor._last_summary_call_audit["request"]
+    assert request_audit["runtime_context_limit_tokens"] == 1_000_000
+    assert compressor._last_summary_call_audit["fallback_reason"] is None
+
+
 class ToolCallRuntime(CapturingRuntime):
     def invoke(self, api_kwargs: dict[str, Any]) -> Any:
         message = SimpleNamespace(content="", tool_calls=[SimpleNamespace(id="call_1")])

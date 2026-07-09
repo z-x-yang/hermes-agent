@@ -4622,7 +4622,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             context_tokens = getattr(compressor, "last_prompt_tokens", 0) or 0
             if context_tokens < 0:
                 context_tokens = 0
-            context_length = getattr(compressor, "context_length", 0) or 0
+            context_length = getattr(
+                compressor,
+                "compression_context_length",
+                getattr(compressor, "context_length", 0),
+            ) or 0
             if context_length < 0:
                 context_length = 0
             snapshot["context_tokens"] = context_tokens
@@ -6116,7 +6120,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self.console.clear()
         ctx_len = None
         if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
-            ctx_len = self.agent.context_compressor.context_length
+            compressor = self.agent.context_compressor
+            ctx_len = getattr(compressor, "compression_context_length", compressor.context_length)
         
         # Auto-compact for narrow terminals — the full banner with caduceus
         # + tool list needs ~80 columns minimum to render without wrapping.
@@ -8402,7 +8407,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     cwd = os.getenv("TERMINAL_CWD", os.getcwd())
                     ctx_len = None
                     if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
-                        ctx_len = self.agent.context_compressor.context_length
+                        compressor = self.agent.context_compressor
+                        ctx_len = getattr(compressor, "compression_context_length", compressor.context_length)
                     build_welcome_banner(
                         console=cc,
                         model=self.model,
@@ -9522,10 +9528,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         total = agent.session_total_tokens
 
         compressor = agent.context_compressor
-        last_prompt = compressor.last_prompt_tokens if compressor.last_prompt_tokens > 0 else 0
-        ctx_len = compressor.context_length
+        status = compressor.get_status() if hasattr(compressor, "get_status") else {}
+        last_prompt = status.get(
+            "last_prompt_tokens",
+            compressor.last_prompt_tokens if compressor.last_prompt_tokens > 0 else 0,
+        )
+        ctx_len = status.get(
+            "context_length",
+            getattr(compressor, "compression_context_length", compressor.context_length),
+        )
         pct = min(100, (last_prompt / ctx_len * 100)) if ctx_len else 0
-        compressions = compressor.compression_count
+        compressions = status.get("compression_count", compressor.compression_count)
 
         msg_count = len(self.conversation_history)
         elapsed = format_duration_compact((datetime.now() - self.session_start).total_seconds())

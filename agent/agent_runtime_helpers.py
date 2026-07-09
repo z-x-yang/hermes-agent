@@ -1237,7 +1237,7 @@ def restore_primary_runtime(agent) -> bool:
 
         # ── Restore context engine state ──
         cc = agent.context_compressor
-        cc.update_model(
+        _update_kwargs = dict(
             model=rt["compressor_model"],
             context_length=rt["compressor_context_length"],
             base_url=rt["compressor_base_url"],
@@ -1245,6 +1245,19 @@ def restore_primary_runtime(agent) -> bool:
             provider=rt["compressor_provider"],
             api_mode=rt.get("compressor_api_mode", ""),
         )
+        try:
+            from agent.context_compressor import ContextCompressor as _BuiltinCompressor
+
+            if isinstance(cc, _BuiltinCompressor):
+                _explicit_compression_ctx = rt.get("compressor_compression_context_length")
+                if _explicit_compression_ctx is None:
+                    cc._compression_context_length_override = False
+                    cc._compression_context_length_config = None
+                else:
+                    _update_kwargs["compression_context_length"] = _explicit_compression_ctx
+        except Exception:
+            pass
+        cc.update_model(**_update_kwargs)
 
         # ── Re-select from the credential pool if one is available ──
         # The snapshot's api_key was captured at construction time.  Across
@@ -2046,6 +2059,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",
         "compressor_provider": getattr(_cc, "provider", agent.provider) if _cc else agent.provider,
         "compressor_context_length": _cc.context_length if _cc else 0,
+        "compressor_compression_context_length": (
+            getattr(_cc, "_compression_context_length_config", None) if _cc else None
+        ),
         "compressor_api_mode": getattr(_cc, "api_mode", agent.api_mode) if _cc else agent.api_mode,
         "compressor_threshold_tokens": _cc.threshold_tokens if _cc else 0,
     }

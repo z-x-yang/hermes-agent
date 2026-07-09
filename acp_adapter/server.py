@@ -1834,7 +1834,13 @@ class HermesACPAgent(acp.Agent):
         model = state.model or getattr(agent, "model", "")
         provider = getattr(agent, "provider", None) or "auto"
         compressor = getattr(agent, "context_compressor", None)
-        context_length = int(getattr(compressor, "context_length", 0) or 0)
+        context_length = int(
+            getattr(
+                compressor,
+                "compression_context_length",
+                getattr(compressor, "context_length", 0),
+            ) or 0
+        )
         threshold_tokens = int(getattr(compressor, "threshold_tokens", 0) or 0)
 
         try:

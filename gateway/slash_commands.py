@@ -4232,8 +4232,9 @@ class GatewaySlashCommandsMixin:
             ctx = agent.context_compressor
             _lpt = ctx.last_prompt_tokens if ctx.last_prompt_tokens > 0 else 0
             if _lpt:
-                pct = min(100, _lpt / ctx.context_length * 100) if ctx.context_length else 0
-                lines.append(t("gateway.usage.label_context", used=f"{_lpt:,}", total=f"{ctx.context_length:,}", pct=f"{pct:.0f}"))
+                _ctx_len = getattr(ctx, "compression_context_length", ctx.context_length)
+                pct = min(100, _lpt / _ctx_len * 100) if _ctx_len else 0
+                lines.append(t("gateway.usage.label_context", used=f"{_lpt:,}", total=f"{_ctx_len:,}", pct=f"{pct:.0f}"))
             if ctx.compression_count:
                 lines.append(t("gateway.usage.label_compressions", count=ctx.compression_count))
 

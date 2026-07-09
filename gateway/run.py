@@ -11059,6 +11059,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_compression_enabled = True
             _hyg_hard_msg_limit = 5000
             _hyg_config_context_length = None
+            _hyg_compression_context_length = None
             _hyg_provider = None
             _hyg_base_url = None
             _hyg_api_key = None
@@ -11105,6 +11106,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hyg_codex_gpt55_autoraise = str(
                             _comp_cfg.get("codex_gpt55_autoraise", True)
                         ).lower() in {"true", "1", "yes"}
+                        _raw_internal_ctx = _comp_cfg.get(
+                            "internal_context_length",
+                            _comp_cfg.get("trigger_context_length"),
+                        )
+                        if _raw_internal_ctx is not None:
+                            try:
+                                _parsed_internal_ctx = int(_raw_internal_ctx)
+                                if _parsed_internal_ctx > 0:
+                                    _hyg_compression_context_length = _parsed_internal_ctx
+                            except (TypeError, ValueError):
+                                pass
                         _raw_hard_limit = _comp_cfg.get("hygiene_hard_message_limit")
                         if _raw_hard_limit is not None:
                             try:
@@ -11158,12 +11170,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
 
             if _hyg_compression_enabled:
-                _hyg_context_length = await get_model_context_length_async(
+                _hyg_runtime_context_length = await get_model_context_length_async(
                     _hyg_model,
                     base_url=_hyg_base_url or "",
                     api_key=_hyg_api_key or "",
                     config_context_length=_hyg_config_context_length,
                     provider=_hyg_provider or "",
+                )
+                _hyg_context_length = (
+                    min(_hyg_compression_context_length, _hyg_runtime_context_length)
+                    if _hyg_compression_context_length
+                    else _hyg_runtime_context_length
                 )
                 try:
                     from agent.auxiliary_client import (

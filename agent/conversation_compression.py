@@ -302,7 +302,11 @@ def check_compression_model_feasibility(agent: Any) -> None:
             # Keep threshold_percent in sync so future main-model
             # context_length changes (update_model) re-derive from a
             # sensible number rather than the original too-high value.
-            main_ctx = agent.context_compressor.context_length
+            main_ctx = getattr(
+                agent.context_compressor,
+                "compression_context_length",
+                agent.context_compressor.context_length,
+            )
             if main_ctx:
                 agent.context_compressor.threshold_percent = (
                     new_threshold / main_ctx

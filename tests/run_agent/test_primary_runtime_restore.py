@@ -82,6 +82,7 @@ class TestPrimaryRuntimeSnapshot:
         assert rt["compressor_model"] == cc.model
         assert rt["compressor_provider"] == cc.provider
         assert rt["compressor_context_length"] == cc.context_length
+        assert rt["compressor_compression_context_length"] is None
         assert rt["compressor_threshold_tokens"] == cc.threshold_tokens
 
     def test_snapshot_includes_anthropic_state_when_applicable(self):
@@ -182,11 +183,17 @@ class TestRestorePrimaryRuntime:
         # Manually simulate compressor being changed (as _try_activate_fallback does)
         agent.context_compressor.context_length = 32000
         agent.context_compressor.threshold_tokens = 25600
+        agent.context_compressor._compression_context_length_override = True
+        agent.context_compressor._compression_context_length_config = 123456
+        agent.context_compressor.compression_context_length = 123456
 
         with patch("run_agent.OpenAI", return_value=MagicMock()):
             agent._restore_primary_runtime()
 
         assert agent.context_compressor.context_length == original_ctx_len
+        assert agent.context_compressor.compression_context_length == original_ctx_len
+        assert agent.context_compressor._compression_context_length_override is False
+        assert agent.context_compressor._compression_context_length_config is None
         assert agent.context_compressor.threshold_tokens == original_threshold
 
     def test_restores_prompt_caching_flag(self):
