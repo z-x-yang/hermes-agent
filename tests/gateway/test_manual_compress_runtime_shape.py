@@ -22,6 +22,15 @@ def test_manual_compress_binds_append_cached_summary_to_full_request_shape_agent
     assert "compress-estimate" not in src
 
 
+def test_manual_compress_full_request_shape_agent_inherits_gateway_fallback_model():
+    """Append-cached retries must stay append-cached when the primary route 429s."""
+    src = SLASH_COMMANDS.read_text()
+    request_kwargs_idx = src.index("request_estimate_kwargs = {")
+    request_agent_idx = src.index("request_estimate_agent = AIAgent", request_kwargs_idx)
+    block = src[request_kwargs_idx:request_agent_idx]
+    assert 'request_estimate_kwargs["fallback_model"] = _fallback_model' in block
+
+
 def test_manual_compress_keeps_internal_summary_off_normal_delivery_path():
     """The full-toolset fix must still avoid the ordinary chat delivery path."""
     src = SLASH_COMMANDS.read_text()

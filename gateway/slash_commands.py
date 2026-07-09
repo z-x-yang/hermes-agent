@@ -3357,6 +3357,8 @@ class GatewaySlashCommandsMixin:
                             getattr(self, "_session_db", None),
                         ),
                     }
+                    if _fallback_model:
+                        request_estimate_kwargs["fallback_model"] = _fallback_model
                     if request_enabled_toolsets is not None:
                         request_estimate_kwargs["enabled_toolsets"] = request_enabled_toolsets
                     if request_disabled_toolsets is not None:
