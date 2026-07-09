@@ -75,6 +75,16 @@ class TestCodexBuildKwargs:
         )
         assert kw.get("reasoning", {}).get("effort") == "high"
 
+    def test_max_reasoning_effort_is_forwarded(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=messages,
+            tools=[],
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+        assert kw["reasoning"]["effort"] == "max"
+
     def test_reasoning_disabled(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(

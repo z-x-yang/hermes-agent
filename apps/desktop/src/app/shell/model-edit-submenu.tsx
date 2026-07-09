@@ -12,20 +12,11 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Switch } from '@/components/ui/switch'
 import { useI18n } from '@/i18n'
+import { REASONING_EFFORT_OPTIONS } from '@/lib/reasoning-effort-options'
 import { normalize } from '@/lib/text'
 import { setModelPreset } from '@/store/model-presets'
 import { notifyError } from '@/store/notifications'
 import { $activeSessionId, setCurrentFastMode, setCurrentReasoningEffort } from '@/store/session'
-
-// Hermes' real reasoning levels (see VALID_REASONING_EFFORTS); `none` is owned
-// by the Thinking toggle, not the radio.
-const EFFORT_OPTIONS = [
-  { value: 'minimal', labelKey: 'minimal' },
-  { value: 'low', labelKey: 'low' },
-  { value: 'medium', labelKey: 'medium' },
-  { value: 'high', labelKey: 'high' },
-  { value: 'xhigh', labelKey: 'max' }
-] as const
 
 /** How "fast" is achieved for a given model — two different mechanisms:
  *  - `param`: the Anthropic/OpenAI `speed=fast` request parameter.
@@ -213,7 +204,7 @@ export function ModelEditSubmenu({
               <DropdownMenuSeparator className="mx-0" />
               <DropdownMenuLabel className={dropdownMenuSectionLabel}>{copy.effort}</DropdownMenuLabel>
               <DropdownMenuRadioGroup onValueChange={value => void patchReasoning(value)} value={effortValue}>
-                {EFFORT_OPTIONS.map(option => (
+                {REASONING_EFFORT_OPTIONS.map(option => (
                   <DropdownMenuRadioItem
                     className={dropdownMenuRow}
                     key={option.value}
@@ -245,5 +236,5 @@ function normalizeEffort(effort: string): string {
     return ''
   }
 
-  return EFFORT_OPTIONS.some(option => option.value === value) ? value : 'medium'
+  return REASONING_EFFORT_OPTIONS.some(option => option.value === value) ? value : 'medium'
 }

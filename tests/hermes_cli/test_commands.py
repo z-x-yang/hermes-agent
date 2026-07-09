@@ -629,6 +629,7 @@ class TestSubcommands:
         assert "/reasoning" in SUBCOMMANDS
         subs = SUBCOMMANDS["/reasoning"]
         assert "high" in subs
+        assert "max" in subs
         assert "show" in subs
         assert "hide" in subs
 

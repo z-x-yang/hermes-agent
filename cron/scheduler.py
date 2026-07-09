@@ -218,14 +218,14 @@ def _resolve_cron_reasoning_config(job: dict, cfg: Any) -> dict | None:
     field keep the old global behavior. Explicit cron/job values fail closed when
     invalid so hand-edited config cannot silently downgrade to a different setting.
     """
-    from hermes_constants import parse_reasoning_effort
+    from hermes_constants import VALID_REASONING_EFFORTS, parse_reasoning_effort
 
     def _parse_explicit_reasoning_effort(effort: str, *, label: str) -> dict | None:
         parsed = parse_reasoning_effort(effort)
         if parsed is None:
             context = f" {label}" if label else ""
             raise ValueError(
-                f"Invalid cron{context} reasoning_effort {effort!r}; expected one of: none, minimal, low, medium, high, xhigh"
+                f"Invalid cron{context} reasoning_effort {effort!r}; expected one of: {', '.join(('none', *VALID_REASONING_EFFORTS))}"
             )
         return parsed
 

@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from hermes_constants import display_hermes_home
+from hermes_constants import VALID_REASONING_EFFORTS, display_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -1040,8 +1040,8 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "reasoning_effort": {
                 "type": "string",
-                "enum": ["none", "minimal", "low", "medium", "high", "xhigh", ""],
-                "description": "Optional per-job reasoning/thinking intensity override for LLM-driven cron jobs. Valid values: none, minimal, low, medium, high, xhigh. Omit to inherit cron.reasoning_effort, then legacy agent.reasoning_effort; on update pass an empty string to clear the per-job override. Ignored by no_agent=True script-only jobs."
+                "enum": ["none", *VALID_REASONING_EFFORTS, ""],
+                "description": "Optional per-job reasoning/thinking intensity override for LLM-driven cron jobs. Valid values: none, minimal, low, medium, high, xhigh, max. Omit to inherit cron.reasoning_effort, then legacy agent.reasoning_effort; on update pass an empty string to clear the per-job override. Ignored by no_agent=True script-only jobs."
             },
             "script": {
                 "type": "string",

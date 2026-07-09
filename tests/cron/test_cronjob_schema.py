@@ -57,6 +57,6 @@ def test_cronjob_schema_exposes_reasoning_effort_override():
 
     prop = CRONJOB_SCHEMA["parameters"]["properties"]["reasoning_effort"]
     assert prop["type"] == "string"
-    assert prop["enum"] == ["none", "minimal", "low", "medium", "high", "xhigh", ""]
+    assert prop["enum"] == ["none", "minimal", "low", "medium", "high", "xhigh", "max", ""]
     assert "per-job" in prop["description"]
     assert "empty string" in prop["description"]

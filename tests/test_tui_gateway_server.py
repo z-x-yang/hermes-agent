@@ -3204,6 +3204,16 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     assert resp_effort["result"]["value"] == "low"
     assert agent.reasoning_config == {"enabled": True, "effort": "low"}
 
+    resp_max = server.handle_request(
+        {
+            "id": "1-max",
+            "method": "config.set",
+            "params": {"session_id": "sid", "key": "reasoning", "value": "max"},
+        }
+    )
+    assert resp_max["result"]["value"] == "max"
+    assert agent.reasoning_config == {"enabled": True, "effort": "max"}
+
     resp_show = server.handle_request(
         {
             "id": "2",

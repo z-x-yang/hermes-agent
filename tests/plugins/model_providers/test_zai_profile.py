@@ -62,7 +62,7 @@ class TestZaiThinkingWireShape:
 
     def test_no_effort_levels_leak_to_top_level(self, zai_profile):
         """GLM has no effort knob — never emit ``reasoning_effort``."""
-        for effort in ("minimal", "low", "medium", "high", "xhigh"):
+        for effort in ("minimal", "low", "medium", "high", "xhigh", "max"):
             _, top_level = zai_profile.build_api_kwargs_extras(
                 reasoning_config={"enabled": True, "effort": effort}, model="glm-5.2"
             )

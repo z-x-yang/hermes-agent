@@ -19,6 +19,15 @@ def test_cron_reasoning_effort_job_override_wins_over_cron_default():
     }
 
 
+def test_cron_reasoning_effort_accepts_max_override():
+    from cron.scheduler import _resolve_cron_reasoning_config
+
+    assert _resolve_cron_reasoning_config({"reasoning_effort": "max"}, {}) == {
+        "enabled": True,
+        "effort": "max",
+    }
+
+
 def test_cron_reasoning_effort_cron_default_wins_over_agent_global():
     from cron.scheduler import _resolve_cron_reasoning_config
 

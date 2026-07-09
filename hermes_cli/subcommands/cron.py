@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Callable
 
+from hermes_constants import VALID_REASONING_EFFORTS
 from hermes_cli.subcommands._shared import add_accept_hooks_flag
 
 
@@ -72,8 +73,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_create.add_argument(
         "--reasoning-effort",
-        choices=["none", "minimal", "low", "medium", "high", "xhigh"],
-        help="Per-job reasoning effort override for LLM-driven jobs: none, minimal, low, medium, high, or xhigh. Omit to inherit cron.reasoning_effort, then legacy agent.reasoning_effort.",
+        choices=["none", *VALID_REASONING_EFFORTS],
+        help="Per-job reasoning effort override for LLM-driven jobs: none, minimal, low, medium, high, xhigh, or max. Omit to inherit cron.reasoning_effort, then legacy agent.reasoning_effort.",
     )
 
     # cron edit
@@ -141,8 +142,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_edit.add_argument(
         "--reasoning-effort",
-        choices=["none", "minimal", "low", "medium", "high", "xhigh", ""],
-        help="Set per-job reasoning effort. Valid: none, minimal, low, medium, high, xhigh. Pass empty string to clear and inherit cron.reasoning_effort, then legacy agent.reasoning_effort.",
+        choices=["none", *VALID_REASONING_EFFORTS, ""],
+        help="Set per-job reasoning effort. Valid: none, minimal, low, medium, high, xhigh, max. Pass empty string to clear and inherit cron.reasoning_effort, then legacy agent.reasoning_effort.",
     )
 
     # lifecycle actions

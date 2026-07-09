@@ -2963,6 +2963,13 @@ class TestBuildSchemaFromConfig:
             assert "options" in entry
             assert "local" in entry["options"]
 
+    def test_delegation_reasoning_options_include_max_but_not_ultra(self):
+        from hermes_cli.web_server import CONFIG_SCHEMA
+
+        options = CONFIG_SCHEMA["delegation.reasoning_effort"]["options"]
+        assert "max" in options
+        assert "ultra" not in options
+
     def test_empty_prefix_produces_correct_keys(self):
         from hermes_cli.web_server import _build_schema_from_config
         test_config = {"model": "test", "nested": {"key": "val"}}

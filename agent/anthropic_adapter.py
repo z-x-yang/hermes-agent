@@ -2628,7 +2628,6 @@ def build_anthropic_kwargs(
     if reasoning_config and isinstance(reasoning_config, dict) and not _is_kimi_coding:
         if reasoning_config.get("enabled") is not False and "haiku" not in model.lower():
             effort = str(reasoning_config.get("effort", "medium")).lower()
-            budget = THINKING_BUDGET.get(effort, 8000)
             if _supports_adaptive_thinking(model):
                 kwargs["thinking"] = {
                     "type": "adaptive",
@@ -2643,6 +2642,12 @@ def build_anthropic_kwargs(
                     "effort": adaptive_effort,
                 }
             else:
+                if effort == "max":
+                    raise ValueError(
+                        f"Reasoning effort 'max' requires an Anthropic model with adaptive thinking; "
+                        f"{model!r} only supports legacy manual thinking through 'xhigh'."
+                    )
+                budget = THINKING_BUDGET.get(effort, 8000)
                 kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
                 # Anthropic requires temperature=1 when thinking is enabled on older models
                 kwargs["temperature"] = 1

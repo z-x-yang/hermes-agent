@@ -12,9 +12,11 @@ from __future__ import annotations
 
 from typing import List, Optional
 
+from hermes_constants import VALID_REASONING_EFFORTS
+
 # LM Studio accepts these top-level reasoning_effort values via its
 # OpenAI-compatible chat.completions endpoint.
-_LM_VALID_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+_LM_VALID_EFFORTS = {"none", *VALID_REASONING_EFFORTS}
 
 # Toggle-style models publish allowed_options as ["off","on"] in /api/v1/models.
 # Map them onto the OpenAI-compatible request vocabulary.

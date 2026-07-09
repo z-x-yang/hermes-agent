@@ -149,6 +149,26 @@ class TestReasoningCommand:
         assert "session only" in result
 
     @pytest.mark.asyncio
+    async def test_handle_reasoning_command_accepts_max(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n  reasoning_effort: medium\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        runner = _make_runner()
+        event = _make_event("/reasoning max")
+        session_key = runner._session_key_for_source(event.source)
+
+        await runner._handle_reasoning_command(event)
+
+        assert runner._session_reasoning_overrides[session_key] == {
+            "enabled": True,
+            "effort": "max",
+        }
+
+    @pytest.mark.asyncio
     async def test_reasoning_global_clears_existing_session_override(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()

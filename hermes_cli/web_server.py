@@ -696,7 +696,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "delegation.reasoning_effort": {
         "type": "select",
         "description": "Reasoning effort for delegated subagents",
-        "options": ["", "low", "medium", "high"],
+        "options": ["", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
     },
     "updates.non_interactive_local_changes": {
         "type": "select",

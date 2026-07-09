@@ -56,6 +56,18 @@ function renderSubmenu(opts: { fastControl: FastControl; reasoning: boolean; req
 // preset-only — the gateway's config.set falls back to global config when no
 // session matches, so it must not be called. (Caught in the second review.)
 describe('ModelEditSubmenu no-session guard', () => {
+  it('offers distinct XHigh and Max values', () => {
+    const requestGateway = vi.fn().mockResolvedValue({})
+    renderSubmenu({ fastControl: { kind: 'none' }, reasoning: true, requestGateway })
+
+    fireEvent.click(screen.getByText('XHigh'))
+    expect(getModelPreset('p1', 'm1').effort).toBe('xhigh')
+
+    fireEvent.click(screen.getByText('Max'))
+    expect(getModelPreset('p1', 'm1').effort).toBe('max')
+    expect(requestGateway).not.toHaveBeenCalled()
+  })
+
   it('param fast: records the preset but skips the gateway without a session', () => {
     const requestGateway = vi.fn().mockResolvedValue({})
     renderSubmenu({ fastControl: { kind: 'param', on: false }, reasoning: false, requestGateway })

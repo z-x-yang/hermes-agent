@@ -914,7 +914,7 @@ def create_job(
         provider: Optional per-job provider override
         base_url: Optional per-job base URL override
         reasoning_effort: Optional per-job reasoning effort override. Valid
-                values: none, minimal, low, medium, high, xhigh. When omitted,
+                values: none, minimal, low, medium, high, xhigh, max. When omitted,
                 the job follows config.yaml agent.reasoning_effort.
         script: Optional path to a script whose stdout feeds the job. With
                 ``no_agent=True`` the script IS the job — its stdout is

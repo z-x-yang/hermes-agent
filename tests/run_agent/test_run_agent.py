@@ -1901,8 +1901,9 @@ class TestBuildApiKwargs:
         )
         assert kwargs["extra_body"]["reasoning"] == {"effort": "medium"}
 
-    def test_reasoning_xhigh_normalized_for_copilot(self, agent):
-        """xhigh effort should normalize to high for Copilot GitHub Models."""
+    @pytest.mark.parametrize("effort", ["xhigh", "max"])
+    def test_reasoning_extreme_effort_normalized_for_copilot(self, agent, effort):
+        """Unsupported extreme efforts should normalize to Copilot's highest level."""
         from agent.transports import get_transport
         from providers import get_provider_profile
 
@@ -1914,7 +1915,7 @@ class TestBuildApiKwargs:
             messages=msgs,
             tools=None,
             supports_reasoning=True,
-            reasoning_config={"enabled": True, "effort": "xhigh"},
+            reasoning_config={"enabled": True, "effort": effort},
             provider_profile=profile,
         )
         assert kwargs["extra_body"]["reasoning"] == {"effort": "high"}

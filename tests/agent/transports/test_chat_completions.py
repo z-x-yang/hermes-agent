@@ -393,14 +393,15 @@ class TestChatCompletionsBuildKwargs:
             "includeThoughts": False,
         }
 
-    def test_gemini_openai_compat_xhigh_clamps_to_high(self, transport):
+    @pytest.mark.parametrize("effort", ["xhigh", "max"])
+    def test_gemini_openai_compat_extreme_effort_clamps_to_high(self, transport, effort):
         msgs = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(
             model="gemini-3-flash-preview",
             messages=msgs,
             provider_name="gemini",
             base_url="https://generativelanguage.googleapis.com/v1beta/openai",
-            reasoning_config={"enabled": True, "effort": "xhigh"},
+            reasoning_config={"enabled": True, "effort": effort},
         )
         assert kw["extra_body"]["extra_body"]["google"]["thinking_config"]["thinking_level"] == "high"
 
@@ -690,6 +691,16 @@ class TestChatCompletionsLmStudioReasoning:
             lmstudio_reasoning_options=["off", "low", "medium", "high"],
         )
         assert kw["reasoning_effort"] == "high"
+
+    def test_passes_through_max_when_allowed(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol", messages=[{"role": "user", "content": "Hi"}],
+            is_lmstudio=True,
+            supports_reasoning=True,
+            reasoning_config={"effort": "max"},
+            lmstudio_reasoning_options=["low", "medium", "high", "xhigh", "max"],
+        )
+        assert kw["reasoning_effort"] == "max"
 
     def test_passes_through_aliased_on_for_toggle(self, transport):
         # User has reasoning enabled at the default "medium"; toggle model

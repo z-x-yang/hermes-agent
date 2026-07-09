@@ -1388,6 +1388,16 @@ class TestBuildAnthropicKwargs:
         assert kwargs["max_tokens"] >= 16000 + 4096
         assert "output_config" not in kwargs
 
+    def test_max_effort_fails_fast_for_legacy_manual_thinking_models(self):
+        with pytest.raises(ValueError, match="max.*adaptive thinking"):
+            build_anthropic_kwargs(
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "maximum reasoning please"}],
+                tools=None,
+                max_tokens=4096,
+                reasoning_config={"enabled": True, "effort": "max"},
+            )
+
     def test_reasoning_config_maps_to_adaptive_thinking_for_4_6_models(self):
         kwargs = build_anthropic_kwargs(
             model="claude-opus-4-6",
