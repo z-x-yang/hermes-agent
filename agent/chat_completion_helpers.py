@@ -1344,14 +1344,40 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_api_mode = "bedrock_converse"
 
         old_model = agent.model
+        old_provider = agent.provider
+        old_base_url = agent.base_url
 
-        # Preserve any explicit model.context_length override for the temporary
-        # fallback route.  Operators use this as a hard cap for the active
-        # session; clearing it here makes same-model fallbacks such as
-        # openai-codex/gpt-5.5 -> gptcodex/gpt-5.5 fall through to the direct
-        # API catalog value (1.05M) instead of the configured Codex cap (272K).
-        # Deliberate /model switches clear the override in switch_model(); a
-        # transient fallback should not silently widen the live context window.
+        # Resolve the fallback route's context independently. ``model.context_length``
+        # on the primary session is a startup cap for the route that just failed;
+        # carrying it into a different provider serving the same model id (for
+        # example openai-codex/gpt-5.5 -> gptcodex/gpt-5.5) can freeze the
+        # fallback at a stale cap. Same-backend fallbacks still inherit the cap,
+        # and a fallback entry may declare its own explicit ``context_length``
+        # which wins over both behaviors below.
+        _fb_config_context_length = None
+        _fb_raw_context_length = fb.get("context_length") if isinstance(fb, dict) else None
+        if _fb_raw_context_length is not None:
+            try:
+                _fb_config_context_length = int(_fb_raw_context_length)
+                if _fb_config_context_length <= 0:
+                    raise ValueError("context_length must be positive")
+            except Exception as _ctx_err:
+                logger.warning(
+                    "Invalid context_length on fallback %s/%s: %r (%s); probing route instead",
+                    fb_provider, fb_model, _fb_raw_context_length, _ctx_err,
+                )
+                _fb_config_context_length = None
+        else:
+            _primary_context_length = getattr(agent, "_config_context_length", None)
+            _old_base_norm = str(old_base_url or "").strip().rstrip("/")
+            _fb_base_norm = str(fb_base_url or "").strip().rstrip("/")
+            _same_route = (
+                fb_provider == old_provider
+                or bool(_old_base_norm and _fb_base_norm and _old_base_norm == _fb_base_norm)
+            )
+            if _same_route and _primary_context_length is not None:
+                _fb_config_context_length = _primary_context_length
+
         agent.model = fb_model
         agent.provider = fb_provider
         agent.base_url = fb_base_url
@@ -1472,7 +1498,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_context_length = get_model_context_length(
                 agent.model, base_url=agent.base_url,
                 api_key=_fb_ctx_api_key, provider=agent.provider,
-                config_context_length=getattr(agent, "_config_context_length", None),
+                config_context_length=_fb_config_context_length,
                 custom_providers=getattr(agent, "_custom_providers", None),
             )
             agent.context_compressor.update_model(

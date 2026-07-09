@@ -69,19 +69,17 @@ def _ra():
 
 
 def _build_codex_gpt55_autoraise_notice(autoraise: Dict[str, float]) -> str:
-    """Build the one-time notice shown when Codex gpt-5.5 raises compaction.
+    """Build the legacy one-time notice for Codex gpt-5.5 threshold raises.
 
-    ``autoraise`` is ``{"from": <old_ratio>, "to": <new_ratio>}``. The same
-    text is printed inline for CLI users and replayed via ``status_callback``
-    for gateway users, so it must be self-contained and include the exact
-    opt-back-out command.
+    The historical Codex gpt-5.5 272K autoraise is retired, but keeping the
+    helper harmless avoids breaking old persisted runtime metadata if one is ever
+    replayed.
     """
     from_pct = int(round(autoraise["from"] * 100))
     to_pct = int(round(autoraise["to"] * 100))
     return (
-        f"ℹ Codex gpt-5.5 caps context at 272K, so auto-compaction was raised "
-        f"to {to_pct}% (from {from_pct}%) to use more of the window before "
-        f"summarizing.\n"
+        f"ℹ Legacy Codex gpt-5.5 auto-compaction threshold was raised "
+        f"to {to_pct}% (from {from_pct}%).\n"
         f"  Opt back out: hermes config set compression.codex_gpt55_autoraise false"
     )
 
@@ -1398,12 +1396,10 @@ def init_agent(
     if not isinstance(_compression_cfg, dict):
         _compression_cfg = {}
     compression_threshold = float(_compression_cfg.get("threshold", 0.50))
-    # Per-model/route compaction-threshold override. Codex gpt-5.5 raises to
-    # 85% (the Codex backend caps the window at 272K, so the default 50% would
-    # compact at ~136K — half the usable context). Gated by an opt-out config
-    # flag so the user can fall back to the global threshold; when the override
-    # fires we stash a one-time notification (replayed on the first turn) that
-    # tells the user what changed and how to revert.
+    # Per-model/route compaction-threshold overrides. Arcee Trinity still raises
+    # to preserve reasoning context. The old Codex gpt-5.5 272K autoraise flag is
+    # passed for config compatibility, but the helper no longer raises that route
+    # because current Codex/gptcodex gpt-5.5 is 1M-class again.
     _codex_gpt55_autoraise = str(
         _compression_cfg.get("codex_gpt55_autoraise", True)
     ).lower() in {"true", "1", "yes"}

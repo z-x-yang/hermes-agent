@@ -1383,16 +1383,13 @@ DEFAULT_CONFIG = {
             "replacement_mode": "persisted_handle_or_sentinel",
             "skip_llm_summary_when_below_threshold": True,
         },
-        "codex_gpt55_autoraise": True,  # When True, gpt-5.5 on the ChatGPT Codex OAuth
-                                      # route raises its compaction trigger to 85% (vs the
-                                      # global `threshold` above). Codex hard-caps gpt-5.5
-                                      # at a 272K window, so the default 50% would compact
-                                      # at ~136K and waste half the usable context. Set to
-                                      # False to opt back down to the global threshold
-                                      # (e.g. 0.50) for Codex gpt-5.5 sessions. Only this
-                                      # exact route is affected — gpt-5.5 on OpenAI's
-                                      # direct API, OpenRouter, and Copilot keep the
-                                      # global threshold regardless.
+        "codex_gpt55_autoraise": True,  # Legacy compatibility knob. Older Hermes builds raised
+                                      # gpt-5.5 on ChatGPT Codex OAuth to 85%
+                                      # because that route briefly exposed only
+                                      # a 272K context window. Current Codex and
+                                      # gptcodex gpt-5.5 are 1M-class again, so
+                                      # the runtime ignores this knob and uses
+                                      # the global `threshold` above.
         "in_place": True,             # When True, compaction rewrites the message
                                       # list and rebuilds the system prompt WITHOUT
                                       # rotating the session id — the conversation

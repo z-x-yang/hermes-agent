@@ -78,14 +78,13 @@ def test_compression_threshold_default_none_for_other_models() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Codex gpt-5.5 compaction-threshold autoraise
+# Codex gpt-5.5 compaction-threshold override retirement
 #
-# ChatGPT's Codex OAuth backend caps gpt-5.5 at a 272K window (verified live:
-# ~330K-token request rejected with context_length_exceeded, ~250K accepted).
-# The default 50% compaction trigger would fire at ~136K — half the usable
-# window — so this route raises the trigger to 85%. Only the Codex OAuth route
-# is affected; the same slug on OpenAI direct / OpenRouter / Copilot exposes a
-# larger window and keeps the user's global threshold.
+# ChatGPT's Codex OAuth backend used to cap gpt-5.5 at 272K, which justified
+# raising its compaction trigger to 85%.  The current Codex backend and the
+# gptcodex proxy both expose a 1M-class window for gpt-5.5, so this historical
+# override must not fire anymore: the user's configured global threshold is the
+# source of truth for Codex gpt-5.5 too.
 # ---------------------------------------------------------------------------
 
 
@@ -95,7 +94,7 @@ def test_compression_threshold_default_none_for_other_models() -> None:
         "gpt-5.5",
         "gpt-5.5-pro",
         "gpt-5.5-2026-04-23",  # dated snapshot
-        "gpt-5.5-codex-mini",  # Codex variant of the 5.5 family (also 272K-capped)
+        "gpt-5.5-codex-mini",  # Codex variant of the 5.5 family
         "openai/gpt-5.5",  # aggregator-prefixed (still on the codex route)
         "GPT-5.5",  # case-insensitive
         "  gpt-5.5  ",  # whitespace tolerant
@@ -125,9 +124,9 @@ def test_is_codex_gpt55_rejects_non_55_models(model) -> None:
 
 
 def test_compression_threshold_for_codex_gpt55() -> None:
-    assert _compression_threshold_for_model("gpt-5.5", "openai-codex") == 0.85
-    assert _compression_threshold_for_model("gpt-5.5-pro", "openai-codex") == 0.85
-    assert _compression_threshold_for_model("openai/gpt-5.5", "openai-codex") == 0.85
+    assert _compression_threshold_for_model("gpt-5.5", "openai-codex") is None
+    assert _compression_threshold_for_model("gpt-5.5-pro", "openai-codex") is None
+    assert _compression_threshold_for_model("openai/gpt-5.5", "openai-codex") is None
 
 
 def test_compression_threshold_codex_gpt55_other_routes_unaffected() -> None:

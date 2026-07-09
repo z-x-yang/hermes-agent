@@ -314,16 +314,10 @@ def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
     return bare == "trinity-large-thinking"
 
 
-# Context window enforced by ChatGPT's Codex OAuth backend for gpt-5.5.
-# The raw OpenAI API and OpenRouter expose 1.05M for the same slug, but the
-# Codex backend hard-caps at 272K (verified live: a ~330K-token request to
-# chatgpt.com/backend-api/codex/responses is rejected with
-# ``context_length_exceeded`` while ~250K succeeds). With a 272K ceiling the
-# default 50% compaction trigger fires at ~136K — wasteful, since the model
-# can hold far more raw context before summarization actually buys anything.
-# We raise the trigger to 85% (~231K) on this exact route so Codex gpt-5.5
-# sessions use the window they actually have.
-_CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
+# Historical note: ChatGPT's Codex OAuth backend briefly capped gpt-5.5 at
+# 272K, and Hermes raised its compaction trigger to 85% on that route.  The
+# current Codex backend and the common gptcodex proxy are 1M-class again, so
+# gpt-5.5 should use the user's configured global compression.threshold.
 
 
 def _is_codex_gpt55(model: Optional[str], provider: Optional[str] = None) -> bool:
@@ -379,18 +373,15 @@ def _compression_threshold_for_model(
 
     Per-model/route overrides:
       - Arcee Trinity Large Thinking → 0.75 (preserve reasoning context).
-      - gpt-5.5 on the Codex OAuth route → 0.85, because Codex caps the window
-        at 272K and the default 50% trigger would compact at ~136K. Gated by
-        ``allow_codex_gpt55_autoraise`` so the user can opt back down to the
-        global default (the caller passes the config flag through here).
+      - historical gpt-5.5/Codex OAuth 272K autoraise is retired; the config
+        flag is accepted for backward compatibility but no longer overrides the
+        user's global threshold.
 
     Returns a float in (0, 1] to override the global ``compression.threshold``
     config value, or ``None`` to leave the user's config value unchanged.
     """
     if _is_arcee_trinity_thinking(model):
         return 0.75
-    if allow_codex_gpt55_autoraise and _is_codex_gpt55(model, provider):
-        return _CODEX_GPT55_COMPACTION_THRESHOLD
     return None
 
 # Default auxiliary models for direct API-key providers (cheap/fast for side tasks)
