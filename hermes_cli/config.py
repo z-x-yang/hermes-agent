@@ -1380,6 +1380,7 @@ DEFAULT_CONFIG = {
             "require_main_runtime": True,
             "allow_tool_choice_none": True,
             "fallback_to_serialized_prompt": True,
+            "transport_retries": 1,
             "audit_sample_summary_chars": 12000,
         },
         "cheap_tool_result_cleanup": {

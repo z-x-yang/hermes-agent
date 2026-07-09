@@ -330,6 +330,7 @@ class AppendCachedSummaryConfig:
     require_main_runtime: bool = True
     allow_tool_choice_none: bool = True
     fallback_to_serialized_prompt: bool = True
+    transport_retries: int = 1
     audit_sample_summary_chars: int = 12000
 
     @classmethod
@@ -362,11 +363,18 @@ class AppendCachedSummaryConfig:
             sample_chars = 12000
         sample_chars = max(0, min(sample_chars, 100000))
 
+        try:
+            transport_retries = int(raw.get("transport_retries", 1))
+        except (TypeError, ValueError):
+            transport_retries = 1
+        transport_retries = max(0, min(transport_retries, 3))
+
         return cls(
             source_scope=source_scope,
             require_main_runtime=_bool("require_main_runtime", True),
             allow_tool_choice_none=_bool("allow_tool_choice_none", True),
             fallback_to_serialized_prompt=_bool("fallback_to_serialized_prompt", True),
+            transport_retries=transport_retries,
             audit_sample_summary_chars=sample_chars,
         )
 
@@ -4637,6 +4645,7 @@ Use this exact structure:
         focus_topic: Optional[str],
         _fallback_depth: int = 0,
         _fallback_limit: Optional[int] = None,
+        _transport_retry_depth: int = 0,
     ) -> Optional[str]:
         """Generate a summary by appending a final instruction to provider-visible history."""
         from agent.compression_summary_runtime import (
@@ -4800,6 +4809,55 @@ Use this exact structure:
                 base_audit["fallback_reason"] = "append_cached_transport_error"
             self._last_summary_error = str(exc)
 
+            classified = classify_api_error(
+                exc,
+                provider=str(base_audit["cache_key_runtime"].get("provider", "") or ""),
+                model=str(base_audit["cache_key_runtime"].get("model", "") or ""),
+                approx_tokens=int(request_tokens),
+                context_length=int(runtime_limit or 0),
+                num_messages=len(request_messages),
+            )
+            failed_attempt = {
+                "provider": base_audit["cache_key_runtime"].get("provider", ""),
+                "model": base_audit["cache_key_runtime"].get("model", ""),
+                "api_mode": base_audit["cache_key_runtime"].get("api_mode", ""),
+                "fallback_reason": base_audit["fallback_reason"],
+                "error_type": exc.__class__.__name__,
+                "classification_reason": classified.reason.value,
+                "status_code": classified.status_code,
+                "retryable": bool(classified.retryable),
+            }
+            base_audit["transport_error"] = dict(failed_attempt)
+
+            same_runtime_retry_reasons = {
+                FailoverReason.timeout,
+                FailoverReason.server_error,
+                FailoverReason.overloaded,
+                FailoverReason.unknown,
+            }
+            transport_retry_limit = int(getattr(append_cfg, "transport_retries", 1) or 0)
+            if (
+                base_audit["fallback_reason"] == "append_cached_transport_error"
+                and classified.reason in same_runtime_retry_reasons
+                and _transport_retry_depth < transport_retry_limit
+            ):
+                summary = self._generate_summary_append_cached(
+                    source_messages=source_messages,
+                    turns_to_summarize=turns_to_summarize,
+                    summarize_start=summarize_start,
+                    compress_end=compress_end,
+                    focus_topic=focus_topic,
+                    _fallback_depth=_fallback_depth,
+                    _fallback_limit=_fallback_limit,
+                    _transport_retry_depth=_transport_retry_depth + 1,
+                )
+                final_audit = self._last_summary_call_audit
+                if isinstance(final_audit, dict):
+                    attempts = list(final_audit.get("transport_retry_attempts") or [])
+                    final_audit["transport_retry_attempts"] = [failed_attempt] + attempts
+                    final_audit["transport_retry_activated"] = True
+                return summary
+
             activate_fallback = getattr(runtime, "activate_fallback", None)
             fallback_budget = int(getattr(runtime, "fallback_attempt_budget", 0) or 0)
             fallback_limit = fallback_budget if _fallback_limit is None else int(_fallback_limit)
@@ -4809,13 +4867,6 @@ Use this exact structure:
                 and fallback_budget > 0
                 and _fallback_depth < fallback_limit
             ):
-                failed_attempt = {
-                    "provider": base_audit["cache_key_runtime"].get("provider", ""),
-                    "model": base_audit["cache_key_runtime"].get("model", ""),
-                    "api_mode": base_audit["cache_key_runtime"].get("api_mode", ""),
-                    "fallback_reason": base_audit["fallback_reason"],
-                    "error_type": exc.__class__.__name__,
-                }
                 try:
                     fallback_activated = bool(activate_fallback(exc))
                 except Exception:
@@ -4829,6 +4880,7 @@ Use this exact structure:
                         focus_topic=focus_topic,
                         _fallback_depth=_fallback_depth + 1,
                         _fallback_limit=fallback_limit,
+                        _transport_retry_depth=0,
                     )
                     final_audit = self._last_summary_call_audit
                     if isinstance(final_audit, dict):

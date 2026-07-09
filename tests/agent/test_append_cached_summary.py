@@ -28,6 +28,7 @@ def test_append_cached_config_defaults_are_disabled_and_safe():
         "require_main_runtime": True,
         "allow_tool_choice_none": True,
         "fallback_to_serialized_prompt": True,
+        "transport_retries": 1,
         "audit_sample_summary_chars": 12000,
     }
 
@@ -38,12 +39,14 @@ def test_append_cached_config_normalizes_invalid_values_to_safe_defaults():
         "require_main_runtime": "yes",
         "allow_tool_choice_none": "0",
         "fallback_to_serialized_prompt": "false",
+        "transport_retries": "not-an-int",
         "audit_sample_summary_chars": "not-an-int",
     })
     assert cfg.source_scope == "compacted_prefix"
     assert cfg.require_main_runtime is True
     assert cfg.allow_tool_choice_none is False
     assert cfg.fallback_to_serialized_prompt is False
+    assert cfg.transport_retries == 1
     assert cfg.audit_sample_summary_chars == 12000
 
 
@@ -260,6 +263,46 @@ class CapturingRuntime:
 
     def estimate_request_tokens(self, api_kwargs: dict[str, Any]) -> int:
         return 500_000
+
+
+@dataclass
+class FlakyTransportRuntime(CapturingRuntime):
+    fail_times: int = 1
+    attempts: int = 0
+
+    def invoke(self, api_kwargs: dict[str, Any]) -> Any:
+        self.attempts += 1
+        if self.attempts <= self.fail_times:
+            raise TimeoutError("simulated transient append-cached transport failure")
+        return super().invoke(api_kwargs)
+
+
+def test_append_cached_retries_retryable_transport_error_before_serialized_fallback():
+    runtime = FlakyTransportRuntime(fail_times=1)
+    with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+        compressor = ContextCompressor(
+            model="gpt-5.5",
+            quiet_mode=True,
+            summary_call_mode="append_cached",
+            append_cached_summary={"fallback_to_serialized_prompt": False, "transport_retries": 1},
+        )
+    compressor.bind_summary_runtime_factory(lambda: runtime)
+
+    summary = compressor._generate_summary(
+        [{"role": "user", "content": "old prefix"}],
+        source_messages=[{"role": "user", "content": "old prefix"}],
+        summarize_start=0,
+        compress_end=1,
+        focus_topic=None,
+    )
+
+    assert summary is not None
+    assert runtime.attempts == 2
+    audit = compressor._last_summary_call_audit
+    assert audit["mode"] == "append_cached"
+    assert audit["transport_retry_activated"] is True
+    assert audit["transport_retry_attempts"][0]["error_type"] == "TimeoutError"
+    assert audit["transport_retry_attempts"][0]["classification_reason"] == "timeout"
 
 
 def test_append_cached_does_not_reembed_previous_summary_when_visible_in_cached_prefix():
