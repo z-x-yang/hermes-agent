@@ -355,3 +355,24 @@ class TestTaskClarifyCard:
                    for row in rows for b in row["components"])
         assert all(b.get("custom_id") != f"ntask:v1:other:{self.PID}"
                    for row in rows for b in row["components"])
+
+    def test_terminal_done_drop_and_snooze_cards_collapse_body_and_recolor(self):
+        cases = [
+            ("done", "完成", 0x4E8CD8, "已完成", "正文已收起，需要恢复可点 ↩。"),
+            ("dropped", "弃置", 0x8E9297, "已弃置", "正文已收起，需要恢复可点 ↩。"),
+            ("snoozed", "暂挂 / 延后提醒", 0x8E9297, "已暂挂 / 延后提醒", "正文已收起，稍后再看。"),
+        ]
+        for state, selected, color, status, hint in cases:
+            card = self.card()
+            card["selectedChoice"] = {"text": selected}
+            card["followthroughState"] = state
+
+            embed = c.task_clarify_embed(card)
+
+            assert embed["color"] == color
+            assert f"已选择：{selected}" in embed["description"]
+            assert f"状态：{status}" in embed["description"]
+            assert hint in embed["description"]
+            assert "合作者回了论文修改意见" not in embed["description"]
+            assert "1. **推荐：先开子区整理上下文**" not in embed["description"]
+            assert embed["footer"]["text"] == "已处理；正文已收起"

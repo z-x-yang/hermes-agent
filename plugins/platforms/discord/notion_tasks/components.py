@@ -86,6 +86,14 @@ _SHORT_LABEL_BY_ROUTINE_ACTION = {
     "done": "✓",
 }
 
+_STATE_COLORS = {
+    "pending": 0xE0A15D,
+    "selected": 0x2ECC71,
+    "done": 0x4E8CD8,
+    "muted": 0x8E9297,
+    "failed": 0xED4245,
+}
+
 # Discord limits: max 5 action rows per message, max 5 buttons per row.
 _MAX_ROWS = 5
 _MAX_PER_ROW = 5
@@ -242,6 +250,61 @@ def _followthrough_status_text(state: str) -> str:
     return "已选择"
 
 
+def _terminal_choice_label(state: str) -> str:
+    if state == "done":
+        return "完成"
+    if state == "dropped":
+        return "弃置"
+    return ""
+
+
+def _compact_followthrough_lines(card: dict) -> list[str] | None:
+    state = _clean_text(card.get("followthroughState") or card.get("followthrough_state"))
+    selected_text = _selected_choice_text(card)
+    if state in {"done", "dropped"}:
+        selected_text = selected_text or _terminal_choice_label(state)
+        lines: list[str] = []
+        if selected_text:
+            lines.append(f"已选择：{selected_text}")
+        lines.append(f"状态：{_followthrough_status_text(state)}")
+        lines.append("正文已收起，需要恢复可点 ↩。")
+        return lines
+    if state in {"selected", "continued", "following_through"} and selected_text:
+        return [
+            f"已选择：{selected_text}",
+            f"状态：{_followthrough_status_text(state)}",
+            "正文已收起，进子区继续。",
+        ]
+    if state == "snoozed" and selected_text:
+        return [
+            f"已选择：{selected_text}",
+            f"状态：{_followthrough_status_text(state)}",
+            "正文已收起，稍后再看。",
+        ]
+    if state == "setting_snooze":
+        return ["正在设置：稍后提醒", "状态：请选择提醒时间", "选完时间前，任务还不会改成 Hold。"]
+    if state == "setting_hold":
+        return ["正在设置：暂挂", "状态：等待填写原因", "提交前，任务还不会改成 Hold。"]
+    return None
+
+
+def _task_clarify_state_kind(card: dict) -> str:
+    state = _clean_text(card.get("followthroughState") or card.get("followthrough_state"))
+    if state == "failed":
+        return "failed"
+    if state == "done":
+        return "done"
+    if state in {"dropped", "snoozed", "setting_snooze", "setting_hold"}:
+        return "muted"
+    if _selected_choice_text(card) or state in {"selected", "continued", "following_through"}:
+        return "selected"
+    return "pending"
+
+
+def _task_clarify_color(card: dict) -> int:
+    return _STATE_COLORS.get(_task_clarify_state_kind(card), _STATE_COLORS["pending"])
+
+
 def task_clarify_embed(card: dict) -> dict:
     """Render a Discord-native task decision card.
 
@@ -250,6 +313,18 @@ def task_clarify_embed(card: dict) -> dict:
     Routine controls are intentionally not listed as main choices.
     """
     title = _task_clarify_title(card)
+    compact_lines = _compact_followthrough_lines(card)
+    if compact_lines:
+        desc = "\n".join(compact_lines)
+        if len(desc) > _DESC_MAX:
+            desc = desc[: _DESC_MAX - 1] + "…"
+        return {
+            "title": f"🧭 Task Clarify · {title}",
+            "description": desc,
+            "color": _task_clarify_color(card),
+            "footer": {"text": "已处理；正文已收起"},
+        }
+
     body = card.get("body") or {}
     context = _clean_text(body.get("context") or card.get("context"), "**这是什么**：任务需要你选择下一步。")
     lines = [context]
@@ -267,7 +342,7 @@ def task_clarify_embed(card: dict) -> dict:
     return {
         "title": f"🧭 Task Clarify · {title}",
         "description": desc,
-        "color": 0xE0A15D,
+        "color": _task_clarify_color(card),
         "footer": {"text": "1/2/3 是智能建议；Snooze/Hold/Dropped/Done 在二级操作"},
     }
 
