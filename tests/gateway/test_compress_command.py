@@ -300,6 +300,119 @@ async def test_compress_command_reports_provider_visible_token_estimates():
 
 
 @pytest.mark.asyncio
+async def test_compress_command_estimates_full_next_turn_not_memory_only_agent():
+    """Gateway /compress uses a memory-only temporary agent to run the
+    summariser, but the displayed request size should describe the next normal
+    turn with the full system prompt and tool schemas.
+    """
+    history = _make_history()
+    compressed = [
+        history[0],
+        {"role": "assistant", "content": "compressed summary"},
+        history[-1],
+    ]
+    runner = _make_runner(history)
+
+    compression_agent = MagicMock()
+    compression_agent.shutdown_memory_provider = MagicMock()
+    compression_agent.close = MagicMock()
+    compression_agent._cached_system_prompt = "MEMORY ONLY SYSTEM"
+    compression_agent.tools = [{"type": "function", "function": {"name": "memory"}}]
+    compression_agent.context_compressor.has_content_to_compress.return_value = True
+    compression_agent.context_compressor._last_compress_aborted = False
+    compression_agent.context_compressor._last_aux_model_failure_model = None
+    compression_agent.context_compressor.estimate_provider_request_tokens.side_effect = [
+        40,
+        20,
+    ]
+    compression_agent.session_id = "sess-1"
+    compression_agent._compress_context.return_value = (compressed, "MEMORY ONLY SYSTEM")
+
+    full_agent = MagicMock()
+    full_agent.shutdown_memory_provider = MagicMock()
+    full_agent.close = MagicMock()
+    full_agent._cached_system_prompt = "FULL SYSTEM"
+    full_agent.tools = [{"type": "function", "function": {"name": "terminal"}}]
+    full_agent.context_compressor.estimate_provider_request_tokens.side_effect = [
+        400,
+        300,
+    ]
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", side_effect=[compression_agent, full_agent]) as cls,
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "Approx request size: ~400 → ~300 tokens" in result
+    assert cls.call_args_list[0].kwargs["enabled_toolsets"] == ["memory"]
+    assert cls.call_args_list[1].kwargs["enabled_toolsets"] != ["memory"]
+    assert "terminal" in cls.call_args_list[1].kwargs["enabled_toolsets"]
+    assert cls.call_args_list[1].kwargs["skip_memory"] is True
+    assert cls.call_args_list[1].kwargs["session_id"].endswith(":compress-estimate")
+    compression_agent.context_compressor.estimate_provider_request_tokens.assert_not_called()
+    full_agent.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_compress_command_restores_session_context_after_estimate_agent():
+    """The full-tool estimate helper uses a synthetic session id; constructing
+    it must not leave the live gateway turn bound to that fake id.
+    """
+    history = _make_history()
+    compressed = [
+        history[0],
+        {"role": "assistant", "content": "compressed summary"},
+        history[-1],
+    ]
+    runner = _make_runner(history)
+
+    compression_agent = MagicMock()
+    compression_agent.shutdown_memory_provider = MagicMock()
+    compression_agent.close = MagicMock()
+    compression_agent._cached_system_prompt = "MEMORY ONLY SYSTEM"
+    compression_agent.tools = [{"type": "function", "function": {"name": "memory"}}]
+    compression_agent.context_compressor.has_content_to_compress.return_value = True
+    compression_agent.context_compressor._last_compress_aborted = False
+    compression_agent.context_compressor._last_aux_model_failure_model = None
+    compression_agent.session_id = "sess-1"
+    compression_agent._compress_context.return_value = (compressed, "MEMORY ONLY SYSTEM")
+
+    full_agent = MagicMock()
+    full_agent.close = MagicMock()
+    full_agent._cached_system_prompt = "FULL SYSTEM"
+    full_agent.tools = [{"type": "function", "function": {"name": "terminal"}}]
+    full_agent.context_compressor.estimate_provider_request_tokens.side_effect = [
+        400,
+        300,
+    ]
+
+    constructed = []
+
+    def _construct_agent(**kwargs):
+        constructed.append(kwargs)
+        from gateway.session_context import set_current_session_id
+
+        set_current_session_id(kwargs["session_id"])
+        return compression_agent if len(constructed) == 1 else full_agent
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", side_effect=_construct_agent),
+        patch("gateway.session_context.set_current_session_id") as set_sid,
+        patch("hermes_logging.set_session_context") as set_log_sid,
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "Compressed:" in result
+    assert constructed[1]["session_id"].endswith(":compress-estimate")
+    assert set_sid.call_args_list[-1].args[0] == "sess-1"
+    assert set_log_sid.call_args_list[-1].args[0] == "sess-1"
+
+
+@pytest.mark.asyncio
 async def test_compress_command_appends_warning_when_compression_aborts():
     """When the auxiliary summariser fails and the compressor ABORTS (returns
     messages unchanged), /compress must append a visible ⚠️ warning to its
@@ -466,8 +579,9 @@ async def test_compress_command_passes_session_db_and_persists_rotated_session()
         result = await runner._handle_compress_command(_make_event())
 
     assert "Compressed:" in result
-    mock_agent_cls.assert_called_once()
-    assert mock_agent_cls.call_args.kwargs["session_db"] is runner._session_db
+    assert mock_agent_cls.call_count == 2
+    assert mock_agent_cls.call_args_list[0].kwargs["session_db"] is runner._session_db
+    assert mock_agent_cls.call_args_list[1].kwargs["session_db"] is runner._session_db
     runner.session_store._save.assert_called_once()
     runner.session_store.rewrite_transcript.assert_called_once_with(
         "sess-2", compressed
@@ -725,14 +839,21 @@ async def test_compress_command_preserves_platform_and_gateway_session_key():
     ):
         await runner._handle_compress_command(_make_event())
 
-    assert mock_agent.call_count == 1
-    _, kwargs = mock_agent.call_args
+    assert mock_agent.call_count == 2
+    first_kwargs = mock_agent.call_args_list[0].kwargs
+    second_kwargs = mock_agent.call_args_list[1].kwargs
     # Platform preserved as the live turn's config key (TELEGRAM -> "telegram"),
     # not the unbound "cli"/"local" fallback.
-    assert kwargs.get("platform") == "telegram"
+    assert first_kwargs.get("platform") == "telegram"
+    assert second_kwargs.get("platform") == "telegram"
     # Stable gateway session key preserved, identical to a normal gateway turn.
-    assert kwargs.get("gateway_session_key") == runner._session_key_for_source(_make_source())
-    assert kwargs["gateway_session_key"]
+    assert first_kwargs.get("gateway_session_key") == runner._session_key_for_source(_make_source())
+    assert second_kwargs.get("gateway_session_key") == runner._session_key_for_source(_make_source())
+    assert first_kwargs["gateway_session_key"]
+    assert first_kwargs["enabled_toolsets"] == ["memory"]
+    assert second_kwargs["enabled_toolsets"] != ["memory"]
+    assert "terminal" in second_kwargs["enabled_toolsets"]
+    assert second_kwargs["skip_memory"] is True
 
 
 
@@ -763,9 +884,12 @@ async def test_compress_command_overrides_stale_resolver_identity():
     ):
         await runner._handle_compress_command(_make_event())  # must not raise
 
-    assert mock_agent.call_count == 1
-    _, kwargs = mock_agent.call_args
+    assert mock_agent.call_count == 2
+    first_kwargs = mock_agent.call_args_list[0].kwargs
+    second_kwargs = mock_agent.call_args_list[1].kwargs
     # Source-derived identity overrides the stale resolver values, passed once.
-    assert kwargs["platform"] == "telegram"
-    assert kwargs["gateway_session_key"] == runner._session_key_for_source(_make_source())
+    assert first_kwargs["platform"] == "telegram"
+    assert second_kwargs["platform"] == "telegram"
+    assert first_kwargs["gateway_session_key"] == runner._session_key_for_source(_make_source())
+    assert second_kwargs["gateway_session_key"] == runner._session_key_for_source(_make_source())
 

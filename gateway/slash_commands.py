@@ -3163,16 +3163,27 @@ class GatewaySlashCommandsMixin:
             # unbound/default "cli" host source — see #50422. _platform_config_key
             # maps LOCAL->"cli" exactly like the live turn, avoiding a new
             # "local" vs "cli" mismatch.
-            from gateway.run import _platform_config_key
+            from gateway.run import _load_gateway_config, _platform_config_key
+            user_config = _load_gateway_config()
             platform_key = (
                 _platform_config_key(source.platform) if source.platform else None
             )
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
                 session_key=session_key,
+                user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
                 return t("gateway.compress.no_provider")
+
+            from hermes_cli.tools_config import _get_platform_tools
+            request_enabled_toolsets = (
+                sorted(_get_platform_tools(user_config, platform_key))
+                if platform_key
+                else None
+            )
+            agent_cfg = user_config.get("agent") or {}
+            request_disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
             conversation_keys = {
                 "role",
@@ -3254,6 +3265,23 @@ class GatewaySlashCommandsMixin:
                 session_id=session_entry.session_id,
                 session_db=getattr(self._session_db, "_db", self._session_db),
             )
+            request_estimate_agent = tmp_agent
+
+            def _restore_live_session_context() -> None:
+                live_sid = getattr(tmp_agent, "session_id", None) or session_entry.session_id
+                try:
+                    from gateway.session_context import set_current_session_id
+
+                    set_current_session_id(live_sid)
+                except Exception:
+                    os.environ["HERMES_SESSION_ID"] = live_sid
+                try:
+                    from hermes_logging import set_session_context
+
+                    set_session_context(live_sid)
+                except Exception:
+                    pass
+
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None
                 # Prevent close() from ending the newly rotated session —
@@ -3261,16 +3289,56 @@ class GatewaySlashCommandsMixin:
                 # must remain open for the next user turn.
                 tmp_agent._end_session_on_close = False
 
+                # The summariser runs with only the memory tool enabled, but the
+                # number shown to the user should include the normal platform
+                # prompt/tool pressure. Build a second side-effect-light agent
+                # with the same platform toolset config for accounting only; if
+                # that fails, fall back to the compression agent rather than
+                # failing /compress itself. skip_memory avoids firing external
+                # memory lifecycle hooks just to print a token estimate.
+                try:
+                    request_estimate_kwargs = {
+                        **runtime_kwargs,
+                        "model": model,
+                        "max_iterations": 1,
+                        "quiet_mode": True,
+                        "skip_memory": True,
+                        "session_id": f"{session_entry.session_id}:compress-estimate",
+                        "session_db": getattr(
+                            getattr(self, "_session_db", None),
+                            "_db",
+                            getattr(self, "_session_db", None),
+                        ),
+                    }
+                    if request_enabled_toolsets is not None:
+                        request_estimate_kwargs["enabled_toolsets"] = request_enabled_toolsets
+                    if request_disabled_toolsets is not None:
+                        request_estimate_kwargs["disabled_toolsets"] = request_disabled_toolsets
+                    request_estimate_agent = AIAgent(
+                        **request_estimate_kwargs,
+                    )
+                    setattr(request_estimate_agent, "_print_fn", lambda *a, **kw: None)
+                    setattr(request_estimate_agent, "_end_session_on_close", False)
+                    _restore_live_session_context()
+                except Exception as estimate_agent_err:
+                    logger.warning(
+                        "Manual /compress: full request estimate agent unavailable "
+                        "(%s); falling back to compression-agent token estimate",
+                        estimate_agent_err,
+                    )
+                    request_estimate_agent = tmp_agent
+
                 # Estimate with system prompt + tool schemas included so the
                 # figure reflects real request pressure, not a transcript-only
-                # underestimate (#6217). Must be computed after tmp_agent is
-                # built so _cached_system_prompt/tools are populated.
+                # underestimate (#6217). Use the full request-estimate agent,
+                # not the memory-only compression agent, so /compress feedback
+                # reflects the next normal turn's prompt/tool pressure.
                 _sys_prompt = materialize_manual_compression_system_prompt(
-                    tmp_agent, None
+                    request_estimate_agent, None
                 )
-                _tools = getattr(tmp_agent, "tools", None) or None
+                _tools = getattr(request_estimate_agent, "tools", None) or None
                 approx_tokens = estimate_manual_compression_request_tokens(
-                    tmp_agent,
+                    request_estimate_agent,
                     msgs,
                     system_prompt=_sys_prompt,
                     tools=_tools,
@@ -3378,12 +3446,12 @@ class GatewaySlashCommandsMixin:
                     session_entry.session_key, last_prompt_tokens=0
                 )
                 _sys_prompt_after = (
-                    getattr(tmp_agent, "_cached_system_prompt", "")
+                    getattr(request_estimate_agent, "_cached_system_prompt", "")
                     or _new_system_prompt
                     or _sys_prompt
                 )
                 new_tokens = estimate_manual_compression_request_tokens(
-                    tmp_agent,
+                    request_estimate_agent,
                     compressed,
                     system_prompt=_sys_prompt_after,
                     tools=_tools,
@@ -3412,6 +3480,11 @@ class GatewaySlashCommandsMixin:
                 # Evict cached agent so next turn rebuilds system prompt
                 # from current files (SOUL.md, memory, etc.).
                 self._evict_cached_agent(session_key)
+                if request_estimate_agent is not tmp_agent:
+                    close_agent = getattr(request_estimate_agent, "close", None)
+                    if callable(close_agent):
+                        close_agent()
+                    _restore_live_session_context()
                 self._cleanup_agent_resources(tmp_agent)
             lines = [f"🗜️ {summary['headline']}"]
             if focus_topic:
