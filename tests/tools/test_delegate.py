@@ -2145,7 +2145,14 @@ class TestDelegateHeartbeat(unittest.TestCase):
 
         parent = _make_mock_parent()
         touch_calls = []
-        parent._touch_activity = lambda desc: touch_calls.append(desc)
+        heartbeat_seen = threading.Event()
+
+        def touch_activity(desc):
+            touch_calls.append(desc)
+            if "API call #5 completed" in desc:
+                heartbeat_seen.set()
+
+        parent._touch_activity = touch_activity
 
         child = MagicMock()
         child.get_activity_summary.return_value = {
@@ -2156,7 +2163,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         }
 
         def slow_run(**kwargs):
-            time.sleep(0.15)
+            assert heartbeat_seen.wait(2), "target heartbeat was never emitted"
             return {"final_response": "done", "completed": True, "api_calls": 5}
 
         child.run_conversation.side_effect = slow_run
