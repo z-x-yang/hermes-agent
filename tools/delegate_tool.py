@@ -1866,6 +1866,124 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _run_child_conversation_with_timeout(
+    *,
+    child,
+    run_callable,
+    timeout_seconds: Optional[float],
+    task_index: int,
+    goal: str,
+    child_start: float,
+    child_progress_cb=None,
+) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Run one child call with the shared interrupt and timeout diagnostics."""
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+
+    timeout_executor = DaemonThreadPoolExecutor(
+        max_workers=1,
+        initializer=_set_subagent_approval_cb,
+        initargs=(_get_subagent_approval_callback(),),
+    )
+    worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}
+
+    def _run_with_thread_capture():
+        worker_thread_holder["t"] = threading.current_thread()
+        return run_callable()
+
+    child_future = _submit_with_context(timeout_executor, _run_with_thread_capture)
+    try:
+        return child_future.result(timeout=timeout_seconds), None
+    except Exception as timeout_exc:
+        try:
+            if hasattr(child, "interrupt"):
+                child.interrupt()
+            elif hasattr(child, "_interrupt_requested"):
+                child._interrupt_requested = True
+        except Exception:
+            pass
+
+        is_timeout = isinstance(timeout_exc, (FuturesTimeoutError, TimeoutError))
+        duration = round(time.monotonic() - child_start, 2)
+        logger.warning(
+            "Subagent %d %s after %.1fs",
+            task_index,
+            "timed out" if is_timeout else f"raised {type(timeout_exc).__name__}",
+            duration,
+        )
+
+        diagnostic_path: Optional[str] = None
+        child_api_calls = 0
+        try:
+            summary = child.get_activity_summary()
+            child_api_calls = int(summary.get("api_call_count", 0) or 0)
+        except Exception:
+            pass
+        if is_timeout and child_api_calls == 0:
+            diagnostic_path = _dump_subagent_timeout_diagnostic(
+                child=child,
+                task_index=task_index,
+                timeout_seconds=float(timeout_seconds or 0.0),
+                duration_seconds=float(duration),
+                worker_thread=worker_thread_holder.get("t"),
+                goal=goal,
+            )
+            if diagnostic_path:
+                logger.warning(
+                    "Subagent %d 0-API-call timeout — diagnostic written to %s",
+                    task_index,
+                    diagnostic_path,
+                )
+
+        if child_progress_cb:
+            try:
+                child_progress_cb(
+                    "subagent.complete",
+                    preview=(
+                        f"Timed out after {duration}s"
+                        if is_timeout
+                        else str(timeout_exc)
+                    ),
+                    status="timeout" if is_timeout else "error",
+                    duration_seconds=duration,
+                    summary="",
+                )
+            except Exception:
+                pass
+
+        if is_timeout:
+            if child_api_calls == 0:
+                error = (
+                    f"Subagent timed out after {timeout_seconds}s without "
+                    "making any API call — the child never reached its first "
+                    "LLM request (prompt construction, credential resolution, "
+                    "or transport may be stuck)."
+                )
+                if diagnostic_path:
+                    error += f" Diagnostic: {diagnostic_path}"
+            else:
+                error = (
+                    f"Subagent timed out after {timeout_seconds}s with "
+                    f"{child_api_calls} API call(s) completed — likely stuck "
+                    "on a slow API call or unresponsive network request."
+                )
+        else:
+            error = str(timeout_exc)
+
+        return None, {
+            "task_index": task_index,
+            "status": "timeout" if is_timeout else "error",
+            "summary": None,
+            "error": error,
+            "exit_reason": "timeout" if is_timeout else "error",
+            "api_calls": child_api_calls,
+            "duration_seconds": duration,
+            "_child_role": getattr(child, "_delegate_role", None),
+            "diagnostic_path": diagnostic_path,
+        }
+    finally:
+        timeout_executor.shutdown(wait=False)
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -2066,23 +2184,6 @@ def _run_single_child(
             if child_timeout_override is not None
             else _get_child_timeout()
         )
-        # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
-        # below; a stdlib non-daemon worker would then block interpreter
-        # exit at atexit-join time if the child never unwinds.
-        from tools.daemon_pool import DaemonThreadPoolExecutor
-        _timeout_executor = DaemonThreadPoolExecutor(
-            max_workers=1,
-            # Install a non-interactive approval callback in the worker thread
-            # so dangerous-command prompts from the subagent don't fall back to
-            # input() and deadlock the parent's prompt_toolkit TUI.
-            # Callback (deny vs approve) is governed by delegation.subagent_auto_approve.
-            initializer=_set_subagent_approval_cb,
-            initargs=(_get_subagent_approval_callback(),),
-        )
-        # Capture the worker thread so the timeout diagnostic can dump its
-        # Python stack (see #14726 — 0-API-call hangs are opaque without it).
-        _worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}
-
         def _relay_child_text(delta: str) -> None:
             # Forward the child's streamed reply text up the progress relay so
             # gateway watch windows mirror it live (subagent.text → message.delta).
@@ -2094,8 +2195,7 @@ def _run_single_child(
             except Exception as e:
                 logger.debug("Child text relay failed: %s", e)
 
-        def _run_with_thread_capture():
-            _worker_thread_holder["t"] = threading.current_thread()
+        def _run_child_conversation():
             user_message = _build_child_task_payload(goal, context)
             return child.run_conversation(
                 user_message=user_message,
@@ -2103,106 +2203,18 @@ def _run_single_child(
                 stream_callback=_relay_child_text,
             )
 
-        _child_future = _submit_with_context(_timeout_executor, _run_with_thread_capture)
-        try:
-            result = _child_future.result(timeout=child_timeout)
-        except Exception as _timeout_exc:
-            # Signal the child to stop so its thread can exit cleanly.
-            try:
-                if hasattr(child, "interrupt"):
-                    child.interrupt()
-                elif hasattr(child, "_interrupt_requested"):
-                    child._interrupt_requested = True
-            except Exception:
-                pass
-
-            is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
-            duration = round(time.monotonic() - child_start, 2)
-            logger.warning(
-                "Subagent %d %s after %.1fs",
-                task_index,
-                "timed out" if is_timeout else f"raised {type(_timeout_exc).__name__}",
-                duration,
-            )
-
-            # When a subagent times out BEFORE making any API call, dump a
-            # diagnostic to help users (and us) see what the child was doing.
-            # See #14726 — without this, 0-API-call hangs are black boxes.
-            diagnostic_path: Optional[str] = None
-            child_api_calls = 0
-            try:
-                _summary = child.get_activity_summary()
-                child_api_calls = int(_summary.get("api_call_count", 0) or 0)
-            except Exception:
-                pass
-            if is_timeout and child_api_calls == 0:
-                diagnostic_path = _dump_subagent_timeout_diagnostic(
-                    child=child,
-                    task_index=task_index,
-                    # is_timeout implies a cap was configured (result(timeout=None)
-                    # never raises FuturesTimeoutError); guard for the type checker.
-                    timeout_seconds=float(child_timeout or 0.0),
-                    duration_seconds=float(duration),
-                    worker_thread=_worker_thread_holder.get("t"),
-                    goal=goal,
-                )
-                if diagnostic_path:
-                    logger.warning(
-                        "Subagent %d 0-API-call timeout — diagnostic written to %s",
-                        task_index,
-                        diagnostic_path,
-                    )
-
-            if child_progress_cb:
-                try:
-                    child_progress_cb(
-                        "subagent.complete",
-                        preview=(
-                            f"Timed out after {duration}s"
-                            if is_timeout
-                            else str(_timeout_exc)
-                        ),
-                        status="timeout" if is_timeout else "error",
-                        duration_seconds=duration,
-                        summary="",
-                    )
-                except Exception:
-                    pass
-
-            if is_timeout:
-                if child_api_calls == 0:
-                    _err = (
-                        f"Subagent timed out after {child_timeout}s without "
-                        f"making any API call — the child never reached its "
-                        f"first LLM request (prompt construction, credential "
-                        f"resolution, or transport may be stuck)."
-                    )
-                    if diagnostic_path:
-                        _err += f" Diagnostic: {diagnostic_path}"
-                else:
-                    _err = (
-                        f"Subagent timed out after {child_timeout}s with "
-                        f"{child_api_calls} API call(s) completed — likely "
-                        f"stuck on a slow API call or unresponsive network request."
-                    )
-            else:
-                _err = str(_timeout_exc)
-
-            return {
-                "task_index": task_index,
-                "status": "timeout" if is_timeout else "error",
-                "summary": None,
-                "error": _err,
-                "exit_reason": "timeout" if is_timeout else "error",
-                "api_calls": child_api_calls,
-                "duration_seconds": duration,
-                "_child_role": getattr(child, "_delegate_role", None),
-                "diagnostic_path": diagnostic_path,
-            }
-        finally:
-            # Shut down executor without waiting — if the child thread
-            # is stuck on blocking I/O, wait=True would hang forever.
-            _timeout_executor.shutdown(wait=False)
+        result, timeout_entry = _run_child_conversation_with_timeout(
+            child=child,
+            run_callable=_run_child_conversation,
+            timeout_seconds=child_timeout,
+            task_index=task_index,
+            goal=goal,
+            child_start=child_start,
+            child_progress_cb=child_progress_cb,
+        )
+        if timeout_entry is not None:
+            return timeout_entry
+        assert result is not None
 
         # Flush any remaining batched progress to gateway
         if child_progress_cb and hasattr(child_progress_cb, "_flush"):
@@ -2416,7 +2428,8 @@ def _run_single_child(
             except Exception as e:
                 logger.debug("Progress callback completion failed: %s", e)
 
-        if retain_session and status == "completed":
+        parent_session_id = str(getattr(parent_agent, "session_id", "") or "")
+        if retain_session and status == "completed" and parent_session_id:
             try:
                 from tools.subagent_sessions import (
                     RetainedSubagentSession,
@@ -2435,7 +2448,7 @@ def _run_single_child(
                 retain_subagent_session(
                     RetainedSubagentSession(
                         agent_id=str(agent_id),
-                        parent_session_id=str(getattr(parent_agent, "session_id", "") or ""),
+                        parent_session_id=parent_session_id,
                         subagent_type=str(retained_type),
                         role=str(retained_role),
                         workspace_path=str(retained_workspace),
@@ -2823,28 +2836,17 @@ def delegate_task(
         )
         child_cfg = cfg
         if resolved_profile:
-            child_cfg = dict(cfg)
-            # Per-agent model/provider overrides must feed the credential
-            # resolver, not just AIAgent's display strings, so base_url,
-            # api_key, and api_mode come from the selected provider too.
-            if resolved_profile.model:
-                child_cfg["model"] = resolved_profile.model
-            if resolved_profile.provider:
-                child_cfg["provider"] = resolved_profile.provider
-
             agent_cfg = (cfg.get("agents") or {}).get(effective_subagent_type) or {}
             provider_changed = (
                 "provider" in agent_cfg
                 and resolved_profile.provider != cfg.get("provider")
             )
-            if provider_changed:
-                # Direct-endpoint and ACP transport settings belong to the
-                # global provider.  They must not override credentials for
-                # an explicitly different per-agent provider.
-                for transport_key in (
-                    "base_url", "api_key", "api_mode", "command", "args",
-                ):
-                    child_cfg.pop(transport_key, None)
+            child_cfg = _prepare_delegation_credentials_config(
+                cfg,
+                model=resolved_profile.model,
+                provider=resolved_profile.provider,
+                provider_changed=provider_changed,
+            )
         try:
             creds = _resolve_delegation_credentials(child_cfg, parent_agent)
         except ValueError as exc:
@@ -3410,6 +3412,39 @@ def _resolve_child_credential_pool(
             exc,
         )
     return None
+
+
+_DELEGATION_TRANSPORT_CONFIG_KEYS = (
+    "base_url",
+    "api_key",
+    "api_mode",
+    "command",
+    "args",
+)
+
+
+def _prepare_delegation_credentials_config(
+    cfg: dict,
+    *,
+    model: Optional[str],
+    provider: Optional[str],
+    provider_changed: bool,
+) -> dict:
+    """Apply child model/provider routing without leaking another transport.
+
+    Direct-endpoint and ACP settings are a credential bundle belonging to the
+    provider that supplied them.  When a profile or retained session selects a
+    different provider, remove that whole bundle before credential resolution.
+    """
+    child_cfg = dict(cfg)
+    if provider_changed:
+        for transport_key in _DELEGATION_TRANSPORT_CONFIG_KEYS:
+            child_cfg.pop(transport_key, None)
+    if model:
+        child_cfg["model"] = model
+    if provider:
+        child_cfg["provider"] = provider
+    return child_cfg
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:

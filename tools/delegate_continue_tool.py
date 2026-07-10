@@ -7,7 +7,8 @@ from typing import Any, Optional
 from tools.registry import registry
 from tools.subagent_sessions import (
     RetainedSubagentSession,
-    get_retained_subagent_session,
+    claim_retained_subagent_session,
+    release_retained_subagent_session,
     update_retained_history,
 )
 
@@ -61,6 +62,7 @@ def _build_continuation_child(
         _build_child_agent,
         _load_config,
         _normalize_role,
+        _prepare_delegation_credentials_config,
         _resolve_delegation_credentials,
     )
     from tools.subagent_profiles import get_subagent_profile, resolve_profile_config
@@ -70,16 +72,15 @@ def _build_continuation_child(
     profile = get_subagent_profile(subagent_type)
     resolved_profile = resolve_profile_config(subagent_type, cfg)
 
-    child_cfg = dict(cfg)
-    if record.model:
-        child_cfg["model"] = record.model
-    elif resolved_profile.model:
-        child_cfg["model"] = resolved_profile.model
-
     parent_provider = str(getattr(parent_agent, "provider", "") or "")
     record_provider = str(record.provider or "")
+    child_cfg = _prepare_delegation_credentials_config(
+        cfg,
+        model=record.model or resolved_profile.model,
+        provider=record_provider or resolved_profile.provider,
+        provider_changed=bool(record_provider and record_provider != parent_provider),
+    )
     if record_provider and record_provider != parent_provider:
-        child_cfg["provider"] = record_provider
         creds = _resolve_delegation_credentials(child_cfg, parent_agent)
     else:
         # Same provider as the live parent: inherit current trusted credentials
@@ -141,17 +142,45 @@ def _run_continuation_entry(
     record: RetainedSubagentSession,
     prompt: str,
     parent_agent,
+    *,
+    child_run_timeout_seconds: Optional[float] = None,
 ) -> dict[str, Any]:
     start = time.monotonic()
     child = None
     try:
         child = _build_continuation_child(record, prompt=prompt, parent_agent=parent_agent)
         payload = _build_continue_payload(prompt)
-        result = child.run_conversation(
-            user_message=payload,
-            conversation_history=list(record.conversation_history),
-            task_id=f"delegation-continue-{record.agent_id}-{int(time.time())}",
-        )
+
+        def _run_child_conversation():
+            return child.run_conversation(
+                user_message=payload,
+                conversation_history=list(record.conversation_history),
+                task_id=f"delegation-continue-{record.agent_id}-{int(time.time())}",
+            )
+
+        if child_run_timeout_seconds is None:
+            result = _run_child_conversation()
+        else:
+            from tools.delegate_tool import _run_child_conversation_with_timeout
+
+            result, timeout_entry = _run_child_conversation_with_timeout(
+                child=child,
+                run_callable=_run_child_conversation,
+                timeout_seconds=child_run_timeout_seconds,
+                task_index=0,
+                goal=prompt,
+                child_start=start,
+            )
+            if timeout_entry is not None:
+                timeout_entry.pop("task_index", None)
+                timeout_entry.pop("_child_role", None)
+                timeout_entry["agent_id"] = record.agent_id
+                timeout_entry["model"] = getattr(child, "model", record.model)
+                timeout_entry["provider"] = getattr(child, "provider", record.provider)
+                timeout_entry["subagent_type"] = record.subagent_type
+                timeout_entry["role"] = getattr(child, "_delegate_role", record.role)
+                return timeout_entry
+            assert result is not None
         messages = result.get("messages") if isinstance(result, dict) else None
         if isinstance(messages, list):
             update_retained_history(record.agent_id, list(messages))
@@ -226,17 +255,23 @@ def delegate_continue(
     if scheduling not in {"auto", "foreground", "background"}:
         return _tool_error(f"Invalid scheduling: {scheduling}")
 
-    try:
-        record = get_retained_subagent_session(agent_id)
-    except KeyError as exc:
-        return _tool_error(str(exc))
-
     parent_session_id = str(getattr(parent_agent, "session_id", "") or "")
-    if record.parent_session_id != parent_session_id:
-        return _tool_error("agent_id does not belong to this parent session")
-
+    if not parent_session_id:
+        return _tool_error("delegate_continue requires a non-empty parent session id.")
     if not isinstance(prompt, str) or not prompt.strip():
         return _tool_error("prompt is required")
+
+    try:
+        record = claim_retained_subagent_session(agent_id)
+    except (KeyError, RuntimeError) as exc:
+        return _tool_error(str(exc))
+
+    if not record.parent_session_id:
+        release_retained_subagent_session(agent_id)
+        return _tool_error("delegate_continue requires a non-empty parent session id.")
+    if record.parent_session_id != parent_session_id:
+        release_retained_subagent_session(agent_id)
+        return _tool_error("agent_id does not belong to this parent session")
 
     from tools.delegate_tool import (
         _get_max_async_children,
@@ -254,13 +289,35 @@ def delegate_continue(
             is_subagent=is_subagent,
         )
     except ValueError as exc:
+        release_retained_subagent_session(agent_id)
         return _tool_error(str(exc))
+
+    foreground_wait_timeout_seconds: Optional[float] = None
+    child_run_timeout_seconds: Optional[float] = None
+    if delivery_mode == "foreground":
+        try:
+            cfg = _load_config()
+            (
+                foreground_wait_timeout_seconds,
+                child_run_timeout_seconds,
+            ) = _resolve_foreground_timeouts(record.subagent_type, cfg)
+        except Exception as exc:
+            release_retained_subagent_session(agent_id)
+            return _tool_error(f"Cannot resolve continuation timeouts: {exc}")
 
     start = time.monotonic()
 
     def _runner() -> dict[str, Any]:
-        entry = _run_continuation_entry(record, prompt, parent_agent)
-        return _combined_for_async(entry)
+        try:
+            entry = _run_continuation_entry(
+                record,
+                prompt,
+                parent_agent,
+                child_run_timeout_seconds=child_run_timeout_seconds,
+            )
+            return _combined_for_async(entry)
+        finally:
+            release_retained_subagent_session(agent_id)
 
     # Nested continuations run inline; they cannot own async delivery.
     if is_subagent:
@@ -287,20 +344,24 @@ def delegate_continue(
     )
     from tools.approval import get_current_session_key
 
-    dispatch = dispatch_async_delegation_batch(
-        goals=[f"Continue retained subagent {record.agent_id}"],
-        context=None,
-        toolsets=None,
-        role=record.role,
-        model=record.model,
-        session_key=get_current_session_key(default=""),
-        runner=_runner,
-        interrupt_fn=None,
-        max_async_children=_get_max_async_children(),
-        initial_delivery_mode=(
-            "foreground_waiting" if delivery_mode == "foreground" else "background"
-        ),
-    )
+    try:
+        dispatch = dispatch_async_delegation_batch(
+            goals=[f"Continue retained subagent {record.agent_id}"],
+            context=None,
+            toolsets=None,
+            role=record.role,
+            model=record.model,
+            session_key=get_current_session_key(default=""),
+            runner=_runner,
+            interrupt_fn=None,
+            max_async_children=_get_max_async_children(),
+            initial_delivery_mode=(
+                "foreground_waiting" if delivery_mode == "foreground" else "background"
+            ),
+        )
+    except Exception as exc:
+        release_retained_subagent_session(agent_id)
+        return _tool_error(f"Failed to dispatch retained subagent continuation: {exc}")
 
     if dispatch.get("status") != "dispatched":
         combined = _runner()
@@ -312,11 +373,9 @@ def delegate_continue(
         return json.dumps(entry, ensure_ascii=False)
 
     if delivery_mode == "foreground":
-        cfg = _load_config()
-        wait_timeout, _run_timeout = _resolve_foreground_timeouts(record.subagent_type, cfg)
         payload = wait_for_async_delegation(
             dispatch,
-            timeout_seconds=float(wait_timeout or 0),
+            timeout_seconds=float(foreground_wait_timeout_seconds or 0),
         )
         if payload is not None:
             return _unwrap_foreground_payload(payload)

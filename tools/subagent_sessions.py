@@ -29,6 +29,7 @@ class RetainedSubagentSession:
 
 _lock = threading.RLock()
 _records: dict[str, RetainedSubagentSession] = {}
+_in_flight: set[str] = set()
 
 
 def _copy_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -40,11 +41,20 @@ def _copy_record(record: RetainedSubagentSession) -> RetainedSubagentSession:
 
 
 def _prune(now: float, max_records: int) -> None:
-    expired = [key for key, value in _records.items() if value.expires_at <= now]
+    expired = [
+        key
+        for key, value in _records.items()
+        if value.expires_at <= now and key not in _in_flight
+    ]
     for key in expired:
         _records.pop(key, None)
     while len(_records) >= max(1, int(max_records or 1)):
-        oldest = min(_records.values(), key=lambda item: item.created_at)
+        removable = [
+            record for key, record in _records.items() if key not in _in_flight
+        ]
+        if not removable:
+            break
+        oldest = min(removable, key=lambda item: item.created_at)
         _records.pop(oldest.agent_id, None)
 
 
@@ -64,10 +74,27 @@ def get_retained_subagent_session(agent_id: str) -> RetainedSubagentSession:
         record = _records.get(agent_id)
         if record is None:
             raise KeyError(f"Unknown retained subagent session: {agent_id}")
-        if record.expires_at <= now:
+        if record.expires_at <= now and agent_id not in _in_flight:
             _records.pop(agent_id, None)
             raise KeyError(f"Retained subagent session expired: {agent_id}")
         return _copy_record(record)
+
+
+def claim_retained_subagent_session(agent_id: str) -> RetainedSubagentSession:
+    """Atomically claim one retained transcript for continuation."""
+    with _lock:
+        record = get_retained_subagent_session(agent_id)
+        if agent_id in _in_flight:
+            raise RuntimeError(
+                f"Retained subagent continuation already in progress: {agent_id}"
+            )
+        _in_flight.add(agent_id)
+        return record
+
+
+def release_retained_subagent_session(agent_id: str) -> None:
+    with _lock:
+        _in_flight.discard(agent_id)
 
 
 def update_retained_history(agent_id: str, history: list[dict[str, Any]]) -> None:
@@ -79,3 +106,4 @@ def update_retained_history(agent_id: str, history: list[dict[str, Any]]) -> Non
 def clear_retained_subagent_sessions() -> None:
     with _lock:
         _records.clear()
+        _in_flight.clear()
