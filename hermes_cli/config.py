@@ -2178,6 +2178,9 @@ DEFAULT_CONFIG = {
         # raise deliberately, each level multiplies API cost.
         "max_spawn_depth": 1,        # depth (1 = flat [default], 2 = orchestrator→leaf, 3+ = deeper)
         "orchestrator_enabled": True,  # kill switch for role="orchestrator"
+        # Aggregate UTF-8 JSON byte budget for process-local retained transcripts.
+        # Operator-only: intentionally absent from model-facing delegation schemas.
+        "max_retained_subagent_bytes": 16777216,
         # When a subagent hits a dangerous-command approval prompt, the parent's
         # prompt_toolkit TUI owns stdin — a thread-local input() call from the
         # subagent worker would deadlock the parent UI. To avoid the deadlock,

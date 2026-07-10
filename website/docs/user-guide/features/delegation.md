@@ -16,9 +16,9 @@ Hermes uses `delegate_task` to run isolated child agents. A child starts with a 
 |---|---|---|---|
 | `Explore` | Search and understand code, files, and supporting sources | Read-only: `read_file`, `search_files`, `web_search`, and `web_extract` | Foreground |
 | `Plan` | Research a codebase and prepare inputs for a later implementation plan | The same read-only ceiling as `Explore`; it cannot edit or claim implementation is complete | Foreground |
-| `general-purpose` | Multi-step repository work, including edits and tests | A closed repo-local allowlist for files, shell/process work, task tracking, skills, and vision; no external side effects or delegation | Background |
+| `general-purpose` | Multi-step repository work, including edits and tests | A closed allowlist for files, raw shell/process work, task tracking, skills, and vision; named messaging/Notion/cron/memory/delegation tools are excluded, but shell access is not a no-side-effect sandbox | Background |
 
-`Explore` and `Plan` cannot write files, run shell commands, create external side effects, or delegate. `general-purpose` may edit and test inside the repository, but it cannot send messages, schedule jobs, write shared memory, execute external side effects, or delegate by default.
+`Explore` and `Plan` cannot write files, run shell commands, create external side effects, or delegate. `general-purpose` may edit and test and cannot directly call the excluded named side-effect tools or delegate by default. However, it deliberately retains raw `terminal` and `process`: shell commands can access networks, invoke authenticated CLIs, and cause external effects. Those actions remain governed by normal terminal approvals and the task instructions; Hermes does not provide hard no-side-effect isolation for this profile.
 
 Omitting `subagent_type` preserves legacy generic delegation. This has two deliberately different compatibility surfaces:
 
@@ -142,7 +142,9 @@ delegate_continue(
 
 Retention safety and lifetime:
 
-- The store is in-process, TTL-bounded, and capacity-bounded (`3600` seconds and `64` records by default).
+- The store is in-process, TTL-bounded, record-count-bounded, and serialized-transcript-byte-bounded (`3600` seconds, `64` records, and `16777216` bytes by default).
+- Initial records larger than the byte budget are not retained. Aggregate pruning removes only non-in-flight records; claimed continuations are never evicted.
+- If a successful continuation grows beyond the byte budget, Hermes returns that successful result with `retention_dropped`, invalidates the retained handle, and rejects future continuation attempts.
 - Only the same nonempty parent session may continue an `agent_id`.
 - Only one continuation for a given `agent_id` may be in flight; a concurrent second call fails immediately. Different retained agents may continue concurrently.
 - `/stop` and shutdown interrupt background continuations.
@@ -167,4 +169,4 @@ Background delegation is asynchronous, but not durable job storage. Closing the 
 
 ## Configuration
 
-Scheduling limits, per-agent model/provider overrides, retention TTL/capacity, concurrency, and nesting are configured under `delegation` in `~/.hermes/config.yaml`. These operator controls are intentionally absent from the model-facing tool schema. See [Configuration → Delegation](/user-guide/configuration#delegation).
+Scheduling limits, per-agent model/provider overrides, retention TTL/count/byte capacity, concurrency, and nesting are configured under `delegation` in `~/.hermes/config.yaml`. These operator controls are intentionally absent from the model-facing tool schema. See [Configuration → Delegation](/user-guide/configuration#delegation).

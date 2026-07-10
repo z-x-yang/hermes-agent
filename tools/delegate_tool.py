@@ -496,6 +496,21 @@ def _get_max_retained_subagents() -> int:
         return 64
 
 
+def _get_max_retained_subagent_bytes() -> int:
+    """Maximum aggregate serialized bytes for retained child transcripts."""
+    cfg = _load_config()
+    raw = cfg.get("max_retained_subagent_bytes", 16777216)
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        logger.warning(
+            "delegation.max_retained_subagent_bytes=%r is not a valid integer; "
+            "using 16777216",
+            raw,
+        )
+        return 16777216
+
+
 def _should_retain_session(retain_session: Optional[bool], subagent_type: Optional[str]) -> bool:
     """Resolve delegate_task retention default for one child."""
     if retain_session is not None:
@@ -2457,8 +2472,12 @@ def _run_single_child(
                         conversation_history=list(messages) if isinstance(messages, list) else [],
                         created_at=now_ts,
                         expires_at=now_ts + _get_retained_session_ttl(),
+                        effective_allowed_tool_names=frozenset(
+                            getattr(child, "valid_tool_names", set()) or set()
+                        ),
                     ),
                     max_records=_get_max_retained_subagents(),
+                    max_total_bytes=_get_max_retained_subagent_bytes(),
                 )
                 entry["agent_id"] = str(agent_id)
                 entry["retained_until"] = now_ts + _get_retained_session_ttl()
@@ -3257,6 +3276,9 @@ def delegate_task(
                 inline_payload = wait_for_async_delegation(
                     dispatch,
                     timeout_seconds=float(foreground_wait_timeout_seconds or 0),
+                    interrupt_requested=lambda: (
+                        getattr(parent_agent, "_interrupt_requested", False) is True
+                    ),
                 )
                 if inline_payload is not None:
                     return inline_payload

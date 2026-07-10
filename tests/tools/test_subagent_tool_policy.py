@@ -110,7 +110,7 @@ def test_direct_hallucinated_tool_name_is_execution_blocked():
     assert "blocked by subagent capability policy" in message
 
 
-def test_general_purpose_cannot_call_external_side_effects():
+def test_general_purpose_blocks_named_external_tools_but_keeps_raw_shell():
     profile = get_subagent_profile("general-purpose")
     policy = ToolNamePolicy(allowed_names=profile.allowed_tool_names)
     agent = SimpleNamespace(_subagent_tool_policy=policy)

@@ -20,7 +20,23 @@ def test_builtin_profile_round_trip(name):
     profile = get_subagent_profile(name)
     assert profile.name == name
     assert profile.model == "inherit"
-    assert profile.can_external_side_effects is False
+
+
+def test_read_only_profiles_remain_hard_no_external_side_effect():
+    for name in ("Explore", "Plan"):
+        profile = get_subagent_profile(name)
+        assert profile.can_write_files is False
+        assert profile.can_external_side_effects is False
+        assert "terminal" not in profile.allowed_tool_names
+        assert "process" not in profile.allowed_tool_names
+
+
+def test_general_purpose_truthfully_reports_raw_shell_external_effect_capability():
+    profile = get_subagent_profile("general-purpose")
+    assert profile.can_external_side_effects is True
+    assert {"terminal", "process"}.issubset(profile.allowed_tool_names)
+    assert "not a no-side-effect sandbox" in profile.system_instructions
+    assert "normal terminal approvals" in profile.system_instructions
 
 
 def test_unknown_profile_fails_closed():

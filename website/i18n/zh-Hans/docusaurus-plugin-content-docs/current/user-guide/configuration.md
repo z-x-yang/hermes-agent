@@ -1639,7 +1639,8 @@ delegation:
   max_foreground_wait_timeout_seconds: 7200  # 全局前台等待安全上限
 
   retained_subagent_ttl_seconds: 3600     # 进程内保留对话的有效期
-  max_retained_subagents: 64              # 进程内保留对话的容量
+  max_retained_subagents: 64              # 进程内保留对话的记录数
+  max_retained_subagent_bytes: 16777216   # 序列化 transcript 聚合预算（16 MiB）
 
   agents:
     Explore:
@@ -1672,7 +1673,9 @@ delegation:
 
 ### 保留子智能体
 
-`retained_subagent_ttl_seconds` 和 `max_retained_subagents` 限制短期、进程内的续接存储。`general-purpose` 只在任务成功完成、父会话 ID 非空且容量足够时默认保留；`Explore` 和 `Plan` 默认一次性使用，除非调用显式设置 `retain_session=true`。
+`retained_subagent_ttl_seconds`、`max_retained_subagents` 和 `max_retained_subagent_bytes` 分别按生命周期、记录数和 UTF-8 JSON transcript 聚合字节数限制短期、进程内的续接存储。`general-purpose` 只在任务成功完成、父会话 ID 非空且容量足够时默认保留；`Explore` 和 `Plan` 默认一次性使用，除非调用显式设置 `retain_session=true`。
+
+字节预算默认是 `16777216`（16 MiB），且仅由 operator 配置；两个模型可见的委派 schema 都不包含该字段。超大的初始记录会 fail closed。聚合裁剪只删除未在续接中的记录，绝不驱逐已 claim 的续接。如果成功续接的更新无法装入预算，结果仍会保留并带 `retention_dropped` 返回，但对应保留 handle 会失效。
 
 保留记录只能由同一个父会话使用；同一个 `agent_id` 同时只能有一个续接任务；Gateway 或进程重启后记录会丢失。无状态请求或父会话 ID 为空时不会返回可续接 ID。`delegate_continue` 会保留原类型、角色、工作区提示、模型/provider 元数据和能力上限，不能更改工具、角色、类型或超时配置。
 

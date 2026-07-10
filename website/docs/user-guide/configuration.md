@@ -1927,7 +1927,8 @@ delegation:
   max_foreground_wait_timeout_seconds: 7200  # Global safety ceiling for foreground waiting
 
   retained_subagent_ttl_seconds: 3600     # In-process retained transcript lifetime
-  max_retained_subagents: 64              # In-process retained transcript capacity
+  max_retained_subagents: 64              # In-process retained transcript count
+  max_retained_subagent_bytes: 16777216   # Aggregate serialized transcript budget (16 MiB)
 
   agents:
     Explore:
@@ -1960,7 +1961,9 @@ These timeout keys are deliberately absent from the model-facing `delegate_task`
 
 ### Retained subagents
 
-`retained_subagent_ttl_seconds` and `max_retained_subagents` bound the short-lived, in-process continuation store. Completed `general-purpose` work is retained by default only when the parent session ID is nonempty and capacity is available. `Explore` and `Plan` are one-shot unless the call explicitly sets `retain_session=true`.
+`retained_subagent_ttl_seconds`, `max_retained_subagents`, and `max_retained_subagent_bytes` bound the short-lived, in-process continuation store by lifetime, record count, and aggregate UTF-8 JSON transcript bytes. Completed `general-purpose` work is retained by default only when the parent session ID is nonempty and capacity is available. `Explore` and `Plan` are one-shot unless the call explicitly sets `retain_session=true`.
+
+The byte budget defaults to `16777216` (16 MiB) and is operator-only: it is absent from both model-facing delegation schemas. Oversized initial records fail closed. Aggregate pruning removes only non-in-flight records and never evicts a claimed continuation. If a successful continuation update cannot fit, its result is preserved and returned with `retention_dropped`, while the retained handle is invalidated.
 
 Retention is same-parent only, permits one in-flight continuation per `agent_id`, and is lost on gateway/process restart. Stateless or empty-session requests do not receive resumable IDs. `delegate_continue` preserves the original type, role, workspace hint, model/provider metadata, and capability ceiling; it cannot change tools, role, type, or timeout configuration.
 

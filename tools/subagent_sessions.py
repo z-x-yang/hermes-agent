@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, replace
+import json
 import threading
 import time
-from typing import Any
+from typing import Any, Optional
 
 
 @dataclass(frozen=True)
@@ -26,11 +27,14 @@ class RetainedSubagentSession:
     conversation_history: list[dict[str, Any]]
     created_at: float
     expires_at: float
+    effective_allowed_tool_names: frozenset[str] = frozenset()
 
 
 _lock = threading.RLock()
 _records: dict[str, RetainedSubagentSession] = {}
 _in_flight: set[str] = set()
+_invalidated: dict[str, str] = {}
+_DEFAULT_MAX_RETAINED_SUBAGENT_BYTES = 16777216
 
 
 def _copy_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -38,10 +42,43 @@ def _copy_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _copy_record(record: RetainedSubagentSession) -> RetainedSubagentSession:
-    return replace(record, conversation_history=_copy_history(record.conversation_history))
+    return replace(
+        record,
+        conversation_history=_copy_history(record.conversation_history),
+        effective_allowed_tool_names=frozenset(record.effective_allowed_tool_names),
+    )
 
 
-def _prune(now: float, max_records: int) -> None:
+def _serialized_history_bytes(history: list[dict[str, Any]]) -> int:
+    try:
+        payload = json.dumps(
+            _copy_history(history),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Retained subagent transcript is not JSON serializable: {exc}"
+        ) from exc
+    return len(payload.encode("utf-8"))
+
+
+def _retained_bytes_locked(*, exclude_agent_id: Optional[str] = None) -> int:
+    return sum(
+        _serialized_history_bytes(record.conversation_history)
+        for agent_id, record in _records.items()
+        if agent_id != exclude_agent_id
+    )
+
+
+def retained_subagent_transcript_bytes() -> int:
+    """Return current serialized transcript bytes for process-local retention."""
+    with _lock:
+        return _retained_bytes_locked()
+
+
+def _prune_expired(now: float) -> None:
     expired = [
         key
         for key, value in _records.items()
@@ -49,35 +86,82 @@ def _prune(now: float, max_records: int) -> None:
     ]
     for key in expired:
         _records.pop(key, None)
-    while len(_records) >= max(1, int(max_records or 1)):
-        removable = [
-            record for key, record in _records.items() if key not in _in_flight
-        ]
-        if not removable:
-            break
-        oldest = min(removable, key=lambda item: item.created_at)
-        _records.pop(oldest.agent_id, None)
+
+
+def _oldest_removable(*, exclude_agent_id: Optional[str] = None):
+    removable = [
+        record
+        for key, record in _records.items()
+        if key not in _in_flight and key != exclude_agent_id
+    ]
+    return min(removable, key=lambda item: item.created_at) if removable else None
+
+
+def _budget_drop_reason(agent_id: str) -> str:
+    return (
+        "Successful continuation exceeded the retained transcript byte budget; "
+        f"the result is preserved, but {agent_id} is no longer resumable."
+    )
 
 
 def retain_subagent_session(
     record: RetainedSubagentSession,
     *,
     max_records: int = 64,
+    max_total_bytes: int = _DEFAULT_MAX_RETAINED_SUBAGENT_BYTES,
 ) -> None:
+    if not record.effective_allowed_tool_names:
+        raise RuntimeError(
+            "Retained subagent session has no original effective tool ceiling; "
+            "refusing retention."
+        )
+    copied = _copy_record(record)
+    record_bytes = _serialized_history_bytes(copied.conversation_history)
+    byte_budget = max(1, int(max_total_bytes or 1))
+    if record_bytes > byte_budget:
+        raise RuntimeError(
+            "Retained subagent transcript exceeds retained transcript byte budget "
+            f"({record_bytes} > {byte_budget} bytes)."
+        )
+
     with _lock:
         capacity = max(1, int(max_records or 1))
-        _prune(time.time(), capacity)
-        if len(_records) >= capacity:
+        _prune_expired(time.time())
+        replacing = record.agent_id in _records
+        if replacing and record.agent_id in _in_flight:
             raise RuntimeError(
-                f"Retained subagent session capacity reached ({capacity} records); "
-                "all retained sessions are in flight."
+                f"Retained subagent continuation already in progress: {record.agent_id}"
             )
-        _records[record.agent_id] = _copy_record(record)
+
+        while True:
+            existing_count = len(_records) - (1 if replacing else 0)
+            existing_bytes = _retained_bytes_locked(exclude_agent_id=record.agent_id)
+            over_count = existing_count + 1 > capacity
+            over_bytes = existing_bytes + record_bytes > byte_budget
+            if not over_count and not over_bytes:
+                break
+            oldest = _oldest_removable(exclude_agent_id=record.agent_id)
+            if oldest is None:
+                if over_count:
+                    raise RuntimeError(
+                        f"Retained subagent session capacity reached ({capacity} records); "
+                        "all retained sessions are in flight."
+                    )
+                raise RuntimeError(
+                    "Retained subagent transcript byte budget reached; "
+                    "all retained sessions are in flight."
+                )
+            _records.pop(oldest.agent_id, None)
+            replacing = record.agent_id in _records
+        _records[record.agent_id] = copied
 
 
 def get_retained_subagent_session(agent_id: str) -> RetainedSubagentSession:
     with _lock:
         now = time.time()
+        invalidation_reason = _invalidated.get(agent_id)
+        if invalidation_reason is not None:
+            raise RuntimeError(invalidation_reason)
         record = _records.get(agent_id)
         if record is None:
             raise KeyError(f"Unknown retained subagent session: {agent_id}")
@@ -104,13 +188,50 @@ def release_retained_subagent_session(agent_id: str) -> None:
         _in_flight.discard(agent_id)
 
 
-def update_retained_history(agent_id: str, history: list[dict[str, Any]]) -> None:
+def invalidate_retained_subagent_session(agent_id: str, reason: str) -> None:
+    """Permanently poison one process-local handle with a stable failure reason."""
+    with _lock:
+        _records.pop(agent_id, None)
+        _invalidated[agent_id] = str(reason)
+
+
+def update_retained_history(
+    agent_id: str,
+    history: list[dict[str, Any]],
+    *,
+    max_total_bytes: int = _DEFAULT_MAX_RETAINED_SUBAGENT_BYTES,
+) -> Optional[str]:
+    """Update a transcript, or invalidate it if the byte budget cannot fit it.
+
+    Returns the stable invalidation reason when retention is dropped; the caller
+    can still return the successful continuation result.
+    """
+    copied_history = _copy_history(history)
+    history_bytes = _serialized_history_bytes(copied_history)
+    byte_budget = max(1, int(max_total_bytes or 1))
     with _lock:
         record = get_retained_subagent_session(agent_id)
-        _records[agent_id] = replace(record, conversation_history=_copy_history(history))
+        reason = _budget_drop_reason(agent_id)
+        if history_bytes > byte_budget:
+            _records.pop(agent_id, None)
+            _invalidated[agent_id] = reason
+            return reason
+
+        _prune_expired(time.time())
+        while _retained_bytes_locked(exclude_agent_id=agent_id) + history_bytes > byte_budget:
+            oldest = _oldest_removable(exclude_agent_id=agent_id)
+            if oldest is None:
+                _records.pop(agent_id, None)
+                _invalidated[agent_id] = reason
+                return reason
+            _records.pop(oldest.agent_id, None)
+
+        _records[agent_id] = replace(record, conversation_history=copied_history)
+        return None
 
 
 def clear_retained_subagent_sessions() -> None:
     with _lock:
         _records.clear()
         _in_flight.clear()
+        _invalidated.clear()

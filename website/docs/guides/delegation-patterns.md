@@ -18,7 +18,7 @@ For the full contract, see [Subagent Delegation](/user-guide/features/delegation
 | Research a change before writing an implementation plan | `Plan` | Read-only, plan-oriented result contract, foreground by default |
 | Edit repository files, run tests, or complete multi-step repo-local work | `general-purpose` | Closed repo-local worker policy, background by default |
 
-Do not ask `Explore` or `Plan` to edit. Do not use `general-purpose` for sending messages, publishing, scheduling jobs, or other external side effects; its built-in policy excludes those tools. The model cannot override these ceilings with `toolsets`.
+Do not ask `Explore` or `Plan` to edit. `general-purpose` excludes named messaging, publishing, scheduling, Notion, cron, and memory-write tools, and the model cannot widen that allowlist with `toolsets`. It still has raw `terminal` and `process`, so shell commands can reach external systems; treat normal terminal approvals and explicit task instructions as the governing boundary, not a hard no-side-effect sandbox.
 
 ## Pattern: focused exploration before acting
 

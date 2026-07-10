@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import threading
 import time
+import uuid
 from typing import Any, Optional
 
 from tools.registry import registry
 from tools.subagent_sessions import (
     RetainedSubagentSession,
     claim_retained_subagent_session,
+    invalidate_retained_subagent_session,
     release_retained_subagent_session,
     update_retained_history,
 )
@@ -45,6 +48,22 @@ DELEGATE_CONTINUE_SCHEMA = {
 
 def _tool_error(message: str) -> str:
     return json.dumps({"error": message}, ensure_ascii=False)
+
+
+def _resolve_retained_workspace(record: RetainedSubagentSession) -> str:
+    raw = str(record.workspace_path or "").strip()
+    try:
+        candidate = Path(raw).expanduser()
+        if not raw or not candidate.is_absolute():
+            raise ValueError
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_dir():
+            raise ValueError
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError(
+            f"Retained subagent workspace is invalid or unavailable: {raw}"
+        ) from None
+    return str(resolved)
 
 
 class _ContinuationInterruptBridge:
@@ -140,7 +159,13 @@ def _build_continuation_child(
     except (TypeError, ValueError):
         max_iterations = 50
 
-    return _build_child_agent(
+    if not record.effective_allowed_tool_names:
+        raise ValueError(
+            "Retained subagent session has no original effective tool ceiling; "
+            "refusing continuation."
+        )
+
+    child = _build_child_agent(
         task_index=0,
         goal=prompt,
         context=None,
@@ -159,6 +184,16 @@ def _build_continuation_child(
         profile=profile,
         workspace_path_override=record.workspace_path,
     )
+
+    from agent.subagent_tool_policy import ToolNamePolicy, apply_tool_policy_to_agent
+
+    current_allowed = frozenset(getattr(child, "valid_tool_names", set()) or set())
+    retained_ceiling = frozenset(record.effective_allowed_tool_names)
+    apply_tool_policy_to_agent(
+        child,
+        ToolNamePolicy(allowed_names=current_allowed & retained_ceiling),
+    )
+    return child
 
 
 def _remove_active_child(parent_agent, child) -> None:
@@ -187,17 +222,35 @@ def _run_continuation_entry(
     start = time.monotonic()
     child = None
     try:
+        try:
+            workspace_path = _resolve_retained_workspace(record)
+        except ValueError as exc:
+            invalidate_retained_subagent_session(record.agent_id, str(exc))
+            raise
         child = _build_continuation_child(record, prompt=prompt, parent_agent=parent_agent)
         if interrupt_bridge is not None:
             interrupt_bridge.register(child)
         payload = _build_continue_payload(prompt)
+        task_id = f"delegation-continue-{record.agent_id}-{uuid.uuid4().hex[:8]}"
 
         def _run_child_conversation():
-            return child.run_conversation(
-                user_message=payload,
-                conversation_history=list(record.conversation_history),
-                task_id=f"delegation-continue-{record.agent_id}-{int(time.time())}",
+            from tools.terminal_tool import (
+                clear_task_env_overrides,
+                register_task_env_overrides,
             )
+
+            register_task_env_overrides(
+                task_id,
+                {"cwd": workspace_path, "_force_task_isolation": True},
+            )
+            try:
+                return child.run_conversation(
+                    user_message=payload,
+                    conversation_history=list(record.conversation_history),
+                    task_id=task_id,
+                )
+            finally:
+                clear_task_env_overrides(task_id)
 
         if child_run_timeout_seconds is None:
             result = _run_child_conversation()
@@ -220,11 +273,26 @@ def _run_continuation_entry(
                 timeout_entry["provider"] = getattr(child, "provider", record.provider)
                 timeout_entry["subagent_type"] = record.subagent_type
                 timeout_entry["role"] = getattr(child, "_delegate_role", record.role)
+                if timeout_entry.get("status") == "timeout":
+                    reason = (
+                        "Retained subagent session is no longer resumable after "
+                        f"timeout: {record.agent_id}"
+                    )
+                    invalidate_retained_subagent_session(record.agent_id, reason)
+                    timeout_entry["retention_dropped"] = True
+                    timeout_entry["note"] = reason
                 return timeout_entry
             assert result is not None
+        retention_drop_reason = None
         messages = result.get("messages") if isinstance(result, dict) else None
         if isinstance(messages, list):
-            update_retained_history(record.agent_id, list(messages))
+            from tools.delegate_tool import _get_max_retained_subagent_bytes
+
+            retention_drop_reason = update_retained_history(
+                record.agent_id,
+                list(messages),
+                max_total_bytes=_get_max_retained_subagent_bytes(),
+            )
         summary = (result or {}).get("final_response") or ""
         status = "completed" if summary else "failed"
         entry: dict[str, Any] = {
@@ -240,6 +308,9 @@ def _run_continuation_entry(
         }
         if status != "completed":
             entry["error"] = (result or {}).get("error") or "Subagent did not produce a response."
+        if retention_drop_reason is not None:
+            entry["retention_dropped"] = True
+            entry["note"] = retention_drop_reason
         return entry
     except Exception as exc:  # noqa: BLE001 - tool must fail closed as JSON
         return {
@@ -313,6 +384,13 @@ def delegate_continue(
     if record.parent_session_id != parent_session_id:
         release_retained_subagent_session(agent_id)
         return _tool_error("agent_id does not belong to this parent session")
+    try:
+        _resolve_retained_workspace(record)
+    except ValueError as exc:
+        reason = str(exc)
+        invalidate_retained_subagent_session(agent_id, reason)
+        release_retained_subagent_session(agent_id)
+        return _tool_error(reason)
 
     from tools.delegate_tool import (
         _get_max_async_children,
@@ -419,6 +497,9 @@ def delegate_continue(
         payload = wait_for_async_delegation(
             dispatch,
             timeout_seconds=float(foreground_wait_timeout_seconds or 0),
+            interrupt_requested=lambda: (
+                getattr(parent_agent, "_interrupt_requested", False) is True
+            ),
         )
         if payload is not None:
             return _unwrap_foreground_payload(payload)

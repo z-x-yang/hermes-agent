@@ -50,7 +50,11 @@ from tools.thread_context import propagate_context_to_thread
 logger = logging.getLogger(__name__)
 
 DeliveryMode = Literal[
-    "foreground_waiting", "foreground_claimed", "background", "delivered"
+    "foreground_waiting",
+    "foreground_claimed",
+    "foreground_interrupted",
+    "background",
+    "delivered",
 ]
 
 # Back-compat alias — the daemon executor now lives in tools.daemon_pool so
@@ -518,9 +522,12 @@ def _push_batch_completion_event(event: Dict[str, Any]) -> None:
 
 
 def wait_for_async_delegation(
-    record_or_id: Any, timeout_seconds: float
+    record_or_id: Any,
+    timeout_seconds: float,
+    *,
+    interrupt_requested: Optional[Callable[[], bool]] = None,
 ) -> Optional[str]:
-    """Claim a foreground result or atomically hand the same work to background."""
+    """Claim foreground delivery, interrupt it, or hand the same work to background."""
     if isinstance(record_or_id, dict):
         delegation_id = record_or_id.get("delegation_id")
     else:
@@ -536,17 +543,74 @@ def wait_for_async_delegation(
     if done_event is None:
         return None
 
-    done_event.wait(timeout=max(0.0, float(timeout_seconds)))
-    with _records_lock:
-        record = _records.get(str(delegation_id))
-        if record is None or record.get("delivery_mode") != "foreground_waiting":
-            return None
-        payload = record.get("result_payload")
-        if payload is not None:
-            record["delivery_mode"] = "foreground_claimed"
-            return payload
-        record["delivery_mode"] = "background"
-        return None
+    timeout = max(0.0, float(timeout_seconds))
+    deadline = time.monotonic() + timeout
+    while True:
+        with _records_lock:
+            record = _records.get(str(delegation_id))
+            if record is None or record.get("delivery_mode") != "foreground_waiting":
+                return None
+            payload = record.get("result_payload")
+            if payload is not None:
+                record["delivery_mode"] = "foreground_claimed"
+                return payload
+
+        parent_interrupted = False
+        if interrupt_requested is not None:
+            try:
+                parent_interrupted = bool(interrupt_requested())
+            except Exception:
+                logger.debug(
+                    "Foreground delegation %s interrupt predicate failed",
+                    delegation_id,
+                    exc_info=True,
+                )
+        if parent_interrupted:
+            with _records_lock:
+                record = _records.get(str(delegation_id))
+                if record is None or record.get("delivery_mode") != "foreground_waiting":
+                    return None
+                payload = record.get("result_payload")
+                if payload is not None:
+                    record["delivery_mode"] = "foreground_claimed"
+                    return payload
+                record["delivery_mode"] = "foreground_interrupted"
+                interrupt_fn = record.get("interrupt_fn")
+            if callable(interrupt_fn):
+                try:
+                    interrupt_fn()
+                except Exception:
+                    logger.debug(
+                        "Foreground delegation %s interrupt failed",
+                        delegation_id,
+                        exc_info=True,
+                    )
+            return json.dumps(
+                {
+                    "status": "interrupted",
+                    "mode": "foreground",
+                    "delegation_id": str(delegation_id),
+                    "error": "Foreground delegation interrupted by parent.",
+                    "note": (
+                        "Late completion delivery is suppressed for this delegation."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            with _records_lock:
+                record = _records.get(str(delegation_id))
+                if record is None or record.get("delivery_mode") != "foreground_waiting":
+                    return None
+                payload = record.get("result_payload")
+                if payload is not None:
+                    record["delivery_mode"] = "foreground_claimed"
+                    return payload
+                record["delivery_mode"] = "background"
+                return None
+        done_event.wait(timeout=min(0.05, remaining))
 
 
 def list_async_delegations() -> List[Dict[str, Any]]:

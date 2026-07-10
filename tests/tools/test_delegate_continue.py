@@ -66,12 +66,24 @@ def _record(**overrides):
         "parent_session_id": "parent-1",
         "subagent_type": "general-purpose",
         "role": "leaf",
-        "workspace_path": "/tmp/repo",
+        "workspace_path": "/tmp",
         "model": "model-a",
         "provider": "openrouter",
         "conversation_history": [{"role": "user", "content": "first"}],
         "created_at": now,
         "expires_at": now + 60,
+        "effective_allowed_tool_names": frozenset(
+            {
+                "terminal",
+                "process",
+                "read_file",
+                "write_file",
+                "patch",
+                "search_files",
+                "web_search",
+                "web_extract",
+            }
+        ),
     }
     data.update(overrides)
     return RetainedSubagentSession(**data)
@@ -88,6 +100,7 @@ class _CompletedRetainableChild:
     session_estimated_cost_usd = 0.0
     session_reasoning_tokens = 0
     tool_progress_callback = None
+    valid_tool_names = {"read_file"}
 
     def run_conversation(self, **kwargs):
         return {
@@ -166,6 +179,161 @@ def test_retained_session_capacity_fails_closed_while_every_record_is_claimed():
     assert get_retained_subagent_session("new").agent_id == "new"
     with pytest.raises(KeyError, match="Unknown"):
         get_retained_subagent_session("in-flight")
+
+
+def test_oversized_initial_retention_fails_closed():
+    history = [{"role": "user", "content": "x" * 512}]
+    with pytest.raises(RuntimeError, match="exceeds retained transcript byte budget"):
+        retain_subagent_session(
+            _record(agent_id="oversized", conversation_history=history),
+            max_total_bytes=128,
+        )
+
+    with pytest.raises(KeyError, match="Unknown"):
+        get_retained_subagent_session("oversized")
+
+
+def test_retained_transcript_aggregate_byte_budget_prunes_only_as_needed():
+    from tools.subagent_sessions import retained_subagent_transcript_bytes
+
+    first_history = [{"role": "user", "content": "a" * 80}]
+    second_history = [{"role": "user", "content": "b" * 80}]
+    first_bytes = len(
+        json.dumps(
+            first_history, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    )
+    second_bytes = len(
+        json.dumps(
+            second_history, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    )
+    budget = first_bytes + second_bytes - 1
+
+    retain_subagent_session(
+        _record(agent_id="first", conversation_history=first_history),
+        max_total_bytes=budget,
+    )
+    retain_subagent_session(
+        _record(agent_id="second", conversation_history=second_history),
+        max_total_bytes=budget,
+    )
+
+    assert retained_subagent_transcript_bytes() <= budget
+    with pytest.raises(KeyError, match="Unknown"):
+        get_retained_subagent_session("first")
+    assert get_retained_subagent_session("second").agent_id == "second"
+
+
+def test_retained_transcript_byte_pruning_never_evicts_claimed_record():
+    from tools.subagent_sessions import (
+        claim_retained_subagent_session,
+        release_retained_subagent_session,
+    )
+
+    history = [{"role": "user", "content": "c" * 80}]
+    record_bytes = len(
+        json.dumps(
+            history, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    )
+    retain_subagent_session(
+        _record(agent_id="claimed", conversation_history=history),
+        max_total_bytes=record_bytes * 2,
+    )
+    claim_retained_subagent_session("claimed")
+    try:
+        with pytest.raises(RuntimeError, match="all retained sessions are in flight"):
+            retain_subagent_session(
+                _record(agent_id="new", conversation_history=history),
+                max_total_bytes=record_bytes * 2 - 1,
+            )
+        assert get_retained_subagent_session("claimed").agent_id == "claimed"
+        with pytest.raises(KeyError, match="Unknown"):
+            get_retained_subagent_session("new")
+    finally:
+        release_retained_subagent_session("claimed")
+
+
+def test_retained_transcript_budget_is_config_authoritative_and_not_model_facing(
+    monkeypatch,
+):
+    from hermes_cli.config import DEFAULT_CONFIG
+    import tools.delegate_tool as delegate_tool
+    from tools.delegate_continue_tool import DELEGATE_CONTINUE_SCHEMA
+
+    assert DEFAULT_CONFIG["delegation"]["max_retained_subagent_bytes"] == 16777216
+    monkeypatch.setattr(
+        delegate_tool,
+        "_load_config",
+        lambda: {"max_retained_subagent_bytes": 321},
+    )
+    assert delegate_tool._get_max_retained_subagent_bytes() == 321
+
+    from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+
+    assert (
+        "max_retained_subagent_bytes"
+        not in DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+    )
+    assert (
+        "max_retained_subagent_bytes"
+        not in DELEGATE_CONTINUE_SCHEMA["parameters"]["properties"]
+    )
+
+
+def test_successful_oversized_continuation_drops_retention_but_keeps_result(
+    monkeypatch,
+):
+    from tools.delegate_continue_tool import _run_continuation_entry, delegate_continue
+
+    class OversizedContinuationChild:
+        model = "model-a"
+        provider = "openrouter"
+
+        def run_conversation(self, **kwargs):
+            return {
+                "final_response": "successful result survives",
+                "messages": kwargs["conversation_history"]
+                + [{"role": "assistant", "content": "z" * 1024}],
+                "api_calls": 1,
+            }
+
+        def close(self):
+            pass
+
+    retain_subagent_session(_record())
+    monkeypatch.setattr(
+        "tools.delegate_continue_tool._build_continuation_child",
+        lambda *_args, **_kwargs: OversizedContinuationChild(),
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._get_max_retained_subagent_bytes",
+        lambda: 128,
+    )
+
+    entry = _run_continuation_entry(
+        get_retained_subagent_session("agent-1"),
+        "continue successfully",
+        _parent(),
+    )
+
+    assert entry["status"] == "completed"
+    assert entry["summary"] == "successful result survives"
+    assert entry["retention_dropped"] is True
+    assert entry["note"] == (
+        "Successful continuation exceeded the retained transcript byte budget; "
+        "the result is preserved, but agent-1 is no longer resumable."
+    )
+    retry = json.loads(
+        delegate_continue("agent-1", "retry", "foreground", parent_agent=_parent())
+    )
+    assert retry == {
+        "error": (
+            "Successful continuation exceeded the retained transcript byte budget; "
+            "the result is preserved, but agent-1 is no longer resumable."
+        )
+    }
 
 
 def test_expired_session_fails_closed():
@@ -264,6 +432,80 @@ def test_delegate_continue_reuses_history_and_updates_retained_record(monkeypatc
     updated = get_retained_subagent_session("agent-1")
     assert updated.subagent_type == "Explore"
     assert updated.conversation_history[-1] == {"role": "assistant", "content": "continued"}
+
+
+def test_continuation_runtime_pins_retained_workspace_and_clears_task_override(
+    monkeypatch, tmp_path
+):
+    import tools.file_tools as file_tools
+    import tools.terminal_tool as terminal_tool
+    from tools.delegate_continue_tool import _run_continuation_entry
+
+    workspace_a = (tmp_path / "workspace-a").resolve()
+    workspace_b = (tmp_path / "workspace-b").resolve()
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    monkeypatch.chdir(workspace_b)
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    seen = {}
+
+    class WorkspaceCheckingChild:
+        model = "model-a"
+        provider = "openrouter"
+
+        def run_conversation(self, **kwargs):
+            task_id = kwargs["task_id"]
+            seen["task_id"] = task_id
+            seen["cwd"] = terminal_tool._task_env_overrides[task_id]["cwd"]
+            seen["resolved_relative"] = str(
+                file_tools._resolve_path_for_task("marker.txt", task_id=task_id)
+            )
+            return {
+                "final_response": "continued in retained workspace",
+                "messages": kwargs["conversation_history"]
+                + [{"role": "assistant", "content": "continued"}],
+                "api_calls": 1,
+            }
+
+        def close(self):
+            pass
+
+    retain_subagent_session(_record(workspace_path=str(workspace_a)))
+    monkeypatch.setattr(
+        "tools.delegate_continue_tool._build_continuation_child",
+        lambda *_args, **_kwargs: WorkspaceCheckingChild(),
+    )
+
+    entry = _run_continuation_entry(
+        get_retained_subagent_session("agent-1"),
+        "continue in A",
+        _parent(),
+    )
+
+    assert entry["status"] == "completed"
+    assert seen["task_id"].startswith("delegation-continue-agent-1-")
+    assert seen["cwd"] == str(workspace_a)
+    assert seen["resolved_relative"] == str(workspace_a / "marker.txt")
+    assert seen["task_id"] not in terminal_tool._task_env_overrides
+
+
+def test_delegate_continue_invalid_workspace_fails_closed_and_invalidates(monkeypatch):
+    from tools.delegate_continue_tool import delegate_continue
+
+    missing = "/definitely/missing/hermes-retained-workspace"
+    retain_subagent_session(_record(workspace_path=missing))
+    first = json.loads(
+        delegate_continue("agent-1", "continue", "foreground", parent_agent=_parent())
+    )
+    assert first["error"] == (
+        "Retained subagent workspace is invalid or unavailable: "
+        f"{missing}"
+    )
+
+    second = json.loads(
+        delegate_continue("agent-1", "retry", "foreground", parent_agent=_parent())
+    )
+    assert second == first
 
 
 def test_delegate_continue_rejects_concurrent_same_agent_without_losing_history(monkeypatch):
@@ -667,6 +909,89 @@ def test_foreground_continue_applies_run_cap_but_background_does_not(monkeypatch
     assert seen_run_caps == [0.25, None]
 
 
+def test_delegate_continue_foreground_parent_interrupt_returns_without_late_queue(
+    monkeypatch, tmp_path
+):
+    import tools.async_delegation as async_delegation
+    from tools.delegate_continue_tool import delegate_continue
+    from tools.process_registry import process_registry
+
+    run_started = threading.Event()
+    allow_finish = threading.Event()
+    interrupt_called = threading.Event()
+    parent = _parent()
+    parent._interrupt_requested = False
+    response = []
+
+    class InterruptibleChild:
+        model = "model-a"
+        provider = "openrouter"
+
+        def run_conversation(self, **_kwargs):
+            run_started.set()
+            assert allow_finish.wait(2)
+            return {
+                "final_response": "too late",
+                "messages": [{"role": "assistant", "content": "too late"}],
+                "api_calls": 1,
+            }
+
+        def interrupt(self):
+            interrupt_called.set()
+
+        def close(self):
+            pass
+
+    async_delegation._reset_for_tests()
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+    monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
+    monkeypatch.setattr(
+        "tools.delegate_continue_tool._build_continuation_child",
+        lambda *_args, **_kwargs: InterruptibleChild(),
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolve_foreground_timeouts",
+        lambda *_args, **_kwargs: (60, 60),
+    )
+    retain_subagent_session(_record(workspace_path=str(tmp_path)))
+
+    try:
+        thread = threading.Thread(
+            target=lambda: response.append(
+                json.loads(
+                    delegate_continue(
+                        "agent-1",
+                        "interrupt me",
+                        "foreground",
+                        parent_agent=parent,
+                    )
+                )
+            )
+        )
+        thread.start()
+        assert run_started.wait(1)
+        parent._interrupt_requested = True
+        thread.join(timeout=1)
+
+        assert not thread.is_alive()
+        assert response[0]["status"] == "interrupted"
+        assert response[0]["error"] == "Foreground delegation interrupted by parent."
+        assert interrupt_called.is_set()
+        assert process_registry.completion_queue.empty()
+
+        with async_delegation._records_lock:
+            future = async_delegation._records[response[0]["delegation_id"]]["future"]
+        allow_finish.set()
+        future.result(timeout=2)
+        assert process_registry.completion_queue.empty()
+    finally:
+        allow_finish.set()
+        async_delegation._reset_for_tests()
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
 def test_run_continuation_entry_interrupts_on_foreground_run_cap(monkeypatch):
     from tools.delegate_continue_tool import _run_continuation_entry
 
@@ -705,6 +1030,81 @@ def test_run_continuation_entry_interrupts_on_foreground_run_cap(monkeypatch):
     assert entry["exit_reason"] == "timeout"
     assert "0.05s" in entry["error"]
     assert interrupted.is_set()
+
+
+def test_foreground_run_cap_poisoned_session_stays_non_resumable_while_worker_lives(
+    monkeypatch, tmp_path
+):
+    import tools.async_delegation as async_delegation
+    from tools.delegate_continue_tool import delegate_continue
+
+    run_started = threading.Event()
+    release_worker = threading.Event()
+    worker_exited = threading.Event()
+    interrupt_called = threading.Event()
+
+    class InterruptIgnoringChild:
+        model = "model-a"
+        provider = "openrouter"
+
+        def run_conversation(self, **_kwargs):
+            run_started.set()
+            assert release_worker.wait(2)
+            worker_exited.set()
+            return {"final_response": "too late", "messages": [], "api_calls": 1}
+
+        def get_activity_summary(self):
+            return {"api_call_count": 1, "current_tool": None, "max_iterations": 1}
+
+        def interrupt(self):
+            interrupt_called.set()
+
+        def close(self):
+            pass
+
+    async_delegation._reset_for_tests()
+    monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
+    monkeypatch.setattr(
+        "tools.delegate_continue_tool._build_continuation_child",
+        lambda *_args, **_kwargs: InterruptIgnoringChild(),
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolve_foreground_timeouts",
+        lambda *_args, **_kwargs: (1, 0.05),
+    )
+    retain_subagent_session(_record(workspace_path=str(tmp_path)))
+
+    try:
+        timed_out = json.loads(
+            delegate_continue(
+                "agent-1", "foreground cap", "foreground", parent_agent=_parent()
+            )
+        )
+        assert run_started.is_set()
+        assert interrupt_called.is_set()
+        assert timed_out["status"] == "timeout"
+        assert timed_out["retention_dropped"] is True
+        assert "no longer resumable" in timed_out["note"]
+        assert not worker_exited.is_set()
+
+        second = json.loads(
+            delegate_continue(
+                "agent-1", "must not race stale history", "foreground", parent_agent=_parent()
+            )
+        )
+        assert second == {
+            "error": (
+                "Retained subagent session is no longer resumable after timeout: "
+                "agent-1"
+            )
+        }
+    finally:
+        release_worker.set()
+        assert worker_exited.wait(2)
+        async_delegation._reset_for_tests()
+
+    with pytest.raises(RuntimeError, match="no longer resumable after timeout"):
+        get_retained_subagent_session("agent-1")
 
 
 def test_delegate_continue_requires_owner_parent_session():
@@ -811,7 +1211,55 @@ def test_build_continuation_child_preserves_explore_capability_ceiling(monkeypat
     assert "delegate_continue" not in child.valid_tool_names
     assert child._delegate_role == "leaf"
     assert child._subagent_profile.name == "Explore"
-    assert "/tmp/repo" in child.kwargs["ephemeral_system_prompt"]
+    assert "/tmp" in child.kwargs["ephemeral_system_prompt"]
+
+
+def test_build_continuation_child_preserves_original_effective_tool_ceiling(monkeypatch):
+    from tools.delegate_continue_tool import _build_continuation_child
+    from toolsets import TOOLSETS
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.session_id = "child-session"
+            self.model = kwargs["model"]
+            self.provider = kwargs["provider"]
+            self.base_url = kwargs["base_url"]
+            self.api_mode = kwargs["api_mode"]
+            self._session_init_model_config = {}
+            names = []
+            for toolset in kwargs.get("enabled_toolsets") or []:
+                names.extend(TOOLSETS.get(toolset, {}).get("tools", []))
+            self.valid_tool_names = set(names)
+            self.tools = [
+                {"type": "function", "function": {"name": name, "parameters": {}}}
+                for name in sorted(self.valid_tool_names)
+            ]
+
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+    record = _record(
+        subagent_type="general-purpose",
+        effective_allowed_tool_names=frozenset({"read_file"}),
+    )
+
+    child = _build_continuation_child(
+        record,
+        prompt="continue narrowly",
+        parent_agent=_parent(enabled_toolsets=["terminal", "file", "web"]),
+    )
+
+    assert child.valid_tool_names == {"read_file"}
+    assert child._subagent_tool_policy.allowed_names == frozenset({"read_file"})
+
+
+def test_build_continuation_child_rejects_missing_effective_tool_ceiling():
+    from tools.delegate_continue_tool import _build_continuation_child
+
+    with pytest.raises(ValueError, match="no original effective tool ceiling"):
+        _build_continuation_child(
+            _record(effective_allowed_tool_names=frozenset()),
+            prompt="must fail closed",
+            parent_agent=_parent(),
+        )
 
 
 def test_build_continuation_child_isolates_retained_provider_transport(monkeypatch):
@@ -879,6 +1327,7 @@ def test_run_single_child_retains_completed_general_purpose_session(monkeypatch)
         session_estimated_cost_usd = 0.0
         session_reasoning_tokens = 0
         tool_progress_callback = None
+        valid_tool_names = {"read_file"}
 
         def run_conversation(self, **kwargs):
             return {
@@ -919,6 +1368,7 @@ def test_run_single_child_retains_completed_general_purpose_session(monkeypatch)
     assert record.subagent_type == "general-purpose"
     assert record.role == "leaf"
     assert record.workspace_path == "/tmp/repo"
+    assert record.effective_allowed_tool_names == frozenset({"read_file"})
     assert record.conversation_history[-1] == {"role": "assistant", "content": "done"}
 
 

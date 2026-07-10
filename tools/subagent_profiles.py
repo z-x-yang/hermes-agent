@@ -87,14 +87,18 @@ _PROFILES = {
         context_policy="normal",
         allowed_tool_names=_CODE_WORKER_TOOLS,
         can_write_files=True,
-        can_external_side_effects=False,
+        can_external_side_effects=True,
         can_delegate=False,
         default_scheduling="background",
         foreground_wait_timeout_seconds=1800,
         child_run_timeout_seconds=7200,
         system_instructions=(
             "You are a general-purpose subagent. Complete the scoped task with "
-            "repo-local actions and tests. Do not re-delegate the whole task."
+            "repo-local actions and tests. Named external-side-effect tools are "
+            "not available, but raw terminal/process access can reach external "
+            "systems: this is not a no-side-effect sandbox. Follow the task "
+            "instructions and normal terminal approvals. Do not re-delegate the "
+            "whole task."
         ),
         result_contract=(
             "Return: outcome; files changed; commands/tests and results; evidence; "

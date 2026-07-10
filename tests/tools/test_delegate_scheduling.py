@@ -207,6 +207,162 @@ def test_concurrent_completion_and_timeout_has_exactly_one_delivery():
         assert wait_for_async_delegation(handle, timeout_seconds=0) is None
 
 
+def test_parent_interrupt_claims_foreground_and_suppresses_late_delivery():
+    injected = []
+    allow_finish = threading.Event()
+    interrupt_called = threading.Event()
+    parent_interrupt = threading.Event()
+    waiter_started = threading.Event()
+    waiter_result = []
+
+    handle = dispatch_async_delegation_batch(
+        goals=["interruptible foreground"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="test-model",
+        session_key="session",
+        runner=lambda: (
+            allow_finish.wait(2),
+            {
+                "results": [{"status": "completed", "summary": "too late"}],
+                "total_duration_seconds": 0.01,
+            },
+        )[1],
+        interrupt_fn=interrupt_called.set,
+        max_async_children=3,
+        initial_delivery_mode="foreground_waiting",
+        inject_fn=lambda event: injected.append(event),
+    )
+    record = _record(handle)
+
+    def wait_in_foreground():
+        waiter_started.set()
+        waiter_result.append(
+            wait_for_async_delegation(
+                handle,
+                timeout_seconds=60,
+                interrupt_requested=parent_interrupt.is_set,
+            )
+        )
+
+    thread = threading.Thread(target=wait_in_foreground)
+    thread.start()
+    assert waiter_started.wait(1)
+    parent_interrupt.set()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    interrupted_payload = json.loads(waiter_result[0])
+    assert interrupted_payload == {
+        "status": "interrupted",
+        "mode": "foreground",
+        "delegation_id": handle["delegation_id"],
+        "error": "Foreground delegation interrupted by parent.",
+        "note": "Late completion delivery is suppressed for this delegation.",
+    }
+    assert interrupt_called.is_set()
+
+    allow_finish.set()
+    record["future"].result(timeout=2)
+    assert injected == []
+    assert process_registry.completion_queue.empty()
+    assert wait_for_async_delegation(handle, timeout_seconds=0) is None
+
+
+def test_delegate_task_foreground_parent_interrupt_returns_inline_without_late_queue(
+    monkeypatch
+):
+    import tools.delegate_tool as dt
+
+    run_started = threading.Event()
+    allow_finish = threading.Event()
+    parent = _parent()
+    response = []
+
+    def run_child(task_index, goal, **_kwargs):
+        run_started.set()
+        assert allow_finish.wait(2)
+        return {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": f"late: {goal}",
+        }
+
+    built = _install_fake_delegate_runtime(monkeypatch, run_child)
+    monkeypatch.setattr(
+        dt,
+        "_load_config",
+        lambda: {
+            "foreground_wait_timeout_seconds": 60,
+            "child_run_timeout_seconds": 60,
+        },
+    )
+
+    thread = threading.Thread(
+        target=lambda: response.append(
+            json.loads(
+                dt.delegate_task(
+                    goal="interrupt me",
+                    subagent_type="Explore",
+                    scheduling="foreground",
+                    parent_agent=parent,
+                )
+            )
+        )
+    )
+    thread.start()
+    assert run_started.wait(1)
+    parent._interrupt_requested = True
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert response[0]["status"] == "interrupted"
+    assert response[0]["error"] == "Foreground delegation interrupted by parent."
+    assert built[0].interrupt.call_count == 1
+    assert process_registry.completion_queue.empty()
+
+    with ad._records_lock:
+        future = next(iter(ad._records.values()))["future"]
+    allow_finish.set()
+    future.result(timeout=2)
+    assert process_registry.completion_queue.empty()
+
+
+def test_completed_foreground_result_wins_over_already_set_parent_interrupt():
+    injected = []
+    interrupt_called = threading.Event()
+    parent_interrupt = threading.Event()
+    handle = dispatch_async_delegation_batch(
+        goals=["already complete"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="test-model",
+        session_key="session",
+        runner=lambda: {
+            "results": [{"status": "completed", "summary": "won race"}],
+            "total_duration_seconds": 0.01,
+        },
+        interrupt_fn=interrupt_called.set,
+        max_async_children=3,
+        initial_delivery_mode="foreground_waiting",
+        inject_fn=lambda event: injected.append(event),
+    )
+    assert _record(handle)["done_event"].wait(2)
+    parent_interrupt.set()
+
+    payload = wait_for_async_delegation(
+        handle,
+        timeout_seconds=60,
+        interrupt_requested=parent_interrupt.is_set,
+    )
+
+    assert json.loads(payload)["results"][0]["summary"] == "won race"
+    assert not interrupt_called.is_set()
+    assert injected == []
+
+
 def test_unclaimed_foreground_completion_is_not_pruned_before_wait(monkeypatch):
     monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 2)
     foreground_injected = []
