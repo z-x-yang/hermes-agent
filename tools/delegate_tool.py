@@ -32,6 +32,11 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
+from tools.subagent_profiles import (
+    SUPPORTED_SUBAGENT_TYPES,
+    get_subagent_profile,
+    resolve_profile_config,
+)
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -1110,6 +1115,9 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    profile=None,
+    model_override: Optional[str] = None,
+    provider_override: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1204,7 +1212,7 @@ def _build_child_agent(
         parent_api_key = parent_agent._client_kwargs.get("api_key")
 
     # Resolve the child's effective model early so it can ride on every event.
-    effective_model_for_cb = model or getattr(parent_agent, "model", None)
+    effective_model_for_cb = model_override or model or getattr(parent_agent, "model", None)
 
     # Build progress callback to relay tool calls to parent display.
     # Identity kwargs thread the subagent_id through every emitted event so the
@@ -1242,8 +1250,8 @@ def _build_child_agent(
         child_thinking_cb = _child_thinking
 
     # Resolve effective credentials: config override > parent inherit
-    effective_model = model or parent_agent.model
-    effective_provider = override_provider or getattr(parent_agent, "provider", None)
+    effective_model = model_override or model or parent_agent.model
+    effective_provider = provider_override or override_provider or getattr(parent_agent, "provider", None)
     effective_base_url = override_base_url or parent_agent.base_url
     if not override_base_url:
         effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
@@ -1287,7 +1295,7 @@ def _build_child_agent(
     # the subagent must use direct API calls — not the parent's ACP transport.
     # Inheriting acp_command unconditionally causes run_agent.py to initialize
     # CopilotACPClient, bypassing override credentials entirely (issue #16816).
-    if override_provider and not override_acp_command:
+    if (override_provider or provider_override) and not override_acp_command:
         effective_acp_command = None
         effective_acp_args = []
 
@@ -1337,7 +1345,7 @@ def _build_child_agent(
     child_providers_order = getattr(parent_agent, "providers_order", None)
     child_provider_sort = getattr(parent_agent, "provider_sort", None)
     child_openrouter_min_coding_score = getattr(parent_agent, "openrouter_min_coding_score", None)
-    if override_provider:
+    if override_provider or provider_override:
         child_providers_allowed = None
         child_providers_ignored = None
         child_providers_order = None
@@ -1390,6 +1398,7 @@ def _build_child_agent(
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
+    child._subagent_profile = profile
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
@@ -2422,9 +2431,15 @@ def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
+    *,
+    subagent_type: Optional[str] = None,
+    scheduling: str = "auto",
+    retain_session: Optional[bool] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
-    background: Optional[bool] = None,
+    background: bool = False,
+    acp_command: Optional[str] = None,
+    acp_args: Optional[List[str]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2443,6 +2458,18 @@ def delegate_task(
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+
+    if scheduling not in {"auto", "foreground", "background"}:
+        return json.dumps({"error": f"Invalid scheduling: {scheduling}"})
+    if subagent_type is not None:
+        try:
+            profile = get_subagent_profile(subagent_type)
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
+        if role == "orchestrator" and not profile.can_delegate:
+            return json.dumps(
+                {"error": f"subagent_type={subagent_type} cannot use role=orchestrator"}
+            )
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
@@ -2525,7 +2552,16 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [
+            {
+                "goal": goal,
+                "context": context,
+                "role": top_role,
+                "subagent_type": subagent_type,
+                "scheduling": scheduling,
+                "retain_session": retain_session,
+            }
+        ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -2540,6 +2576,25 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        task_scheduling = task.get("scheduling", scheduling)
+        if task_scheduling not in {"auto", "foreground", "background"}:
+            return json.dumps({"error": f"Invalid scheduling: {task_scheduling}"})
+        task_subagent_type = task.get("subagent_type", subagent_type)
+        task_role = task.get("role") or top_role
+        if task_subagent_type is not None:
+            try:
+                task_profile = get_subagent_profile(task_subagent_type)
+            except ValueError as exc:
+                return json.dumps({"error": str(exc)})
+            if task_role == "orchestrator" and not task_profile.can_delegate:
+                return json.dumps(
+                    {
+                        "error": (
+                            f"subagent_type={task_subagent_type} "
+                            "cannot use role=orchestrator"
+                        )
+                    }
+                )
 
     overall_start = time.monotonic()
     results = []
@@ -2564,6 +2619,13 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            effective_subagent_type = t.get("subagent_type", subagent_type)
+            profile = get_subagent_profile(effective_subagent_type) if effective_subagent_type else None
+            resolved_profile = (
+                resolve_profile_config(effective_subagent_type, cfg)
+                if effective_subagent_type
+                else None
+            )
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2582,6 +2644,9 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                profile=profile,
+                model_override=resolved_profile.model if resolved_profile else None,
+                provider_override=resolved_profile.provider if resolved_profile else None,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -3435,6 +3500,20 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "subagent_type": {
+                            "type": "string",
+                            "enum": list(SUPPORTED_SUBAGENT_TYPES),
+                            "description": "Built-in subagent type. Omit to preserve legacy generic delegation.",
+                        },
+                        "scheduling": {
+                            "type": "string",
+                            "enum": ["auto", "foreground", "background"],
+                            "description": "Whether the parent waits, returns immediately, or uses the type default.",
+                        },
+                        "retain_session": {
+                            "type": "boolean",
+                            "description": "Retain the child transcript for delegate_continue.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3447,6 +3526,20 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "subagent_type": {
+                "type": "string",
+                "enum": list(SUPPORTED_SUBAGENT_TYPES),
+                "description": "Built-in subagent type. Omit to preserve legacy generic delegation.",
+            },
+            "scheduling": {
+                "type": "string",
+                "enum": ["auto", "foreground", "background"],
+                "description": "Whether the parent waits, returns immediately, or uses the type default.",
+            },
+            "retain_session": {
+                "type": "boolean",
+                "description": "Retain the child transcript for delegate_continue.",
             },
             "background": {
                 "type": "boolean",
@@ -3516,6 +3609,9 @@ registry.register(
         goal=args.get("goal"),
         context=args.get("context"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
+        subagent_type=args.get("subagent_type"),
+        scheduling=args.get("scheduling", "auto"),
+        retain_session=args.get("retain_session"),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),

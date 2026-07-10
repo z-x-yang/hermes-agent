@@ -86,6 +86,28 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
+        subagent_type_schema = {
+            "type": "string",
+            "enum": ["Explore", "Plan", "general-purpose"],
+            "description": "Built-in subagent type. Omit to preserve legacy generic delegation.",
+        }
+        scheduling_schema = {
+            "type": "string",
+            "enum": ["auto", "foreground", "background"],
+            "description": "Whether the parent waits, returns immediately, or uses the type default.",
+        }
+        retain_session_schema = {
+            "type": "boolean",
+            "description": "Retain the child transcript for delegate_continue.",
+        }
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertEqual(props["subagent_type"], subagent_type_schema)
+        self.assertEqual(props["scheduling"], scheduling_schema)
+        self.assertEqual(props["retain_session"], retain_session_schema)
+        self.assertEqual(task_props["subagent_type"], subagent_type_schema)
+        self.assertEqual(task_props["scheduling"], scheduling_schema)
+        self.assertEqual(task_props["retain_session"], retain_session_schema)
+
     def test_schema_description_advertises_runtime_limits(self):
         """The model must see the user's actual concurrency / spawn-depth caps,
         not the framework defaults. Without this, models that read 'default 3'
@@ -2246,6 +2268,73 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 class TestDispatchDelegateTask(unittest.TestCase):
     """Tests for the _dispatch_delegate_task helper and full param forwarding."""
 
+    def test_delegate_task_validates_subagent_type_and_scheduling(self):
+        parent = _make_mock_parent(depth=0)
+
+        invalid_scheduling = json.loads(
+            delegate_task(goal="test", scheduling="later", parent_agent=parent)
+        )
+        self.assertEqual(invalid_scheduling["error"], "Invalid scheduling: later")
+
+        unknown_type = json.loads(
+            delegate_task(goal="test", subagent_type="review-readonly", parent_agent=parent)
+        )
+        self.assertIn("Unknown subagent_type", unknown_type["error"])
+
+        invalid_role = json.loads(
+            delegate_task(
+                goal="test",
+                subagent_type="Explore",
+                role="orchestrator",
+                parent_agent=parent,
+            )
+        )
+        self.assertEqual(
+            invalid_role["error"],
+            "subagent_type=Explore cannot use role=orchestrator",
+        )
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_subagent_profile_model_provider_override_reaches_child_builder(self, mock_creds):
+        mock_creds.return_value = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "global-model",
+            "provider": "global-provider",
+            "agents": {
+                "Explore": {
+                    "model": "cheap-model",
+                    "provider": "openrouter",
+                }
+            },
+        }
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="inspect only",
+                subagent_type="Explore",
+                parent_agent=parent,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["model"], "cheap-model")
+        self.assertEqual(kwargs["provider"], "openrouter")
+
     def test_model_acp_args_not_forwarded(self):
         """The live model dispatch path strips hidden ACP transport args."""
         import run_agent
@@ -2279,6 +2368,43 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertEqual(captured["goal"], "test")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
+
+    def test_new_subagent_fields_forwarded(self):
+        """The live dispatch path forwards Task 1 subagent type plumbing."""
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "goal": "test",
+                    "subagent_type": "Explore",
+                    "scheduling": "foreground",
+                    "retain_session": True,
+                    "tasks": [
+                        {
+                            "goal": "nested",
+                            "subagent_type": "Plan",
+                            "scheduling": "auto",
+                            "retain_session": False,
+                        },
+                    ],
+                },
+            )
+
+        self.assertEqual(captured["subagent_type"], "Explore")
+        self.assertEqual(captured["scheduling"], "foreground")
+        self.assertIs(captured["retain_session"], True)
+        self.assertEqual(captured["tasks"][0]["subagent_type"], "Plan")
+        self.assertEqual(captured["tasks"][0]["scheduling"], "auto")
+        self.assertIs(captured["tasks"][0]["retain_session"], False)
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
