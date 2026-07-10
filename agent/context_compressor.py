@@ -4605,33 +4605,15 @@ Use this exact structure:
         previous_summary_in_prefix: bool = False,
     ) -> str:
         """Build the final user instruction for append-cached summary calls."""
-        previous_summary_guidance = (
-            "If the conversation above includes an earlier compaction summary, "
-            "treat that visible summary as the prior checkpoint; it is part of "
-            "the cached prefix and is intentionally not repeated in this instruction."
-        )
-        if previous_summary or previous_summary_in_prefix:
-            prompt = f"""{rules.preamble}
+        prompt = f"""{rules.preamble}
 
-You are updating a context compaction summary. The conversation messages above are the provider-visible compacted prefix that will be replaced by this summary. The retained tail is not included in this request and will remain verbatim after the summary.
+Write the replacement structured checkpoint summary using the provider-visible compacted prefix above. The retained tail is not included in this request and will remain verbatim after the summary.
 
-{previous_summary_guidance}
-
-Role=user messages in the conversation above are authoritative over earlier summary content. If they conflict, preserve the newer user state in active sections.
+Role=user messages above are authoritative. If messages conflict, preserve the newer user state in active sections.
 
 {rules.minimal_sufficient_state_rule}
 
-Update the summary using this exact nine-section structure. Incorporate the conversation above, and remove or mark obsolete information when messages inside the summarized slice cancelled, narrowed, or replaced earlier work. Keep "## Pending Tasks" limited to genuinely open work visible from the previous summary plus the conversation above. Update "## Current Work" and "## Optional Next Step" to reflect the precise continuation point at the compression boundary. Do not preserve completed or cancelled work as pending. In "## All User Messages", carry forward every entry from the previous summary and append the conversation's real user messages; never drop, merge, or paraphrase away a user's wording.
-
-{rules.template_sections}"""
-        else:
-            prompt = f"""{rules.preamble}
-
-Create a structured checkpoint summary for the conversation messages above. Those messages are the provider-visible compacted prefix that will be replaced by this summary. The retained tail is not included in this request and will remain verbatim after the summary.
-
-{rules.minimal_sufficient_state_rule}
-
-Use this exact structure:
+Use this exact nine-section structure. Incorporate the conversation above, and remove or mark obsolete information when messages inside the summarized slice cancelled, narrowed, or replaced earlier work. Keep "## Pending Tasks" limited to genuinely open work visible above. Update "## Current Work" and "## Optional Next Step" to reflect the precise continuation point at the compression boundary. Do not preserve completed or cancelled work as pending. In "## All User Messages", preserve every existing entry visible above and append the conversation's real user messages; never drop, merge, or paraphrase away a user's wording.
 
 {rules.template_sections}"""
 

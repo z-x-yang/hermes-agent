@@ -325,20 +325,28 @@ def test_append_instruction_does_not_embed_serialized_turns():
     assert "UNIQUE_SERIALIZED_HISTORY_MARKER" not in append_instruction
 
 
-def test_append_instruction_never_embeds_previous_summary_text():
+def test_append_instruction_is_invariant_to_previous_summary_state():
     with patch("agent.context_compressor.get_model_context_length", return_value=100000):
         compressor = ContextCompressor(model="test/model", quiet_mode=True)
     turns = [{"role": "user", "content": "new delta"}]
     rules = compressor._build_summary_rules(turns, compressor._compute_summary_budget(turns))
-    append_instruction = compressor._build_append_cached_summary_instruction(
+    without_previous = compressor._build_append_cached_summary_instruction(
         rules,
-        previous_summary="PREVIOUS_SUMMARY_MUST_NOT_BE_IN_APPEND_PROMPT",
+        previous_summary=None,
         focus_topic=None,
         previous_summary_in_prefix=False,
     )
+    with_previous = compressor._build_append_cached_summary_instruction(
+        rules,
+        previous_summary="PREVIOUS_SUMMARY_MUST_NOT_BE_IN_APPEND_PROMPT",
+        focus_topic=None,
+        previous_summary_in_prefix=True,
+    )
 
-    assert "PREVIOUS_SUMMARY_MUST_NOT_BE_IN_APPEND_PROMPT" not in append_instruction
-    assert "PREVIOUS SUMMARY:" not in append_instruction
+    assert with_previous == without_previous
+    assert "PREVIOUS_SUMMARY_MUST_NOT_BE_IN_APPEND_PROMPT" not in with_previous
+    assert "earlier compaction summary" not in with_previous.lower()
+    assert "intentionally not repeated" not in with_previous.lower()
 
 
 @dataclass
@@ -451,7 +459,7 @@ def test_append_cached_does_not_reembed_previous_summary_when_visible_in_cached_
     assert runtime.captured_messages is not None
     instruction = runtime.captured_messages[-1]["content"]
     assert "PREVIOUS_SUMMARY_MARKER_SHOULD_STAY_IN_CACHED_PREFIX_ONLY" not in instruction
-    assert "intentionally not repeated in this instruction" in instruction
+    assert "intentionally not repeated in this instruction" not in instruction
     request_audit = compressor._last_summary_call_audit["request"]
     assert request_audit["previous_summary_in_cached_prefix"] is True
     assert request_audit["previous_summary_chars_in_instruction"] == 0
