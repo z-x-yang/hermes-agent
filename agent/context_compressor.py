@@ -4605,23 +4605,19 @@ Use this exact structure:
         previous_summary_in_prefix: bool = False,
     ) -> str:
         """Build the final user instruction for append-cached summary calls."""
+        previous_summary_guidance = (
+            "If the conversation above includes an earlier compaction summary, "
+            "treat that visible summary as the prior checkpoint; it is part of "
+            "the cached prefix and is intentionally not repeated in this instruction."
+        )
         if previous_summary or previous_summary_in_prefix:
-            if previous_summary_in_prefix:
-                previous_summary_block = (
-                    "PREVIOUS SUMMARY:\n"
-                    "The previous compaction summary already present in the conversation "
-                    "above is part of the cached prefix. Use that visible summary as the "
-                    "prior checkpoint; it is intentionally not repeated here."
-                )
-            else:
-                previous_summary_block = f"PREVIOUS SUMMARY:\n{previous_summary}"
             prompt = f"""{rules.preamble}
 
 You are updating a context compaction summary. The conversation messages above are the provider-visible compacted prefix that will be replaced by this summary. The retained tail is not included in this request and will remain verbatim after the summary.
 
-{previous_summary_block}
+{previous_summary_guidance}
 
-Role=user messages in the conversation above are authoritative over PREVIOUS SUMMARY. If they conflict, preserve the newer user state in active sections.
+Role=user messages in the conversation above are authoritative over earlier summary content. If they conflict, preserve the newer user state in active sections.
 
 {rules.minimal_sufficient_state_rule}
 
@@ -4672,13 +4668,10 @@ Use this exact structure:
             compress_end=compress_end,
         )
         prefix_messages = list(source_messages[:compress_end])
-        previous_summary_in_prefix = self._previous_summary_visible_in_prefix(
-            previous_summary_for_prompt,
-            prefix_messages,
-        )
+        previous_summary_in_prefix = bool(previous_summary_for_prompt)
         instruction = self._build_append_cached_summary_instruction(
             rules,
-            previous_summary=None if previous_summary_in_prefix else previous_summary_for_prompt,
+            previous_summary=None,
             focus_topic=focus_topic,
             previous_summary_in_prefix=previous_summary_in_prefix,
         )
@@ -4744,9 +4737,7 @@ Use this exact structure:
             "instruction_chars": len(instruction),
             "previous_summary_in_cached_prefix": bool(previous_summary_in_prefix),
             "previous_summary_chars_available": len(previous_summary_for_prompt or ""),
-            "previous_summary_chars_in_instruction": (
-                0 if previous_summary_in_prefix else len(previous_summary_for_prompt or "")
-            ),
+            "previous_summary_chars_in_instruction": 0,
             "tokens_estimate": int(request_tokens),  # legacy compatibility
             "rough_tokens_estimate": int(request_tokens),
             "request_shape_estimate_tokens": int(request_tokens),

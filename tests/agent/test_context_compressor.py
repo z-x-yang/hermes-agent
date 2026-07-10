@@ -2837,7 +2837,7 @@ Latest user says: {tail_text}
 
         assert "older summarized request" not in previous_for_prompt
         assert tail_text not in instruction
-        assert "retained tail user message omitted" in instruction
+        assert "retained tail user message omitted" not in instruction
 
     def test_user_ledger_skips_sender_only_gateway_prefix_rows(self):
         turns = [

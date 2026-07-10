@@ -325,6 +325,22 @@ def test_append_instruction_does_not_embed_serialized_turns():
     assert "UNIQUE_SERIALIZED_HISTORY_MARKER" not in append_instruction
 
 
+def test_append_instruction_never_embeds_previous_summary_text():
+    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        compressor = ContextCompressor(model="test/model", quiet_mode=True)
+    turns = [{"role": "user", "content": "new delta"}]
+    rules = compressor._build_summary_rules(turns, compressor._compute_summary_budget(turns))
+    append_instruction = compressor._build_append_cached_summary_instruction(
+        rules,
+        previous_summary="PREVIOUS_SUMMARY_MUST_NOT_BE_IN_APPEND_PROMPT",
+        focus_topic=None,
+        previous_summary_in_prefix=False,
+    )
+
+    assert "PREVIOUS_SUMMARY_MUST_NOT_BE_IN_APPEND_PROMPT" not in append_instruction
+    assert "PREVIOUS SUMMARY:" not in append_instruction
+
+
 @dataclass
 class CapturingRuntime:
     context_limit_tokens: int = 1_000_000
@@ -435,9 +451,46 @@ def test_append_cached_does_not_reembed_previous_summary_when_visible_in_cached_
     assert runtime.captured_messages is not None
     instruction = runtime.captured_messages[-1]["content"]
     assert "PREVIOUS_SUMMARY_MARKER_SHOULD_STAY_IN_CACHED_PREFIX_ONLY" not in instruction
-    assert "previous compaction summary already present" in instruction
+    assert "intentionally not repeated in this instruction" in instruction
     request_audit = compressor._last_summary_call_audit["request"]
     assert request_audit["previous_summary_in_cached_prefix"] is True
+    assert request_audit["previous_summary_chars_in_instruction"] == 0
+
+
+def test_append_cached_never_reembeds_previous_summary_when_prefix_detection_misses():
+    runtime = CapturingRuntime()
+    with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+        compressor = ContextCompressor(
+            model="gpt-5.5",
+            quiet_mode=True,
+            summary_call_mode="append_cached",
+            append_cached_summary={"fallback_to_serialized_prompt": False},
+        )
+    compressor.bind_summary_runtime_factory(lambda: runtime)
+    previous_summary = (
+        "## Primary Request and Intent\n"
+        "PREVIOUS_SUMMARY_DETECTOR_MISS_MUST_NOT_BE_REEMBEDDED\n\n"
+        "## All User Messages\n1. \"old ask\" — prior user request."
+    )
+    compressor._previous_summary = previous_summary
+    messages = [
+        {"role": "assistant", "content": "[CONTEXT COMPACTION]\nsummary text was redacted or normalized differently"},
+        {"role": "user", "content": "new delta"},
+    ]
+
+    summary = compressor._generate_summary(
+        messages[1:2],
+        source_messages=messages,
+        summarize_start=1,
+        compress_end=2,
+        focus_topic=None,
+    )
+
+    assert summary is not None
+    assert runtime.captured_messages is not None
+    instruction = runtime.captured_messages[-1]["content"]
+    assert "PREVIOUS_SUMMARY_DETECTOR_MISS_MUST_NOT_BE_REEMBEDDED" not in instruction
+    request_audit = compressor._last_summary_call_audit["request"]
     assert request_audit["previous_summary_chars_in_instruction"] == 0
 
 
