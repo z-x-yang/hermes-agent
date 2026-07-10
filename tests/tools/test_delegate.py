@@ -2297,8 +2297,8 @@ class TestDispatchDelegateTask(unittest.TestCase):
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     def test_subagent_profile_model_provider_override_reaches_child_builder(self, mock_creds):
         mock_creds.return_value = {
-            "model": None,
-            "provider": None,
+            "model": "cheap-model",
+            "provider": "openrouter",
             "base_url": None,
             "api_key": None,
             "api_mode": None,
@@ -2334,6 +2334,74 @@ class TestDispatchDelegateTask(unittest.TestCase):
         _, kwargs = MockAgent.call_args
         self.assertEqual(kwargs["model"], "cheap-model")
         self.assertEqual(kwargs["provider"], "openrouter")
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_subagent_profile_provider_override_resolves_full_credentials(self, mock_creds):
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "max_iterations": 45,
+            "model": "global-model",
+            "provider": "global-provider",
+            "agents": {
+                "Explore": {
+                    "model": "cheap-model",
+                    "provider": "openrouter",
+                }
+            },
+        }
+
+        def resolve_side_effect(call_cfg, parent_agent):
+            self.assertIs(parent_agent, parent)
+            provider = call_cfg.get("provider")
+            model = call_cfg.get("model")
+            if provider == "openrouter" and model == "cheap-model":
+                return {
+                    "model": "cheap-model",
+                    "provider": "openrouter",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key": "sk-or-explore",
+                    "api_mode": "chat_completions",
+                }
+            return {
+                "model": model,
+                "provider": provider,
+                "base_url": "https://global.example/v1",
+                "api_key": "global-key",
+                "api_mode": "global_mode",
+            }
+
+        mock_creds.side_effect = resolve_side_effect
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="inspect only",
+                subagent_type="Explore",
+                parent_agent=parent,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["model"], "cheap-model")
+        self.assertEqual(kwargs["provider"], "openrouter")
+        self.assertEqual(kwargs["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(kwargs["api_key"], "sk-or-explore")
+        self.assertEqual(kwargs["api_mode"], "chat_completions")
+        self.assertTrue(
+            any(
+                call.args[0].get("provider") == "openrouter"
+                and call.args[0].get("model") == "cheap-model"
+                for call in mock_creds.call_args_list
+            ),
+            "Explore override must be merged before resolving credentials",
+        )
 
     def test_model_acp_args_not_forwarded(self):
         """The live model dispatch path strips hidden ACP transport args."""

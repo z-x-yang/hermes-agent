@@ -2523,16 +2523,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2614,6 +2604,7 @@ def delegate_task(
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
+    dispatch_model = None
     try:
         for i, t in enumerate(task_list):
             # Per-task role beats top-level; normalise again so unknown
@@ -2626,6 +2617,22 @@ def delegate_task(
                 if effective_subagent_type
                 else None
             )
+            child_cfg = cfg
+            if resolved_profile:
+                child_cfg = dict(cfg)
+                # Per-agent model/provider overrides must feed the credential
+                # resolver, not just AIAgent's display strings, so base_url,
+                # api_key, and api_mode come from the selected provider too.
+                if resolved_profile.model:
+                    child_cfg["model"] = resolved_profile.model
+                if resolved_profile.provider:
+                    child_cfg["provider"] = resolved_profile.provider
+            try:
+                creds = _resolve_delegation_credentials(child_cfg, parent_agent)
+            except ValueError as exc:
+                return tool_error(str(exc))
+            if dispatch_model is None:
+                dispatch_model = creds["model"]
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2645,8 +2652,6 @@ def delegate_task(
                 override_acp_args=creds.get("args"),
                 role=effective_role,
                 profile=profile,
-                model_override=resolved_profile.model if resolved_profile else None,
-                provider_override=resolved_profile.provider if resolved_profile else None,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2981,7 +2986,7 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=dispatch_model,
             session_key=_session_key,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
