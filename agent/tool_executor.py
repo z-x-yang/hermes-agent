@@ -31,6 +31,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
+from agent.subagent_tool_policy import tool_policy_block_message
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -570,20 +571,41 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
-        function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
-            agent,
-            function_name=function_name,
-            function_args=function_args,
-            effective_task_id=effective_task_id,
-            tool_call_id=getattr(tool_call, "id", "") or "",
-        )
+        # Built-in subagent profiles use a closed runtime capability allowlist.
+        # Check the resolved underlying name immediately after Tool Search unwrap
+        # so neither the bridge nor request/plugin middleware can bypass policy.
+        _capability_block = tool_policy_block_message(agent, function_name)
+        if _capability_block is None:
+            function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+            )
+        else:
+            middleware_trace = []
 
         # ── Block evaluation (BEFORE checkpoint preflight) ───────────
         # We must know whether the tool will execute before touching
         # checkpoint state (dedup slot, real snapshots).
         block_result = None
         blocked_by_guardrail = False
-        if _ts_scope_block is not None:
+        if _capability_block is not None:
+            block_result = json.dumps({"error": _capability_block}, ensure_ascii=False)
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=block_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                status="blocked",
+                error_type="subagent_capability_block",
+                error_message=_capability_block,
+                middleware_trace=[],
+            )
+        elif _ts_scope_block is not None:
             # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
             block_result = _ts_scope_block
             _emit_terminal_post_tool_call(
@@ -1203,21 +1225,29 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
-        function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
-            agent,
-            function_name=function_name,
-            function_args=function_args,
-            effective_task_id=effective_task_id,
-            tool_call_id=getattr(tool_call, "id", "") or "",
-        )
+        # Check the resolved underlying name before any middleware, plugin hook,
+        # guardrail, checkpoint, callback, or dispatch can observe/execute it.
+        _capability_block = tool_policy_block_message(agent, function_name)
+        if _capability_block is None:
+            function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+            )
+        else:
+            middleware_trace = []
 
-        # Check plugin hooks for a block directive before executing.
-        _block_msg: Optional[str] = None
-        _block_error_type = "plugin_block"
-        if _ts_scope_block is not None:
+        # Check capability and plugin policies before executing.
+        _block_msg: Optional[str] = _capability_block
+        _block_error_type = (
+            "subagent_capability_block" if _capability_block is not None else "plugin_block"
+        )
+        if _block_msg is None and _ts_scope_block is not None:
             _block_msg = _ts_scope_block
             _block_error_type = "tool_scope_block"
-        else:
+        elif _block_msg is None:
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 _block_msg = get_pre_tool_call_block_message(
@@ -1242,7 +1272,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
 
         if _execution_blocked:
-            # Tool blocked by plugin or guardrail policy — skip counters,
+            # Tool blocked by capability, plugin, or guardrail policy — skip counters,
             # callbacks, checkpointing, activity mutation, and real execution.
             pass
         # Reset nudge counters when the relevant tool is actually used
@@ -1317,7 +1347,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         tool_start_time = time.time()
 
         if _block_msg is not None:
-            # Tool blocked by plugin policy — return error without executing.
+            # Tool blocked by capability/plugin/scope policy — do not execute.
             function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
             tool_duration = 0.0
             _emit_terminal_post_tool_call(

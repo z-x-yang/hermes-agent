@@ -1398,6 +1398,16 @@ def _build_child_agent(
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
     )
+    if profile is not None:
+        from agent.subagent_tool_policy import (
+            ToolNamePolicy,
+            apply_tool_policy_to_agent,
+        )
+
+        apply_tool_policy_to_agent(
+            child,
+            ToolNamePolicy(allowed_names=profile.allowed_tool_names),
+        )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
