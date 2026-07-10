@@ -43,6 +43,23 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
                 messages,
                 copy_messages=True,
             )
+            system_prompt = getattr(agent, "_cached_system_prompt", None)
+            if isinstance(system_prompt, str) and system_prompt:
+                ephemeral_system = getattr(agent, "ephemeral_system_prompt", None)
+                if isinstance(ephemeral_system, str) and ephemeral_system:
+                    system_prompt = (system_prompt + "\n\n" + ephemeral_system).strip()
+            if (
+                isinstance(system_prompt, str)
+                and system_prompt
+                and not (
+                    provider_messages
+                    and isinstance(provider_messages[0], dict)
+                    and provider_messages[0].get("role") == "system"
+                )
+            ):
+                provider_messages = [
+                    {"role": "system", "content": system_prompt}
+                ] + provider_messages
             return agent._build_api_kwargs(provider_messages)
         finally:
             agent._ephemeral_max_output_tokens = old_ephemeral

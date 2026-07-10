@@ -133,6 +133,8 @@ class FakeCodexAgentForSummaryRuntime:
     reasoning_effort = None
     tools = [{"type": "function", "name": "noop"}]
     session_api_calls = 7
+    _cached_system_prompt = "FULL_STABLE_SYSTEM_PROMPT_MARKER"
+    ephemeral_system_prompt = None
 
     class Compressor:
         context_length = 1_000_000
@@ -145,9 +147,15 @@ class FakeCodexAgentForSummaryRuntime:
 
     def _build_api_kwargs(self, messages):
         self.seen_ephemeral = self._ephemeral_max_output_tokens
+        instructions = "DEFAULT_AGENT_IDENTITY_FALLBACK"
+        input_messages = messages
+        if messages and messages[0].get("role") == "system":
+            instructions = messages[0].get("content", "")
+            input_messages = messages[1:]
         return {
             "model": self.model,
-            "input": messages,
+            "instructions": instructions,
+            "input": input_messages,
             "max_output_tokens": self._ephemeral_max_output_tokens,
         }
 
@@ -180,6 +188,31 @@ def test_make_summary_runtime_forwards_ephemeral_output_tokens_to_codex_build_kw
     assert agent.seen_ephemeral == 12345
     assert kwargs["max_output_tokens"] == 12345
     assert getattr(runtime, "main_api_calls_in_process") == 7
+
+
+def test_make_summary_runtime_reuses_cached_system_prompt_for_codex_prefix_cache():
+    agent = FakeCodexAgentForSummaryRuntime()
+    agent._cached_system_prompt = "FULL_STABLE_SYSTEM_PROMPT_MARKER"
+    runtime = make_summary_runtime(agent)
+
+    kwargs = runtime.build_kwargs([{"role": "user", "content": "summarize"}], 12345)
+
+    assert kwargs["instructions"] == "FULL_STABLE_SYSTEM_PROMPT_MARKER"
+    assert kwargs["input"] == [{"role": "user", "content": "summarize"}]
+
+
+def test_make_summary_runtime_reuses_ephemeral_system_prompt_for_codex_prefix_cache():
+    agent = FakeCodexAgentForSummaryRuntime()
+    agent._cached_system_prompt = "FULL_STABLE_SYSTEM_PROMPT_MARKER"
+    agent.ephemeral_system_prompt = "EPHEMERAL_SYSTEM_PROMPT_MARKER"
+    runtime = make_summary_runtime(agent)
+
+    kwargs = runtime.build_kwargs([{"role": "user", "content": "summarize"}], 12345)
+
+    assert kwargs["instructions"] == (
+        "FULL_STABLE_SYSTEM_PROMPT_MARKER\n\nEPHEMERAL_SYSTEM_PROMPT_MARKER"
+    )
+    assert kwargs["input"] == [{"role": "user", "content": "summarize"}]
 
 
 def test_make_summary_runtime_canonicalizes_tool_arguments_like_main_api_copy():
