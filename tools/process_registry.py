@@ -142,6 +142,8 @@ class ProcessSession:
     _watch_strike_candidate: bool = field(default=False, repr=False)
     _watch_consecutive_strikes: int = field(default=0, repr=False)
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    _kill_intent_pending: bool = field(default=False, repr=False)
+    _completion_deferred_for_kill: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
@@ -1273,26 +1275,36 @@ finally:
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
         # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
-        if (
-            was_running
-            and session.notify_on_complete
-            and not (
-                session.completion_reason == "killed"
-                and session.termination_source in {"process.kill", "kill_all"}
-            )
-        ):
-            from tools.ansi_strip import strip_ansi
-            output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
-            self.completion_queue.put({
-                "type": "completion",
-                "session_id": session.id,
-                "session_key": session.session_key,
-                "command": session.command,
-                "exit_code": session.exit_code,
-                "completion_reason": session.completion_reason,
-                "termination_source": session.termination_source,
-                "output": output_tail,
-            })
+        should_enqueue_completion = False
+        if was_running and session.notify_on_complete:
+            with session._lock:
+                if session._kill_intent_pending:
+                    # The signal call has not returned yet, so the reader cannot
+                    # know whether this exit was caused by the explicit kill.
+                    # Defer the decision to kill_process's success/error path.
+                    session._completion_deferred_for_kill = True
+                elif not (
+                    session.completion_reason == "killed"
+                    and session.termination_source in {"process.kill", "kill_all"}
+                ):
+                    should_enqueue_completion = True
+        if should_enqueue_completion:
+            self._enqueue_completion_notification(session)
+
+    def _enqueue_completion_notification(self, session: ProcessSession):
+        """Queue one notify_on_complete event using the session's terminal state."""
+        from tools.ansi_strip import strip_ansi
+        output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
+        self.completion_queue.put({
+            "type": "completion",
+            "session_id": session.id,
+            "session_key": session.session_key,
+            "command": session.command,
+            "exit_code": session.exit_code,
+            "completion_reason": session.completion_reason,
+            "termination_source": session.termination_source,
+            "output": output_tail,
+        })
 
     # ----- Query Methods -----
 
@@ -1623,6 +1635,52 @@ finally:
                 "exit_code": session.exit_code,
             }
 
+        can_signal = bool(
+            session._pty
+            or session.process
+            or (session.env_ref and session.pid)
+            or (session.detached and session.pid_scope == "host" and session.pid)
+        )
+        if not can_signal:
+            return {
+                "status": "error",
+                "error": (
+                    "Recovered process cannot be killed after restart because "
+                    "its original runtime handle is no longer available"
+                ),
+            }
+
+        # For a recovered host process, prove the PID still belongs to this
+        # session before recording an expected kill intent. Never tree-kill a
+        # recycled PID, and don't relabel a naturally exited process as killed.
+        if (
+            session.detached
+            and session.pid_scope == "host"
+            and session.pid
+            and not self._host_pid_is_ours(session.pid, session.host_start_time)
+        ):
+            with session._lock:
+                session.exited = True
+                session.exit_code = None
+            self._move_to_finished(session)
+            return {
+                "status": "already_exited",
+                "exit_code": session.exit_code,
+            }
+
+        # Record the explicit kill intent BEFORE signaling, but do not rewrite
+        # the terminal result yet. The stdout/PTY/env reader can observe an
+        # exit and call _move_to_finished() before the terminator returns; it
+        # must defer notification until we know whether signaling succeeded.
+        with session._lock:
+            if session.exited:
+                return {
+                    "status": "already_exited",
+                    "exit_code": session.exit_code,
+                }
+            session._kill_intent_pending = True
+            session._completion_deferred_for_kill = False
+
         # Kill via PTY, Popen (local), or env execute (non-local)
         try:
             if session._pty:
@@ -1638,34 +1696,23 @@ finally:
                 # shell wrapper and leaves Git Bash descendants behind.
                 self._terminate_host_pid(session.process.pid, session.host_start_time)
             elif session.env_ref and session.pid:
-                # Non-local -- kill inside sandbox
-                session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                # Non-local -- kill inside sandbox. Environment.execute returns
+                # nonzero statuses as data, so fail closed instead of reporting
+                # a successful kill when the shell command was rejected.
+                kill_result = session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                kill_returncode = kill_result.get("returncode")
+                if kill_returncode != 0:
+                    rendered_returncode = "unknown" if kill_returncode is None else kill_returncode
+                    raise RuntimeError(f"Remote kill failed (exit code {rendered_returncode})")
             elif session.detached and session.pid_scope == "host" and session.pid:
-                # Identity check, not bare liveness: if the PID is gone OR was
-                # recycled onto an unrelated process, treat our process as
-                # exited and never tree-kill the stranger.
-                if not self._host_pid_is_ours(session.pid, session.host_start_time):
-                    with session._lock:
-                        session.exited = True
-                        session.exit_code = None
-                    self._move_to_finished(session)
-                    return {
-                        "status": "already_exited",
-                        "exit_code": session.exit_code,
-                    }
                 self._terminate_host_pid(session.pid, session.host_start_time)
-            else:
-                return {
-                    "status": "error",
-                    "error": (
-                        "Recovered process cannot be killed after restart because "
-                        "its original runtime handle is no longer available"
-                    ),
-                }
-            session.exited = True
-            session.exit_code = -15  # SIGTERM
-            session.completion_reason = "killed"
-            session.termination_source = source
+            with session._lock:
+                session.exit_code = -15  # Preserve existing process.kill contract.
+                session.completion_reason = "killed"
+                session.termination_source = source
+                session._kill_intent_pending = False
+                session._completion_deferred_for_kill = False
+                session.exited = True
             self._move_to_finished(session)
             self._write_checkpoint()
             return {
@@ -1675,6 +1722,17 @@ finally:
                 "termination_source": session.termination_source,
             }
         except Exception as e:
+            # If the reader already observed a real exit while the signal call
+            # was unresolved, its completion was deferred. A failed signal
+            # means that exit must keep its real status and notify normally.
+            enqueue_deferred_completion = False
+            with session._lock:
+                session._kill_intent_pending = False
+                if session.exited and session._completion_deferred_for_kill:
+                    enqueue_deferred_completion = session.notify_on_complete
+                session._completion_deferred_for_kill = False
+            if enqueue_deferred_completion:
+                self._enqueue_completion_notification(session)
             return {"status": "error", "error": str(e)}
 
     def write_stdin(self, session_id: str, data: str) -> dict:

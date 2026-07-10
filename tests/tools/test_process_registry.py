@@ -1308,6 +1308,157 @@ class TestKillProcess:
         assert result["status"] == "killed"
         assert registry.drain_notifications() == []
 
+    def test_expected_process_kill_suppresses_reader_race_notification(self, registry, monkeypatch):
+        """The reader may observe SIGTERM before kill_process returns from the terminator."""
+        s = _make_session(sid="proc_expected_kill_race", command="codex review --uncommitted")
+        s.process = MagicMock()
+        s.process.pid = 12345
+        s.host_start_time = 67890
+        s.notify_on_complete = True
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        def terminate_and_run_reader(pid, expected_start=None):
+            assert (pid, expected_start) == (12345, 67890)
+            # Mirror _stdout_reader_loop's finally block running immediately
+            # after SIGTERM, before kill_process regains control.
+            with s._lock:
+                s.exited = True
+                if s.completion_reason != "killed":
+                    s.exit_code = -15
+                    s.completion_reason = "exited"
+            registry._move_to_finished(s)
+
+        monkeypatch.setattr(registry, "_terminate_host_pid", terminate_and_run_reader)
+
+        result = registry.kill_process(s.id)
+
+        assert result["status"] == "killed"
+        assert result["termination_source"] == "process.kill"
+        assert registry.drain_notifications() == []
+
+    def test_kill_all_suppresses_reader_race_notification(self, registry, monkeypatch):
+        """kill_all uses the same deferred-notification contract as process.kill."""
+        s = _make_session(sid="proc_kill_all_race", command="python monitor.py")
+        s.process = MagicMock()
+        s.process.pid = 12345
+        s.host_start_time = 67890
+        s.notify_on_complete = True
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        def terminate_and_run_reader(pid, expected_start=None):
+            with s._lock:
+                s.exited = True
+                if s.completion_reason != "killed":
+                    s.exit_code = -15
+                    s.completion_reason = "exited"
+            registry._move_to_finished(s)
+
+        monkeypatch.setattr(registry, "_terminate_host_pid", terminate_and_run_reader)
+
+        assert registry.kill_all() == 1
+        assert s.completion_reason == "killed"
+        assert s.termination_source == "kill_all"
+        assert registry.drain_notifications() == []
+
+    def test_failed_expected_process_kill_restores_running_state(self, registry, monkeypatch):
+        """A failed signal must not leave a live process labeled as killed."""
+        s = _make_session(sid="proc_expected_kill_error", command="python monitor.py")
+        s.process = MagicMock()
+        s.process.pid = 12345
+        s.host_start_time = 67890
+        s.notify_on_complete = True
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        def fail_to_terminate(pid, expected_start=None):
+            raise OSError("signal failed")
+
+        monkeypatch.setattr(registry, "_terminate_host_pid", fail_to_terminate)
+
+        result = registry.kill_process(s.id)
+
+        assert result == {"status": "error", "error": "signal failed"}
+        assert s.exited is False
+        assert s.exit_code is None
+        assert s.completion_reason == "exited"
+        assert s.termination_source == ""
+        assert registry.get(s.id) is s
+        assert registry.drain_notifications() == []
+
+    def test_remote_kill_nonzero_exit_keeps_process_running(self, registry, monkeypatch):
+        """A remote shell kill failure must not be reported as a successful kill."""
+        s = _make_session(sid="proc_remote_kill_error", command="python worker.py")
+        s.env_ref = MagicMock()
+        s.env_ref.execute.return_value = {"output": "", "returncode": 1}
+        s.pid = 12345
+        s.pid_scope = "sandbox"
+        s.notify_on_complete = True
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        result = registry.kill_process(s.id)
+
+        assert result == {"status": "error", "error": "Remote kill failed (exit code 1)"}
+        assert s.exited is False
+        assert s.exit_code is None
+        assert s.completion_reason == "exited"
+        assert s.termination_source == ""
+        assert registry.get(s.id) is s
+        assert registry.drain_notifications() == []
+
+    def test_remote_kill_missing_returncode_keeps_process_running(self, registry, monkeypatch):
+        """Malformed remote results fail closed instead of claiming the process was killed."""
+        s = _make_session(sid="proc_remote_kill_unknown", command="python worker.py")
+        s.env_ref = MagicMock()
+        s.env_ref.execute.return_value = {"output": ""}
+        s.pid = 12345
+        s.pid_scope = "sandbox"
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        result = registry.kill_process(s.id)
+
+        assert result == {"status": "error", "error": "Remote kill failed (exit code unknown)"}
+        assert s.exited is False
+        assert registry.get(s.id) is s
+
+    def test_failed_kill_racing_with_real_exit_preserves_completion_notification(self, registry, monkeypatch):
+        """If signaling fails, a concurrent real exit must still notify."""
+        s = _make_session(sid="proc_failed_kill_real_exit", command="python worker.py")
+        s.process = MagicMock()
+        s.process.pid = 12345
+        s.host_start_time = 67890
+        s.notify_on_complete = True
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        def reader_exits_then_signal_fails(pid, expected_start=None):
+            with s._lock:
+                s.exited = True
+                if s.completion_reason != "killed":
+                    s.exit_code = 7
+                    s.completion_reason = "exited"
+            registry._move_to_finished(s)
+            raise OSError("signal failed after concurrent exit")
+
+        monkeypatch.setattr(registry, "_terminate_host_pid", reader_exits_then_signal_fails)
+
+        result = registry.kill_process(s.id)
+
+        assert result == {"status": "error", "error": "signal failed after concurrent exit"}
+        assert s.exited is True
+        assert s.exit_code == 7
+        assert s.completion_reason == "exited"
+        assert s.termination_source == ""
+        notifications = registry.drain_notifications()
+        assert len(notifications) == 1
+        event, text = notifications[0]
+        assert event["session_id"] == s.id
+        assert event["exit_code"] == 7
+        assert "exited (exit code 7)" in text
+
     def test_kill_detached_session_uses_host_pid(self, registry):
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
