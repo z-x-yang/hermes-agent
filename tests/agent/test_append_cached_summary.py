@@ -151,6 +151,25 @@ class FakeCodexAgentForSummaryRuntime:
             "max_output_tokens": self._ephemeral_max_output_tokens,
         }
 
+    @staticmethod
+    def _sanitize_api_messages(messages):
+        from agent.agent_runtime_helpers import sanitize_api_messages
+
+        return sanitize_api_messages(messages)
+
+    @staticmethod
+    def _drop_thinking_only_and_merge_users(
+        messages,
+        *,
+        drop_codex_reasoning_items=True,
+    ):
+        from agent.agent_runtime_helpers import drop_thinking_only_and_merge_users
+
+        return drop_thinking_only_and_merge_users(
+            messages,
+            drop_codex_reasoning_items=drop_codex_reasoning_items,
+        )
+
 
 def test_make_summary_runtime_forwards_ephemeral_output_tokens_to_codex_build_kwargs():
     agent = FakeCodexAgentForSummaryRuntime()
@@ -161,6 +180,83 @@ def test_make_summary_runtime_forwards_ephemeral_output_tokens_to_codex_build_kw
     assert agent.seen_ephemeral == 12345
     assert kwargs["max_output_tokens"] == 12345
     assert getattr(runtime, "main_api_calls_in_process") == 7
+
+
+def test_make_summary_runtime_canonicalizes_tool_arguments_like_main_api_copy():
+    agent = FakeCodexAgentForSummaryRuntime()
+    runtime = make_summary_runtime(agent)
+    raw_messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "noop",
+                        "arguments": '{"z":2, "a":1}',
+                    },
+                }
+            ],
+        }
+    ]
+
+    kwargs = runtime.build_kwargs(raw_messages, 12345)
+
+    arguments = kwargs["input"][0]["tool_calls"][0]["function"]["arguments"]
+    assert arguments == '{"a":1,"z":2}'
+    assert raw_messages[0]["tool_calls"][0]["function"]["arguments"] == '{"z":2, "a":1}'
+
+
+def test_make_summary_runtime_sanitizer_does_not_mutate_source_tool_calls():
+    agent = FakeCodexAgentForSummaryRuntime()
+    runtime = make_summary_runtime(agent)
+    raw_messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_blank",
+                    "type": "function",
+                    "function": {"name": "", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_blank", "content": "ok"},
+    ]
+
+    kwargs = runtime.build_kwargs(raw_messages, 12345)
+
+    assert kwargs["input"][0]["tool_calls"][0]["function"]["name"] == "invalid_tool_call"
+    assert raw_messages[0]["tool_calls"][0]["function"]["name"] == ""
+
+
+def test_make_summary_runtime_strips_content_like_main_api_copy():
+    agent = FakeCodexAgentForSummaryRuntime()
+    runtime = make_summary_runtime(agent)
+    raw_messages = [{"role": "user", "content": "  summarize me  \n"}]
+
+    kwargs = runtime.build_kwargs(raw_messages, 12345)
+
+    assert kwargs["input"][0]["content"] == "summarize me"
+    assert raw_messages[0]["content"] == "  summarize me  \n"
+
+
+def test_make_summary_runtime_drops_thinking_only_turn_like_main_api_copy():
+    agent = FakeCodexAgentForSummaryRuntime()
+    runtime = make_summary_runtime(agent)
+    raw_messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "", "reasoning_content": "hidden"},
+        {"role": "user", "content": "second"},
+    ]
+
+    kwargs = runtime.build_kwargs(raw_messages, 12345)
+
+    assert kwargs["input"] == [{"role": "user", "content": "first\n\nsecond"}]
+    assert len(raw_messages) == 3
 
 
 def test_make_summary_runtime_exposes_agent_fallback_activation():

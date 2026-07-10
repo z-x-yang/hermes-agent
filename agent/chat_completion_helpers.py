@@ -117,6 +117,96 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
     return _chars(api_payload) // 4
 
 
+def prepare_provider_visible_messages(
+    agent: Any,
+    messages: list[dict[str, Any]],
+    *,
+    copy_messages: bool = False,
+) -> list[dict[str, Any]]:
+    """Normalize shared history without turn-local context injections.
+
+    Normal turns and append-cached summary calls must serialize the same
+    provider-visible prefix. User-memory and runtime-status injection stay at
+    their turn-specific call sites; byte-stable whitespace and tool arguments
+    live here.
+    """
+    api_messages = (
+        [_copy_message_for_provider_shaping(message) for message in messages]
+        if copy_messages
+        else messages
+    )
+
+    sanitize = getattr(agent, "_sanitize_api_messages", None)
+    if callable(sanitize):
+        sanitized = sanitize(api_messages)
+        if isinstance(sanitized, list):
+            api_messages = sanitized
+
+    drop_thinking = getattr(agent, "_drop_thinking_only_and_merge_users", None)
+    if callable(drop_thinking):
+        dropped = drop_thinking(
+            api_messages,
+            drop_codex_reasoning_items=getattr(agent, "api_mode", None) != "codex_responses",
+        )
+        if isinstance(dropped, list):
+            api_messages = dropped
+
+    for message in api_messages:
+        if isinstance(message.get("content"), str):
+            message["content"] = message["content"].strip()
+
+        tool_calls = message.get("tool_calls")
+        if not tool_calls:
+            continue
+        normalized_tool_calls = []
+        for tool_call in tool_calls:
+            if isinstance(tool_call, dict) and "function" in tool_call:
+                function = tool_call.get("function")
+                if isinstance(function, dict):
+                    arguments = function.get("arguments", "{}")
+                    try:
+                        arguments_obj = json.loads(arguments)
+                        normalized_arguments = json.dumps(
+                            arguments_obj,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                    except Exception:
+                        normalized_arguments = _repair_tool_call_arguments(
+                            arguments,
+                            function.get("name", "?"),
+                        )
+                    tool_call = {
+                        **tool_call,
+                        "function": {
+                            **function,
+                            "arguments": normalized_arguments,
+                        },
+                    }
+            normalized_tool_calls.append(tool_call)
+        message["tool_calls"] = normalized_tool_calls
+
+    return api_messages
+
+
+def _copy_message_for_provider_shaping(message: dict[str, Any]) -> dict[str, Any]:
+    copied = message.copy()
+    tool_calls = copied.get("tool_calls")
+    if isinstance(tool_calls, list):
+        copied_tool_calls = []
+        for tool_call in tool_calls:
+            if isinstance(tool_call, dict):
+                copied_tool_call = tool_call.copy()
+                function = copied_tool_call.get("function")
+                if isinstance(function, dict):
+                    copied_tool_call["function"] = function.copy()
+                copied_tool_calls.append(copied_tool_call)
+            else:
+                copied_tool_calls.append(tool_call)
+        copied["tool_calls"] = copied_tool_calls
+    return copied
+
+
 def _is_openai_codex_backend(agent) -> bool:
     base_url_lower = str(getattr(agent, "_base_url_lower", "") or "")
     base_url_hostname = str(getattr(agent, "_base_url_hostname", "") or "")

@@ -28,6 +28,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.chat_completion_helpers import prepare_provider_visible_messages
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
@@ -37,7 +38,6 @@ from agent.turn_retry_state import TurnRetryState
 from agent.memory_manager import build_memory_context_block
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
-    _repair_tool_call_arguments,
     _sanitize_messages_non_ascii,
     _sanitize_messages_surrogates,
     _sanitize_structure_non_ascii,
@@ -1030,62 +1030,11 @@ def run_conversation(
                 native_anthropic=agent._use_native_cache_layout,
             )
 
-        # Safety net: strip orphaned tool results / add stubs for missing
-        # results before sending to the API.  Runs unconditionally — not
-        # gated on context_compressor — so orphans from session loading or
-        # manual message manipulation are always caught.
-        api_messages = agent._sanitize_api_messages(api_messages)
+        # Keep the provider-visible history byte-stable across normal turns
+        # and append-cached summary calls. Turn-local memory/runtime-status
+        # injections happen above and are deliberately outside this helper.
+        api_messages = prepare_provider_visible_messages(agent, api_messages)
 
-        # Drop thinking-only assistant turns (reasoning but no visible
-        # output and no tool_calls) and merge any adjacent user messages
-        # left behind. Prevents Anthropic 400s ("The final block in an
-        # assistant message cannot be `thinking`.") and equivalent errors
-        # from third-party Anthropic-compatible gateways that can't replay
-        # a thinking-only turn. Runs on the per-call copy only — the
-        # stored conversation history keeps the reasoning block for the
-        # UI transcript and session persistence.
-        api_messages = agent._drop_thinking_only_and_merge_users(
-            api_messages,
-            drop_codex_reasoning_items=agent.api_mode != "codex_responses",
-        )
-
-        # Normalize message whitespace and tool-call JSON for consistent
-        # prefix matching.  Ensures bit-perfect prefixes across turns,
-        # which enables KV cache reuse on local inference servers
-        # (llama.cpp, vLLM, Ollama) and improves cache hit rates for
-        # cloud providers.  Operates on api_messages (the API copy) so
-        # the original conversation history in `messages` is untouched.
-        for am in api_messages:
-            if isinstance(am.get("content"), str):
-                am["content"] = am["content"].strip()
-        for am in api_messages:
-            tcs = am.get("tool_calls")
-            if not tcs:
-                continue
-            new_tcs = []
-            for tc in tcs:
-                if isinstance(tc, dict) and "function" in tc:
-                    try:
-                        args_obj = json.loads(tc["function"]["arguments"])
-                        tc = {**tc, "function": {
-                            **tc["function"],
-                            "arguments": json.dumps(
-                                args_obj, separators=(",", ":"),
-                                sort_keys=True,
-                            ),
-                        }}
-                    except Exception:
-                        tc["function"]["arguments"] = _repair_tool_call_arguments(
-                            tc["function"]["arguments"],
-                            tc["function"].get("name", "?"),
-                        )
-                new_tcs.append(tc)
-            am["tool_calls"] = new_tcs
-
-        # Proactively strip any surrogate characters before the API call.
-        # Models served via Ollama (Kimi K2.5, GLM-5, Qwen) can return
-        # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
-        # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
 
         # Calculate approximate request size for logging

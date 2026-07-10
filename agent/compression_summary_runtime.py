@@ -31,13 +31,19 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
     from agent.chat_completion_helpers import (
         estimate_request_context_tokens,
         interruptible_api_call,
+        prepare_provider_visible_messages,
     )
 
     def _build_kwargs(messages: list[dict[str, Any]], max_tokens: int) -> dict[str, Any]:
         old_ephemeral = getattr(agent, "_ephemeral_max_output_tokens", None)
         try:
             agent._ephemeral_max_output_tokens = max_tokens
-            return agent._build_api_kwargs(messages)
+            provider_messages = prepare_provider_visible_messages(
+                agent,
+                messages,
+                copy_messages=True,
+            )
+            return agent._build_api_kwargs(provider_messages)
         finally:
             agent._ephemeral_max_output_tokens = old_ephemeral
 
