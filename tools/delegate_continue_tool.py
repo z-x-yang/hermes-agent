@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import Any, Optional
 
@@ -44,6 +45,43 @@ DELEGATE_CONTINUE_SCHEMA = {
 
 def _tool_error(message: str) -> str:
     return json.dumps({"error": message}, ensure_ascii=False)
+
+
+class _ContinuationInterruptBridge:
+    """Thread-safe interrupt handle for one lazily-built continuation child."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._child = None
+        self._interrupt_requested = False
+        self._interrupt_delivered = False
+
+    @staticmethod
+    def _signal_child(child) -> None:
+        interrupt = getattr(child, "interrupt", None)
+        if callable(interrupt):
+            interrupt()
+        else:
+            child._interrupt_requested = True
+
+    def register(self, child) -> None:
+        with self._lock:
+            self._child = child
+            should_interrupt = self._interrupt_requested and not self._interrupt_delivered
+            if should_interrupt:
+                self._interrupt_delivered = True
+        if should_interrupt:
+            self._signal_child(child)
+
+    def __call__(self) -> None:
+        with self._lock:
+            self._interrupt_requested = True
+            child = self._child
+            should_interrupt = child is not None and not self._interrupt_delivered
+            if should_interrupt:
+                self._interrupt_delivered = True
+        if should_interrupt:
+            self._signal_child(child)
 
 
 def _build_continuation_child(
@@ -144,11 +182,14 @@ def _run_continuation_entry(
     parent_agent,
     *,
     child_run_timeout_seconds: Optional[float] = None,
+    interrupt_bridge: Optional[_ContinuationInterruptBridge] = None,
 ) -> dict[str, Any]:
     start = time.monotonic()
     child = None
     try:
         child = _build_continuation_child(record, prompt=prompt, parent_agent=parent_agent)
+        if interrupt_bridge is not None:
+            interrupt_bridge.register(child)
         payload = _build_continue_payload(prompt)
 
         def _run_child_conversation():
@@ -306,6 +347,7 @@ def delegate_continue(
             return _tool_error(f"Cannot resolve continuation timeouts: {exc}")
 
     start = time.monotonic()
+    interrupt_bridge = _ContinuationInterruptBridge()
 
     def _runner() -> dict[str, Any]:
         try:
@@ -314,6 +356,7 @@ def delegate_continue(
                 prompt,
                 parent_agent,
                 child_run_timeout_seconds=child_run_timeout_seconds,
+                interrupt_bridge=interrupt_bridge,
             )
             return _combined_for_async(entry)
         finally:
@@ -353,7 +396,7 @@ def delegate_continue(
             model=record.model,
             session_key=get_current_session_key(default=""),
             runner=_runner,
-            interrupt_fn=None,
+            interrupt_fn=interrupt_bridge,
             max_async_children=_get_max_async_children(),
             initial_delivery_mode=(
                 "foreground_waiting" if delivery_mode == "foreground" else "background"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, replace
 import threading
 import time
@@ -33,7 +34,7 @@ _in_flight: set[str] = set()
 
 
 def _copy_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [dict(item) for item in list(history or []) if isinstance(item, dict)]
+    return copy.deepcopy([item for item in list(history or []) if isinstance(item, dict)])
 
 
 def _copy_record(record: RetainedSubagentSession) -> RetainedSubagentSession:
@@ -64,7 +65,13 @@ def retain_subagent_session(
     max_records: int = 64,
 ) -> None:
     with _lock:
-        _prune(time.time(), max_records)
+        capacity = max(1, int(max_records or 1))
+        _prune(time.time(), capacity)
+        if len(_records) >= capacity:
+            raise RuntimeError(
+                f"Retained subagent session capacity reached ({capacity} records); "
+                "all retained sessions are in flight."
+            )
         _records[record.agent_id] = _copy_record(record)
 
 

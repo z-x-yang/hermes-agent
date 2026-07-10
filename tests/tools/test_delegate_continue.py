@@ -113,6 +113,61 @@ def test_retained_session_round_trip_and_ttl():
     assert get_retained_subagent_session("agent-1") == record
 
 
+def test_retained_session_history_is_deeply_isolated():
+    nested_history = [
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "original"}],
+            "tool_calls": [
+                {"function": {"name": "read_file", "arguments": {"path": "/tmp/a"}}}
+            ],
+        }
+    ]
+    retain_subagent_session(_record(conversation_history=nested_history))
+
+    nested_history[0]["content"][0]["text"] = "mutated source"
+    nested_history[0]["tool_calls"][0]["function"]["arguments"]["path"] = "/tmp/source"
+    fetched = get_retained_subagent_session("agent-1")
+    fetched.conversation_history[0]["content"][0]["text"] = "mutated result"
+    fetched.conversation_history[0]["tool_calls"][0]["function"]["arguments"]["path"] = "/tmp/result"
+
+    stored = get_retained_subagent_session("agent-1")
+    assert stored.conversation_history[0]["content"][0]["text"] == "original"
+    assert stored.conversation_history[0]["tool_calls"][0]["function"]["arguments"] == {
+        "path": "/tmp/a"
+    }
+
+
+def test_retained_session_capacity_fails_closed_while_every_record_is_claimed():
+    import tools.subagent_sessions as sessions
+    from tools.subagent_sessions import (
+        claim_retained_subagent_session,
+        release_retained_subagent_session,
+    )
+
+    retain_subagent_session(_record(agent_id="in-flight"), max_records=1)
+    claim_retained_subagent_session("in-flight")
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"Retained subagent session capacity reached \(1 records\)",
+    ):
+        retain_subagent_session(_record(agent_id="new"), max_records=1)
+
+    assert len(sessions._records) == 1
+    assert get_retained_subagent_session("in-flight").agent_id == "in-flight"
+    with pytest.raises(KeyError, match="Unknown"):
+        get_retained_subagent_session("new")
+
+    release_retained_subagent_session("in-flight")
+    retain_subagent_session(_record(agent_id="new"), max_records=1)
+
+    assert len(sessions._records) == 1
+    assert get_retained_subagent_session("new").agent_id == "new"
+    with pytest.raises(KeyError, match="Unknown"):
+        get_retained_subagent_session("in-flight")
+
+
 def test_expired_session_fails_closed():
     record = _record(agent_id="expired", created_at=time.time() - 10, expires_at=time.time() - 1)
     retain_subagent_session(record)
@@ -305,6 +360,141 @@ def test_delegate_continue_releases_claim_after_runner_exception(monkeypatch):
     assert dispatch_count == 2
 
 
+def test_background_continue_interrupt_all_reaches_child_and_releases_claim(monkeypatch):
+    import tools.async_delegation as async_delegation
+    from tools.delegate_continue_tool import delegate_continue
+    from tools.subagent_sessions import (
+        claim_retained_subagent_session,
+        release_retained_subagent_session,
+    )
+
+    run_started = threading.Event()
+    interrupted = threading.Event()
+    interrupt_calls = []
+
+    class InterruptibleChild:
+        model = "model-a"
+        provider = "openrouter"
+        _interrupt_requested = False
+
+        def run_conversation(self, **_kwargs):
+            run_started.set()
+            assert interrupted.wait(2)
+            return {"final_response": "", "messages": [], "api_calls": 1}
+
+        def interrupt(self):
+            self._interrupt_requested = True
+            interrupt_calls.append(True)
+            interrupted.set()
+
+        def close(self):
+            pass
+
+    child = InterruptibleChild()
+    async_delegation._reset_for_tests()
+    monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
+    monkeypatch.setattr(
+        "tools.delegate_continue_tool._build_continuation_child",
+        lambda *_args, **_kwargs: child,
+    )
+    retain_subagent_session(_record())
+
+    try:
+        result = json.loads(
+            delegate_continue("agent-1", "keep going", "background", parent_agent=_parent())
+        )
+        assert result["status"] == "dispatched"
+        assert run_started.wait(2)
+
+        with async_delegation._records_lock:
+            async_record = async_delegation._records[result["delegation_id"]]
+            assert callable(async_record["interrupt_fn"])
+            done_event = async_record["done_event"]
+
+        assert async_delegation.interrupt_all("test") == 1
+        assert interrupted.wait(2)
+        assert done_event.wait(2)
+        assert child._interrupt_requested is True
+        assert len(interrupt_calls) == 1
+
+        claimed = claim_retained_subagent_session("agent-1")
+        assert claimed.agent_id == "agent-1"
+        release_retained_subagent_session("agent-1")
+    finally:
+        interrupted.set()
+        async_delegation._reset_for_tests()
+
+
+def test_background_continue_latches_interrupt_until_child_is_built(monkeypatch):
+    import tools.async_delegation as async_delegation
+    from tools.delegate_continue_tool import delegate_continue
+
+    build_entered = threading.Event()
+    allow_build = threading.Event()
+    interrupted = threading.Event()
+    interrupt_calls = []
+    done_event = None
+
+    class InterruptibleChild:
+        model = "model-a"
+        provider = "openrouter"
+        _interrupt_requested = False
+
+        def run_conversation(self, **_kwargs):
+            assert self._interrupt_requested is True
+            return {"final_response": "", "messages": [], "api_calls": 1}
+
+        def interrupt(self):
+            self._interrupt_requested = True
+            interrupt_calls.append(True)
+            interrupted.set()
+
+        def close(self):
+            pass
+
+    child = InterruptibleChild()
+
+    def blocking_build(*_args, **_kwargs):
+        build_entered.set()
+        assert allow_build.wait(2)
+        return child
+
+    async_delegation._reset_for_tests()
+    monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
+    monkeypatch.setattr(
+        "tools.delegate_continue_tool._build_continuation_child",
+        blocking_build,
+    )
+    retain_subagent_session(_record())
+
+    try:
+        result = json.loads(
+            delegate_continue("agent-1", "keep going", "background", parent_agent=_parent())
+        )
+        assert result["status"] == "dispatched"
+        assert build_entered.wait(2)
+
+        with async_delegation._records_lock:
+            async_record = async_delegation._records[result["delegation_id"]]
+            assert callable(async_record["interrupt_fn"])
+            done_event = async_record["done_event"]
+
+        assert async_delegation.interrupt_all("test pre-build") == 1
+        assert not interrupted.is_set()
+        allow_build.set()
+
+        assert interrupted.wait(2)
+        assert done_event.wait(2)
+        assert child._interrupt_requested is True
+        assert len(interrupt_calls) == 1
+    finally:
+        allow_build.set()
+        interrupted.set()
+        if done_event is not None:
+            done_event.wait(2)
+        async_delegation._reset_for_tests()
+
+
 @pytest.mark.parametrize("sync_path", ["nested", "stateless", "capacity"])
 def test_delegate_continue_releases_claim_after_sync_fallbacks(monkeypatch, sync_path):
     from tools.delegate_continue_tool import delegate_continue
@@ -412,7 +602,9 @@ def test_foreground_continue_applies_run_cap_but_background_does_not(monkeypatch
         parent_agent,
         *,
         child_run_timeout_seconds=None,
+        interrupt_bridge=None,
     ):
+        assert interrupt_bridge is not None
         seen_run_caps.append(child_run_timeout_seconds)
         return {
             "status": "completed",
