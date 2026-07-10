@@ -136,17 +136,18 @@ A continuation keeps the original type, role, workspace hint, model/provider met
 
 ## Pattern: nested orchestration only when needed
 
-Nested delegation is for legacy generic orchestrators, not the three built-in profiles:
+Nested delegation is available to legacy generic orchestrators and to `general-purpose` only when it is explicitly configured with `role="orchestrator"`. `Explore` and `Plan` always reject the orchestrator role:
 
 ```python
 delegate_task(
     goal="Survey three migration approaches and synthesize a recommendation",
     context="Repository: /home/user/webapp.",
+    subagent_type="general-purpose",
     role="orchestrator",
 )
 ```
 
-This requires `delegation.max_spawn_depth >= 2` and `delegation.orchestrator_enabled: true`. Nested work is synchronous/foreground; explicit background nesting fails closed. Each level can multiply cost, so prefer a top-level batch when the subtasks are already known.
+`general-purpose` remains a leaf by default. An effective orchestrator receives only `delegate_task` beyond the exact current-parent/profile tool ceiling; it does not receive `delegate_continue` or other delegation/MCP tools. This requires `delegation.max_spawn_depth >= 2` and `delegation.orchestrator_enabled: true`. Nested work is synchronous/foreground; explicit background nesting fails closed. Each level can multiply cost, so prefer a top-level batch when the subtasks are already known.
 
 ## Scheduling checklist
 

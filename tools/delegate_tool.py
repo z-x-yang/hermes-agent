@@ -1212,6 +1212,7 @@ def _build_child_agent(
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
     workspace_path_override: Optional[str] = None,
+    register_with_parent: bool = True,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1480,15 +1481,50 @@ def _build_child_agent(
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
     )
-    if profile is not None:
-        from agent.subagent_tool_policy import (
-            ToolNamePolicy,
-            apply_tool_policy_to_agent,
-        )
+    from agent.subagent_tool_policy import ToolNamePolicy, apply_tool_policy_to_agent
 
+    loaded_tool_names = frozenset(
+        getattr(child, "valid_tool_names", set()) or set()
+    )
+    final_allowed_names = loaded_tool_names
+    if profile is not None:
+        final_allowed_names &= profile.allowed_tool_names
+
+    # ``valid_tool_names`` is the parent's exact, already-resolved runtime
+    # authority. Toolset reconstruction is only a legacy fallback when that
+    # attribute is genuinely absent; an explicitly empty set must fail closed.
+    import inspect as _inspect
+
+    _missing_parent_names = object()
+    try:
+        _static_parent_names = _inspect.getattr_static(
+            parent_agent, "valid_tool_names", _missing_parent_names
+        )
+    except Exception:
+        _static_parent_names = _missing_parent_names
+    exact_parent_names = None
+    if _static_parent_names is not _missing_parent_names:
+        exact_parent_names = frozenset(
+            getattr(parent_agent, "valid_tool_names", set()) or set()
+        )
+        final_allowed_names &= exact_parent_names
+
+    # Orchestration grants exactly one name beyond inherited/profile ceilings.
+    # The grant is valid only when the effective role survived runtime gates and
+    # the delegation toolset actually loaded delegate_task into this child.
+    orchestrator_eligible = profile is None or profile.can_delegate
+    if (
+        effective_role == "orchestrator"
+        and orchestrator_eligible
+        and "delegation" in child_toolsets
+        and "delegate_task" in loaded_tool_names
+    ):
+        final_allowed_names |= frozenset({"delegate_task"})
+
+    if profile is not None or exact_parent_names is not None:
         apply_tool_policy_to_agent(
             child,
-            ToolNamePolicy(allowed_names=profile.allowed_tool_names),
+            ToolNamePolicy(allowed_names=final_allowed_names),
         )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
@@ -1522,8 +1558,9 @@ def _build_child_agent(
     if child_pool is not None:
         child._credential_pool = child_pool
 
-    # Register child for interrupt propagation
-    if hasattr(parent_agent, "_active_children"):
+    # Synchronous child lifecycles are parent-owned by default. Accepted async
+    # continuations opt out at construction so there is no attachment race.
+    if register_with_parent and hasattr(parent_agent, "_active_children"):
         lock = getattr(parent_agent, "_active_children_lock", None)
         if lock:
             with lock:

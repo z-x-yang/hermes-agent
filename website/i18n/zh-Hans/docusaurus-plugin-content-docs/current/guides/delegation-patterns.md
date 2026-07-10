@@ -136,17 +136,18 @@ delegate_continue(
 
 ## 模式：确有必要时再用嵌套编排
 
-嵌套委派只适用于旧版通用编排者，不适用于三个内置 profile：
+嵌套委派可用于旧版通用编排者，也可用于显式设置 `role="orchestrator"` 的 `general-purpose`。`Explore` 和 `Plan` 始终拒绝编排者角色：
 
 ```python
 delegate_task(
     goal="Survey three migration approaches and synthesize a recommendation",
     context="Repository: /home/user/webapp.",
+    subagent_type="general-purpose",
     role="orchestrator",
 )
 ```
 
-这要求 `delegation.max_spawn_depth >= 2` 且 `delegation.orchestrator_enabled: true`。嵌套工作同步前台执行；显式要求嵌套后台运行会直接失败。每增加一层都可能成倍增加费用，因此在子任务已经明确时，应优先使用顶层批次。
+`general-purpose` 默认仍是 leaf。只有最终通过运行时 gate 的编排者，才会在父级精确工具上限和 profile 上限之外额外获得 `delegate_task`；不会获得 `delegate_continue` 或其他委派/MCP 工具。这要求 `delegation.max_spawn_depth >= 2` 且 `delegation.orchestrator_enabled: true`。嵌套工作同步前台执行；显式要求嵌套后台运行会直接失败。每增加一层都可能成倍增加费用，因此在子任务已经明确时，应优先使用顶层批次。
 
 ## 调度检查表
 

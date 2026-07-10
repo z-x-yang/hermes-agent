@@ -1691,7 +1691,7 @@ delegation:
 
 `max_concurrent_children` 同时限制单个批次中的任务数和并发后台委派单元数（默认 `3`，下限 `1`，无硬性上限）。环境变量 `DELEGATION_MAX_CONCURRENT_CHILDREN` 可以覆盖它。超出上限的批次会返回明确错误，不会被截断。一个成功接收的批次只占一个后台单元、返回一个 handle，并在稍后注入一次汇总结果。
 
-`max_spawn_depth` 默认 `1`（扁平），下限为 `1`，没有硬性上限。设为 `2` 可让旧版通用编排者子智能体生成叶子子智能体；三个内置类型都不允许使用编排者角色。`orchestrator_enabled: false` 会强制所有子智能体变成 leaf。每增加一层都可能成倍增加费用和并发量，请谨慎提高。参见[子智能体委派 → 嵌套编排](features/delegation.md#嵌套编排)。
+`max_spawn_depth` 默认 `1`（扁平），下限为 `1`，没有硬性上限。设为 `2` 可让旧版通用编排者或显式配置的 `general-purpose` 编排者生成叶子子智能体。`Explore` 和 `Plan` 会拒绝编排者角色；`general-purpose` 只有显式指定该角色时才不再是 leaf。最终有效的编排者只会额外获得 `delegate_task`。`orchestrator_enabled: false` 会强制所有子智能体变成 leaf。每增加一层都可能成倍增加费用和并发量，请谨慎提高。参见[子智能体委派 → 嵌套编排](features/delegation.md#嵌套编排)。
 
 ## 澄清
 

@@ -34,6 +34,7 @@ def test_read_only_profiles_remain_hard_no_external_side_effect():
 def test_general_purpose_truthfully_reports_raw_shell_external_effect_capability():
     profile = get_subagent_profile("general-purpose")
     assert profile.can_external_side_effects is True
+    assert profile.can_delegate is True
     assert {"terminal", "process"}.issubset(profile.allowed_tool_names)
     assert "not a no-side-effect sandbox" in profile.system_instructions
     assert "normal terminal approvals" in profile.system_instructions

@@ -107,6 +107,66 @@ def test_auto_uses_background_for_general_purpose_and_batches():
     assert _resolve_scheduling("Explore", "auto", True, False) == "background"
 
 
+def test_explicit_general_purpose_orchestrator_is_eligible_under_runtime_gates(
+    monkeypatch,
+):
+    import tools.delegate_tool as dt
+
+    built = _install_fake_delegate_runtime(
+        monkeypatch,
+        lambda task_index, goal, **_kwargs: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": goal,
+        },
+    )
+    monkeypatch.setattr(dt, "_get_orchestrator_enabled", lambda: True)
+    monkeypatch.setattr(dt, "_get_max_spawn_depth", lambda: 2)
+
+    result = json.loads(
+        dt.delegate_task(
+            goal="orchestrate one worker layer",
+            subagent_type="general-purpose",
+            role="orchestrator",
+            scheduling="foreground",
+            parent_agent=_parent(),
+        )
+    )
+
+    assert result["results"][0]["status"] == "completed"
+    assert built[0]._delegate_role == "orchestrator"
+
+
+@pytest.mark.parametrize("subagent_type", ["Explore", "Plan"])
+def test_read_only_profiles_still_fail_fast_for_explicit_orchestrator(
+    monkeypatch, subagent_type
+):
+    import tools.delegate_tool as dt
+
+    built = _install_fake_delegate_runtime(
+        monkeypatch,
+        lambda task_index, goal, **_kwargs: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": "unexpected",
+        },
+    )
+
+    result = json.loads(
+        dt.delegate_task(
+            goal="must stay read only",
+            subagent_type=subagent_type,
+            role="orchestrator",
+            parent_agent=_parent(),
+        )
+    )
+
+    assert result["error"] == (
+        f"subagent_type={subagent_type} cannot use role=orchestrator"
+    )
+    assert built == []
+
+
 def test_generic_foreground_timeouts_use_global_then_general_purpose_defaults():
     from tools.delegate_tool import _resolve_foreground_timeouts
 

@@ -751,6 +751,190 @@ def test_background_continue_latches_interrupt_until_child_is_built(monkeypatch)
         async_delegation._reset_for_tests()
 
 
+@pytest.mark.parametrize("scheduling", ["background", "foreground"])
+def test_top_level_async_continue_is_never_parent_lifecycle_owned(
+    monkeypatch, scheduling
+):
+    import tools.async_delegation as async_delegation
+    from tools.delegate_continue_tool import delegate_continue
+
+    run_started = threading.Event()
+    allow_finish = threading.Event()
+    bridge_interrupt = threading.Event()
+    parent_lifecycle_interrupt = threading.Event()
+    registration_flags = []
+    responses = []
+    child = None
+
+    class BlockingChild:
+        model = "model-a"
+        provider = "openrouter"
+
+        def run_conversation(self, **kwargs):
+            run_started.set()
+            assert allow_finish.wait(2)
+            return {
+                "final_response": "continued",
+                "messages": kwargs["conversation_history"]
+                + [{"role": "assistant", "content": "continued"}],
+                "api_calls": 1,
+            }
+
+        def interrupt(self, *args):
+            if args:
+                parent_lifecycle_interrupt.set()
+            else:
+                bridge_interrupt.set()
+            allow_finish.set()
+
+        def close(self):
+            pass
+
+    child = BlockingChild()
+
+    def fake_build(*_args, parent_agent, register_with_parent=True, **_kwargs):
+        registration_flags.append(register_with_parent)
+        if register_with_parent:
+            parent_agent._active_children.append(child)
+        return child
+
+    async_delegation._reset_for_tests()
+    monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
+    monkeypatch.setattr(
+        "tools.delegate_continue_tool._build_continuation_child",
+        fake_build,
+    )
+    if scheduling == "foreground":
+        monkeypatch.setattr(
+            "tools.delegate_tool._resolve_foreground_timeouts",
+            lambda *_args, **_kwargs: (60, 60),
+        )
+    parent = _parent()
+    retain_subagent_session(_record())
+
+    caller = threading.Thread(
+        target=lambda: responses.append(
+            json.loads(
+                delegate_continue(
+                    "agent-1",
+                    "keep going",
+                    scheduling,
+                    parent_agent=parent,
+                )
+            )
+        )
+    )
+    caller.start()
+    try:
+        assert run_started.wait(2)
+        assert child not in parent._active_children
+
+        for active_child in list(parent._active_children):
+            active_child.interrupt("parent lifecycle release")
+        assert not parent_lifecycle_interrupt.is_set()
+
+        assert async_delegation.interrupt_all("async registry owner") == 1
+        assert bridge_interrupt.wait(2)
+    finally:
+        allow_finish.set()
+        caller.join(timeout=2)
+        with async_delegation._records_lock:
+            futures = [record["future"] for record in async_delegation._records.values()]
+        for future in futures:
+            future.result(timeout=2)
+        async_delegation._reset_for_tests()
+
+    assert not caller.is_alive()
+    assert registration_flags == [False]
+    assert responses
+
+
+@pytest.mark.parametrize("sync_path", ["nested", "stateless", "capacity"])
+def test_sync_continue_fallbacks_remain_parent_attached_while_running(
+    monkeypatch, sync_path
+):
+    from tools.delegate_continue_tool import delegate_continue
+
+    run_started = threading.Event()
+    allow_finish = threading.Event()
+    registration_flags = []
+    responses = []
+    parent = _parent()
+
+    class BlockingChild:
+        model = "model-a"
+        provider = "openrouter"
+
+        def run_conversation(self, **kwargs):
+            run_started.set()
+            assert allow_finish.wait(2)
+            return {
+                "final_response": "continued inline",
+                "messages": kwargs["conversation_history"]
+                + [{"role": "assistant", "content": "continued inline"}],
+                "api_calls": 1,
+            }
+
+        def close(self):
+            pass
+
+    child = BlockingChild()
+
+    def fake_build(*_args, parent_agent, register_with_parent=True, **_kwargs):
+        registration_flags.append(register_with_parent)
+        if register_with_parent:
+            parent_agent._active_children.append(child)
+        return child
+
+    monkeypatch.setattr(
+        "tools.delegate_continue_tool._build_continuation_child",
+        fake_build,
+    )
+    if sync_path == "nested":
+        parent._delegate_depth = 1
+        scheduling = "auto"
+    elif sync_path == "stateless":
+        monkeypatch.setattr(
+            "gateway.session_context.async_delivery_supported", lambda: False
+        )
+        scheduling = "background"
+    else:
+        monkeypatch.setattr(
+            "gateway.session_context.async_delivery_supported", lambda: True
+        )
+        monkeypatch.setattr(
+            "tools.async_delegation.dispatch_async_delegation_batch",
+            lambda **_kwargs: {"status": "rejected", "error": "capacity"},
+        )
+        scheduling = "background"
+
+    retain_subagent_session(_record())
+    caller = threading.Thread(
+        target=lambda: responses.append(
+            json.loads(
+                delegate_continue(
+                    "agent-1",
+                    "continue inline",
+                    scheduling,
+                    parent_agent=parent,
+                )
+            )
+        )
+    )
+    caller.start()
+    try:
+        assert run_started.wait(2)
+        assert registration_flags == [True]
+        assert child in parent._active_children
+    finally:
+        allow_finish.set()
+        caller.join(timeout=2)
+
+    assert not caller.is_alive()
+    assert child not in parent._active_children
+    assert responses[0]["status"] == "completed"
+
+
 @pytest.mark.parametrize("sync_path", ["nested", "stateless", "capacity"])
 def test_delegate_continue_releases_claim_after_sync_fallbacks(monkeypatch, sync_path):
     from tools.delegate_continue_tool import delegate_continue
@@ -859,8 +1043,10 @@ def test_foreground_continue_applies_run_cap_but_background_does_not(monkeypatch
         *,
         child_run_timeout_seconds=None,
         interrupt_bridge=None,
+        register_with_parent=True,
     ):
         assert interrupt_bridge is not None
+        assert register_with_parent is False
         seen_run_caps.append(child_run_timeout_seconds)
         return {
             "status": "completed",
@@ -1249,6 +1435,110 @@ def test_build_continuation_child_preserves_original_effective_tool_ceiling(monk
 
     assert child.valid_tool_names == {"read_file"}
     assert child._subagent_tool_policy.allowed_names == frozenset({"read_file"})
+
+
+def test_build_continuation_child_intersects_exact_current_parent_tool_names(monkeypatch):
+    from tools.delegate_continue_tool import _build_continuation_child
+    from toolsets import TOOLSETS
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.session_id = "child-session"
+            self.model = kwargs["model"]
+            self.provider = kwargs["provider"]
+            self.base_url = kwargs["base_url"]
+            self.api_mode = kwargs["api_mode"]
+            self._session_init_model_config = {}
+            names = []
+            for toolset in kwargs.get("enabled_toolsets") or []:
+                names.extend(TOOLSETS.get(toolset, {}).get("tools", []))
+            self.valid_tool_names = set(names)
+            self.tools = [
+                {"type": "function", "function": {"name": name, "parameters": {}}}
+                for name in sorted(self.valid_tool_names)
+            ]
+
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+    parent = _parent(enabled_toolsets=["file"])
+    parent.valid_tool_names = {"read_file"}
+    record = _record(
+        subagent_type="general-purpose",
+        effective_allowed_tool_names=frozenset(
+            {"read_file", "search_files", "write_file", "patch"}
+        ),
+    )
+
+    child = _build_continuation_child(
+        record,
+        prompt="continue under the narrower live parent",
+        parent_agent=parent,
+    )
+
+    assert child.valid_tool_names == {"read_file"}
+    assert child._subagent_tool_policy.allowed_names == frozenset({"read_file"})
+
+
+@pytest.mark.parametrize("subagent_type", [None, "general-purpose"])
+@pytest.mark.parametrize(
+    ("original_has_delegate_task", "orchestrator_enabled", "expected_role"),
+    [(True, True, "orchestrator"), (False, True, "orchestrator"), (True, False, "leaf")],
+)
+def test_orchestrator_continuation_preserves_only_original_delegate_task_exception(
+    monkeypatch,
+    subagent_type,
+    original_has_delegate_task,
+    orchestrator_enabled,
+    expected_role,
+):
+    from tools.delegate_continue_tool import _build_continuation_child
+    from toolsets import TOOLSETS
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.session_id = "child-session"
+            self.model = kwargs["model"]
+            self.provider = kwargs["provider"]
+            self.base_url = kwargs["base_url"]
+            self.api_mode = kwargs["api_mode"]
+            self._session_init_model_config = {}
+            names = []
+            for toolset in kwargs.get("enabled_toolsets") or []:
+                names.extend(TOOLSETS.get(toolset, {}).get("tools", []))
+            self.valid_tool_names = set(names)
+            self.tools = [
+                {"type": "function", "function": {"name": name, "parameters": {}}}
+                for name in sorted(self.valid_tool_names)
+            ]
+
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        "tools.delegate_tool._get_orchestrator_enabled",
+        lambda: orchestrator_enabled,
+    )
+    monkeypatch.setattr("tools.delegate_tool._get_max_spawn_depth", lambda: 2)
+    retained_names = {"read_file", "delegate_continue"}
+    if original_has_delegate_task:
+        retained_names.add("delegate_task")
+    parent = _parent(enabled_toolsets=["file"])
+    parent.valid_tool_names = {"read_file"}
+
+    child = _build_continuation_child(
+        _record(
+            subagent_type=subagent_type,
+            role="orchestrator",
+            effective_allowed_tool_names=frozenset(retained_names),
+        ),
+        prompt="continue orchestration",
+        parent_agent=parent,
+    )
+
+    expected_names = {"read_file"}
+    if original_has_delegate_task and orchestrator_enabled:
+        expected_names.add("delegate_task")
+    assert child._delegate_role == expected_role
+    assert child.valid_tool_names == expected_names
+    assert child._subagent_tool_policy.allowed_names == frozenset(expected_names)
+    assert "delegate_continue" not in child.valid_tool_names
 
 
 def test_build_continuation_child_rejects_missing_effective_tool_ceiling():

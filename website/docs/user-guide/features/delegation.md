@@ -16,9 +16,9 @@ Hermes uses `delegate_task` to run isolated child agents. A child starts with a 
 |---|---|---|---|
 | `Explore` | Search and understand code, files, and supporting sources | Read-only: `read_file`, `search_files`, `web_search`, and `web_extract` | Foreground |
 | `Plan` | Research a codebase and prepare inputs for a later implementation plan | The same read-only ceiling as `Explore`; it cannot edit or claim implementation is complete | Foreground |
-| `general-purpose` | Multi-step repository work, including edits and tests | A closed allowlist for files, raw shell/process work, task tracking, skills, and vision; named messaging/Notion/cron/memory/delegation tools are excluded, but shell access is not a no-side-effect sandbox | Background |
+| `general-purpose` | Multi-step repository work, including edits and tests | A closed allowlist for files, raw shell/process work, task tracking, skills, and vision; named messaging/Notion/cron/memory/delegation tools are excluded by default, but shell access is not a no-side-effect sandbox | Background |
 
-`Explore` and `Plan` cannot write files, run shell commands, create external side effects, or delegate. `general-purpose` may edit and test and cannot directly call the excluded named side-effect tools or delegate by default. However, it deliberately retains raw `terminal` and `process`: shell commands can access networks, invoke authenticated CLIs, and cause external effects. Those actions remain governed by normal terminal approvals and the task instructions; Hermes does not provide hard no-side-effect isolation for this profile.
+`Explore` and `Plan` cannot write files, run shell commands, create external side effects, or delegate. `general-purpose` may edit and test and cannot directly call the excluded named side-effect tools or delegate by default. When explicitly configured as an effective orchestrator, it receives only `delegate_task` as a role-granted exception; it does not receive `delegate_continue`, MCP tools, or any other excluded name. It deliberately retains raw `terminal` and `process`: shell commands can access networks, invoke authenticated CLIs, and cause external effects. Those actions remain governed by normal terminal approvals and the task instructions; Hermes does not provide hard no-side-effect isolation for this profile.
 
 Omitting `subagent_type` preserves legacy generic delegation. This has two deliberately different compatibility surfaces:
 
@@ -153,10 +153,11 @@ Retention safety and lifetime:
 
 ## Nested orchestration
 
-Legacy generic children may use `role="orchestrator"` when nested delegation is enabled. Built-in `Explore`, `Plan`, and `general-purpose` profiles do not permit the orchestrator role.
+Legacy generic children may use `role="orchestrator"` when nested delegation is enabled. `general-purpose` is also eligible when explicitly assigned that role; `Explore` and `Plan` reject it.
 
-- `role="leaf"` is the default and cannot delegate.
+- `role="leaf"` is the default and cannot delegate, including for `general-purpose`.
 - `role="orchestrator"` keeps delegation only when `delegation.orchestrator_enabled` is true and the configured `max_spawn_depth` permits another level.
+- An effective orchestrator receives only `delegate_task` as a role-granted exception beyond the exact current-parent/profile ceilings; `delegate_continue`, MCP, and all other names remain excluded.
 - `max_spawn_depth` defaults to `1` (flat delegation), has a floor of `1`, and has no hard upper ceiling. Each extra level can multiply cost and concurrency.
 
 Nested work stays synchronous/foreground so a child cannot detach work from the parent that owns it.

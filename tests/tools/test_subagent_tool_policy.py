@@ -140,10 +140,157 @@ def test_profiled_child_filters_visible_and_runtime_tool_names():
     assert built is child
     assert child.valid_tool_names == {"read_file"}
     assert [tool["function"]["name"] for tool in child.tools] == ["read_file"]
-    assert child._subagent_tool_policy.allowed_names == frozenset(
-        {"read_file", "search_files", "web_search", "web_extract"}
-    )
+    assert child._subagent_tool_policy.allowed_names == frozenset({"read_file"})
     assert child._skip_mcp_refresh is True
+
+
+@pytest.mark.parametrize("profile_name", [None, "general-purpose"])
+def test_initial_child_intersects_exact_current_parent_tool_names(profile_name):
+    parent = _parent_agent()
+    parent.enabled_toolsets = ["file"]
+    parent.valid_tool_names = {"read_file"}
+    child = _child_agent()
+    profile = get_subagent_profile(profile_name) if profile_name else None
+
+    with patch("run_agent.AIAgent", return_value=child):
+        built = _build_child_agent(
+            task_index=0,
+            goal="Stay within the current parent ceiling",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=10,
+            task_count=1,
+            parent_agent=parent,
+            profile=profile,
+        )
+
+    assert built.valid_tool_names == {"read_file"}
+    assert [tool["function"]["name"] for tool in built.tools] == ["read_file"]
+    assert built._subagent_tool_policy.allowed_names == frozenset({"read_file"})
+
+
+@pytest.mark.parametrize("profile_name", [None, "general-purpose"])
+def test_initial_child_keeps_exact_empty_parent_tool_names_fail_closed(profile_name):
+    parent = _parent_agent()
+    parent.enabled_toolsets = ["file"]
+    parent.valid_tool_names = set()
+    child = _child_agent()
+    profile = get_subagent_profile(profile_name) if profile_name else None
+
+    with patch("run_agent.AIAgent", return_value=child):
+        built = _build_child_agent(
+            task_index=0,
+            goal="Have no tools",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=10,
+            task_count=1,
+            parent_agent=parent,
+            profile=profile,
+        )
+
+    assert built.valid_tool_names == set()
+    assert built.tools == []
+    assert built._subagent_tool_policy.allowed_names == frozenset()
+
+
+def test_general_purpose_orchestrator_gets_only_loaded_delegate_task_role_exception():
+    parent = _parent_agent()
+    parent.enabled_toolsets = ["file"]
+    parent.valid_tool_names = {"read_file"}
+    child = _child_agent()
+    child.valid_tool_names |= {"delegate_task", "delegate_continue"}
+    child.tools.extend([_tool("delegate_task"), _tool("delegate_continue")])
+
+    with (
+        patch("run_agent.AIAgent", return_value=child),
+        patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+        patch("tools.delegate_tool._get_max_spawn_depth", return_value=2),
+    ):
+        built = _build_child_agent(
+            task_index=0,
+            goal="Orchestrate one worker layer",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=10,
+            task_count=1,
+            parent_agent=parent,
+            role="orchestrator",
+            profile=get_subagent_profile("general-purpose"),
+        )
+
+    assert built._delegate_role == "orchestrator"
+    assert built.valid_tool_names == {"read_file", "delegate_task"}
+    assert built._subagent_tool_policy.allowed_names == frozenset(
+        {"read_file", "delegate_task"}
+    )
+    assert "delegate_continue" not in built.valid_tool_names
+
+
+@pytest.mark.parametrize("bounded_gate", ["kill_switch", "depth"])
+def test_general_purpose_orchestrator_role_exception_requires_live_runtime_gates(
+    bounded_gate,
+):
+    parent = _parent_agent()
+    parent.enabled_toolsets = ["file"]
+    parent.valid_tool_names = {"read_file"}
+    child = _child_agent()
+    child.valid_tool_names |= {"delegate_task", "delegate_continue"}
+    child.tools.extend([_tool("delegate_task"), _tool("delegate_continue")])
+    orchestrator_enabled = bounded_gate != "kill_switch"
+    max_spawn_depth = 1 if bounded_gate == "depth" else 2
+
+    with (
+        patch("run_agent.AIAgent", return_value=child),
+        patch(
+            "tools.delegate_tool._get_orchestrator_enabled",
+            return_value=orchestrator_enabled,
+        ),
+        patch(
+            "tools.delegate_tool._get_max_spawn_depth",
+            return_value=max_spawn_depth,
+        ),
+    ):
+        built = _build_child_agent(
+            task_index=0,
+            goal="Bounded orchestrator",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=10,
+            task_count=1,
+            parent_agent=parent,
+            role="orchestrator",
+            profile=get_subagent_profile("general-purpose"),
+        )
+
+    assert built._delegate_role == "leaf"
+    assert built.valid_tool_names == {"read_file"}
+    assert built._subagent_tool_policy.allowed_names == frozenset({"read_file"})
+
+
+def test_initial_child_can_skip_parent_lifecycle_registration():
+    parent = _parent_agent()
+    child = _child_agent()
+
+    with patch("run_agent.AIAgent", return_value=child):
+        built = _build_child_agent(
+            task_index=0,
+            goal="Async-owned child",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=10,
+            task_count=1,
+            parent_agent=parent,
+            register_with_parent=False,
+        )
+
+    assert built is child
+    assert child not in parent._active_children
 
 
 def test_legacy_child_has_no_hard_allowlist_policy():

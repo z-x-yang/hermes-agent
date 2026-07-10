@@ -108,6 +108,7 @@ def _build_continuation_child(
     *,
     prompt: str,
     parent_agent,
+    register_with_parent: bool = True,
 ):
     """Rebuild a child agent from retained non-secret metadata.
 
@@ -183,6 +184,7 @@ def _build_continuation_child(
         role=effective_role,
         profile=profile,
         workspace_path_override=record.workspace_path,
+        register_with_parent=register_with_parent,
     )
 
     from agent.subagent_tool_policy import ToolNamePolicy, apply_tool_policy_to_agent
@@ -218,6 +220,7 @@ def _run_continuation_entry(
     *,
     child_run_timeout_seconds: Optional[float] = None,
     interrupt_bridge: Optional[_ContinuationInterruptBridge] = None,
+    register_with_parent: bool = True,
 ) -> dict[str, Any]:
     start = time.monotonic()
     child = None
@@ -227,7 +230,12 @@ def _run_continuation_entry(
         except ValueError as exc:
             invalidate_retained_subagent_session(record.agent_id, str(exc))
             raise
-        child = _build_continuation_child(record, prompt=prompt, parent_agent=parent_agent)
+        child = _build_continuation_child(
+            record,
+            prompt=prompt,
+            parent_agent=parent_agent,
+            register_with_parent=register_with_parent,
+        )
         if interrupt_bridge is not None:
             interrupt_bridge.register(child)
         payload = _build_continue_payload(prompt)
@@ -427,7 +435,7 @@ def delegate_continue(
     start = time.monotonic()
     interrupt_bridge = _ContinuationInterruptBridge()
 
-    def _runner() -> dict[str, Any]:
+    def _run(*, register_with_parent: bool) -> dict[str, Any]:
         try:
             entry = _run_continuation_entry(
                 record,
@@ -435,14 +443,21 @@ def delegate_continue(
                 parent_agent,
                 child_run_timeout_seconds=child_run_timeout_seconds,
                 interrupt_bridge=interrupt_bridge,
+                register_with_parent=register_with_parent,
             )
             return _combined_for_async(entry)
         finally:
             release_retained_subagent_session(agent_id)
 
+    def _sync_runner() -> dict[str, Any]:
+        return _run(register_with_parent=True)
+
+    def _async_runner() -> dict[str, Any]:
+        return _run(register_with_parent=False)
+
     # Nested continuations run inline; they cannot own async delivery.
     if is_subagent:
-        combined = _runner()
+        combined = _sync_runner()
         return _unwrap_foreground_payload(json.dumps(combined, ensure_ascii=False))
 
     try:
@@ -451,7 +466,7 @@ def delegate_continue(
     except Exception:
         async_ok = True
     if not async_ok:
-        combined = _runner()
+        combined = _sync_runner()
         entry = combined["results"][0]
         entry["note"] = (
             f"scheduling={delivery_mode} cannot detach on this endpoint "
@@ -473,7 +488,7 @@ def delegate_continue(
             role=record.role,
             model=record.model,
             session_key=get_current_session_key(default=""),
-            runner=_runner,
+            runner=_async_runner,
             interrupt_fn=interrupt_bridge,
             max_async_children=_get_max_async_children(),
             initial_delivery_mode=(
@@ -485,7 +500,7 @@ def delegate_continue(
         return _tool_error(f"Failed to dispatch retained subagent continuation: {exc}")
 
     if dispatch.get("status") != "dispatched":
-        combined = _runner()
+        combined = _sync_runner()
         entry = combined["results"][0]
         entry["note"] = (
             "The background delegation pool was at capacity, so the retained "
