@@ -90,6 +90,7 @@ def _register_context_cwd_terminal_override(task_id: str) -> bool:
 DELEGATE_BLOCKED_TOOLS = frozenset(
     [
         "delegate_task",  # no recursive delegation
+        "delegate_continue",  # no recursive retained-session control
         "clarify",  # no user interaction
         "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
@@ -465,6 +466,41 @@ def _get_max_async_children() -> int:
             "delegations too. Remove the stale key from config.yaml."
         )
     return _get_max_concurrent_children()
+
+
+def _get_retained_session_ttl() -> int:
+    """TTL in seconds for short-lived retained child transcripts."""
+    cfg = _load_config()
+    raw = cfg.get("retained_subagent_ttl_seconds", 3600)
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        logger.warning(
+            "delegation.retained_subagent_ttl_seconds=%r is not a valid integer; using 3600",
+            raw,
+        )
+        return 3600
+
+
+def _get_max_retained_subagents() -> int:
+    """Maximum in-process retained child transcripts."""
+    cfg = _load_config()
+    raw = cfg.get("max_retained_subagents", 64)
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        logger.warning(
+            "delegation.max_retained_subagents=%r is not a valid integer; using 64",
+            raw,
+        )
+        return 64
+
+
+def _should_retain_session(retain_session: Optional[bool], subagent_type: Optional[str]) -> bool:
+    """Resolve delegate_task retention default for one child."""
+    if retain_session is not None:
+        return is_truthy_value(retain_session, default=False)
+    return subagent_type == "general-purpose"
 
 
 def _get_child_timeout() -> Optional[float]:
@@ -1160,6 +1196,7 @@ def _build_child_agent(
     profile=None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
+    workspace_path_override: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1239,7 +1276,7 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
-    workspace_hint = _resolve_workspace_hint(parent_agent)
+    workspace_hint = workspace_path_override or _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
         profile=profile,
         role=effective_role,
@@ -1836,7 +1873,10 @@ def _run_single_child(
     parent_agent=None,
     context: Optional[str] = None,
     child_timeout_override: Optional[float] = None,
-    **_kwargs,
+    retain_session: Optional[bool] = None,
+    subagent_type: Optional[str] = None,
+    role: Optional[str] = None,
+    workspace_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a pre-built child agent. Called from within a thread.
@@ -2376,6 +2416,42 @@ def _run_single_child(
             except Exception as e:
                 logger.debug("Progress callback completion failed: %s", e)
 
+        if retain_session and status == "completed":
+            try:
+                from tools.subagent_sessions import (
+                    RetainedSubagentSession,
+                    retain_subagent_session,
+                )
+
+                agent_id = (
+                    getattr(child, "session_id", None)
+                    or getattr(child, "_subagent_id", None)
+                    or child_task_id
+                )
+                now_ts = time.time()
+                retained_type = subagent_type or "general-purpose"
+                retained_role = getattr(child, "_delegate_role", None) or role or "leaf"
+                retained_workspace = workspace_path or _resolve_workspace_hint(parent_agent) or ""
+                retain_subagent_session(
+                    RetainedSubagentSession(
+                        agent_id=str(agent_id),
+                        parent_session_id=str(getattr(parent_agent, "session_id", "") or ""),
+                        subagent_type=str(retained_type),
+                        role=str(retained_role),
+                        workspace_path=str(retained_workspace),
+                        model=str(getattr(child, "model", "") or ""),
+                        provider=str(getattr(child, "provider", "") or ""),
+                        conversation_history=list(messages) if isinstance(messages, list) else [],
+                        created_at=now_ts,
+                        expires_at=now_ts + _get_retained_session_ttl(),
+                    ),
+                    max_records=_get_max_retained_subagents(),
+                )
+                entry["agent_id"] = str(agent_id)
+                entry["retained_until"] = now_ts + _get_retained_session_ttl()
+            except Exception:
+                logger.debug("Failed to retain subagent session", exc_info=True)
+
         return entry
 
     except Exception as exc:
@@ -2837,6 +2913,12 @@ def delegate_task(
                 parent_agent=parent_agent,
                 context=_t.get("context"),
                 child_timeout_override=child_timeout_overrides[_i],
+                retain_session=_should_retain_session(
+                    _t.get("retain_session"), _t.get("subagent_type", subagent_type)
+                ),
+                subagent_type=_t.get("subagent_type", subagent_type),
+                role=getattr(child, "_delegate_role", _t.get("role") or top_role),
+                workspace_path=_resolve_workspace_hint(parent_agent) or "",
             )
             results.append(result)
         else:
@@ -2860,6 +2942,12 @@ def delegate_task(
                         parent_agent=parent_agent,
                         context=t.get("context"),
                         child_timeout_override=child_timeout_overrides[i],
+                        retain_session=_should_retain_session(
+                            t.get("retain_session"), t.get("subagent_type", subagent_type)
+                        ),
+                        subagent_type=t.get("subagent_type", subagent_type),
+                        role=getattr(child, "_delegate_role", t.get("role") or top_role),
+                        workspace_path=_resolve_workspace_hint(parent_agent) or "",
                     )
                     futures[future] = i
 

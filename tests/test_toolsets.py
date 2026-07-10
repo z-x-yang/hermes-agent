@@ -275,7 +275,7 @@ class TestResolveToolsetIncludeRegistry:
     def test_get_toolset_include_registry_false_is_static(self):
         ts = get_toolset("delegation", include_registry=False)
         assert ts is not None
-        assert ts["tools"] == ["delegate_task"]
+        assert ts["tools"] == ["delegate_task", "delegate_continue"]
 
     def test_static_view_threads_through_includes(self):
         # 'debugging' has direct tools [terminal, process] and includes [web, file]

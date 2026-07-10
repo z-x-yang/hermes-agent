@@ -5664,6 +5664,17 @@ class AIAgent:
             _dispatch_origin="model",
         )
 
+    def _dispatch_delegate_continue(self, function_args: dict) -> str:
+        """Single live-agent call site for delegate_continue dispatch."""
+        from tools.delegate_continue_tool import delegate_continue as _delegate_continue
+
+        return _delegate_continue(
+            agent_id=function_args.get("agent_id", ""),
+            prompt=function_args.get("prompt", ""),
+            scheduling=function_args.get("scheduling", "auto"),
+            parent_agent=self,
+        )
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
                      pre_tool_block_checked: bool = False,
