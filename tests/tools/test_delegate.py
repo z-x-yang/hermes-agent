@@ -2403,6 +2403,122 @@ class TestDispatchDelegateTask(unittest.TestCase):
             "Explore override must be merged before resolving credentials",
         )
 
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_subagent_provider_override_isolates_global_transport_fields(self, mock_creds):
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "provider": "global-provider",
+            "model": "global-model",
+            "base_url": "https://global.example/v1",
+            "api_key": "global-key",
+            "api_mode": "anthropic_messages",
+            "command": "global-acp",
+            "args": ["--global"],
+            "agents": {
+                "Explore": {
+                    "provider": "openrouter",
+                    "model": "cheap-model",
+                }
+            },
+        }
+        resolver_inputs = []
+
+        def resolve_side_effect(call_cfg, parent_agent):
+            self.assertIs(parent_agent, parent)
+            resolver_inputs.append(dict(call_cfg))
+            if call_cfg.get("base_url"):
+                return {
+                    "model": call_cfg.get("model"),
+                    "provider": "custom",
+                    "base_url": call_cfg["base_url"],
+                    "api_key": call_cfg.get("api_key"),
+                    "api_mode": call_cfg.get("api_mode"),
+                    "command": call_cfg.get("command"),
+                    "args": list(call_cfg.get("args") or []),
+                }
+            return {
+                "model": call_cfg.get("model"),
+                "provider": call_cfg.get("provider"),
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "openrouter-key",
+                "api_mode": "chat_completions",
+                "command": None,
+                "args": [],
+            }
+
+        mock_creds.side_effect = resolve_side_effect
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="inspect only",
+                subagent_type="Explore",
+                parent_agent=parent,
+            )
+
+        self.assertEqual(len(resolver_inputs), 1)
+        self.assertEqual(resolver_inputs[0]["provider"], "openrouter")
+        self.assertEqual(resolver_inputs[0]["model"], "cheap-model")
+        for transport_key in ("base_url", "api_key", "api_mode", "command", "args"):
+            self.assertNotIn(transport_key, resolver_inputs[0])
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["model"], "cheap-model")
+        self.assertEqual(kwargs["provider"], "openrouter")
+        self.assertEqual(kwargs["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(kwargs["api_key"], "openrouter-key")
+        self.assertEqual(kwargs["api_mode"], "chat_completions")
+        self.assertIsNone(kwargs["acp_command"])
+        self.assertEqual(kwargs["acp_args"], [])
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_batch_credential_error_prevents_partial_child_construction(self, mock_creds):
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "agents": {
+                "Explore": {"provider": "openrouter", "model": "cheap-model"},
+                "Plan": {"provider": "broken-provider", "model": "plan-model"},
+            }
+        }
+
+        def resolve_side_effect(call_cfg, parent_agent):
+            self.assertIs(parent_agent, parent)
+            if call_cfg.get("provider") == "broken-provider":
+                raise ValueError("Cannot resolve Plan credentials")
+            return {
+                "model": call_cfg.get("model"),
+                "provider": call_cfg.get("provider"),
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "openrouter-key",
+                "api_mode": "chat_completions",
+            }
+
+        mock_creds.side_effect = resolve_side_effect
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), \
+             patch("run_agent.AIAgent") as MockAgent:
+            result = json.loads(
+                delegate_task(
+                    tasks=[
+                        {"goal": "inspect", "subagent_type": "Explore"},
+                        {"goal": "plan", "subagent_type": "Plan"},
+                    ],
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(result["error"], "Cannot resolve Plan credentials")
+        self.assertEqual(mock_creds.call_count, 2)
+        MockAgent.assert_not_called()
+
     def test_model_acp_args_not_forwarded(self):
         """The live model dispatch path strips hidden ACP transport args."""
         import run_agent

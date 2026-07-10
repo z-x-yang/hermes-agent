@@ -2593,6 +2593,53 @@ def delegate_task(
     # Track goal labels for progress display (truncated for readability)
     task_labels = [t["goal"][:40] for t in task_list]
 
+    # Resolve every task profile and credential bundle before constructing any
+    # AIAgent, so a later task's credential error cannot leave a partial batch.
+    prepared_children = []
+    dispatch_model = None
+    for i, t in enumerate(task_list):
+        # Per-task role beats top-level; normalise again so unknown
+        # per-task values warn and degrade to leaf uniformly.
+        effective_role = _normalize_role(t.get("role") or top_role)
+        effective_subagent_type = t.get("subagent_type", subagent_type)
+        profile = get_subagent_profile(effective_subagent_type) if effective_subagent_type else None
+        resolved_profile = (
+            resolve_profile_config(effective_subagent_type, cfg)
+            if effective_subagent_type
+            else None
+        )
+        child_cfg = cfg
+        if resolved_profile:
+            child_cfg = dict(cfg)
+            # Per-agent model/provider overrides must feed the credential
+            # resolver, not just AIAgent's display strings, so base_url,
+            # api_key, and api_mode come from the selected provider too.
+            if resolved_profile.model:
+                child_cfg["model"] = resolved_profile.model
+            if resolved_profile.provider:
+                child_cfg["provider"] = resolved_profile.provider
+
+            agent_cfg = (cfg.get("agents") or {}).get(effective_subagent_type) or {}
+            provider_changed = (
+                "provider" in agent_cfg
+                and resolved_profile.provider != cfg.get("provider")
+            )
+            if provider_changed:
+                # Direct-endpoint and ACP transport settings belong to the
+                # global provider.  They must not override credentials for
+                # an explicitly different per-agent provider.
+                for transport_key in (
+                    "base_url", "api_key", "api_mode", "command", "args",
+                ):
+                    child_cfg.pop(transport_key, None)
+        try:
+            creds = _resolve_delegation_credentials(child_cfg, parent_agent)
+        except ValueError as exc:
+            return tool_error(str(exc))
+        if dispatch_model is None:
+            dispatch_model = creds["model"]
+        prepared_children.append((i, t, effective_role, profile, creds))
+
     # Save parent tool names BEFORE any child construction mutates the global.
     # _build_child_agent() calls AIAgent() which calls get_tool_definitions(),
     # which overwrites model_tools._last_resolved_tool_names with child's toolset.
@@ -2604,35 +2651,8 @@ def delegate_task(
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
-    dispatch_model = None
     try:
-        for i, t in enumerate(task_list):
-            # Per-task role beats top-level; normalise again so unknown
-            # per-task values warn and degrade to leaf uniformly.
-            effective_role = _normalize_role(t.get("role") or top_role)
-            effective_subagent_type = t.get("subagent_type", subagent_type)
-            profile = get_subagent_profile(effective_subagent_type) if effective_subagent_type else None
-            resolved_profile = (
-                resolve_profile_config(effective_subagent_type, cfg)
-                if effective_subagent_type
-                else None
-            )
-            child_cfg = cfg
-            if resolved_profile:
-                child_cfg = dict(cfg)
-                # Per-agent model/provider overrides must feed the credential
-                # resolver, not just AIAgent's display strings, so base_url,
-                # api_key, and api_mode come from the selected provider too.
-                if resolved_profile.model:
-                    child_cfg["model"] = resolved_profile.model
-                if resolved_profile.provider:
-                    child_cfg["provider"] = resolved_profile.provider
-            try:
-                creds = _resolve_delegation_credentials(child_cfg, parent_agent)
-            except ValueError as exc:
-                return tool_error(str(exc))
-            if dispatch_model is None:
-                dispatch_model = creds["model"]
+        for i, t, effective_role, profile, creds in prepared_children:
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
