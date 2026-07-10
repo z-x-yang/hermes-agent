@@ -509,6 +509,36 @@ def _get_child_timeout() -> Optional[float]:
     return DEFAULT_CHILD_TIMEOUT
 
 
+def _resolve_scheduling(
+    subagent_type: Optional[str],
+    scheduling: str,
+    is_batch: bool,
+    is_subagent: bool,
+) -> str:
+    """Resolve foreground/background policy for one delegation unit."""
+    if is_subagent:
+        if scheduling == "background":
+            raise ValueError("Nested/orchestrator delegation must run foreground")
+        return "foreground"
+    if scheduling != "auto":
+        return scheduling
+    if is_batch or subagent_type is None:
+        return "background"
+    return get_subagent_profile(subagent_type).default_scheduling
+
+
+def _resolve_foreground_timeouts(
+    subagent_type: Optional[str], delegation_config: Optional[Dict[str, Any]] = None
+) -> tuple[int, int]:
+    """Resolve independent parent wait and child run caps for foreground work."""
+    cfg = delegation_config if delegation_config is not None else _load_config()
+    resolved = resolve_profile_config(subagent_type or "general-purpose", cfg)
+    return (
+        resolved.foreground_wait_timeout_seconds,
+        resolved.child_run_timeout_seconds,
+    )
+
+
 def _get_max_spawn_depth() -> int:
     """Read delegation.max_spawn_depth from config, floored at 1 (no ceiling).
 
@@ -1805,6 +1835,7 @@ def _run_single_child(
     child=None,
     parent_agent=None,
     context: Optional[str] = None,
+    child_timeout_override: Optional[float] = None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -1990,7 +2021,11 @@ def _run_single_child(
         # Run child with an optional hard timeout (off by default —
         # result(timeout=None) blocks until the child finishes). Stuck-child
         # protection comes from the heartbeat staleness monitor instead.
-        child_timeout = _get_child_timeout()
+        child_timeout = (
+            child_timeout_override
+            if child_timeout_override is not None
+            else _get_child_timeout()
+        )
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
@@ -2465,6 +2500,7 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     parent_agent=None,
+    _dispatch_origin: str = "direct",
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2507,16 +2543,32 @@ def delegate_task(
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
 
-    # Background (async) delegation now applies to BOTH single tasks and
-    # batches. A batch simply becomes N independent async dispatches: each
-    # child runs on the daemon executor and re-enters the conversation via
-    # the completion queue on its own, carrying its own handle. There's no
-    # combined "wait for all" — fan-out is exactly N background subagents.
-    background = is_truthy_value(background, default=False) if background is not None else False
+    # ``background`` is a legacy Python-only compatibility knob. Model-facing
+    # callers use scheduling plus the internal dispatch-origin sentinel.
+    legacy_background_requested = (
+        is_truthy_value(background, default=False) if background is not None else False
+    )
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
     depth = getattr(parent_agent, "_delegate_depth", 0)
+    is_subagent = depth > 0
+    nested_background_requested = (
+        legacy_background_requested
+        or scheduling == "background"
+        or (
+            isinstance(tasks, list)
+            and any(
+                isinstance(task, dict)
+                and task.get("scheduling", scheduling) == "background"
+                for task in tasks
+            )
+        )
+    )
+    if is_subagent and nested_background_requested:
+        return json.dumps(
+            {"error": "Nested/orchestrator delegation must run foreground"}
+        )
     max_spawn = _get_max_spawn_depth()
     if depth >= max_spawn:
         return json.dumps(
@@ -2610,12 +2662,73 @@ def delegate_task(
                     }
                 )
 
+    explicit_profile_or_scheduling = (
+        _dispatch_origin == "model"
+        or legacy_background_requested
+        or scheduling != "auto"
+        or subagent_type is not None
+        or any(
+            isinstance(task, dict)
+            and (
+                task.get("subagent_type") is not None
+                or task.get("scheduling", "auto") != "auto"
+            )
+            for task in task_list
+        )
+    )
+    is_batch = len(task_list) > 1
+    if not explicit_profile_or_scheduling and not is_subagent:
+        # Historical direct-Python compatibility: a plain delegate_task(...)
+        # remains synchronous even though model-facing legacy auto is background.
+        delivery_mode = "foreground"
+        use_async_registry = False
+        foreground_started = False
+    else:
+        try:
+            resolved_modes = [
+                _resolve_scheduling(
+                    task.get("subagent_type", subagent_type),
+                    task.get("scheduling", scheduling),
+                    is_batch,
+                    is_subagent,
+                )
+                for task in task_list
+            ]
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
+        if legacy_background_requested:
+            delivery_mode = "background"
+        else:
+            delivery_mode = (
+                "background" if "background" in resolved_modes else "foreground"
+            )
+        # Nested sessions consume workers inline and never own gateway delivery,
+        # but they are still foreground-started work and keep the profile run cap.
+        use_async_registry = not is_subagent
+        foreground_started = delivery_mode == "foreground"
+
     overall_start = time.monotonic()
     results = []
 
     n_tasks = len(task_list)
     # Track goal labels for progress display (truncated for readability)
     task_labels = [t["goal"][:40] for t in task_list]
+
+    child_timeout_overrides: Dict[int, Optional[float]] = {
+        i: None for i in range(n_tasks)
+    }
+    foreground_wait_timeout_seconds: Optional[float] = None
+    if foreground_started:
+        wait_timeouts = []
+        for i, task in enumerate(task_list):
+            wait_timeout, run_timeout = _resolve_foreground_timeouts(
+                task.get("subagent_type", subagent_type), cfg
+            )
+            wait_timeouts.append(wait_timeout)
+            child_timeout_overrides[i] = run_timeout
+        # A consolidated mixed batch gets enough wait budget for its slowest
+        # selected profile; each child still keeps its own independent run cap.
+        foreground_wait_timeout_seconds = max(wait_timeouts)
 
     # Resolve every task profile and credential bundle before constructing any
     # AIAgent, so a later task's credential error cannot leave a partial batch.
@@ -2723,6 +2836,7 @@ def delegate_task(
                 child=child,
                 parent_agent=parent_agent,
                 context=_t.get("context"),
+                child_timeout_override=child_timeout_overrides[_i],
             )
             results.append(result)
         else:
@@ -2745,6 +2859,7 @@ def delegate_task(
                         child=child,
                         parent_agent=parent_agent,
                         context=t.get("context"),
+                        child_timeout_override=child_timeout_overrides[i],
                     )
                     futures[future] = i
 
@@ -2957,14 +3072,10 @@ def delegate_task(
             "total_duration_seconds": total_duration,
         }
 
-    # ----- Background dispatch: run the WHOLE batch as one async unit -----
-    # When background is true, the entire fan-out runs on the daemon executor
-    # via a single async delegation. _execute_and_aggregate() joins on every
-    # child and produces ONE consolidated results block, which re-enters the
-    # conversation as a single message when ALL children finish. The chat is
-    # not blocked in the meantime. This is the contract: dispatch N subagents,
-    # keep chatting, get the combined summaries back together at the end.
-    if background:
+    # ----- Async registry path: background or top-level foreground wait -----
+    # Foreground waiting and background delivery share the same future. A wait
+    # timeout only flips delivery ownership; it never starts replacement work.
+    if use_async_registry:
         from tools.async_delegation import dispatch_async_delegation_batch
         from tools.approval import get_current_session_key
 
@@ -2989,10 +3100,10 @@ def delegate_task(
             _sync_result = _execute_and_aggregate()
             if isinstance(_sync_result, dict):
                 _sync_result["note"] = (
-                    "background=true is not available on this endpoint (stateless "
-                    "HTTP API — no channel to deliver a detached subagent result "
-                    "after the turn ends), so the subagent(s) ran SYNCHRONOUSLY and "
-                    "the result is included above."
+                    f"scheduling={delivery_mode} cannot detach on this endpoint "
+                    "(stateless HTTP API — no channel can deliver a later subagent "
+                    "result), so the subagent(s) ran SYNCHRONOUSLY and the result "
+                    "is included above."
                 )
             return json.dumps(_sync_result, ensure_ascii=False)
 
@@ -3042,9 +3153,38 @@ def delegate_task(
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
+            initial_delivery_mode=(
+                "foreground_waiting"
+                if delivery_mode == "foreground"
+                else "background"
+            ),
         )
 
         if dispatch.get("status") == "dispatched":
+            if delivery_mode == "foreground":
+                from tools.async_delegation import wait_for_async_delegation
+
+                inline_payload = wait_for_async_delegation(
+                    dispatch,
+                    timeout_seconds=float(foreground_wait_timeout_seconds or 0),
+                )
+                if inline_payload is not None:
+                    return inline_payload
+                return json.dumps(
+                    {
+                        "status": "backgrounded_after_foreground_timeout",
+                        "mode": "background",
+                        "count": len(_goals),
+                        "delegation_id": dispatch["delegation_id"],
+                        "goals": _goals,
+                        "note": (
+                            "Foreground wait timed out. The same child work is "
+                            "still running and will re-enter on completion."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+
             n = len(_goals)
             note = (
                 "Subagent is running in the background. You and the user can "
@@ -3068,9 +3208,17 @@ def delegate_task(
             }
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
+        # Pool at capacity / schedule failure — restore the already-built
+        # children to parent interrupt tracking before running them inline.
+        if hasattr(parent_agent, "_active_children"):
+            _ac_lock = getattr(parent_agent, "_active_children_lock", None)
+            for _c in _child_agents:
+                if _ac_lock:
+                    with _ac_lock:
+                        if _c not in parent_agent._active_children:
+                            parent_agent._active_children.append(_c)
+                elif _c not in parent_agent._active_children:
+                    parent_agent._active_children.append(_c)
         logger.info(
             "delegate_task: async pool at capacity (%s); running the whole "
             "batch synchronously instead.",
@@ -3384,12 +3532,17 @@ def _build_top_level_description() -> str:
         f"2. Batch (parallel): provide 'tasks' array with up to {max_children} "
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). {nesting_clause}\n\n"
-        "BOTH MODES RUN IN THE BACKGROUND. delegate_task returns immediately — "
-        "you and the user keep working, and each subagent's full result "
-        "re-enters the conversation as its own new message when it finishes. A "
-        "batch is just N independent background subagents (N handles, each "
-        "completes on its own). Do NOT wait or poll; just continue with other "
-        "work after dispatching.\n\n"
+        "SCHEDULING: scheduling='foreground' waits for the subagent result up to "
+        "the configured foreground timeout; if that wait expires, the same work "
+        "continues in the background and re-enters later. "
+        "scheduling='background' returns immediately with a handle. "
+        "scheduling='auto' uses the subagent type and call shape: a single "
+        "Explore or Plan task waits in the foreground, while generic, "
+        "general-purpose, and batch calls run in the background. Nested "
+        "delegation always runs in the foreground. A background batch is one "
+        "async unit: it returns one batch handle and sends one consolidated "
+        "completion only after all children finish, not one handle or completion "
+        "per child.\n\n"
         "WHEN TO USE delegate_task:\n"
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
         "- Tasks that would flood your context with intermediate data\n"
@@ -3600,13 +3753,9 @@ DELEGATE_TASK_SCHEMA = {
             "background": {
                 "type": "boolean",
                 "description": (
-                    "DEPRECATED / IGNORED. Single-task delegations always run "
-                    "in the background automatically — you do not need to (and "
-                    "cannot) opt in or out. The result re-enters the "
-                    "conversation as a new message when the subagent finishes; "
-                    "just continue working in the meantime. Setting this has no "
-                    "effect; the parameter remains only for backward "
-                    "compatibility."
+                    "DEPRECATED / IGNORED for model calls. Use 'scheduling' instead "
+                    "to request auto, foreground, or background execution. This "
+                    "parameter remains only for direct-Python backward compatibility."
                 ),
             },
         },
@@ -3620,19 +3769,26 @@ from tools.registry import registry, tool_error
 
 
 def _model_background_value(args: dict, parent_agent=None) -> bool:
-    """Background flag for the MODEL-facing dispatch path (registry fallback).
-
-    Delegations from the top-level agent always run in the background — the
-    model does not choose. This applies to both a single task and a fan-out
-    batch (each task becomes its own independent background subagent). The one
-    exception is a delegation from an orchestrator subagent (depth > 0), which
-    needs its workers' results within its own turn. The live path is
-    ``run_agent._dispatch_delegate_task``; this lambda mirrors it for the rare
-    case the intercept is bypassed. Direct Python callers of ``delegate_task``
-    keep the historical synchronous default.
-    """
+    """Compatibility helper mirroring model-origin scheduling resolution."""
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    tasks = args.get("tasks")
+    if isinstance(tasks, list) and tasks:
+        items = tasks
+        is_batch = len(tasks) > 1
+    else:
+        items = [args]
+        is_batch = False
+    resolved = [
+        _resolve_scheduling(
+            item.get("subagent_type", args.get("subagent_type")),
+            item.get("scheduling", args.get("scheduling", "auto")),
+            is_batch,
+            is_subagent,
+        )
+        for item in items
+        if isinstance(item, dict)
+    ]
+    return "background" in resolved
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
@@ -3670,8 +3826,8 @@ registry.register(
         retain_session=args.get("retain_session"),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
-        background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
+        _dispatch_origin="model",
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

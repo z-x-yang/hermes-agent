@@ -124,19 +124,31 @@ def resolve_profile_config(
     agent_cfg = dict((delegation_config.get("agents") or {}).get(name) or {})
     model = agent_cfg.get("model", delegation_config.get("model"))
     provider = agent_cfg.get("provider", delegation_config.get("provider"))
+    wait_timeout = int(
+        agent_cfg.get(
+            "foreground_wait_timeout_seconds",
+            delegation_config.get(
+                "foreground_wait_timeout_seconds",
+                profile.foreground_wait_timeout_seconds,
+            ),
+        )
+    )
+    max_wait_timeout = int(
+        delegation_config.get("max_foreground_wait_timeout_seconds", 7200)
+    )
+    if max_wait_timeout <= 0:
+        max_wait_timeout = 7200
     return ResolvedProfileConfig(
         model=model,
         provider=provider,
-        foreground_wait_timeout_seconds=int(
-            agent_cfg.get(
-                "foreground_wait_timeout_seconds",
-                profile.foreground_wait_timeout_seconds,
-            )
-        ),
+        foreground_wait_timeout_seconds=min(wait_timeout, max_wait_timeout),
         child_run_timeout_seconds=int(
             agent_cfg.get(
                 "child_run_timeout_seconds",
-                profile.child_run_timeout_seconds,
+                delegation_config.get(
+                    "child_run_timeout_seconds",
+                    profile.child_run_timeout_seconds,
+                ),
             )
         ),
     )

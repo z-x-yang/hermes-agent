@@ -36,17 +36,22 @@ logic stays in one place.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
+
+DeliveryMode = Literal[
+    "foreground_waiting", "foreground_claimed", "background", "delivered"
+]
 
 # Back-compat alias — the daemon executor now lives in tools.daemon_pool so
 # other subsystems (tool_executor, memory_manager, delegate_tool, skills_hub)
@@ -112,6 +117,7 @@ def _prune_completed_locked() -> None:
         (rid, r)
         for rid, r in _records.items()
         if r.get("status") != "running"
+        and r.get("delivery_mode") != "foreground_waiting"
     ]
     if len(completed) <= _MAX_RETAINED_COMPLETED:
         return
@@ -319,22 +325,20 @@ def dispatch_async_delegation_batch(
     runner: Callable[[], Dict[str, Any]],
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    initial_delivery_mode: DeliveryMode = "background",
+    inject_fn: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
-    """Dispatch a WHOLE fan-out batch as ONE background unit.
+    """Dispatch a whole fan-out batch as one async registry unit.
 
-    Unlike ``dispatch_async_delegation`` (which backs a single subagent),
-    ``runner`` here runs the entire batch — it builds and joins on every child
-    in parallel and returns the combined ``{"results": [...],
-    "total_duration_seconds": N}`` dict that the synchronous path would have
-    returned. We occupy ONE async slot for the whole batch (the in-batch
-    parallelism is bounded separately by ``max_concurrent_children``), so a
-    single ``delegate_task`` fan-out never exhausts the async pool by itself.
+    ``runner`` executes the entire batch, joining every child and returning the
+    same combined ``{"results": [...], "total_duration_seconds": N}`` payload
+    as the synchronous path. The unit begins in either background-delivery or
+    foreground-waiting mode; a timed-out foreground waiter atomically hands the
+    same future to background delivery.
 
-    When the batch finishes, a SINGLE completion event is pushed onto the
-    shared ``process_registry.completion_queue`` carrying the full per-task
-    ``results`` list, so the consolidated summaries re-enter the conversation
-    as one message once every child is done — the chat is never blocked while
-    they run.
+    The batch occupies one async slot (in-batch parallelism is bounded by
+    ``max_concurrent_children``). Background completion preserves the existing
+    single consolidated ``process_registry.completion_queue`` event schema.
 
     Returns ``{"status": "dispatched", "delegation_id": ...}`` on success or
     ``{"status": "rejected", "error": ...}`` when the async pool is at
@@ -361,6 +365,12 @@ def dispatch_async_delegation_batch(
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
         "is_batch": True,
+        "delivery_mode": initial_delivery_mode,
+        "done_event": threading.Event(),
+        "result_payload": None,
+        "combined_result": None,
+        "future": None,
+        "inject_fn": inject_fn,
     }
     with _records_lock:
         running = sum(
@@ -407,7 +417,11 @@ def dispatch_async_delegation_batch(
 
     try:
         # Propagate the dispatching profile to the detached batch children.
-        executor.submit(propagate_context_to_thread(_worker))
+        future = executor.submit(propagate_context_to_thread(_worker))
+        with _records_lock:
+            current = _records.get(delegation_id)
+            if current is not None:
+                current["future"] = future
     except Exception as exc:  # pragma: no cover
         with _records_lock:
             _records.pop(delegation_id, None)
@@ -426,7 +440,7 @@ def dispatch_async_delegation_batch(
 def _finalize_batch(
     delegation_id: str, combined: Dict[str, Any], status: str
 ) -> None:
-    """Mark a batch record complete and push ONE combined completion event."""
+    """Record completion, then deliver it to exactly one consumer."""
     with _records_lock:
         record = _records.get(delegation_id)
         if record is None:
@@ -434,24 +448,33 @@ def _finalize_batch(
         record["status"] = status
         record["completed_at"] = time.time()
         record["interrupt_fn"] = None
-        event_record = dict(record)
+        record["combined_result"] = combined
+        record["result_payload"] = json.dumps(combined, ensure_ascii=False)
+        event = _build_batch_completion_event(dict(record), combined, status)
+        record["done_event"].set()
+        should_inject = record.get("delivery_mode") == "background"
+        if should_inject:
+            record["delivery_mode"] = "delivered"
+        inject_fn = record.get("inject_fn")
         _prune_completed_locked()
 
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s finished but process_registry import "
-            "failed; result lost: %s",
-            delegation_id, exc,
-        )
+    if not should_inject:
         return
+    if inject_fn is not None:
+        inject_fn(event)
+        return
+    _push_batch_completion_event(event)
 
+
+def _build_batch_completion_event(
+    event_record: Dict[str, Any], combined: Dict[str, Any], status: str
+) -> Dict[str, Any]:
+    """Build the existing consolidated completion event schema."""
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
-    evt = {
+    return {
         "type": "async_delegation",
-        "delegation_id": delegation_id,
+        "delegation_id": event_record.get("delegation_id"),
         "session_key": event_record.get("session_key", ""),
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
@@ -469,8 +492,23 @@ def _finalize_batch(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
+
+
+def _push_batch_completion_event(event: Dict[str, Any]) -> None:
+    """Push one already-built batch event onto the production queue."""
+    delegation_id = event.get("delegation_id")
     try:
-        process_registry.completion_queue.put(evt)
+        from tools.process_registry import process_registry
+    except Exception as exc:  # pragma: no cover
+        logger.error(
+            "Async delegation batch %s finished but process_registry import "
+            "failed; result lost: %s",
+            delegation_id, exc,
+        )
+        return
+
+    try:
+        process_registry.completion_queue.put(event)
     except Exception as exc:  # pragma: no cover
         logger.error(
             "Async delegation batch %s: failed to enqueue completion event; "
@@ -479,14 +517,57 @@ def _finalize_batch(
         )
 
 
+def wait_for_async_delegation(
+    record_or_id: Any, timeout_seconds: float
+) -> Optional[str]:
+    """Claim a foreground result or atomically hand the same work to background."""
+    if isinstance(record_or_id, dict):
+        delegation_id = record_or_id.get("delegation_id")
+    else:
+        delegation_id = record_or_id
+    if not delegation_id:
+        return None
+
+    with _records_lock:
+        record = _records.get(str(delegation_id))
+        if record is None:
+            return None
+        done_event = record.get("done_event")
+    if done_event is None:
+        return None
+
+    done_event.wait(timeout=max(0.0, float(timeout_seconds)))
+    with _records_lock:
+        record = _records.get(str(delegation_id))
+        if record is None or record.get("delivery_mode") != "foreground_waiting":
+            return None
+        payload = record.get("result_payload")
+        if payload is not None:
+            record["delivery_mode"] = "foreground_claimed"
+            return payload
+        record["delivery_mode"] = "background"
+        return None
+
+
 def list_async_delegations() -> List[Dict[str, Any]]:
     """Snapshot of async delegations (running + recently completed).
 
-    Safe to call from any thread. Excludes the non-serialisable interrupt_fn.
+    Safe to call from any thread. Excludes runtime-only synchronization fields.
     """
     with _records_lock:
         return [
-            {k: v for k, v in r.items() if k != "interrupt_fn"}
+            {
+                k: v
+                for k, v in r.items()
+                if k
+                not in {
+                    "interrupt_fn",
+                    "future",
+                    "done_event",
+                    "delivery_lock",
+                    "inject_fn",
+                }
+            }
             for r in _records.values()
         ]
 

@@ -32,6 +32,9 @@ def test_per_agent_config_overrides_global_without_exposing_to_model():
     cfg = {
         "model": "global-model",
         "provider": "openrouter",
+        "foreground_wait_timeout_seconds": 1200,
+        "child_run_timeout_seconds": 2400,
+        "max_foreground_wait_timeout_seconds": 7200,
         "agents": {
             "Explore": {
                 "model": "cheap-model",
@@ -45,3 +48,27 @@ def test_per_agent_config_overrides_global_without_exposing_to_model():
     assert resolved.provider == "openrouter"
     assert resolved.foreground_wait_timeout_seconds == 900
     assert resolved.child_run_timeout_seconds == 1800
+
+
+def test_global_timeouts_override_profile_defaults():
+    resolved = resolve_profile_config(
+        "Explore",
+        {
+            "foreground_wait_timeout_seconds": 1234,
+            "child_run_timeout_seconds": 2345,
+        },
+    )
+    assert resolved.foreground_wait_timeout_seconds == 1234
+    assert resolved.child_run_timeout_seconds == 2345
+
+
+def test_foreground_wait_timeout_is_clamped_by_positive_maximum():
+    resolved = resolve_profile_config(
+        "Plan",
+        {
+            "foreground_wait_timeout_seconds": 9000,
+            "max_foreground_wait_timeout_seconds": 4000,
+            "agents": {"Plan": {"foreground_wait_timeout_seconds": 8000}},
+        },
+    )
+    assert resolved.foreground_wait_timeout_seconds == 4000

@@ -364,36 +364,61 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     assert _drain_one() is None
 
 
-def test_model_dispatch_forces_background():
-    """The MODEL-facing dispatch path forces background=True for any top-level
-    delegation (single task OR batch), and keeps it off for an orchestrator
-    subagent (depth > 0). Direct delegate_task() callers are unaffected (they
-    keep the synchronous default)."""
+def test_model_dispatch_resolves_auto_by_type_and_shape():
+    """Registry-fallback scheduling matches the live model path."""
     import tools.delegate_tool as dt
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, patch
+    from tools.registry import registry
 
     top = MagicMock()
     top._delegate_depth = 0
     sub = MagicMock()
     sub._delegate_depth = 1
 
-    # Registry-fallback helper: top-level always background, regardless of
-    # single vs batch; subagent never.
     assert dt._model_background_value({"goal": "x"}, top) is True
     assert dt._model_background_value(
-        {"tasks": [{"goal": "a"}, {"goal": "b"}]}, top
-    ) is True
-    assert dt._model_background_value({"tasks": [{"goal": "a"}]}, top) is True
-    assert dt._model_background_value({"goal": "x"}, sub) is False
-    assert dt._model_background_value(
-        {"tasks": [{"goal": "a"}, {"goal": "b"}]}, sub
+        {"goal": "x", "subagent_type": "Explore"}, top
     ) is False
+    assert dt._model_background_value(
+        {"goal": "x", "subagent_type": "Plan"}, top
+    ) is False
+    assert dt._model_background_value(
+        {"goal": "x", "subagent_type": "general-purpose"}, top
+    ) is True
+    assert dt._model_background_value(
+        {"tasks": [{"goal": "a", "subagent_type": "Explore"}]}, top
+    ) is False
+    assert dt._model_background_value(
+        {
+            "tasks": [
+                {"goal": "a", "subagent_type": "Explore"},
+                {"goal": "b", "subagent_type": "Explore"},
+            ]
+        },
+        top,
+    ) is True
+    assert dt._model_background_value({"goal": "x"}, sub) is False
+
+    captured = {}
+
+    def fake_delegate(**kwargs):
+        captured.update(kwargs)
+        return "{}"
+
+    entry = registry.get_entry("delegate_task")
+    assert entry is not None
+    with patch("tools.delegate_tool.delegate_task", fake_delegate):
+        entry.handler(
+            {"goal": "x", "subagent_type": "Explore", "scheduling": "auto"},
+            parent_agent=top,
+        )
+    assert captured["_dispatch_origin"] == "model"
+    assert captured["scheduling"] == "auto"
+    assert "background" not in captured
 
 
-def test_run_agent_dispatch_forces_background():
-    """run_agent._dispatch_delegate_task — the live model path — forces
-    background on for any top-level delegation (single OR batch) and off for a
-    subagent."""
+def test_run_agent_dispatch_forwards_model_origin_for_resolver():
+    """The live model path delegates scheduling instead of forcing a bool."""
     from unittest.mock import patch
     import run_agent
 
@@ -403,23 +428,35 @@ def test_run_agent_dispatch_forces_background():
     captured = {}
 
     def _fake_delegate(**kwargs):
+        captured.clear()
         captured.update(kwargs)
         return "{}"
 
     with patch("tools.delegate_tool.delegate_task", _fake_delegate):
         agent = _FakeAgent()
         run_agent.AIAgent._dispatch_delegate_task(agent, {"goal": "x"})
-        assert captured["background"] is True
+        assert captured["_dispatch_origin"] == "model"
+        assert captured["scheduling"] == "auto"
+        assert "background" not in captured
 
         run_agent.AIAgent._dispatch_delegate_task(
-            agent, {"tasks": [{"goal": "a"}, {"goal": "b"}]}
+            agent,
+            {
+                "goal": "inspect",
+                "subagent_type": "Explore",
+                "scheduling": "foreground",
+            },
         )
-        assert captured["background"] is True
+        assert captured["subagent_type"] == "Explore"
+        assert captured["scheduling"] == "foreground"
+        assert captured["_dispatch_origin"] == "model"
+        assert "background" not in captured
 
         sub = _FakeAgent()
         sub._delegate_depth = 1
         run_agent.AIAgent._dispatch_delegate_task(sub, {"goal": "x"})
-        assert captured["background"] is False
+        assert captured["_dispatch_origin"] == "model"
+        assert "background" not in captured
 
 
 def test_dispatch_never_forwards_model_toolsets():

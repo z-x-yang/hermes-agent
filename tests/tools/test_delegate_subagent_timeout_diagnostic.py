@@ -273,7 +273,7 @@ class TestRunSingleChildTimeoutDump:
         assert result["status"] == "timeout"
         assert result["api_calls"] == 5
         # No diagnostic file should be written for timeouts that made
-        # actual API calls — the old generic "stuck on slow call" message
+        # actual API calls — the old generic "stuck on slow call" explanation
         # still applies.
         assert result.get("diagnostic_path") is None
         assert "stuck on a slow API call" in result["error"]
@@ -282,3 +282,28 @@ class TestRunSingleChildTimeoutDump:
         if logs_dir.is_dir():
             dumps = list(logs_dir.glob("subagent-timeout-*.log"))
             assert dumps == []
+
+    def test_explicit_child_timeout_override_is_independent_of_legacy_timeout(
+        self, hermes_home, monkeypatch
+    ):
+        from tools import delegate_tool
+
+        child = _StubChild(api_call_count=2, hang_seconds=10.0)
+        monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.3)
+        parent = MagicMock()
+        parent._touch_activity = MagicMock()
+        parent._current_task_id = None
+
+        started = time.monotonic()
+        result = delegate_tool._run_single_child(
+            task_index=0,
+            goal="foreground child",
+            child=child,
+            parent_agent=parent,
+            child_timeout_override=0.05,
+        )
+        elapsed = time.monotonic() - started
+
+        assert result["status"] == "timeout"
+        assert "0.05s" in result["error"]
+        assert elapsed < 1.0
