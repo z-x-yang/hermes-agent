@@ -15636,9 +15636,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if session.exited:
                 # --- Agent-triggered completion: inject synthetic message ---
-                # Skip if the agent already consumed the result via wait/log.
-                # poll() is read-only and intentionally does NOT mark consumed
-                # (#10156) — a status check must not suppress this delivery turn.
+                # Skip if the agent already consumed the terminal result via
+                # wait/log or an exited poll().  That second check matters for
+                # gateway turns: a process may finish, the agent may poll it and
+                # include the result in its final answer, and this watcher may
+                # only reach the same completion after the turn ends.
                 from tools.process_registry import format_process_notification, process_registry as _pr_check
                 if agent_notify and not _pr_check.is_completion_consumed(session_id):
                     from tools.ansi_strip import strip_ansi

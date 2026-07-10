@@ -101,8 +101,8 @@ async def test_notify_on_complete_sets_internal_flag(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_poll_does_not_suppress_notify_on_complete_watcher(monkeypatch, tmp_path):
-    """Regression: polling an exited process must not suppress watcher injection."""
+async def test_poll_suppresses_duplicate_notify_on_complete_watcher(monkeypatch, tmp_path):
+    """Polling an exited process consumes the completion for late watcher delivery."""
     import tools.process_registry as pr_module
 
     registry = ProcessRegistry()
@@ -118,7 +118,7 @@ async def test_poll_does_not_suppress_notify_on_complete_watcher(monkeypatch, tm
 
     poll_result = registry.poll(session.id)
     assert poll_result["status"] == "exited"
-    assert not registry.is_completion_consumed(session.id)
+    assert registry.is_completion_consumed(session.id)
 
     monkeypatch.setattr(pr_module, "process_registry", registry)
 
@@ -134,10 +134,7 @@ async def test_poll_does_not_suppress_notify_on_complete_watcher(monkeypatch, tm
 
     await runner._run_process_watcher(watcher)
 
-    assert adapter.handle_message.await_count == 1
-    event = adapter.handle_message.await_args.args[0]
-    assert session.id in event.text
-    assert event.internal is True
+    assert getattr(adapter.handle_message, "await_count") == 0
 
 
 @pytest.mark.asyncio

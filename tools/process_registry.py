@@ -181,19 +181,17 @@ class ProcessRegistry:
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
 
         # Track sessions whose completion was already consumed by the agent
-        # via wait/log.  Drain loops AND gateway/tui watchers skip notifications
-        # for these — a blocking wait() or a full read_log() means the agent
-        # has the output in hand and is acting on it this turn.
+        # via wait/log or by poll() returning a terminal state.  Drain loops AND
+        # gateway/tui watchers skip notifications for these — once the terminal
+        # state is returned to the agent, a later notify_on_complete injection
+        # would be a duplicate of information already available in the turn.
         self._completion_consumed: set = set()
 
-        # Track sessions the agent merely *observed* exited via poll().  poll()
-        # is a read-only status check, so it does NOT mark _completion_consumed
-        # (that would let a status check suppress the gateway/tui watcher's
-        # autonomous delivery turn — #10156).  But on the CLI the poll result
-        # is returned inline in the same turn, so the idle/post-turn drain must
-        # still skip the queued completion to avoid a duplicate [SYSTEM: ...]
-        # injection (the bug #8228 originally fixed).  drain_notifications()
-        # consults this set; the gateway/tui watchers deliberately do NOT.
+        # Track sessions the agent observed exited via poll().  This is now a
+        # compatibility/belt-and-suspenders signal for CLI drain dedupe; the
+        # cross-surface lifecycle ack is _completion_consumed above.  It still
+        # lets older or partially migrated queued completion paths dedupe a poll
+        # observation without changing watch_match/watch_disabled events.
         self._poll_observed: set = set()
 
         # Global watch-match circuit breaker — across all sessions.
@@ -1299,7 +1297,7 @@ finally:
     # ----- Query Methods -----
 
     def is_completion_consumed(self, session_id: str) -> bool:
-        """Check if a completion notification was already consumed via wait/log."""
+        """Check if a completion notification was already consumed by the agent."""
         return session_id in self._completion_consumed
 
     def is_session_waiting(self, session_id: str) -> bool:
@@ -1341,13 +1339,11 @@ finally:
     def _drain_should_skip(self, session_id: str) -> bool:
         """Whether the CLI drain should skip a completion event for this session.
 
-        Skips when the agent has either truly consumed the output (wait/log →
-        ``_completion_consumed``) or observed the exit inline via poll()
-        (``_poll_observed``).  In both cases the CLI agent already has the
-        result this turn, so injecting a [SYSTEM: ...] completion would be a
-        duplicate (#8228).  The gateway/tui watchers do NOT use this — they
-        check only ``is_completion_consumed`` so a read-only poll never
-        suppresses their autonomous delivery turn (#10156).
+        Skips when the agent has consumed the terminal state/output (wait/log
+        or exited poll → ``_completion_consumed``) or when an older queue path
+        only recorded the poll observation (``_poll_observed``).  In both cases
+        the CLI agent already has the result this turn, so injecting a
+        [SYSTEM: ...] completion would be a duplicate (#8228).
         """
         return session_id in self._completion_consumed or session_id in self._poll_observed
 
@@ -1483,16 +1479,12 @@ finally:
             result["exit_code"] = session.exit_code
             result["completion_reason"] = session.completion_reason
             result["termination_source"] = session.termination_source
-            # NOTE: poll() is a read-only status query and deliberately does
-            # NOT mark the session _completion_consumed. wait()/read_log()
-            # represent actual output consumption and do mark it. Marking
-            # consumed here would let a status check silently suppress the
-            # notify_on_complete watcher's autonomous delivery turn (#10156).
-            #
-            # We DO record it in _poll_observed so the CLI's inline drain still
-            # dedups (the agent already saw the exit in this turn's poll result)
-            # without affecting the gateway/tui watchers, which only consult
-            # _completion_consumed.
+            # Once poll() returns a terminal state to the agent, the completion
+            # has been observed in this turn.  Mark it consumed so late gateway
+            # / TUI notify_on_complete watchers do not inject the same result
+            # again after the final response.  Running polls remain read-only
+            # and do not suppress future completion notifications.
+            self._completion_consumed.add(session_id)
             self._poll_observed.add(session_id)
         if session.detached:
             result["detached"] = True
