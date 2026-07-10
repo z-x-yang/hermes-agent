@@ -340,7 +340,10 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     assert parsed["mode"] == "background"
     assert parsed["count"] == 3
     assert parsed["delegation_id"].startswith("deleg_")
+    assert "delegation_ids" not in parsed
     assert parsed["goals"] == ["a", "b", "c"]
+    assert "consolidated results" in parsed["note"]
+    assert "single message" in parsed["note"]
     # ONE background unit for the whole fan-out (not three), and the call
     # returned while all children are still blocked → chat not blocked.
     assert process_registry.completion_queue.empty()

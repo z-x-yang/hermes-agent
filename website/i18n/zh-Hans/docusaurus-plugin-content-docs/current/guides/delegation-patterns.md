@@ -1,256 +1,186 @@
 ---
 sidebar_position: 13
-title: "委托与并行工作"
-description: "何时以及如何使用子代理委托——并行研究、代码审查和多文件工作的模式"
+title: "委派与并行工作"
+description: "Explore、Plan、general-purpose、批次与保留续接的实用模式"
 ---
 
-# 委托与并行工作
+# 委派与并行工作
 
-Hermes 可以生成隔离的子代理来并行处理任务。每个子代理拥有独立的对话、终端会话和工具集。只有最终摘要会返回——中间工具调用不会进入你的上下文窗口。
+Hermes 可以把边界清晰的工作交给隔离的子智能体。选择内置类型可获得稳定的能力上限；把任务上下文写完整后，再由调度器决定父智能体是否需要等待。
 
-完整功能参考，请参阅[子代理委托](/user-guide/features/delegation)。
+完整契约请参阅[子智能体委派](/user-guide/features/delegation)。
 
----
+## 选择能力最窄的内置类型
 
-## 何时委托
+| 需求 | 类型 | 原因 |
+|---|---|---|
+| 定位代码、追踪调用路径、收集 file:line 证据 | `Explore` | 只读，默认前台运行 |
+| 在编写实施计划前调研改动范围 | `Plan` | 只读，按计划调研格式返回，默认前台运行 |
+| 编辑仓库文件、运行测试或完成多步骤仓库内任务 | `general-purpose` | 使用封闭的仓库内工作策略，默认后台运行 |
 
-**适合委托的场景：**
-- 推理密集型子任务（调试、代码审查、研究综合）
-- 会用中间数据淹没上下文的任务
-- 并行独立工作流（同时进行研究 A 和研究 B）
-- 需要代理以无偏见方式处理的全新上下文任务
+不要让 `Explore` 或 `Plan` 编辑文件。也不要用 `general-purpose` 发消息、发布内容、创建定时任务或执行其他外部副作用；它的内置策略不包含这些工具。模型不能通过 `toolsets` 绕过能力上限。
 
-**使用其他方式的场景：**
-- 单次工具调用 → 直接使用工具
-- 步骤间有逻辑的机械性多步骤工作 → `execute_code`
-- 需要用户交互的任务 → 子代理无法使用 `clarify`
-- 快速文件编辑 → 直接操作
-- 必须在当前轮次结束后继续运行的持久性长任务 → `cronjob` 或 `terminal(background=True, notify_on_complete=True)`。`delegate_task` 是**同步**的：若父轮次被中断，活跃的子代理将被取消，其工作将被丢弃。
+## 模式：行动前先做定向调查
 
----
+需要证据、又不希望产生改动时，使用 `Explore`：
 
-## 模式：并行研究
-
-同时研究三个主题并获取结构化摘要：
-
-```
-并行研究以下三个主题：
-1. WebAssembly 在浏览器之外的现状
-2. 2025 年 RISC-V 服务器芯片的采用情况
-3. 量子计算的实际应用
-
-重点关注近期进展和关键参与者。
+```python
+delegate_task(
+    goal="Trace how expired access tokens trigger refresh",
+    context="""Repository: /home/user/webapp.
+Start at src/auth/middleware.py. Return file:symbol:line evidence,
+what you searched, and any unresolved call edges.""",
+    subagent_type="Explore",
+)
 ```
 
-在后台，Hermes 使用：
+单个 `Explore` 在 `auto` 下前台运行。通常结果会直接返回；如果达到已配置的等待时限，同一个子智能体会转交后台继续执行，稍后只投递一次结果。
+
+## 模式：只调研计划输入，不实施
+
+需要为后续计划收集资料时，使用 `Plan`：
+
+```python
+delegate_task(
+    goal="Research what must change to add rotating refresh tokens",
+    context="""Repository: /home/user/webapp.
+Identify critical files, existing tests, migration risks, security constraints,
+and open questions. Do not edit files.""",
+    subagent_type="Plan",
+)
+```
+
+`Plan` 不能写文件，也不能运行 shell。它的输出供父智能体制定计划使用，不能视为已经完成实现的证据。
+
+## 模式：单个后台实现任务
+
+边界清晰、可以独立推进的仓库内任务适合 `general-purpose`：
+
+```python
+delegate_task(
+    goal="Fix refresh-token reuse detection and add regression tests",
+    context="""Repository: /home/user/webapp.
+Relevant files: src/auth/tokens.py and tests/auth/test_tokens.py.
+Run: pytest tests/auth/test_tokens.py -q.
+Return changed files and exact test output.""",
+    subagent_type="general-purpose",
+)
+```
+
+在 `auto` 下，Hermes 会立即返回后台 handle。父智能体应继续其他工作，不要轮询；完成结果稍后会注入所属会话。后台委派无法跨越 `/new`、`/stop`、进程关闭或重启持久存在。
+
+## 模式：并行只读调研
+
+互不依赖的只读问题很适合组成批次：
 
 ```python
 delegate_task(tasks=[
     {
-        "goal": "Research WebAssembly outside the browser in 2025",
-        "context": "Focus on: runtimes (Wasmtime, Wasmer), cloud/edge use cases, WASI progress",
-        "toolsets": ["web"]
+        "goal": "Map token creation and signing",
+        "context": "Repository: /home/user/webapp. Return file:line evidence.",
+        "subagent_type": "Explore",
     },
     {
-        "goal": "Research RISC-V server chip adoption",
-        "context": "Focus on: server chips shipping, cloud providers adopting, software ecosystem",
-        "toolsets": ["web"]
+        "goal": "Map token validation and revocation",
+        "context": "Repository: /home/user/webapp. Return file:line evidence.",
+        "subagent_type": "Explore",
     },
     {
-        "goal": "Research practical quantum computing applications",
-        "context": "Focus on: error correction breakthroughs, real-world use cases, key companies",
-        "toolsets": ["web"]
-    }
+        "goal": "Map authentication test coverage gaps",
+        "context": "Repository: /home/user/webapp. Read only; do not modify tests.",
+        "subagent_type": "Explore",
+    },
 ])
 ```
 
-三个任务并发运行。每个子代理独立搜索网络并返回摘要。父代理随后将它们综合成一份连贯的简报。
+多任务批次在 `auto` 下后台运行。整个 fan-out 只返回**一个 handle**，等所有子任务完成后只产生**一次汇总结果**；不会为每个任务分别生成 handle 或完成消息。
 
----
+如果任务数超过 `delegation.max_concurrent_children`，请拆成多个批次。Hermes 会拒绝过大的批次，不会静默截断。
 
-## 模式：代码审查
+## 模式：并行编辑时明确文件所有权
 
-将安全审查委托给一个全新上下文的子代理，让它以无先入之见的方式审查代码：
-
-```
-审查 src/auth/ 中的认证模块，检查安全问题。
-检查 SQL 注入、JWT 验证问题、密码处理
-和会话管理。修复发现的问题并运行测试。
-```
-
-关键在于 `context` 字段——它必须包含子代理所需的一切信息：
-
-```python
-delegate_task(
-    goal="Review src/auth/ for security issues and fix any found",
-    context="""Project at /home/user/webapp. Python 3.11, Flask, PyJWT, bcrypt.
-    Auth files: src/auth/login.py, src/auth/jwt.py, src/auth/middleware.py
-    Test command: pytest tests/auth/ -v
-    Focus on: SQL injection, JWT validation, password hashing, session management.
-    Fix issues found and verify tests pass.""",
-    toolsets=["terminal", "file"]
-)
-```
-
-:::warning 上下文问题
-子代理对你的对话**一无所知**。它们从完全空白的状态开始。如果你委托"修复我们讨论的那个 bug"，子代理根本不知道你指的是哪个 bug。务必明确传递文件路径、错误信息、项目结构和约束条件。
-:::
-
----
-
-## 模式：比较备选方案
-
-并行评估同一问题的多种解决方案，然后选出最佳方案：
-
-```
-我需要为 Django 应用添加全文搜索。并行评估三种方案：
-1. PostgreSQL tsvector（内置）
-2. 通过 django-elasticsearch-dsl 使用 Elasticsearch
-3. 通过 meilisearch-python 使用 Meilisearch
-
-对每种方案评估：配置复杂度、查询能力、资源需求
-和维护开销。比较后推荐一种。
-```
-
-每个子代理独立研究一个选项。由于它们相互隔离，不存在交叉干扰——每项评估都基于自身的优缺点。父代理获取全部三份摘要后进行比较。
-
----
-
-## 模式：多文件重构
-
-将大型重构任务拆分给并行子代理，每个子代理负责代码库的不同部分：
+多个 `general-purpose` 子智能体可能操作同一个工作树，因此只有文件范围互不重叠时才适合并行：
 
 ```python
 delegate_task(tasks=[
     {
-        "goal": "Refactor all API endpoint handlers to use the new response format",
-        "context": """Project at /home/user/api-server.
-        Files: src/handlers/users.py, src/handlers/auth.py, src/handlers/billing.py
-        Old format: return {"data": result, "status": "ok"}
-        New format: return APIResponse(data=result, status=200).to_dict()
-        Import: from src.responses import APIResponse
-        Run tests after: pytest tests/handlers/ -v""",
-        "toolsets": ["terminal", "file"]
+        "goal": "Update server token responses",
+        "context": "Repository: /home/user/webapp. Own only src/api/tokens.py and tests/api/test_tokens.py.",
+        "subagent_type": "general-purpose",
     },
     {
-        "goal": "Update all client SDK methods to handle the new response format",
-        "context": """Project at /home/user/api-server.
-        Files: sdk/python/client.py, sdk/python/models.py
-        Old parsing: result = response.json()["data"]
-        New parsing: result = response.json()["data"] (same key, but add status code checking)
-        Also update sdk/python/tests/test_client.py""",
-        "toolsets": ["terminal", "file"]
+        "goal": "Update Python SDK token parsing",
+        "context": "Repository: /home/user/webapp. Own only sdk/python/ and its tests.",
+        "subagent_type": "general-purpose",
     },
-    {
-        "goal": "Update API documentation to reflect the new response format",
-        "context": """Project at /home/user/api-server.
-        Docs at: docs/api/. Format: Markdown with code examples.
-        Update all response examples from old format to new format.
-        Add a 'Response Format' section to docs/api/overview.md explaining the schema.""",
-        "toolsets": ["terminal", "file"]
-    }
 ])
 ```
 
-:::tip
-每个子代理拥有独立的终端会话。只要它们编辑不同的文件，就可以在同一项目目录中工作而互不干扰。如果两个子代理可能修改同一文件，请在并行工作完成后自行处理该文件。
-:::
+如果多个子智能体可能修改同一个文件、运行破坏性仓库命令，或依赖彼此尚未提交的输出，就不要并行。最终应由父智能体整合并验证完整 diff。
 
----
+## 模式：保留一条实现线程继续追问
 
-## 模式：先收集后分析
-
-使用 `execute_code` 进行机械性数据收集，然后委托推理密集型分析：
+`general-purpose` 成功完成后，只要父会话 ID 非空且容量足够，默认会保留其会话。使用返回的 `agent_id` 继续紧密相关的工作：
 
 ```python
-# 第一步：机械性收集（此处 execute_code 更合适——无需推理）
-execute_code("""
-from hermes_tools import web_search, web_extract
-
-results = []
-for query in ["AI funding Q1 2026", "AI startup acquisitions 2026", "AI IPOs 2026"]:
-    r = web_search(query, limit=5)
-    for item in r["data"]["web"]:
-        results.append({"title": item["title"], "url": item["url"], "desc": item["description"]})
-
-# Extract full content from top 5 most relevant
-urls = [r["url"] for r in results[:5]]
-content = web_extract(urls)
-
-# Save for the analysis step
-import json
-with open("/tmp/ai-funding-data.json", "w") as f:
-    json.dump({"search_results": results, "extracted": content["results"]}, f)
-print(f"Collected {len(results)} results, extracted {len(content['results'])} pages")
-""")
-
-# 第二步：推理密集型分析（此处委托更合适）
-delegate_task(
-    goal="Analyze AI funding data and write a market report",
-    context="""Raw data at /tmp/ai-funding-data.json contains search results and
-    extracted web pages about AI funding, acquisitions, and IPOs in Q1 2026.
-    Write a structured market report: key deals, trends, notable players,
-    and outlook. Focus on deals over $100M.""",
-    toolsets=["terminal", "file"]
+delegate_continue(
+    agent_id="<agent_id>",
+    prompt="Address the remaining edge case from the failed parametrized test.",
+    scheduling="auto",
 )
 ```
 
-这通常是最高效的模式：`execute_code` 以低成本处理 10 余次顺序工具调用，然后子代理在干净的上下文中完成单次高成本推理任务。
+如果需要继续 `Explore` 或 `Plan`，初次调用时设置 `retain_session=true`。保留记录只存在于当前进程，受 TTL 和容量限制，而且只能由同一个父会话使用。同一个 `agent_id` 不能同时运行两个续接；重启后记录会丢失。
 
----
+续接会保留原来的类型、角色、工作区提示、模型/provider 元数据和能力上限。不能借此把 `Explore` 提升为编辑器，也不能修改工具、超时或所属父会话。
 
-## 工具集选择
+## 模式：确有必要时再用嵌套编排
 
-根据子代理的需求选择工具集：
+嵌套委派只适用于旧版通用编排者，不适用于三个内置 profile：
 
-| 任务类型 | 工具集 | 原因 |
-|-----------|----------|-----|
-| 网络研究 | `["web"]` | 仅 web_search + web_extract |
-| 代码工作 | `["terminal", "file"]` | Shell 访问 + 文件操作 |
-| 全栈 | `["terminal", "file", "web"]` | 除消息功能外的全部工具 |
-| 只读分析 | `["file"]` | 只能读取文件，无 Shell |
-
-限制工具集可使子代理保持专注，并防止意外副作用（例如研究子代理执行 Shell 命令）。
-
----
-
-## 约束条件
-
-- **默认 3 个并行任务**：批次默认并发 3 个子代理（可通过 config.yaml 中的 `delegation.max_concurrent_children` 配置，无硬性上限，最低为 1）
-- **嵌套委托需显式启用**：叶子子代理（默认）无法调用 `delegate_task`、`clarify`、`memory`、`send_message` 或 `execute_code`。编排器子代理（`role="orchestrator"`）保留 `delegate_task` 以支持进一步委托，但仅在 `delegation.max_spawn_depth` 高于默认值 1 时生效（支持 1-3）；其余四项仍被禁用。可通过 `delegation.orchestrator_enabled: false` 全局禁用。
-
-### 调整并发数与深度
-
-| 配置项 | 默认值 | 范围 | 效果 |
-|--------|---------|-------|--------|
-| `max_concurrent_children` | 3 | >=1 | 每次 `delegate_task` 调用的并行批次大小 |
-| `max_spawn_depth` | 1 | 1-3 | 可进一步生成子代理的委托层级数 |
-
-示例：运行 30 个并行 worker 并启用嵌套子代理：
-
-```yaml
-delegation:
-  max_concurrent_children: 30
-  max_spawn_depth: 2
+```python
+delegate_task(
+    goal="Survey three migration approaches and synthesize a recommendation",
+    context="Repository: /home/user/webapp.",
+    role="orchestrator",
+)
 ```
 
-- **独立终端** — 每个子代理拥有独立的终端会话，具有独立的工作目录和状态
-- **无对话历史** — 子代理只能看到父代理调用 `delegate_task` 时传入的 `goal` 和 `context`
-- **默认 50 次迭代** — 对简单任务设置较低的 `max_iterations` 以节省成本
-- **非持久性** — `delegate_task` 是同步的，在父轮次内运行。若父轮次被中断（新用户消息、`/stop`、`/new`），所有活跃子代理将被取消（`status="interrupted"`），其工作将被丢弃。对于必须在当前轮次结束后继续运行的工作，请使用 `cronjob` 或 `terminal(background=True, notify_on_complete=True)`。
+这要求 `delegation.max_spawn_depth >= 2` 且 `delegation.orchestrator_enabled: true`。嵌套工作同步前台执行；显式要求嵌套后台运行会直接失败。每增加一层都可能成倍增加费用，因此在子任务已经明确时，应优先使用顶层批次。
 
----
+## 调度检查表
 
-## 技巧
+- 单个 `Explore`/`Plan` + `auto` → 前台。
+- 单个 `general-purpose` + `auto` → 后台。
+- 模型发起的旧版通用调用 + `auto` → 后台。
+- 多任务批次 + `auto` → 后台，一个 handle、一次结果。
+- 嵌套/编排委派 → 同步前台。
+- 直接 Python 旧版调用，且未指定类型、调度或后台请求 → 走同步兼容路径。
+- 前台等待超时 → 同一个 future 转交后台，之后只投递一次完成结果。
+- 前台启动的任务使用配置的 child run cap；纯后台任务不会自动套用这项 profile 超时。
 
-**目标要具体。** "修复 bug"过于模糊。"修复 api/handlers.py 第 47 行的 TypeError，该错误由 parse_body() 向 process_request() 返回 None 引起"才能给子代理足够的信息。
+## 上下文与验证检查表
 
-**包含文件路径。** 子代理不了解你的项目结构。务必提供相关文件的绝对路径、项目根目录和测试命令。
+委派前请写明：
 
-**利用委托实现上下文隔离。** 有时你需要全新的视角。委托迫使你清晰地阐述问题，而子代理会在没有对话中积累的假设前提下处理它。
+- 仓库或工作区路径；
+- 精确的文件、symbol、错误信息或搜索目标；
+- 允许的范围，以及子智能体拥有的文件；
+- 测试或验证命令；
+- 输出语言和证据格式。
 
-**核验结果。** 子代理的摘要只是摘要。如果子代理说"修复了 bug 且测试通过"，请自行运行测试或查看 diff 来验证。
+完成后：
 
----
+- 查看真实 diff 或文件内容；
+- 由父智能体重新运行关键测试；
+- 把摘要视为自我报告，而不是独立证据；
+- 记住一个批次完成消息中可能包含多个子任务结果；
+- 只有在原能力上限仍然合适时才使用 `delegate_continue`。
 
-*完整的委托参考——所有参数、ACP 集成和高级配置——请参阅[子代理委托](/user-guide/features/delegation)。*
+## 不适合委派的情况
+
+- 只需一次工具调用：直接调用工具。
+- 不需要复杂推理的机械式 API/工具流水线：使用 `execute_code`。
+- 需要用户澄清：子智能体不能使用 `clarify`。
+- 需要外部副作用：由获得明确授权的父智能体工具执行并核验结果。
+- 必须跨越 Gateway 生命周期长期运行：使用 cron 或独立管理的后台进程。

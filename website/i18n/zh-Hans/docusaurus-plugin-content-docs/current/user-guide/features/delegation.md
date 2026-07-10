@@ -1,290 +1,170 @@
 ---
 sidebar_position: 7
 title: "子智能体委派"
-description: "使用 delegate_task 为并行工作流生成隔离的子智能体"
+description: "内置子智能体类型、调度、续接与能力边界"
 ---
 
 # 子智能体委派
 
-`delegate_task` 工具会生成具有隔离上下文、受限工具集和独立终端会话的子 AIAgent 实例。每个子智能体获得全新的对话并独立运行——只有其最终摘要会进入父智能体的上下文。
+Hermes 通过 `delegate_task` 运行隔离的子智能体。每个子智能体都有独立的对话与终端状态，只会收到父智能体传入的任务和上下文，最后返回结构化结果。调用方不能随意指定子智能体工具：Hermes 会先考虑父智能体当前可用的工具，再强制套用所选子智能体类型的能力上限。
 
-## 单任务
+## 内置子智能体类型
+
+`subagent_type` 只接受以下三个内置值：
+
+| 类型 | 适用工作 | 能力上限 | 单任务使用 `scheduling="auto"` 时 |
+|---|---|---|---|
+| `Explore` | 搜索并理解代码、文件和辅助资料 | 只读：`read_file`、`search_files`、`web_search`、`web_extract` | 前台 |
+| `Plan` | 调研代码库，为后续实施计划准备输入 | 与 `Explore` 相同的只读上限；不能编辑，也不能声称实现已完成 | 前台 |
+| `general-purpose` | 需要编辑、测试的多步骤仓库内工作 | 使用封闭的仓库内工具白名单，可操作文件、shell/进程、任务、技能和视觉工具；不能产生外部副作用或继续委派 | 后台 |
+
+`Explore` 和 `Plan` 不能写文件、运行 shell、产生外部副作用或委派。`general-purpose` 可以在仓库内编辑和测试，但默认不能发消息、创建定时任务、写共享记忆、执行外部副作用或继续委派。
+
+省略 `subagent_type` 会保留旧版通用委派行为。这里有两个刻意不同的兼容入口：
+
+- **模型发起**且使用旧版 `scheduling="auto"` 的调用会在后台运行。
+- 直接调用 Python API 时，如果既未指定子智能体类型，也没有显式指定调度或后台运行，则仍保持同步执行。
+
+不要用直接 Python API 的兼容规则推断模型侧的调度行为。
+
+## 单任务与批次
+
+进行一次只读调查：
 
 ```python
 delegate_task(
-    goal="Debug why tests fail",
-    context="Error: assertion in test_foo.py line 42",
-    toolsets=["terminal", "file"]
+    goal="Locate the authentication retry logic and explain its call path",
+    context="Repository root: /home/user/webapp. Include file:line evidence.",
+    subagent_type="Explore",
 )
 ```
 
-## 并行批处理
+执行一个仓库内实现任务：
 
-默认最多 3 个并发子智能体（可配置，无硬性上限）：
+```python
+delegate_task(
+    goal="Fix the failing authentication retry tests",
+    context="Repository root: /home/user/webapp. Run pytest tests/auth/.",
+    subagent_type="general-purpose",
+)
+```
+
+并行批次：
 
 ```python
 delegate_task(tasks=[
-    {"goal": "Research topic A", "toolsets": ["web"]},
-    {"goal": "Research topic B", "toolsets": ["web"]},
-    {"goal": "Fix the build", "toolsets": ["terminal", "file"]}
+    {
+        "goal": "Map the token refresh path",
+        "context": "Repository root: /home/user/webapp.",
+        "subagent_type": "Explore",
+    },
+    {
+        "goal": "Map session invalidation",
+        "context": "Repository root: /home/user/webapp.",
+        "subagent_type": "Explore",
+    },
 ])
 ```
 
-## 子智能体上下文的工作方式
+模型可见的 schema 不包含 `toolsets`、模型/provider 选择、迭代预算或超时控制。这些都由用户配置和运行策略决定。即使旧客户端仍传入已移除字段，也不能借此放宽子智能体的能力上限。
 
-:::warning 关键：子智能体一无所知
-子智能体以**全新对话**启动。它们对父智能体的对话历史、之前的工具调用或委派前讨论的任何内容一无所知。子智能体的唯一上下文来自父智能体调用 `delegate_task` 时填写的 `goal` 和 `context` 字段。
-:::
+## 调度
 
-这意味着父智能体必须在调用中传递子智能体所需的**一切**信息：
+`scheduling` 可取 `auto`、`foreground` 或 `background`。
+
+- **`auto`**：单个 `Explore` 或 `Plan` 任务在前台运行；`general-purpose`、旧版通用调用以及多任务批次在后台运行。
+- **`foreground`**：Hermes 等待到已解析的前台等待时限。
+- **`background`**：立即返回一个 handle，完成后再把结果注入原来的会话。
+- **嵌套/编排任务**：始终同步前台执行；显式要求嵌套后台运行会直接失败，不会悄悄放行。
+
+前台等待和子智能体执行使用两个不同的时限：
+
+1. `foreground_wait_timeout_seconds` 决定父智能体等待多久。
+2. `child_run_timeout_seconds` 限制**从前台启动**的子智能体最多运行多久，值来自全局或对应类型的配置。
+
+如果先到达前台等待时限，Hermes 会把**同一个仍在运行的 future**交给后台投递，不会重启子智能体。调用方先收到 `backgrounded_after_foreground_timeout`，等该 future 完成后只会再收到一次结果。
+
+纯后台启动的任务保持既有行为：profile 的 `child_run_timeout_seconds` 不会变成覆盖所有后台任务的统一超时。如果用户另行配置了旧版 `delegation.child_timeout_seconds` 硬上限，它仍会独立生效。
+
+### 批次结果统一投递
+
+一个批次就是一个异步单元：
+
+- 只返回一个 `delegation_id`；
+- 只占用一个后台槽位；
+- 所有子任务完成后只投递一次汇总结果；
+- 结果仍按任务索引排序。
+
+Hermes 不会为批次中的每个任务分别返回 handle，也不会分别注入完成消息。
+
+如果当前端点无法投递后续消息（例如无状态 HTTP 请求），或者后台池已经满了，Hermes 会同步执行已准备好的任务，并在结果中解释原因，而不是返回一个永远无法完成投递的 handle。
+
+## 上下文隔离
+
+新子智能体不会继承父智能体的对话记录。请在 `goal` 和 `context` 中写全仓库根目录、相关文件、错误信息、约束、验证命令以及输出语言。
 
 ```python
-# BAD - subagent has no idea what "the error" is
-delegate_task(goal="Fix the error")
+# 过于含糊
+delegate_task(goal="Fix the error", subagent_type="general-purpose")
 
-# GOOD - subagent has all context it needs
+# 信息完整
 delegate_task(
     goal="Fix the TypeError in api/handlers.py",
-    context="""The file api/handlers.py has a TypeError on line 47:
-    'NoneType' object has no attribute 'get'.
-    The function process_request() receives a dict from parse_body(),
-    but parse_body() returns None when Content-Type is missing.
-    The project is at /home/user/myproject and uses Python 3.11."""
+    context="""Repository: /home/user/webapp.
+process_request() receives None from parse_body() when Content-Type is missing.
+Add a regression test and run pytest tests/api/.""",
+    subagent_type="general-purpose",
 )
 ```
 
-子智能体会收到一个基于你的 goal 和 context 构建的专注系统 prompt（提示词），指示其完成任务并提供结构化摘要，包括所做的事情、发现的内容、修改的文件以及遇到的问题。
+子智能体摘要只是自我报告。父智能体应当重新核验关键文件改动、测试结果和外部事实，再把它们当作已确认结论交给用户。
 
-## 实际示例
+## 保留会话与 `delegate_continue`
 
-### 并行研究
+`delegate_task` 可以暂时保留已完成子智能体的对话，供后续继续：
 
-同时研究多个主题并收集摘要：
+- `general-purpose` 默认只在任务**成功完成**后保留，而且父会话 ID 必须非空，存储容量也必须足够。
+- `Explore` 和 `Plan` 默认一次性使用；如需续接，显式设置 `retain_session=true`。
+- 设置 `retain_session=false` 可禁止本次保留。
+- 无状态请求或父会话 ID 为空时，不会返回可续接的 `agent_id`。
 
-```python
-delegate_task(tasks=[
-    {
-        "goal": "Research the current state of WebAssembly in 2025",
-        "context": "Focus on: browser support, non-browser runtimes, language support",
-        "toolsets": ["web"]
-    },
-    {
-        "goal": "Research the current state of RISC-V adoption in 2025",
-        "context": "Focus on: server chips, embedded systems, software ecosystem",
-        "toolsets": ["web"]
-    },
-    {
-        "goal": "Research quantum computing progress in 2025",
-        "context": "Focus on: error correction breakthroughs, practical applications, key players",
-        "toolsets": ["web"]
-    }
-])
-```
-
-### 代码审查 + 修复
-
-将审查并修复的工作流委派给全新上下文：
+保留成功的结果中会包含 `agent_id`。继续同一个子智能体：
 
 ```python
-delegate_task(
-    goal="Review the authentication module for security issues and fix any found",
-    context="""Project at /home/user/webapp.
-    Auth module files: src/auth/login.py, src/auth/jwt.py, src/auth/middleware.py.
-    The project uses Flask, PyJWT, and bcrypt.
-    Focus on: SQL injection, JWT validation, password handling, session management.
-    Fix any issues found and run the test suite (pytest tests/auth/).""",
-    toolsets=["terminal", "file"]
+delegate_continue(
+    agent_id="<agent_id from the completed result>",
+    prompt="Now add the missing regression test and rerun the focused suite.",
+    scheduling="auto",
 )
 ```
 
-### 多文件重构
+`delegate_continue` 只接受 `agent_id`、`prompt` 和 `scheduling`。续接时会保留原来的子智能体类型、角色、工作区提示、模型/provider 元数据和能力上限，不能借续接修改工具、类型、角色、保留策略或超时。
 
-将会大量占用父智能体上下文的大型重构任务委派出去：
+保留机制的安全边界与生命周期：
 
-```python
-delegate_task(
-    goal="Refactor all Python files in src/ to replace print() with proper logging",
-    context="""Project at /home/user/myproject.
-    Use the 'logging' module with logger = logging.getLogger(__name__).
-    Replace print() calls with appropriate log levels:
-    - print(f"Error: ...") -> logger.error(...)
-    - print(f"Warning: ...") -> logger.warning(...)
-    - print(f"Debug: ...") -> logger.debug(...)
-    - Other prints -> logger.info(...)
-    Don't change print() in test files or CLI output.
-    Run pytest after to verify nothing broke.""",
-    toolsets=["terminal", "file"]
-)
-```
+- 存储仅存在于当前进程，受 TTL 和容量限制（默认 `3600` 秒、`64` 条）。
+- 只有同一个且非空的父会话才能续接对应 `agent_id`。
+- 同一个 `agent_id` 同时只能有一个续接任务；第二个并发请求会立即失败。不同的保留子智能体可以并发续接。
+- `/stop` 和进程关闭会中断后台续接。
+- Gateway 或进程重启会丢失全部保留会话；这不是持久化存储。
+- 记录中不保存凭据或自定义 `base_url`。续接时会从当前可信配置重新解析凭据，因此配置变化后不能保证精确复现旧的自定义端点。
 
-## 批处理模式详情
+## 嵌套编排
 
-当你提供 `tasks` 数组时，子智能体会使用线程池**并行**运行：
+启用嵌套委派后，旧版通用子智能体可以使用 `role="orchestrator"`。三个内置 profile（`Explore`、`Plan`、`general-purpose`）都不允许使用编排者角色。
 
-- **最大并发数：** 默认 3 个任务（可通过 `delegation.max_concurrent_children` 或环境变量 `DELEGATION_MAX_CONCURRENT_CHILDREN` 配置；最低为 1，无硬性上限）。超出限制的批次会返回工具错误，而不是被静默截断。
-- **线程池：** 使用 `ThreadPoolExecutor`，以配置的并发限制作为最大工作线程数
-- **进度显示：** 在 CLI 模式下，树形视图会实时显示每个子智能体的工具调用，并附带每个任务的完成行。在 gateway 模式下，进度会被批量汇总并转发给父智能体的进度回调
-- **结果排序：** 结果按任务索引排序，与输入顺序一致，不受完成顺序影响
-- **中断传播：** 中断父智能体（例如发送新消息）会中断所有活跃的子智能体
+- `role="leaf"` 是默认值，不能继续委派。
+- 只有 `delegation.orchestrator_enabled` 为 true 且 `max_spawn_depth` 允许下一层时，`role="orchestrator"` 才会保留委派能力。
+- `max_spawn_depth` 默认 `1`，表示扁平委派；最小值为 `1`，没有硬性上限。每增加一层都可能成倍增加费用和并发量。
 
-单任务委派直接运行，无线程池开销。
+嵌套工作始终同步前台执行，子智能体不能把任务从拥有它的父会话中脱离出去。
 
-## 模型覆盖
+## 中断、监控与持久性
 
-你可以通过 `config.yaml` 为子智能体配置不同的模型——适用于将简单任务委派给更便宜/更快的模型：
+TUI 中可用 `/agents`（别名 `/tasks`）查看正在运行和最近完成的子智能体。`/stop` 与进程关闭会把中断传播到前台、后台子智能体以及后台续接。
 
-```yaml
-# In ~/.hermes/config.yaml
-delegation:
-  model: "google/gemini-flash-2.0"    # Cheaper model for subagents
-  provider: "openrouter"              # Optional: route subagents to a different provider
-```
-
-如果省略，子智能体将使用与父智能体相同的模型。
-
-## 工具集选择建议
-
-`toolsets` 参数控制子智能体可以访问的工具。根据任务选择：
-
-| 工具集模式 | 使用场景 |
-|----------------|----------|
-| `["terminal", "file"]` | 代码工作、调试、文件编辑、构建 |
-| `["web"]` | 研究、事实核查、文档查阅 |
-| `["terminal", "file", "web"]` | 全栈任务（默认） |
-| `["file"]` | 只读分析、无需执行的代码审查 |
-| `["terminal"]` | 系统管理、进程管理 |
-
-无论你指定什么，某些工具集对子智能体始终被屏蔽：
-- `delegation` — 对叶子子智能体屏蔽（默认）。`role="orchestrator"` 的子智能体可保留，受 `max_spawn_depth` 约束——参见下方[深度限制与嵌套编排](#depth-limit-and-nested-orchestration)。
-- `clarify` — 子智能体无法与用户交互
-- `memory` — 不可写入共享持久内存
-- `code_execution` — 子智能体应逐步推理
-- `send_message` — 无跨平台副作用（例如发送 Telegram 消息）
-
-## 最大迭代次数
-
-每个子智能体都有迭代次数限制（默认：50），控制其可进行的工具调用轮次：
-
-```python
-delegate_task(
-    goal="Quick file check",
-    context="Check if /etc/nginx/nginx.conf exists and print its first 10 lines",
-    max_iterations=10  # Simple task, don't need many turns
-)
-```
-
-## 子智能体超时
-
-默认情况下，子智能体**没有挂钟超时限制**。子智能体只会因其实际执行的操作而失败——API 错误、工具错误或达到迭代预算上限——而不会被委派层面的计时器终止。早期版本曾设有硬性上限（300 秒，后为 600 秒），但这会在任务执行过程中误杀正常工作的子智能体：深度代码审查、大规模研究分发以及慢速推理模型经常需要超过 10 分钟，而它们全程都在稳定推进。
-
-真正卡死的子智能体仍会被检测到：当子智能体没有任何进展（无 API 调用、无工具启动）时，心跳陈旧度监控会停止刷新父智能体的活动状态，从而让网关的不活动超时机制对真正卡死的工作进程生效。
-
-如果仍需要硬性上限（例如对无人值守的 cron 驱动委派进行成本控制），可按安装实例选择启用：
-
-```yaml
-delegation:
-  child_timeout_seconds: 0     # 默认：0 = 无超时
-  # child_timeout_seconds: 1800  # 选择启用的硬性上限（下限 30 秒）
-```
-
-正值会对每个子智能体强制执行挂钟时间硬限制；`0` 或负值表示禁用。
-
-:::tip 零调用超时时的诊断转储
-在配置了硬性上限的情况下，如果子智能体在**零次** API 调用的情况下超时（通常原因：provider 不可达、认证失败或工具 schema 被拒绝），`delegate_task` 会将结构化诊断信息写入 `~/.hermes/logs/subagent-timeout-<session>-<timestamp>.log`，其中包含子智能体的配置快照、凭据解析追踪以及早期错误消息。比之前的静默超时行为更易于定位根因。
-:::
-
-## 监控运行中的子智能体（`/agents`）
-
-TUI 提供 `/agents` 浮层（别名 `/tasks`），将递归 `delegate_task` 扇出转化为一级审计界面：
-
-- 运行中和最近完成的子智能体的实时树形视图，按父智能体分组
-- 每个分支的费用、token 和已触及文件的汇总
-- 终止和暂停控制——可在不中断其兄弟智能体的情况下取消特定子智能体
-- 事后回顾：即使子智能体已返回父智能体，也可逐轮查看其历史记录
-
-经典 CLI 仅将 `/agents` 打印为文本摘要；TUI 才是浮层真正发挥作用的地方。参见 [TUI — 斜杠命令](/user-guide/tui#slash-commands)。
-
-## 深度限制与嵌套编排 {#depth-limit-and-nested-orchestration}
-
-默认情况下，委派是**扁平的**：父智能体（深度 0）生成子智能体（深度 1），而这些子智能体无法进一步委派。这可防止失控的递归委派。
-
-对于多阶段工作流（研究 → 综合，或对子问题进行并行编排），父智能体可以生成**编排者**子智能体，这些子智能体*可以*委派自己的工作线程：
-
-```python
-delegate_task(
-    goal="Survey three code review approaches and recommend one",
-    role="orchestrator",  # Allows this child to spawn its own workers
-    context="...",
-)
-```
-
-- `role="leaf"`（默认）：子智能体无法进一步委派——与扁平委派行为相同。
-- `role="orchestrator"`：子智能体保留 `delegation` 工具集。受 `delegation.max_spawn_depth` 约束（默认 **1** = 扁平，因此在默认设置下 `role="orchestrator"` 无效）。将 `max_spawn_depth` 提高到 2 可允许编排者子智能体生成叶子孙智能体；设为 3 则允许三层（上限）。
-- `delegation.orchestrator_enabled: false`：全局开关，无论 `role` 参数如何，强制所有子智能体为 `leaf`。
-
-**费用警告：** 在 `max_spawn_depth: 3` 和 `max_concurrent_children: 3` 的情况下，树可达到 3×3×3 = 27 个并发叶子智能体。每增加一层都会成倍增加开销——请谨慎提高 `max_spawn_depth`。
-
-## 生命周期与持久性
-
-:::warning delegate_task 是同步的——不具备持久性
-`delegate_task` 在**父智能体的当前轮次内**运行。它会阻塞父智能体，直到所有子智能体完成（或被取消）。它**不是**后台任务队列：
-
-- 如果父智能体被中断（用户发送新消息、`/stop`、`/new`），所有活跃的子智能体都会被取消并返回 `status="interrupted"`。其进行中的工作将被丢弃。
-- 子智能体在父智能体轮次结束后**不会**继续运行。
-- 被取消的子智能体会返回结构化结果（`status="interrupted"`，`exit_reason="interrupted"`），但由于父智能体也被中断，该结果通常不会出现在用户可见的回复中。
-
-对于必须在中断后存活或超出当前轮次的**持久长时间运行工作**，请使用：
-
-- `cronjob`（action=`create`）——调度独立的智能体运行；不受父智能体轮次中断影响。
-- `terminal(background=True, notify_on_complete=True)`——长时间运行的 shell 命令，在智能体执行其他操作时持续运行。
-:::
-
-## 关键特性
-
-- 每个子智能体获得其**独立的终端会话**（与父智能体分离）
-- **嵌套委派为可选项**——只有 `role="orchestrator"` 的子智能体可以进一步委派，且仅在 `max_spawn_depth` 从默认值 1（扁平）提高后才生效。可通过 `orchestrator_enabled: false` 全局禁用。
-- 叶子子智能体**不能**调用：`delegate_task`、`clarify`、`memory`、`send_message`、`execute_code`。编排者子智能体保留 `delegate_task`，但仍不能使用其他四个。
-- **中断传播**——中断父智能体会中断所有活跃的子智能体（包括编排者下的孙智能体）
-- 只有最终摘要进入父智能体的上下文，保持 token 使用高效
-- 子智能体继承父智能体的 **API 密钥、provider 配置和凭据池**（支持在速率限制时轮换密钥）
-
-## delegate_task 与 execute_code 对比
-
-| 因素 | delegate_task | execute_code |
-|--------|--------------|-------------|
-| **推理** | 完整 LLM 推理循环 | 仅 Python 代码执行 |
-| **上下文** | 全新隔离对话 | 无对话，仅脚本 |
-| **工具访问** | 所有非屏蔽工具，具备推理能力 | 通过 RPC 访问 7 个工具，无推理 |
-| **并行性** | 默认 3 个并发子智能体（可配置） | 单脚本 |
-| **最适合** | 需要判断力的复杂任务 | 机械式多步骤流水线 |
-| **Token 费用** | 较高（完整 LLM 循环） | 较低（仅返回 stdout） |
-| **用户交互** | 无（子智能体无法澄清） | 无 |
-
-**经验法则：** 当子任务需要推理、判断或多步骤问题解决时，使用 `delegate_task`。当需要机械式数据处理或脚本化工作流时，使用 `execute_code`。
+后台委派是异步执行，但不是持久任务存储。通过 `/new` 关闭所属会话、停止进程或重启 Gateway，都可能丢弃正在运行的工作和保留记录。必须跨越 agent/Gateway 生命周期的任务，应使用 cron 或独立管理的后台进程。
 
 ## 配置
 
-```yaml
-# In ~/.hermes/config.yaml
-delegation:
-  max_iterations: 50                        # Max turns per child (default: 50)
-  # max_concurrent_children: 3              # Parallel children per batch (default: 3)
-  # max_spawn_depth: 1                      # Tree depth (1-3, default 1 = flat). Raise to 2 to allow orchestrator children to spawn leaves; 3 for three levels.
-  # orchestrator_enabled: true              # Disable to force all children to leaf role.
-  model: "google/gemini-3-flash-preview"             # Optional provider/model override
-  provider: "openrouter"                             # Optional built-in provider
-  api_mode: anthropic_messages                       # optional; auto-detected from base_url for anthropic_messages endpoints
-
-# Or use a direct custom endpoint instead of provider:
-delegation:
-  model: "qwen2.5-coder"
-  base_url: "http://localhost:1234/v1"
-  api_key: "local-key"
-  # api_mode: "anthropic_messages"  # Optional. Wire protocol override for base_url ("chat_completions", "codex_responses", or "anthropic_messages"). Empty = auto-detect from URL (e.g. /anthropic suffix). Set explicitly for endpoints the heuristic can't classify (Azure AI Foundry, MiniMax, Zhipu GLM, LiteLLM proxies, …).
-```
-
-当 `base_url` 指向 Anthropic 兼容端点时——例如路径以 `/anthropic` 结尾、Azure Foundry Claude 路由或 MiniMax `/anthropic` 代理——`api_mode` 会被自动检测为 `anthropic_messages`，子智能体无需任何配置即可使用正确的传输格式。当自动检测结果有误时（罕见），请显式设置 `api_mode`。
-
-:::tip
-智能体会根据任务复杂度自动处理委派。你无需明确要求它进行委派——它会在合适时自行决定。
-:::
+调度时限、各类型模型/provider 覆盖、保留 TTL/容量、并发和嵌套深度都在 `~/.hermes/config.yaml` 的 `delegation` 下配置。这些由用户掌控的设置不会暴露在模型可见的工具 schema 中。详见[配置 → 委派](/user-guide/configuration#委托)。

@@ -71,22 +71,31 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
-        # toolsets is intentionally NOT exposed to the model — subagents always
-        # inherit the parent's toolsets. Letting the model name toolsets was a
-        # capability-selection surface the model should not control.
-        self.assertNotIn("toolsets", props)
-        self.assertNotIn("toolsets", props["tasks"]["items"]["properties"])
-        # max_iterations is intentionally NOT exposed to the model — it's
-        # config-authoritative via delegation.max_iterations so users get
-        # predictable budgets.
-        self.assertNotIn("max_iterations", props)
+        task_props = props["tasks"]["items"]["properties"]
+
+        # Capability, budget, and timeout policy is operator-controlled. Neither
+        # the top-level call nor a batch item may select/relax these fields.
+        hidden_policy_fields = {
+            "toolsets",
+            "max_iterations",
+            "foreground_wait_timeout_seconds",
+            "child_run_timeout_seconds",
+            "max_foreground_wait_timeout_seconds",
+            "on_foreground_wait_timeout",
+            "model",
+            "provider",
+        }
+        for field in hidden_policy_fields:
+            self.assertNotIn(field, props)
+            self.assertNotIn(field, task_props)
+
         # ACP subprocess transport is operator-controlled via config.yaml, not
-        # model-controlled via delegate_task arguments.
+        # the model-facing schema.
         self.assertNotIn("acp_command", props)
         self.assertNotIn("acp_args", props)
-        self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
-        self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
-        self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
+        self.assertNotIn("acp_command", task_props)
+        self.assertNotIn("acp_args", task_props)
+        self.assertNotIn("maxItems", props["tasks"])  # runtime-configurable limit
 
         subagent_type_schema = {
             "type": "string",
@@ -102,7 +111,9 @@ class TestDelegateRequirements(unittest.TestCase):
             "type": "boolean",
             "description": "Retain the child transcript for delegate_continue.",
         }
-        task_props = props["tasks"]["items"]["properties"]
+        self.assertEqual(props["subagent_type"]["enum"], ["Explore", "Plan", "general-purpose"])
+        self.assertEqual(props["scheduling"]["enum"], ["auto", "foreground", "background"])
+        self.assertIn("retain_session", props)
         self.assertEqual(props["subagent_type"], subagent_type_schema)
         self.assertEqual(props["scheduling"], scheduling_schema)
         self.assertEqual(props["retain_session"], retain_session_schema)
@@ -137,6 +148,11 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn(f"up to {max_children}", tasks_desc)
         # role parameter description names the spawn-depth limit.
         self.assertIn(f"max_spawn_depth={max_depth}", role_desc)
+        # One batch is one model-visible handle and one later consolidated
+        # completion, never independent handles/completions per child.
+        self.assertIn("one batch handle", desc)
+        self.assertIn("one consolidated completion", desc)
+        self.assertIn("not one handle or completion per child", desc)
         # The misleading "default 3" / "default 2" wording is gone from
         # every dynamic surface (model-facing).
         for surface in (desc, tasks_desc, role_desc):
@@ -158,6 +174,20 @@ class TestDelegateRequirements(unittest.TestCase):
         )
         self.assertIn(f"up to {_get_max_concurrent_children()}", fn["description"])
         self.assertIn(f"max_spawn_depth={_get_max_spawn_depth()}", fn["description"])
+        effective_props = fn["parameters"]["properties"]
+        effective_task_props = effective_props["tasks"]["items"]["properties"]
+        for field in {
+            "toolsets",
+            "max_iterations",
+            "foreground_wait_timeout_seconds",
+            "child_run_timeout_seconds",
+            "max_foreground_wait_timeout_seconds",
+            "on_foreground_wait_timeout",
+            "model",
+            "provider",
+        }:
+            self.assertNotIn(field, effective_props)
+            self.assertNotIn(field, effective_task_props)
 
 
 class TestChildSystemPrompt(unittest.TestCase):

@@ -1618,31 +1618,77 @@ checkpoints:
 
 ## 委托
 
-为委托工具配置子 agent 行为：
+在 `delegation` 下配置子智能体能力、调度、保留、provider 路由、并发与嵌套：
 
 ```yaml
 delegation:
-  # model: "google/gemini-3-flash-preview"  # 覆盖模型（空 = 继承父级）
-  # provider: "openrouter"                  # 覆盖 provider（空 = 继承父级）
-  # base_url: "http://localhost:1234/v1"    # 直接 OpenAI 兼容端点（优先于 provider）
-  # api_key: "local-key"                    # base_url 的 API 密钥（回退到 OPENAI_API_KEY）
-  # api_mode: ""                            # base_url 的线路协议："chat_completions"、"codex_responses" 或 "anthropic_messages"。空 = 从 URL 自动检测（例如 /anthropic 后缀 → anthropic_messages）。对启发式无法检测的非标准端点显式设置。
-  max_concurrent_children: 3                # 每批并行子 agent 数（下限 1，无上限）。也可通过 DELEGATION_MAX_CONCURRENT_CHILDREN 环境变量设置。
-  max_spawn_depth: 1                        # 委托树深度上限（1-3，截断）。1 = 扁平（默认）：父级生成无法委托的叶子。2 = 编排器子级可以生成叶子孙级。3 = 三级。
-  orchestrator_enabled: true                # 全局终止开关。为 false 时，role="orchestrator" 被忽略，每个子级无论 max_spawn_depth 如何都被强制为叶子。
+  # 共享 provider/model 默认值；省略时继承父智能体。
+  # model: "google/gemini-3-flash-preview"
+  # provider: "openrouter"
+  # base_url: "http://localhost:1234/v1"  # 直接端点，优先于 provider
+  # api_key: "local-key"
+  # api_mode: ""                          # chat_completions、codex_responses 或 anthropic_messages；空 = 自动检测
+
+  max_concurrent_children: 3              # 批次宽度与并发后台单元上限；下限 1，无硬性上限
+  max_spawn_depth: 1                      # 1 = 扁平；下限 1，无硬性上限
+  orchestrator_enabled: true              # false 会把所有子智能体强制为 leaf
+
+  # 全局后备值；下方各类型配置优先。
+  # foreground_wait_timeout_seconds: 1800
+  # child_run_timeout_seconds: 7200
+  max_foreground_wait_timeout_seconds: 7200  # 全局前台等待安全上限
+
+  retained_subagent_ttl_seconds: 3600     # 进程内保留对话的有效期
+  max_retained_subagents: 64              # 进程内保留对话的容量
+
+  agents:
+    Explore:
+      # model: "claude-haiku-4-5"          # 省略 = 使用共享/全局委派模型
+      foreground_wait_timeout_seconds: 900
+      child_run_timeout_seconds: 1800
+    Plan:
+      foreground_wait_timeout_seconds: 1800
+      child_run_timeout_seconds: 3600
+    general-purpose:
+      foreground_wait_timeout_seconds: 1800
+      child_run_timeout_seconds: 7200
+
+  # 旧版可选硬上限，纯后台任务也受它约束。
+  # child_timeout_seconds: 0               # 0 = 禁用；正值的下限为 30 秒
 ```
 
-**子 agent provider:model 覆盖：** 默认情况下，子 agent 继承父 agent 的 provider 和模型。设置 `delegation.provider` 和 `delegation.model` 将子 agent 路由到不同的 provider:model 对 —— 例如，在您的主 agent 运行昂贵推理模型时，为范围较窄的子任务使用便宜/快速的模型。
+### 调度与超时语义
 
-**直接端点覆盖：** 如果您想要明显的自定义端点路径，请设置 `delegation.base_url`、`delegation.api_key` 和 `delegation.model`。这将子 agent 直接发送到该 OpenAI 兼容端点，并优先于 `delegation.provider`。如果省略 `delegation.api_key`，Hermes 仅回退到 `OPENAI_API_KEY`。
+使用 `auto` 时，单个 `Explore` 或 `Plan` 在前台运行；`general-purpose`、模型发起的旧版通用调用以及多任务批次在后台运行。嵌套/编排委派只能同步前台执行。
 
-**线路协议（`api_mode`）：** Hermes 从 `delegation.base_url` 自动检测线路协议（例如以 `/anthropic` 结尾的路径 → `anthropic_messages`；Codex/原生 Anthropic/Kimi-coding 主机名保留其现有检测）。对于启发式无法分类的端点 —— 例如 Azure AI Foundry、MiniMax、Zhipu GLM 或前置 Anthropic 形状后端的 LiteLLM 代理 —— 请将 `delegation.api_mode` 显式设置为 `chat_completions`、`codex_responses` 或 `anthropic_messages` 之一。留空（默认）以保持自动检测。
+`foreground_wait_timeout_seconds` 与 `child_run_timeout_seconds` 是彼此独立、以配置为准的控制项：
 
-委托 provider 使用与 CLI/gateway 启动相同的凭据解析。所有配置的 provider 均受支持：`openrouter`、`nous`、`copilot`、`zai`、`kimi-coding`、`minimax`、`minimax-cn`。设置 provider 时，系统自动解析正确的基础 URL、API 密钥和 API 模式 —— 无需手动凭据连接。
+- wait timeout 决定父智能体何时停止阻塞。超时后，Hermes 会把**同一个仍在运行的 future**交给后台投递，并在完成后只发送一次结果；不会重启子智能体。
+- run timeout 限制**从前台启动**的任务。`agents.<类型>` 的值优先于全局值；两者都未设置时使用上面列出的内置 profile 默认值。
+- `max_foreground_wait_timeout_seconds` 为最终解析出的等待时限设置全局上限。
+- 纯后台任务不会自动套用 profile 的 `child_run_timeout_seconds`。只有用户显式配置旧版 `child_timeout_seconds` 时，才会额外施加独立硬上限。
 
-**优先级：** 配置中的 `delegation.base_url` → 配置中的 `delegation.provider` → 父 provider（继承）。配置中的 `delegation.model` → 父模型（继承）。仅设置 `model` 而不设置 `provider` 仅更改模型名称，同时保留父级凭据（适用于在同一 provider（如 OpenRouter）内切换模型）。
+这些超时字段不会出现在模型可见的 `delegate_task` 或 `delegate_continue` schema 中，模型不能选择或放宽它们。前台等待超时固定采用后台接管，不存在可配置的超时动作。
 
-**宽度和深度：** `max_concurrent_children` 限制每批并行运行的子 agent 数量（默认 `3`，下限 1，无上限）。也可通过 `DELEGATION_MAX_CONCURRENT_CHILDREN` 环境变量设置。当模型提交的 `tasks` 数组超过上限时，`delegate_task` 返回工具错误解释限制，而不是静默截断。`max_spawn_depth` 控制委托树深度（截断到 1-3）。在默认 `1` 时，委托是扁平的：子级无法生成孙级，传递 `role="orchestrator"` 静默降级为 `leaf`。提升到 `2` 使编排器子级可以生成叶子孙级；`3` 用于三级树。Agent 通过 `role="orchestrator"` 按调用选择编排；`orchestrator_enabled: false` 强制每个子级回到叶子，无论如何。成本呈乘法增长 —— 在 `max_spawn_depth: 3` 和 `max_concurrent_children: 3` 时，树可以达到 3×3×3 = 27 个并发叶子 agent。使用模式请参阅[子 Agent 委托 → 深度限制和嵌套编排](features/delegation.md#depth-limit-and-nested-orchestration)。
+### 保留子智能体
+
+`retained_subagent_ttl_seconds` 和 `max_retained_subagents` 限制短期、进程内的续接存储。`general-purpose` 只在任务成功完成、父会话 ID 非空且容量足够时默认保留；`Explore` 和 `Plan` 默认一次性使用，除非调用显式设置 `retain_session=true`。
+
+保留记录只能由同一个父会话使用；同一个 `agent_id` 同时只能有一个续接任务；Gateway 或进程重启后记录会丢失。无状态请求或父会话 ID 为空时不会返回可续接 ID。`delegate_continue` 会保留原类型、角色、工作区提示、模型/provider 元数据和能力上限，不能更改工具、角色、类型或超时配置。
+
+### Provider 与模型路由
+
+默认情况下，子智能体继承父智能体的 provider 和模型。共享的 `delegation.provider`/`delegation.model` 可以覆盖默认值；`delegation.agents.<类型>.provider`/`model` 可以只覆盖某个内置类型。仅设置 `model` 时，会继续使用所选 provider 的凭据。
+
+使用直接端点时，设置 `delegation.base_url`、`delegation.api_key` 和 `delegation.model`。直接端点优先于 `delegation.provider`；省略 `api_key` 时，Hermes 只回退到 `OPENAI_API_KEY`。`api_mode` 可设为 `chat_completions`、`codex_responses` 或 `anthropic_messages`；留空时按 URL/provider 自动检测。
+
+保留记录不会存储凭据或自定义 `base_url`。续接时会从当前可信配置重新解析凭据，因此配置变化后不能保证精确复现旧的自定义端点。
+
+### 宽度与深度
+
+`max_concurrent_children` 同时限制单个批次中的任务数和并发后台委派单元数（默认 `3`，下限 `1`，无硬性上限）。环境变量 `DELEGATION_MAX_CONCURRENT_CHILDREN` 可以覆盖它。超出上限的批次会返回明确错误，不会被截断。一个成功接收的批次只占一个后台单元、返回一个 handle，并在稍后注入一次汇总结果。
+
+`max_spawn_depth` 默认 `1`（扁平），下限为 `1`，没有硬性上限。设为 `2` 可让旧版通用编排者子智能体生成叶子子智能体；三个内置类型都不允许使用编排者角色。`orchestrator_enabled: false` 会强制所有子智能体变成 leaf。每增加一层都可能成倍增加费用和并发量，请谨慎提高。参见[子智能体委派 → 嵌套编排](features/delegation.md#嵌套编排)。
 
 ## 澄清
 

@@ -1906,31 +1906,77 @@ checkpoints:
 
 ## Delegation
 
-Configure subagent behavior for the delegate tool:
+Configure child capabilities, scheduling, retention, provider routing, concurrency, and nesting under `delegation`:
 
 ```yaml
 delegation:
-  # model: "google/gemini-3-flash-preview"  # Override model (empty = inherit parent)
-  # provider: "openrouter"                  # Override provider (empty = inherit parent)
-  # base_url: "http://localhost:1234/v1"    # Direct OpenAI-compatible endpoint (takes precedence over provider)
-  # api_key: "local-key"                    # API key for base_url (falls back to OPENAI_API_KEY)
-  # api_mode: ""                            # Wire protocol for base_url: "chat_completions", "codex_responses", or "anthropic_messages". Empty = auto-detect from URL (e.g. /anthropic suffix → anthropic_messages). Set explicitly for non-standard endpoints the heuristic can't detect.
-  max_concurrent_children: 3                # Parallel children per batch (floor 1, no ceiling). Also via DELEGATION_MAX_CONCURRENT_CHILDREN env var.
-  max_spawn_depth: 1                        # Delegation tree depth cap (1-3, clamped). 1 = flat (default): parent spawns leaves that cannot delegate. 2 = orchestrator children can spawn leaf grandchildren. 3 = three levels.
-  orchestrator_enabled: true                # Global kill switch. When false, role="orchestrator" is ignored and every child is forced to leaf regardless of max_spawn_depth.
+  # Shared provider/model defaults. Omitted values inherit from the parent.
+  # model: "google/gemini-3-flash-preview"
+  # provider: "openrouter"
+  # base_url: "http://localhost:1234/v1"  # Direct endpoint; takes precedence over provider
+  # api_key: "local-key"
+  # api_mode: ""                          # chat_completions, codex_responses, or anthropic_messages; empty = auto-detect
+
+  max_concurrent_children: 3              # Batch width and concurrent background-unit cap; floor 1, no ceiling
+  max_spawn_depth: 1                      # 1 = flat; floor 1, no ceiling
+  orchestrator_enabled: true              # false forces every child to leaf
+
+  # Global fallbacks. Per-agent values below take precedence.
+  # foreground_wait_timeout_seconds: 1800
+  # child_run_timeout_seconds: 7200
+  max_foreground_wait_timeout_seconds: 7200  # Global safety ceiling for foreground waiting
+
+  retained_subagent_ttl_seconds: 3600     # In-process retained transcript lifetime
+  max_retained_subagents: 64              # In-process retained transcript capacity
+
+  agents:
+    Explore:
+      # model: "claude-haiku-4-5"          # Omitted = shared/global delegation model
+      foreground_wait_timeout_seconds: 900
+      child_run_timeout_seconds: 1800
+    Plan:
+      foreground_wait_timeout_seconds: 1800
+      child_run_timeout_seconds: 3600
+    general-purpose:
+      foreground_wait_timeout_seconds: 1800
+      child_run_timeout_seconds: 7200
+
+  # Older optional hard cap for every child, including pure background work.
+  # child_timeout_seconds: 0               # 0 = disabled; positive values have a 30-second floor
 ```
 
-**Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
+### Scheduling and timeout semantics
 
-**Direct endpoint override:** If you want the obvious custom-endpoint path, set `delegation.base_url`, `delegation.api_key`, and `delegation.model`. That sends subagents directly to that OpenAI-compatible endpoint and takes precedence over `delegation.provider`. If `delegation.api_key` is omitted, Hermes falls back to `OPENAI_API_KEY` only.
+A single `Explore` or `Plan` task uses foreground scheduling under `auto`; `general-purpose`, model-originated legacy generic calls, and multi-task batches use background scheduling. Nested/orchestrator delegation is synchronous and foreground-only.
 
-**Wire protocol (`api_mode`):** Hermes auto-detects the wire protocol from `delegation.base_url` (e.g. paths ending in `/anthropic` → `anthropic_messages`; Codex / native Anthropic / Kimi-coding hostnames keep their existing detection). For endpoints the heuristic can't classify — for example Azure AI Foundry, MiniMax, Zhipu GLM, or LiteLLM proxies fronting an Anthropic-shaped backend — set `delegation.api_mode` explicitly to one of `chat_completions`, `codex_responses`, or `anthropic_messages`. Leave it empty (the default) to keep auto-detection.
+`foreground_wait_timeout_seconds` and `child_run_timeout_seconds` are independent, config-authoritative controls:
 
-The delegation provider uses the same credential resolution as CLI/gateway startup. All configured providers are supported: `openrouter`, `nous`, `copilot`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`. When a provider is set, the system automatically resolves the correct base URL, API key, and API mode — no manual credential wiring needed.
+- The wait timeout determines when the parent stops blocking. If it expires, Hermes hands the **same running future** to background delivery and produces exactly one later completion; it does not restart the child.
+- The run timeout caps work that **started in foreground**. The `agents.<type>` value overrides the global value, which otherwise falls back to that built-in profile's default shown above.
+- `max_foreground_wait_timeout_seconds` caps the resolved wait timeout globally.
+- Pure background jobs do not receive the profile `child_run_timeout_seconds` as a blanket cap. The older, explicitly configured `child_timeout_seconds` remains a separate opt-in hard cap.
 
-**Precedence:** `delegation.base_url` in config → `delegation.provider` in config → parent provider (inherited). `delegation.model` in config → parent model (inherited). Setting just `model` without `provider` changes only the model name while keeping the parent's credentials (useful for switching models within the same provider like OpenRouter).
+These timeout keys are deliberately absent from the model-facing `delegate_task` and `delegate_continue` schemas. The model cannot choose or relax them. Foreground-wait expiry always uses background handoff; there is no configurable timeout action.
 
-**Width and depth:** `max_concurrent_children` caps how many subagents run in parallel per batch (default `3`, floor of 1, no ceiling). Can also be set via the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var. When the model submits a `tasks` array longer than the cap, `delegate_task` returns a tool error explaining the limit rather than silently truncating. `max_spawn_depth` controls the delegation tree depth (clamped to 1-3). At the default `1`, delegation is flat: children cannot spawn grandchildren, and passing `role="orchestrator"` silently degrades to `leaf`. Raise to `2` so orchestrator children can spawn leaf grandchildren; `3` for three-level trees. The agent opts into orchestration per call via `role="orchestrator"`; `orchestrator_enabled: false` forces every child back to leaf regardless. Cost scales multiplicatively — at `max_spawn_depth: 3` with `max_concurrent_children: 3`, the tree can reach 3×3×3 = 27 concurrent leaf agents. See [Subagent Delegation → Depth Limit and Nested Orchestration](features/delegation.md#depth-limit-and-nested-orchestration) for usage patterns.
+### Retained subagents
+
+`retained_subagent_ttl_seconds` and `max_retained_subagents` bound the short-lived, in-process continuation store. Completed `general-purpose` work is retained by default only when the parent session ID is nonempty and capacity is available. `Explore` and `Plan` are one-shot unless the call explicitly sets `retain_session=true`.
+
+Retention is same-parent only, permits one in-flight continuation per `agent_id`, and is lost on gateway/process restart. Stateless or empty-session requests do not receive resumable IDs. `delegate_continue` preserves the original type, role, workspace hint, model/provider metadata, and capability ceiling; it cannot change tools, role, type, or timeout configuration.
+
+### Provider and model routing
+
+By default, subagents inherit the parent agent's provider and model. Shared `delegation.provider`/`delegation.model` values override that default; `delegation.agents.<type>.provider`/`model` can override one built-in type. Setting only `model` keeps the selected provider's credentials.
+
+For a direct endpoint, set `delegation.base_url`, `delegation.api_key`, and `delegation.model`. A direct endpoint takes precedence over `delegation.provider`; if `api_key` is omitted, Hermes falls back to `OPENAI_API_KEY`. `api_mode` may be `chat_completions`, `codex_responses`, or `anthropic_messages`; leaving it empty enables URL/provider detection.
+
+Retained records do not store credentials or custom `base_url` values. A continuation resolves credentials again from current trusted configuration, so exact custom-endpoint fidelity after configuration changes is not guaranteed.
+
+### Width and depth
+
+`max_concurrent_children` caps both tasks in one batch and concurrent background delegation units (default `3`, floor `1`, no ceiling). `DELEGATION_MAX_CONCURRENT_CHILDREN` is the environment-variable override. Oversized batches fail with a clear error rather than being truncated. One accepted batch consumes one background unit, returns one handle, and later injects one consolidated result.
+
+`max_spawn_depth` defaults to `1` (flat), has a floor of `1`, and has no hard upper ceiling. Raise it to `2` to allow a legacy generic orchestrator child to spawn leaves. The three built-in types do not permit the orchestrator role. `orchestrator_enabled: false` forces every child to leaf. Each additional level can multiply cost and concurrency; raise it deliberately. See [Subagent Delegation → Nested orchestration](features/delegation.md#nested-orchestration).
 
 ## Clarify
 

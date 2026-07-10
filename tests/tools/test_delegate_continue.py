@@ -189,7 +189,21 @@ def test_delegate_continue_schema_is_narrow_and_registered():
 
     props = DELEGATE_CONTINUE_SCHEMA["parameters"]["properties"]
     assert set(props) == {"agent_id", "prompt", "scheduling"}
-    for forbidden in {"subagent_type", "role", "toolsets", "max_iterations", "timeout", "retain_session"}:
+    assert props["scheduling"]["enum"] == ["auto", "foreground", "background"]
+    for forbidden in {
+        "subagent_type",
+        "role",
+        "toolsets",
+        "model",
+        "provider",
+        "max_iterations",
+        "timeout",
+        "foreground_wait_timeout_seconds",
+        "child_run_timeout_seconds",
+        "max_foreground_wait_timeout_seconds",
+        "on_foreground_wait_timeout",
+        "retain_session",
+    }:
         assert forbidden not in props
     assert DELEGATE_CONTINUE_SCHEMA["parameters"]["required"] == ["agent_id", "prompt"]
     assert "delegate_continue" in TOOLSETS["delegation"]["tools"]
