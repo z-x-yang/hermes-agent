@@ -60,6 +60,16 @@ def _schema_and_meta(path) -> tuple[list[tuple], list[tuple]]:
         conn.close()
 
 
+def _replace_v2_table(path, table: str, sql: str) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(sql)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def test_new_empty_db_uses_v2_without_content_shadows(tmp_path):
     db = SessionDB(tmp_path / "new.db")
     try:
@@ -225,3 +235,123 @@ def test_v2_wrong_owner_trigger_is_inconsistent(tmp_path):
         assert detect_fts_schema(db._conn) == "inconsistent"
     finally:
         db.close()
+
+
+@pytest.mark.parametrize(
+    ("table", "sql"),
+    [
+        (
+            "messages_fts",
+            "CREATE VIRTUAL TABLE messages_fts USING fts5("
+            "content, content='messages_fts_unicode_content_v2')",
+        ),
+        (
+            "messages_fts",
+            "CREATE VIRTUAL TABLE messages_fts USING fts5("
+            "content, content='messages_fts_unicode_content_v2', "
+            "content_rowid='wrong_id')",
+        ),
+        (
+            "messages_fts",
+            "CREATE VIRTUAL TABLE messages_fts USING fts5("
+            "content, content_rowid='id')",
+        ),
+        (
+            "messages_fts",
+            "CREATE VIRTUAL TABLE messages_fts USING fts5("
+            "content, content='wrong_unicode_owner', content_rowid='id')",
+        ),
+        (
+            "messages_fts_trigram",
+            "CREATE VIRTUAL TABLE messages_fts_trigram USING fts5("
+            "content, content='messages_fts_trigram_content_v2', tokenize='trigram')",
+        ),
+        (
+            "messages_fts_trigram",
+            "CREATE VIRTUAL TABLE messages_fts_trigram USING fts5("
+            "content, content='messages_fts_trigram_content_v2', "
+            "content_rowid='wrong_id', tokenize='trigram')",
+        ),
+        (
+            "messages_fts_trigram",
+            "CREATE VIRTUAL TABLE messages_fts_trigram USING fts5("
+            "content, content='messages_fts_trigram_content_v2', content_rowid='id')",
+        ),
+        (
+            "messages_fts_trigram",
+            "CREATE VIRTUAL TABLE messages_fts_trigram USING fts5("
+            "content, content='messages_fts_trigram_content_v2', "
+            "content_rowid='id', tokenize='unicode61')",
+        ),
+        (
+            "messages_fts_trigram",
+            "CREATE VIRTUAL TABLE messages_fts_trigram USING fts5("
+            "content, content_rowid='id', tokenize='trigram')",
+        ),
+        (
+            "messages_fts_trigram",
+            "CREATE VIRTUAL TABLE messages_fts_trigram USING fts5("
+            "content, content='wrong_trigram_owner', "
+            "content_rowid='id', tokenize='trigram')",
+        ),
+    ],
+    ids=[
+        "unicode-missing-content-rowid",
+        "unicode-wrong-content-rowid",
+        "unicode-missing-owner",
+        "unicode-wrong-owner",
+        "trigram-missing-content-rowid",
+        "trigram-wrong-content-rowid",
+        "trigram-missing-tokenizer",
+        "trigram-wrong-tokenizer",
+        "trigram-missing-owner",
+        "trigram-wrong-owner",
+    ],
+)
+def test_malformed_v2_table_fails_closed_without_startup_writes(
+    tmp_path, table, sql
+):
+    path = tmp_path / "malformed-v2-table.db"
+    SessionDB(path).close()
+    _replace_v2_table(path, table, sql)
+
+    conn = sqlite3.connect(path)
+    try:
+        assert detect_fts_schema(conn) == "inconsistent"
+    finally:
+        conn.close()
+
+    before = _schema_and_meta(path)
+    with pytest.raises(RuntimeError, match="inconsistent FTS schema"):
+        SessionDB(path)
+    assert _schema_and_meta(path) == before
+
+
+def test_v2_table_detection_accepts_normalized_quoting_and_whitespace(tmp_path):
+    path = tmp_path / "quoted-v2-table.db"
+    SessionDB(path).close()
+    _replace_v2_table(
+        path,
+        "messages_fts",
+        '''CREATE VIRTUAL TABLE messages_fts USING fts5(
+               content,
+               content = "messages_fts_unicode_content_v2",
+               content_rowid = "id"
+           )''',
+    )
+    _replace_v2_table(
+        path,
+        "messages_fts_trigram",
+        '''CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(
+               content,
+               content = "messages_fts_trigram_content_v2",
+               content_rowid = "id",
+               tokenize = "trigram"
+           )''',
+    )
+
+    conn = sqlite3.connect(path)
+    try:
+        assert detect_fts_schema(conn) == "v2_external"
+    finally:
+        conn.close()

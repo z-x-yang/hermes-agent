@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from typing import Literal
 
@@ -139,6 +140,35 @@ def _marker(conn: sqlite3.Connection) -> str | None:
     return None if row is None else str(row[0])
 
 
+_FTS5_OPTION_RE = re.compile(
+    r"\b(?P<key>content_rowid|content|tokenize)\s*=\s*"
+    r"(?P<value>'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|"
+    r"\[(?:]]|[^]])*\]|[^,\s)]+)",
+    re.IGNORECASE,
+)
+
+
+def _fts5_options(sql: str) -> dict[str, str] | None:
+    """Return normalized FTS5 options, independent of SQL quoting/spacing."""
+    if re.search(r"\busing\s+fts5\s*\(", sql, re.IGNORECASE) is None:
+        return None
+    options: dict[str, str] = {}
+    for match in _FTS5_OPTION_RE.finditer(sql):
+        key = match.group("key").lower()
+        if key in options:
+            return None
+        value = match.group("value").strip()
+        if value[:1] in {"'", '"', "`", "["}:
+            closing = "]" if value[0] == "[" else value[0]
+            if not value.endswith(closing):
+                return None
+            value = value[1:-1]
+            if closing != "]":
+                value = value.replace(closing * 2, closing)
+        options[key] = value.lower()
+    return options
+
+
 def detect_fts_schema(conn: sqlite3.Connection) -> FtsSchemaKind:
     """Purely classify FTS ownership; contradictions are never guessed."""
     objects = _master(conn)
@@ -157,17 +187,29 @@ def detect_fts_schema(conn: sqlite3.Connection) -> FtsSchemaKind:
     trigram = objects.get("messages_fts_trigram")
     unicode_view = objects.get("messages_fts_unicode_content_v2")
     trigram_view = objects.get("messages_fts_trigram_content_v2")
-    if base is None:
+    if base is None or base[0] != "table":
+        return "inconsistent"
+    if trigram is not None and trigram[0] != "table":
         return "inconsistent"
 
-    base_sql = "".join(base[1].lower().replace('"', "'").split())
-    trigram_sql = (
-        "" if trigram is None else "".join(trigram[1].lower().replace('"', "'").split())
+    base_options = _fts5_options(base[1])
+    trigram_options = None if trigram is None else _fts5_options(trigram[1])
+    if base_options is None or (trigram is not None and trigram_options is None):
+        return "inconsistent"
+    base_has_external = "content" in base_options
+    trigram_has_external = (
+        trigram_options is not None and "content" in trigram_options
     )
-    base_has_external = "content=" in base_sql
-    trigram_has_external = "content=" in trigram_sql
-    base_external = "content='messages_fts_unicode_content_v2'" in base_sql
-    trigram_external = "content='messages_fts_trigram_content_v2'" in trigram_sql
+    base_external = (
+        base_options.get("content") == "messages_fts_unicode_content_v2"
+        and base_options.get("content_rowid") == "id"
+    )
+    trigram_external = (
+        trigram_options is not None
+        and trigram_options.get("content") == "messages_fts_trigram_content_v2"
+        and trigram_options.get("content_rowid") == "id"
+        and trigram_options.get("tokenize") == "trigram"
+    )
     views_valid = (
         unicode_view is not None
         and unicode_view[0] == "view"
