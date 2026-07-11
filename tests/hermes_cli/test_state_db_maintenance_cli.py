@@ -4,9 +4,15 @@ import io
 import sys
 import types
 
+import pytest
+
 from hermes_cli.console_engine import HermesConsoleEngine
 from hermes_state import SessionDB
-from state_db_maintenance import MaintenanceJournal, write_maintenance_journal
+from state_db_maintenance import (
+    MaintenanceBlockedError,
+    MaintenanceJournal,
+    write_maintenance_journal,
+)
 
 
 def test_sessions_repair_fails_closed_during_active_maintenance(tmp_path, monkeypatch):
@@ -36,9 +42,11 @@ def test_main_sessions_repair_prints_recovery_instructions(tmp_path, monkeypatch
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
     monkeypatch.setattr(sys, "argv", ["hermes", "sessions", "repair"])
 
-    main_mod.main()
+    with pytest.raises(SystemExit) as exc_info:
+        main_mod.main()
 
     output = capsys.readouterr().out
+    assert exc_info.value.code == 1
     assert "write blocked by active maintenance" in output
     assert "fts-status" in output
 
@@ -91,3 +99,46 @@ def test_doctor_fix_is_read_only_and_actionable_during_maintenance(
         and kwargs.get("uri") is True
         for database, kwargs in state_db_connects
     )
+
+
+def test_doctor_preserves_read_only_corruption_reason_during_maintenance(
+    tmp_path, monkeypatch
+):
+    import hermes_state
+    from hermes_cli import doctor as doctor_mod
+
+    home = tmp_path / ".hermes"
+    project = tmp_path / "project"
+    home.mkdir()
+    project.mkdir()
+    (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
+    db_path = home / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.close()
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *args, **kwargs: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    def blocked_write_probe(path, *, write_probe=True):
+        assert path == db_path
+        if write_probe:
+            raise MaintenanceBlockedError(
+                "write blocked by active maintenance; run fts-status"
+            )
+        return "readonly-corruption-evidence"
+
+    monkeypatch.setattr(hermes_state, "_db_opens_cleanly", blocked_write_probe)
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        doctor_mod.run_doctor(Namespace(fix=False, ack=None))
+
+    rendered = output.getvalue()
+    assert "readonly-corruption-evidence" in rendered
+    assert "fails a read-only health check" in rendered
+    assert "fails a write-health probe" not in rendered
