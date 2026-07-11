@@ -21,8 +21,14 @@ import pytest
 import hermes_state
 from hermes_state import (
     SessionDB,
+    _db_opens_cleanly,
     is_malformed_db_error,
     repair_state_db_schema,
+)
+from state_db_maintenance import (
+    MaintenanceBlockedError,
+    MaintenanceJournal,
+    write_maintenance_journal,
 )
 
 
@@ -51,6 +57,63 @@ def _corrupt_duplicate_fts(db_path: Path) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def test_active_maintenance_blocks_direct_health_probe_and_repair(tmp_path):
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    write_maintenance_journal(db_path, MaintenanceJournal.new("op-1", db_path))
+
+    with pytest.raises(MaintenanceBlockedError, match="fts-status"):
+        _db_opens_cleanly(db_path)
+    with pytest.raises(MaintenanceBlockedError, match="fts-status"):
+        repair_state_db_schema(db_path)
+
+
+def test_active_maintenance_blocks_sessiondb_before_writable_connect(tmp_path):
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    write_maintenance_journal(db_path, MaintenanceJournal.new("op-1", db_path))
+
+    with pytest.raises(MaintenanceBlockedError, match="fts-status"):
+        SessionDB(db_path=db_path)
+
+
+def test_read_only_health_probe_uses_query_only_uri_during_maintenance(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    write_maintenance_journal(db_path, MaintenanceJournal.new("op-1", db_path))
+    real_connect = sqlite3.connect
+    calls = []
+    statements = []
+
+    class RecordingConnection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, statement, *args, **kwargs):
+            statements.append(statement)
+            return self._connection.execute(statement, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    def recording_connect(database, *args, **kwargs):
+        calls.append((database, kwargs.copy()))
+        return RecordingConnection(real_connect(database, *args, **kwargs))
+
+    monkeypatch.setattr(hermes_state.sqlite3, "connect", recording_connect)
+
+    assert _db_opens_cleanly(db_path, write_probe=False) is None
+    assert calls == [(f"file:{db_path}?mode=ro", {"uri": True, "isolation_level": None})]
+    assert statements[0] == "PRAGMA query_only=ON"
+    assert not any(
+        token in statement.upper()
+        for statement in statements
+        for token in ("INSERT", "BEGIN", "CHECKPOINT", "VACUUM")
+    )
 
 
 def test_duplicate_fts_makes_every_statement_fail(tmp_path):
@@ -175,7 +238,7 @@ def test_strategy_b_rebuild_when_dedup_insufficient(tmp_path, monkeypatch):
     real_check = hermes_state._db_opens_cleanly
     calls = {"n": 0}
 
-    def flaky_check(path):
+    def flaky_check(path, **kwargs):
         calls["n"] += 1
         try:
             probe = sqlite3.connect(str(path))

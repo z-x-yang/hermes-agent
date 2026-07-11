@@ -13481,12 +13481,17 @@ def main():
                 _db_opens_cleanly,
                 repair_state_db_schema,
             )
+            from state_db_maintenance import MaintenanceBlockedError
 
             db_path = DEFAULT_DB_PATH
             if not db_path.exists():
                 print(f"No session database at {db_path} (nothing to repair).")
                 return
-            reason = _db_opens_cleanly(db_path)
+            try:
+                reason = _db_opens_cleanly(db_path)
+            except MaintenanceBlockedError as exc:
+                print(f"✗ {exc}")
+                return
             if reason is None:
                 print(f"✓ {db_path} opens cleanly — no repair needed.")
                 return
@@ -13494,9 +13499,13 @@ def main():
             if getattr(args, "check_only", False):
                 return
             print("Repairing (a backup copy is made first)…")
-            report = repair_state_db_schema(
-                db_path, backup=not getattr(args, "no_backup", False)
-            )
+            try:
+                report = repair_state_db_schema(
+                    db_path, backup=not getattr(args, "no_backup", False)
+                )
+            except MaintenanceBlockedError as exc:
+                print(f"✗ {exc}")
+                return
             if report.get("repaired"):
                 if report.get("backup_path"):
                     print(f"  backup: {report['backup_path']}")

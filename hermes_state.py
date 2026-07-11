@@ -27,6 +27,10 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
+from state_db_maintenance import (
+    MaintenancePermit,
+    assert_state_db_maintenance_access,
+)
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -497,7 +501,12 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
         return None
 
 
-def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+def _db_opens_cleanly(
+    db_path: Path,
+    *,
+    write_probe: bool = True,
+    permit: MaintenancePermit | None = None,
+) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
     Runs the same first-statement (``PRAGMA journal_mode``) that trips the
@@ -508,14 +517,29 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
     through the FTS triggers — is reported as unhealthy rather than slipping
     past as a false "ok" (#50502).
     """
-    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    db_path = Path(db_path)
+    assert_state_db_maintenance_access(
+        db_path, write_capable=write_probe, permit=permit
+    )
+    if write_probe:
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+    else:
+        conn = sqlite3.connect(
+            f"file:{db_path}?mode=ro", uri=True, isolation_level=None
+        )
     try:
-        conn.execute("PRAGMA journal_mode").fetchone()
+        if write_probe:
+            conn.execute("PRAGMA journal_mode").fetchone()
+        else:
+            conn.execute("PRAGMA query_only=ON")
         rows = conn.execute("PRAGMA integrity_check").fetchall()
         problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
         if problems:
             return "; ".join(problems[:3])
         conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
+
+        if not write_probe:
+            return None
 
         # FTS write probe: drive a row through the messages_fts* triggers in a
         # transaction that is always rolled back, so a corrupt FTS index that
@@ -553,7 +577,12 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         conn.close()
 
 
-def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
+def repair_state_db_schema(
+    db_path: Path,
+    *,
+    backup: bool = True,
+    permit: MaintenancePermit | None = None,
+) -> Dict[str, Any]:
     """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
     FTS indexes reject writes.
 
@@ -580,6 +609,9 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     Returns a report dict: ``{repaired: bool, strategy: str|None,
     backup_path: str|None, error: str|None}``.
     """
+    db_path = Path(db_path)
+    assert_state_db_maintenance_access(db_path, write_capable=True, permit=permit)
+
     report: Dict[str, Any] = {
         "repaired": False,
         "strategy": None,
@@ -587,12 +619,11 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         "error": None,
     }
 
-    db_path = Path(db_path)
     if not db_path.exists():
         report["error"] = f"{db_path} does not exist"
         return report
 
-    if _db_opens_cleanly(db_path) is None:
+    if _db_opens_cleanly(db_path, permit=permit) is None:
         report["repaired"] = True
         report["strategy"] = "already_healthy"
         return report
@@ -618,7 +649,7 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
                     continue
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly(db_path, permit=permit) is None:
             report["repaired"] = True
             report["strategy"] = "rebuild_fts"
             logger.warning(
@@ -648,7 +679,7 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             conn.commit()
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly(db_path, permit=permit) is None:
             report["repaired"] = True
             report["strategy"] = "dedup_schema"
             logger.warning(
@@ -670,7 +701,7 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             conn.execute("VACUUM")
         finally:
             conn.close()
-        reason = _db_opens_cleanly(db_path)
+        reason = _db_opens_cleanly(db_path, permit=permit)
         if reason is None:
             report["repaired"] = True
             report["strategy"] = "drop_fts_rebuild"
@@ -907,6 +938,9 @@ class SessionDB:
         self._conn = None
         try:
             if read_only:
+                assert_state_db_maintenance_access(
+                    self.db_path, write_capable=False
+                )
                 # Read-only attach for cross-profile aggregation: SELECT-only,
                 # so we skip schema init entirely (no DDL, no FTS probe, no
                 # column reconcile). Crucially this takes NO write lock, so
@@ -925,6 +959,9 @@ class SessionDB:
                 self._conn.row_factory = sqlite3.Row
                 return
 
+            assert_state_db_maintenance_access(
+                self.db_path, write_capable=True
+            )
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
             def _connect_and_init():

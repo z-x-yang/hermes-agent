@@ -1223,20 +1223,33 @@ def run_doctor(args):
     if state_db_path.exists():
         try:
             import sqlite3
-            conn = sqlite3.connect(str(state_db_path))
-            cursor = conn.execute("SELECT COUNT(*) FROM sessions")
-            count = cursor.fetchone()[0]
-            conn.close()
+            from hermes_state import _db_opens_cleanly, repair_state_db_schema
+            from state_db_maintenance import MaintenanceBlockedError
+
+            conn = sqlite3.connect(f"file:{state_db_path}?mode=ro", uri=True)
+            try:
+                conn.execute("PRAGMA query_only=ON")
+                count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+            finally:
+                conn.close()
             check_ok(f"{_DHH}/state.db exists ({count} sessions)")
 
-            # FTS write-health probe (#50502): `SELECT COUNT(*)` above succeeds
-            # even when the FTS index is corrupt and every message write fails
-            # through the triggers. `_db_opens_cleanly` now drives a rolled-back
-            # write so this otherwise-silent corruption class is surfaced (and
-            # repaired in place with --fix).
-            from hermes_state import _db_opens_cleanly, repair_state_db_schema
+            # Keep doctor diagnostics read-only while a nonterminal maintenance
+            # journal owns the database. Outside maintenance, retain the write
+            # probe that detects FTS corruption invisible to base-table reads.
+            try:
+                _write_reason = _db_opens_cleanly(state_db_path)
+            except MaintenanceBlockedError as maintenance_error:
+                _write_reason = _db_opens_cleanly(
+                    state_db_path, write_probe=False
+                )
+                check_warn(
+                    "state.db write diagnostics/fixes blocked by active maintenance",
+                    f"({maintenance_error})",
+                )
+                issues.append(str(maintenance_error))
+                _write_reason = None
 
-            _write_reason = _db_opens_cleanly(state_db_path)
             if _write_reason is not None:
                 check_warn(
                     f"{_DHH}/state.db fails a write-health probe (FTS index may be corrupt)",
@@ -1281,34 +1294,45 @@ def run_doctor(args):
                     f"({e})",
                 )
                 if should_fix:
-                    report = repair_state_db_schema(state_db_path)
-                    if report.get("repaired"):
-                        try:
-                            conn = sqlite3.connect(str(state_db_path))
-                            count = conn.execute(
-                                "SELECT COUNT(*) FROM sessions"
-                            ).fetchone()[0]
-                            conn.close()
-                        except Exception:
-                            count = "?"
-                        backup_name = (
-                            Path(report["backup_path"]).name
-                            if report.get("backup_path") else "n/a"
-                        )
-                        check_ok(
-                            f"Repaired state.db schema ({count} sessions recovered)",
-                            f"(strategy: {report.get('strategy')}; backup: {backup_name})",
-                        )
-                        fixed_count += 1
-                    else:
+                    try:
+                        report = repair_state_db_schema(state_db_path)
+                    except MaintenanceBlockedError as maintenance_error:
                         check_warn(
-                            "state.db schema repair did not recover automatically",
-                            f"({report.get('error')}; backup: {report.get('backup_path')})",
+                            "state.db schema repair blocked by active maintenance",
+                            f"({maintenance_error})",
                         )
-                        issues.append(
-                            "state.db schema malformed and auto-repair failed — "
-                            "restore from the backup copy beside state.db"
-                        )
+                        issues.append(str(maintenance_error))
+                    else:
+                        if report.get("repaired"):
+                            try:
+                                conn = sqlite3.connect(
+                                    f"file:{state_db_path}?mode=ro", uri=True
+                                )
+                                conn.execute("PRAGMA query_only=ON")
+                                count = conn.execute(
+                                    "SELECT COUNT(*) FROM sessions"
+                                ).fetchone()[0]
+                                conn.close()
+                            except Exception:
+                                count = "?"
+                            backup_name = (
+                                Path(report["backup_path"]).name
+                                if report.get("backup_path") else "n/a"
+                            )
+                            check_ok(
+                                f"Repaired state.db schema ({count} sessions recovered)",
+                                f"(strategy: {report.get('strategy')}; backup: {backup_name})",
+                            )
+                            fixed_count += 1
+                        else:
+                            check_warn(
+                                "state.db schema repair did not recover automatically",
+                                f"({report.get('error')}; backup: {report.get('backup_path')})",
+                            )
+                            issues.append(
+                                "state.db schema malformed and auto-repair failed — "
+                                "restore from the backup copy beside state.db"
+                            )
                 else:
                     issues.append(
                         "state.db schema malformed — run 'hermes doctor --fix' "
@@ -1330,13 +1354,31 @@ def run_doctor(args):
                     "(may indicate missed checkpoints)"
                 )
                 if should_fix:
-                    import sqlite3
-                    conn = sqlite3.connect(str(state_db_path))
-                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                    conn.close()
-                    new_size = wal_path.stat().st_size if wal_path.exists() else 0
-                    check_ok(f"WAL checkpoint performed ({wal_size // 1024}K → {new_size // 1024}K)")
-                    fixed_count += 1
+                    from state_db_maintenance import (
+                        MaintenanceBlockedError,
+                        assert_state_db_maintenance_access,
+                    )
+
+                    try:
+                        assert_state_db_maintenance_access(
+                            state_db_path, write_capable=True
+                        )
+                    except MaintenanceBlockedError as exc:
+                        check_warn(
+                            "WAL checkpoint blocked by active maintenance",
+                            f"({exc})",
+                        )
+                        issues.append(str(exc))
+                    else:
+                        import sqlite3
+                        conn = sqlite3.connect(str(state_db_path))
+                        try:
+                            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        finally:
+                            conn.close()
+                        new_size = wal_path.stat().st_size if wal_path.exists() else 0
+                        check_ok(f"WAL checkpoint performed ({wal_size // 1024}K → {new_size // 1024}K)")
+                        fixed_count += 1
                 else:
                     issues.append("Large WAL file — run 'hermes doctor --fix' to checkpoint")
             elif wal_size > 10 * 1024 * 1024:  # 10 MB
