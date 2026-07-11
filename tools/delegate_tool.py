@@ -17,6 +17,7 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import inspect
 import json
 import logging
 import contextvars
@@ -92,8 +93,8 @@ def _register_context_cwd_terminal_override(task_id: str) -> bool:
     return True
 
 
-# Control-plane tools denied to leaf children. An approved orchestrator may
-# receive delegate_task only; delegate_continue and clarify remain denied.
+# Default control-plane deny set. Automatically eligible GP children may receive
+# delegate_task only; delegate_continue and clarify always remain denied.
 DELEGATE_BLOCKED_TOOLS = frozenset(
     [
         "delegate_task",
@@ -160,9 +161,8 @@ def _get_subagent_approval_callback():
         return _subagent_auto_approve
     return _subagent_auto_deny
 
-# NOTE: nested delegation is granted by role='orchestrator' (which re-adds the
-# "delegation" toolset in _build_child_agent), NOT by the model naming toolsets
-# — the model has no toolsets argument. Subagents inherit the parent's toolsets.
+# Nested delegation is derived from the GP profile, exact parent authority,
+# depth, and the operator kill switch. The model cannot request toolsets.
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
 # One-shot guard: the high-concurrency cost advisory is emitted at most once
@@ -383,21 +383,31 @@ def _looks_like_error_output(content: Any) -> bool:
     )
 
 
-def _normalize_role(r: Optional[str]) -> str:
-    """Normalise a caller-provided role to 'leaf' or 'orchestrator'.
+def _parent_exposes_tool_name(parent_agent, name: str) -> bool:
+    marker = object()
+    try:
+        static_names = inspect.getattr_static(parent_agent, "valid_tool_names", marker)
+    except Exception:
+        return False
+    if static_names is marker:
+        return False
+    return name in frozenset(
+        getattr(parent_agent, "valid_tool_names", set()) or set()
+    )
 
-    None/empty -> 'leaf'.  Unknown strings coerce to 'leaf' with a
-    warning log (matches the silent-degrade pattern of
-    _get_orchestrator_enabled).  _build_child_agent adds a second
-    degrade layer for depth/kill-switch bounds.
-    """
-    if r is None or not r:
-        return "leaf"
-    r_norm = str(r).strip().lower()
-    if r_norm in {"leaf", "orchestrator"}:
-        return r_norm
-    logger.warning("Unknown delegate_task role=%r, coercing to 'leaf'", r)
-    return "leaf"
+
+def _child_can_delegate(
+    *,
+    profile_name: str,
+    parent_agent,
+    child_depth: int,
+    max_spawn_depth: int,
+) -> bool:
+    if profile_name != DEFAULT_SUBAGENT_TYPE:
+        return False
+    if not _get_orchestrator_enabled() or child_depth >= max_spawn_depth:
+        return False
+    return _parent_exposes_tool_name(parent_agent, "delegate_task")
 
 
 def _get_max_concurrent_children() -> int:
@@ -615,11 +625,10 @@ def _get_max_spawn_depth() -> int:
     (blocked by this guard AND, for leaf children, by the delegation
     toolset strip in _strip_blocked_tools).
 
-    Raise to 2+ to unlock nested orchestration. role="orchestrator"
-    removes the toolset strip for spawning children when
-    max_spawn_depth >= 2, enabling them to spawn their own workers.
-    Like max_concurrent_children, there is no upper ceiling — but each
-    extra level multiplies API cost, so raise it deliberately.
+    Raise to 2+ to allow GP children with exact parent delegation authority
+    to spawn their own workers. Like max_concurrent_children, there is no
+    upper ceiling — but each extra level multiplies API cost, so raise it
+    deliberately.
     """
     cfg = _load_config()
     val = cfg.get("max_spawn_depth")
@@ -646,12 +655,7 @@ def _get_max_spawn_depth() -> int:
 
 
 def _get_orchestrator_enabled() -> bool:
-    """Global kill switch for the orchestrator role.
-
-    When False, role="orchestrator" is silently forced to "leaf" in
-    _build_child_agent and the delegation toolset is stripped as before.
-    Lets an operator disable the feature without a code revert.
-    """
+    """Global kill switch for automatically derived nested delegation."""
     cfg = _load_config()
     val = cfg.get("orchestrator_enabled", True)
     if isinstance(val, bool):
@@ -1292,10 +1296,6 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
-    # Per-call role controlling whether the child can further delegate.
-    # 'leaf' (default) cannot; 'orchestrator' retains the delegation
-    # toolset subject to depth/kill-switch bounds applied below.
-    role: str = "leaf",
     profile=None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
@@ -1320,37 +1320,14 @@ def _build_child_agent(
     if profile is None:
         profile = get_subagent_profile(DEFAULT_SUBAGENT_TYPE)
 
-    # ── Role resolution ─────────────────────────────────────────────────
-    # Orchestration survives only when the runtime gates, selected profile,
-    # and the parent's exact resolved tool authority all permit delegation.
-    import inspect as _inspect
-
-    _missing_parent_names = object()
-    try:
-        _static_parent_names = _inspect.getattr_static(
-            parent_agent, "valid_tool_names", _missing_parent_names
-        )
-    except Exception:
-        _static_parent_names = _missing_parent_names
-    exact_parent_names = None
-    if _static_parent_names is not _missing_parent_names:
-        exact_parent_names = frozenset(
-            getattr(parent_agent, "valid_tool_names", set()) or set()
-        )
-
     child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
     max_spawn = _get_max_spawn_depth()
-    profile_allows_delegation = profile.name == DEFAULT_SUBAGENT_TYPE
-    parent_allows_delegation = bool(
-        exact_parent_names is not None and "delegate_task" in exact_parent_names
+    allow_delegation = _child_can_delegate(
+        profile_name=profile.name,
+        parent_agent=parent_agent,
+        child_depth=child_depth,
+        max_spawn_depth=max_spawn,
     )
-    orchestrator_ok = (
-        _get_orchestrator_enabled()
-        and child_depth < max_spawn
-        and profile_allows_delegation
-        and parent_allows_delegation
-    )
-    effective_role = role if (role == "orchestrator" and orchestrator_ok) else "leaf"
 
     # ── Subagent identity (stable across events, 0-indexed for TUI) ─────
     # subagent_id is generated here so the progress callback, the
@@ -1400,9 +1377,9 @@ def _build_child_agent(
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
-    # A surviving orchestrator may reload the delegation toolset only after the
-    # parent's exact resolved authority has proved delegate_task is available.
-    if effective_role == "orchestrator" and "delegation" not in child_toolsets:
+    # Name-level availability only assembles the toolset. Exact resolved
+    # authority is intersected below by build_child_tool_policy().
+    if allow_delegation and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
     workspace_hint = workspace_path_override or _resolve_workspace_hint(parent_agent)
@@ -1410,7 +1387,7 @@ def _build_child_agent(
         governance_snapshot = load_governance_snapshot()
     child_prompt = _build_child_system_prompt(
         profile=profile,
-        allow_delegation=effective_role == "orchestrator",
+        allow_delegation=allow_delegation,
         workspace_path=workspace_hint or "",
         child_depth=child_depth,
         max_spawn_depth=max_spawn,
@@ -1628,9 +1605,9 @@ def _build_child_agent(
             profile_name=profile.name,
             profile_allowed_names=profile.allowed_tool_names,
             denied_names=(
-                DELEGATE_BLOCKED_TOOLS - {"delegate_task"}
-                if effective_role == "orchestrator"
-                else DELEGATE_BLOCKED_TOOLS
+                frozenset({"delegate_continue", "clarify"})
+                if allow_delegation
+                else frozenset({"delegate_task", "delegate_continue", "clarify"})
             ),
         ),
     )
@@ -1638,11 +1615,8 @@ def _build_child_agent(
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
-    # Set delegation depth so children can't spawn grandchildren
+    # Set delegation depth so runtime policy can bound grandchildren.
     child._delegate_depth = child_depth
-    # Stash the post-degrade role for introspection (leaf if the
-    # kill switch or depth bounded the caller's requested role).
-    child._delegate_role = effective_role
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
@@ -1699,7 +1673,6 @@ def _build_child_agent(
             parent_subagent_id=parent_subagent_id,
             child_session_id=getattr(child, "session_id", None),
             child_subagent_id=subagent_id,
-            child_role=effective_role,
             child_goal=description,
         )
     except Exception:
@@ -1770,7 +1743,7 @@ def _dump_subagent_timeout_diagnostic(
         for attr in (
             "model", "provider", "api_mode", "base_url", "max_iterations",
             "quiet_mode", "skip_memory", "skip_context_files", "platform",
-            "_delegate_role", "_delegate_depth",
+            "_delegate_depth",
         ):
             try:
                 val = getattr(child, attr, None)
@@ -2142,7 +2115,6 @@ def _run_child_conversation_with_timeout(
             "exit_reason": "timeout" if is_timeout else "error",
             "api_calls": child_api_calls,
             "duration_seconds": duration,
-            "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
         }
     finally:
@@ -2158,7 +2130,6 @@ def _run_single_child(
     child_timeout_override: Optional[float] = None,
     retain_session: Optional[bool] = None,
     subagent_type: Optional[str] = None,
-    role: Optional[str] = None,
     workspace_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -2333,7 +2304,6 @@ def _run_single_child(
                 "exit_reason": "error",
                 "api_calls": 0,
                 "duration_seconds": round(time.monotonic() - child_start, 2),
-                "_child_role": getattr(child, "_delegate_role", None),
             }
         parent_task_id = getattr(parent_agent, "_current_task_id", None)
         wall_start = time.time()
@@ -2478,10 +2448,6 @@ def _run_single_child(
                 ),
             },
             "tool_trace": tool_trace,
-            # Captured before the finally block calls child.close() so the
-            # parent thread can fire subagent_stop with the correct role.
-            # Stripped before the dict is serialised back to the model.
-            "_child_role": getattr(child, "_delegate_role", None),
             # Captured before child.close() so the parent aggregator can fold
             # the child's total spend into the parent's session cost.  Port of
             # Kilo-Org/kilocode#9448 — previously the footer only reflected the
@@ -2609,7 +2575,6 @@ def _run_single_child(
                 )
                 now_ts = time.time()
                 retained_type = subagent_type or "general-purpose"
-                retained_role = getattr(child, "_delegate_role", None) or role or "leaf"
                 retained_workspace = workspace_path or _resolve_workspace_hint(parent_agent) or ""
                 governance = getattr(child, "_governance_diagnostics", None)
                 policy = getattr(child, "_subagent_tool_policy", None)
@@ -2636,7 +2601,6 @@ def _run_single_child(
                         agent_id=str(agent_id),
                         parent_session_id=parent_session_id,
                         subagent_type=str(retained_type),
-                        role=str(retained_role),
                         workspace_path=str(retained_workspace),
                         model=str(getattr(child, "model", "") or ""),
                         provider=str(getattr(child, "provider", "") or ""),
@@ -2702,7 +2666,6 @@ def _run_single_child(
             "error": str(exc),
             "api_calls": 0,
             "duration_seconds": duration,
-            "_child_role": getattr(child, "_delegate_role", None),
         }
 
     finally:
@@ -2900,7 +2863,6 @@ def delegate_task(
             }
         )
 
-    top_role = "leaf"
     delivery_mode = "background" if runs_in_background else "foreground"
     use_async_registry = not is_subagent
     foreground_started = not runs_in_background
@@ -2941,7 +2903,6 @@ def delegate_task(
     prepared_children = []
     dispatch_model = None
     for i, t in enumerate(task_list):
-        effective_role = top_role
         effective_subagent_type = t.get("subagent_type", subagent_type)
         profile = get_subagent_profile(effective_subagent_type) if effective_subagent_type else None
         resolved_profile = (
@@ -2968,7 +2929,7 @@ def delegate_task(
             return tool_error(str(exc))
         if dispatch_model is None:
             dispatch_model = creds["model"]
-        prepared_children.append((i, t, effective_role, profile, creds))
+        prepared_children.append((i, t, profile, creds))
 
     # Save parent tool names BEFORE any child construction mutates the global.
     # _build_child_agent() calls AIAgent() which calls get_tool_definitions(),
@@ -2982,7 +2943,7 @@ def delegate_task(
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
     try:
-        for i, t, effective_role, profile, creds in prepared_children:
+        for i, t, profile, creds in prepared_children:
             child = _build_child_agent(
                 task_index=i,
                 description=t["description"],
@@ -3001,7 +2962,6 @@ def delegate_task(
                 pin_override_credential=bool(creds.get("credential_pinned", False)),
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
-                role=effective_role,
                 profile=profile,
                 governance_snapshot=governance_snapshot,
             )
@@ -3036,7 +2996,6 @@ def delegate_task(
                     None, _t.get("subagent_type", subagent_type)
                 ),
                 subagent_type=_t.get("subagent_type", subagent_type),
-                role=getattr(child, "_delegate_role", top_role),
                 workspace_path=_resolve_workspace_hint(parent_agent) or "",
             )
             results.append(result)
@@ -3065,7 +3024,6 @@ def delegate_task(
                             None, t.get("subagent_type", subagent_type)
                         ),
                         subagent_type=t.get("subagent_type", subagent_type),
-                        role=getattr(child, "_delegate_role", top_role),
                         workspace_path=_resolve_workspace_hint(parent_agent) or "",
                     )
                     futures[future] = i
@@ -3075,10 +3033,6 @@ def delegate_task(
                 # the parent blocks forever even after interrupt propagation.
                 # Instead, use wait() with a short timeout so we can bail
                 # when the parent is interrupted.
-                # Map task_index -> child agent, so fabricated entries for
-                # still-pending futures can carry the correct _delegate_role.
-                _child_by_index = {i: child for (i, _, child) in children}
-
                 pending = set(futures.keys())
                 while pending:
                     if getattr(parent_agent, "_interrupt_requested", False) is True:
@@ -3098,9 +3052,6 @@ def delegate_task(
                                         "error": str(exc),
                                         "api_calls": 0,
                                         "duration_seconds": 0,
-                                        "_child_role": getattr(
-                                            _child_by_index.get(idx), "_delegate_role", None
-                                        ),
                                     }
                             else:
                                 entry = {
@@ -3110,9 +3061,6 @@ def delegate_task(
                                     "error": "Parent agent interrupted — child did not finish in time",
                                     "api_calls": 0,
                                     "duration_seconds": 0,
-                                    "_child_role": getattr(
-                                        _child_by_index.get(idx), "_delegate_role", None
-                                    ),
                                 }
                             results.append(entry)
                             completed_count += 1
@@ -3135,9 +3083,6 @@ def delegate_task(
                                 "error": str(exc),
                                 "api_calls": 0,
                                 "duration_seconds": 0,
-                                "_child_role": getattr(
-                                    _child_by_index.get(idx), "_delegate_role", None
-                                ),
                             }
                         results.append(entry)
                         completed_count += 1
@@ -3230,7 +3175,6 @@ def delegate_task(
         # subagent_stop hook loop so we don't walk `results` twice.
         _children_cost_total = 0.0
         for entry in results:
-            child_role = entry.pop("_child_role", None)
             child_cost = entry.pop("_child_cost_usd", 0.0)
             try:
                 if child_cost:
@@ -3251,7 +3195,6 @@ def delegate_task(
                     parent_session_id=_parent_session_id,
                     parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
                     child_session_id=getattr(_child_agent, "session_id", None),
-                    child_role=child_role,
                     child_summary=entry.get("summary"),
                     child_status=entry.get("status"),
                     duration_ms=int((entry.get("duration_seconds") or 0) * 1000),
@@ -3363,7 +3306,6 @@ def delegate_task(
             # Metadata for the completion block only; subagents inherit the
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
-            role=top_role,
             model=dispatch_model,
             session_key=_session_key,
             runner=_batch_runner,

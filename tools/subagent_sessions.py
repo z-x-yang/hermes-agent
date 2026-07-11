@@ -24,7 +24,6 @@ class RetainedSubagentSession:
     agent_id: str
     parent_session_id: str
     subagent_type: str
-    role: str
     workspace_path: str
     model: str
     provider: str

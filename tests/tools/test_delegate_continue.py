@@ -94,6 +94,10 @@ def _parent(session_id: str = "parent-1", *, enabled_toolsets=None):
     return parent
 
 
+def test_retained_session_has_no_role_field():
+    assert "role" not in RetainedSubagentSession.__dataclass_fields__
+
+
 def _record(**overrides):
     now = time.time()
     from agent.subagent_governance import load_governance_snapshot
@@ -121,7 +125,6 @@ def _record(**overrides):
         "agent_id": "agent-1",
         "parent_session_id": "parent-1",
         "subagent_type": "general-purpose",
-        "role": "leaf",
         "workspace_path": "/tmp",
         "model": "model-a",
         "provider": "openrouter",
@@ -142,7 +145,6 @@ class _CompletedRetainableChild:
     session_id = "child-session"
     model = "model-a"
     provider = "openrouter"
-    _delegate_role = "leaf"
     _subagent_id = "sa-test"
     session_prompt_tokens = 0
     session_completion_tokens = 0
@@ -396,7 +398,10 @@ def test_retained_session_metadata_does_not_persist_api_keys():
     field_names = {field.name for field in dataclasses.fields(RetainedSubagentSession)}
     assert "api_key" not in field_names
     assert "secret" not in field_names
-    assert {"model", "provider", "subagent_type", "role", "workspace_path"}.issubset(field_names)
+    assert {"model", "provider", "subagent_type", "workspace_path"}.issubset(
+        field_names
+    )
+    assert "role" not in field_names
 
 
 def test_delegate_continue_schema_is_narrow_and_registered():
@@ -511,7 +516,7 @@ def test_continuation_reloads_modified_current_active_governance(monkeypatch, tm
         prompts.append(
             _build_child_system_prompt(
                 profile=kwargs["profile"],
-                allow_delegation=kwargs["role"] == "orchestrator",
+                allow_delegation=False,
                 workspace_path=kwargs["workspace_path_override"],
                 child_depth=1,
                 max_spawn_depth=1,
@@ -1638,7 +1643,7 @@ def test_build_continuation_child_preserves_explore_capability_ceiling(monkeypat
 
     monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
 
-    record = _record(subagent_type="Explore", role="leaf")
+    record = _record(subagent_type="Explore")
     child = _build_continuation_child(
         record,
         prompt="same investigation",
@@ -1653,7 +1658,7 @@ def test_build_continuation_child_preserves_explore_capability_ceiling(monkeypat
     assert "patch" not in child.valid_tool_names
     assert "terminal" not in child.valid_tool_names
     assert "delegate_continue" not in child.valid_tool_names
-    assert child._delegate_role == "leaf"
+    assert not hasattr(child, "_delegate_role")
     assert child._subagent_profile.name == "Explore"
     assert "/tmp" in child.kwargs["ephemeral_system_prompt"]
 
@@ -1745,22 +1750,22 @@ def test_build_continuation_child_intersects_exact_current_parent_tool_names(mon
         "original_has_delegate_task",
         "parent_has_delegate_task",
         "orchestrator_enabled",
-        "expected_role",
+        "expected_delegation",
     ),
     [
-        (True, True, True, "orchestrator"),
-        (False, True, True, "leaf"),
-        (True, False, True, "leaf"),
-        (True, True, False, "leaf"),
+        (True, True, True, True),
+        (False, True, True, False),
+        (True, False, True, False),
+        (True, True, False, False),
     ],
 )
-def test_orchestrator_continuation_requires_original_and_current_delegate_task(
+def test_continuation_delegation_requires_original_and_current_authority(
     monkeypatch,
     subagent_type,
     original_has_delegate_task,
     parent_has_delegate_task,
     orchestrator_enabled,
-    expected_role,
+    expected_delegation,
 ):
     from tools.delegate_continue_tool import _build_continuation_child
     from toolsets import TOOLSETS
@@ -1804,7 +1809,6 @@ def test_orchestrator_continuation_requires_original_and_current_delegate_task(
     child = _build_continuation_child(
         _record(
             subagent_type=subagent_type,
-            role="orchestrator",
             effective_allowed_tool_names=frozenset(retained_names),
         ),
         prompt="continue orchestration",
@@ -1812,9 +1816,9 @@ def test_orchestrator_continuation_requires_original_and_current_delegate_task(
     )
 
     expected_names = {"read_file"}
-    if original_has_delegate_task and parent_has_delegate_task and orchestrator_enabled:
+    if expected_delegation:
         expected_names.add("delegate_task")
-    assert child._delegate_role == expected_role
+    assert not hasattr(child, "_delegate_role")
     assert child.valid_tool_names == expected_names
     assert child._subagent_tool_policy.allowed_names == frozenset(expected_names)
     assert "delegate_continue" not in child.valid_tool_names
@@ -1893,7 +1897,6 @@ def test_run_single_child_retains_completed_general_purpose_session(monkeypatch)
         session_id = "child-session"
         model = "model-a"
         provider = "openrouter"
-        _delegate_role = "leaf"
         _subagent_id = "sa-test"
         session_prompt_tokens = 0
         session_completion_tokens = 0
@@ -1962,7 +1965,6 @@ def test_run_single_child_retains_completed_general_purpose_session(monkeypatch)
         child_timeout_override=30,
         retain_session=True,
         subagent_type="general-purpose",
-        role="leaf",
         workspace_path="/tmp/repo",
     )
 
@@ -1975,7 +1977,6 @@ def test_run_single_child_retains_completed_general_purpose_session(monkeypatch)
     assert record.files_written == ("/tmp/repo/changed.py",)
     assert record.tool_trace_metadata[0][0] == "read_file"
     assert record.subagent_type == "general-purpose"
-    assert record.role == "leaf"
     assert record.workspace_path == "/tmp/repo"
     assert record.effective_allowed_tool_names == frozenset({"read_file"})
     assert record.profile_id == governance.profile_id
@@ -2018,7 +2019,6 @@ def test_run_single_child_surfaces_retention_failure(monkeypatch):
         child_timeout_override=30,
         retain_session=True,
         subagent_type="general-purpose",
-        role="leaf",
         workspace_path="/tmp/repo",
     )
 
@@ -2073,7 +2073,6 @@ def test_initial_retained_history_projects_handle_only_tool_results(monkeypatch)
         child_timeout_override=30,
         retain_session=True,
         subagent_type="general-purpose",
-        role="leaf",
         workspace_path="/tmp/repo",
     )
 
@@ -2156,7 +2155,6 @@ def test_run_single_child_does_not_retain_without_parent_session_id(monkeypatch)
         child_timeout_override=30,
         retain_session=True,
         subagent_type="general-purpose",
-        role="leaf",
         workspace_path="/tmp/repo",
     )
 

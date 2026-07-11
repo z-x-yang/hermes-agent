@@ -26,7 +26,7 @@ DELEGATE_CONTINUE_SCHEMA = {
     "description": (
         "Continue the same retained history instead of spawning a new child when "
         "a completed delegate_task result returned an agent_id. The original "
-        "subagent type, workspace hint, model/provider metadata, role, and "
+        "subagent type, workspace hint, model/provider metadata, and "
         "capability ceiling are preserved; callers cannot choose new tools."
     ),
     "parameters": {
@@ -124,7 +124,6 @@ def _build_continuation_child(
     from tools.delegate_tool import (
         _build_child_agent,
         _load_config,
-        _normalize_role,
         _prepare_delegation_credentials_config,
         _resolve_delegation_credentials,
     )
@@ -179,17 +178,6 @@ def _build_continuation_child(
             "args": [],
         }
 
-    effective_role = _normalize_role(record.role)
-    if effective_role == "orchestrator":
-        original_names = frozenset(record.effective_allowed_tool_names)
-        current_parent_names = frozenset(
-            getattr(parent_agent, "valid_tool_names", set()) or set()
-        )
-        if not (
-            "delegate_task" in original_names
-            and "delegate_task" in current_parent_names
-        ):
-            effective_role = "leaf"
     default_max_iter = cfg.get("max_iterations")
     try:
         max_iterations = int(default_max_iter) if default_max_iter is not None else 50
@@ -218,7 +206,6 @@ def _build_continuation_child(
         pin_override_credential=bool(creds.get("credential_pinned", False)),
         override_acp_command=creds.get("command"),
         override_acp_args=creds.get("args"),
-        role=effective_role,
         profile=profile,
         workspace_path_override=record.workspace_path,
         register_with_parent=register_with_parent,
@@ -360,12 +347,11 @@ def _run_continuation_entry(
             )
             if timeout_entry is not None:
                 timeout_entry.pop("task_index", None)
-                timeout_entry.pop("_child_role", None)
                 timeout_entry["agent_id"] = record.agent_id
                 timeout_entry["model"] = getattr(child, "model", record.model)
                 timeout_entry["provider"] = getattr(child, "provider", record.provider)
                 timeout_entry["subagent_type"] = record.subagent_type
-                timeout_entry["role"] = getattr(child, "_delegate_role", record.role)
+
                 if timeout_entry.get("status") == "timeout":
                     reason = (
                         "Retained subagent session is no longer resumable after "
@@ -410,7 +396,6 @@ def _run_continuation_entry(
             "model": getattr(child, "model", record.model),
             "provider": getattr(child, "provider", record.provider),
             "subagent_type": record.subagent_type,
-            "role": getattr(child, "_delegate_role", record.role),
         }
         if status != "completed":
             entry["error"] = (result or {}).get("error") or "Subagent did not produce a response."
@@ -587,7 +572,6 @@ def delegate_continue(
             goals=[f"Continue retained subagent {record.agent_id}"],
             context=None,
             toolsets=None,
-            role=record.role,
             model=record.model,
             session_key=get_current_session_key(default=""),
             runner=_async_runner,

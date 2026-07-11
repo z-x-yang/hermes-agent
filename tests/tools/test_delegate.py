@@ -994,7 +994,6 @@ class TestSubagentCostRollup(unittest.TestCase):
                     "summary": "A",
                     "api_calls": 2,
                     "duration_seconds": 1.0,
-                    "_child_role": "leaf",
                     "_child_cost_usd": 0.15,
                 },
                 {
@@ -1003,7 +1002,6 @@ class TestSubagentCostRollup(unittest.TestCase):
                     "summary": "B",
                     "api_calls": 2,
                     "duration_seconds": 1.0,
-                    "_child_role": "leaf",
                     "_child_cost_usd": 0.27,
                 },
                 {
@@ -1013,7 +1011,6 @@ class TestSubagentCostRollup(unittest.TestCase):
                     "error": "boom",
                     "api_calls": 0,
                     "duration_seconds": 0.1,
-                    "_child_role": "leaf",
                     "_child_cost_usd": 0.03,
                 },
             ]
@@ -1047,7 +1044,6 @@ class TestSubagentCostRollup(unittest.TestCase):
                 "summary": "done",
                 "api_calls": 1,
                 "duration_seconds": 0.5,
-                "_child_role": "leaf",
                 "_child_cost_usd": 0.0,
             }
             delegate_task(description="free local run", prompt="free local run", parent_agent=parent, run_in_background=False)
@@ -1069,7 +1065,6 @@ class TestSubagentCostRollup(unittest.TestCase):
                 "summary": "done",
                 "api_calls": 1,
                 "duration_seconds": 0.5,
-                "_child_role": "leaf",
                 "_child_cost_usd": 0.30,
             }
             delegate_task(description="billed run", prompt="billed run", parent_agent=parent, run_in_background=False)
@@ -2933,16 +2928,6 @@ class TestMaxSpawnDepth(unittest.TestCase):
     def test_max_spawn_depth_invalid_falls_back_to_default(self, mock_cfg):
         from tools.delegate_tool import _get_max_spawn_depth
         self.assertEqual(_get_max_spawn_depth(), 1)
-
-
-# =========================================================================
-# role param plumbing
-# =========================================================================
-#
-# These tests cover the schema + signature + stash plumbing of the role
-# param.  The full role-honoring behavior (toolset re-add, role-aware
-# prompt) lives in TestOrchestratorRoleBehavior below; these tests only
-# assert on _delegate_role stashing and on the schema shape.
 
 
 class TestFallbackModelInheritance(unittest.TestCase):
