@@ -20,8 +20,38 @@ from agent.context_compressor import (
     _bound_retained_nonvisible_metadata,
     _estimate_msg_budget_tokens,
     _retained_provider_payload_message_for_budget,
+    _summarize_tool_result,
 )
 from hermes_state import SessionDB
+
+
+def test_delegate_tool_summary_uses_simplified_description():
+    summary = _summarize_tool_result(
+        "delegate_task",
+        json.dumps({
+            "description": "Review gateway",
+            "prompt": "Inspect all gateway race paths.",
+        }),
+        '{"status":"completed"}',
+    )
+
+    assert "Review gateway" in summary
+    assert "Inspect all gateway race paths" not in summary
+
+
+def test_delegate_batch_summary_uses_item_descriptions():
+    summary = _summarize_tool_result(
+        "delegate_task",
+        json.dumps({"tasks": [
+            {"description": "Review PR A", "prompt": "Inspect PR A"},
+            {"description": "Review PR B", "prompt": "Inspect PR B"},
+        ]}),
+        '{"status":"completed"}',
+    )
+
+    assert "Review PR A" in summary
+    assert "Review PR B" in summary
+    assert "Inspect PR A" not in summary
 
 
 def _make_quota_429_error(resets_in_seconds):

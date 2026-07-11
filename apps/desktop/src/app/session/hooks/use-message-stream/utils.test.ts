@@ -47,12 +47,20 @@ describe('delegateTaskPayloads', () => {
 
   it('maps a running tool.start to a subagent.start spec', () => {
     const [spec] = delegateTaskPayloads(
-      payload({ name: 'delegate_task', tool_id: 't1', args: { goal: 'do it' } }),
+      payload({
+        name: 'delegate_task',
+        tool_id: 't1',
+        args: { description: 'inspect gateway', prompt: 'Inspect gateway race paths.' }
+      }),
       'running',
       'tool.start'
     )
 
-    expect(spec).toMatchObject({ event_type: 'subagent.start', goal: 'do it', status: 'running' })
+    expect(spec).toMatchObject({
+      event_type: 'subagent.start',
+      goal: 'inspect gateway',
+      status: 'running'
+    })
   })
 
   it('maps completion (with error) to a failed subagent.complete', () => {

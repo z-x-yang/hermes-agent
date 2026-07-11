@@ -5692,7 +5692,7 @@ class AIAgent:
         return _delegate_continue(
             agent_id=function_args.get("agent_id", ""),
             prompt=function_args.get("prompt", ""),
-            scheduling=function_args.get("scheduling", "auto"),
+            run_in_background=function_args.get("run_in_background"),
             parent_agent=self,
         )
 

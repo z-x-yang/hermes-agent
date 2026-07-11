@@ -428,9 +428,15 @@ def test_dispatch_never_forwards_model_toolsets():
 
     with patch("tools.delegate_tool.delegate_task", _fake_delegate):
         run_agent.AIAgent._dispatch_delegate_task(
-            _FakeAgent(), {"goal": "x", "toolsets": ["web", "terminal"]}
+            _FakeAgent(), {
+                "description": "inspect scope",
+                "prompt": "Inspect the scoped tool surface.",
+                "toolsets": ["web", "terminal"],
+            }
         )
     assert "toolsets" not in captured
+    assert captured["description"] == "inspect scope"
+    assert captured["prompt"] == "Inspect the scoped tool surface."
 
 
 def test_delegate_task_background_detaches_child_from_parent(monkeypatch):

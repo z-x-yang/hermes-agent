@@ -2196,36 +2196,45 @@ def test_run_single_child_does_not_retain_without_parent_session_id(monkeypatch)
         get_retained_subagent_session("child-session")
 
 
-def test_live_agent_invoke_tool_dispatches_delegate_continue_with_parent_agent():
-    from agent.agent_runtime_helpers import invoke_tool
+def test_live_agent_adapter_dispatches_simplified_delegate_continue(monkeypatch):
+    import run_agent
+    import tools.delegate_continue_tool as dct
 
     captured = {}
 
-    class FakeAgent:
-        session_id = "parent-live"
-        valid_tool_names = {"delegate_continue"}
-        enabled_toolsets = {"delegation"}
-        disabled_toolsets = None
-        _context_engine_tool_names = set()
-        _memory_manager = None
-        _current_turn_id = "turn-1"
-        _current_api_request_id = "req-1"
+    def fake_delegate_continue(
+        agent_id,
+        prompt,
+        run_in_background=None,
+        *,
+        parent_agent=None,
+    ):
+        captured.update({
+            "agent_id": agent_id,
+            "prompt": prompt,
+            "run_in_background": run_in_background,
+            "parent_agent": parent_agent,
+        })
+        return json.dumps({"status": "completed", "agent_id": agent_id})
 
-        def _dispatch_delegate_continue(self, args):
-            captured["self"] = self
-            captured["args"] = dict(args)
-            return json.dumps({"status": "completed", "agent_id": args["agent_id"]})
+    monkeypatch.setattr(dct, "delegate_continue", fake_delegate_continue)
+    agent = object.__new__(run_agent.AIAgent)
 
-    agent = FakeAgent()
     result = json.loads(
-        invoke_tool(
+        run_agent.AIAgent._dispatch_delegate_continue(
             agent,
-            "delegate_continue",
-            {"agent_id": "agent-1", "prompt": "continue", "scheduling": "foreground"},
-            "task-1",
+            {
+                "agent_id": "agent-1",
+                "prompt": "continue",
+                "run_in_background": False,
+            },
         )
     )
 
     assert result == {"status": "completed", "agent_id": "agent-1"}
-    assert captured["self"] is agent
-    assert captured["args"]["prompt"] == "continue"
+    assert captured == {
+        "agent_id": "agent-1",
+        "prompt": "continue",
+        "run_in_background": False,
+        "parent_agent": agent,
+    }

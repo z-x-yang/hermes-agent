@@ -1649,10 +1649,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if tasks_arg and isinstance(tasks_arg, list):
                 spinner_label = f"🔀 delegating {len(tasks_arg)} tasks · (/agents to monitor)"
             else:
-                goal_preview = (function_args.get("goal") or "")[:30]
+                description_preview = (function_args.get("description") or "")[:30]
                 spinner_label = (
-                    f"🔀 {goal_preview} · (/agents to monitor)"
-                    if goal_preview
+                    f"🔀 {description_preview} · (/agents to monitor)"
+                    if description_preview
                     else "🔀 delegating · (/agents to monitor)"
                 )
             spinner = None

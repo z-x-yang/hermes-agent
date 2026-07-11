@@ -219,9 +219,15 @@ class TestDelegateTask(unittest.TestCase):
         result = json.loads(delegate_task(description="  ", prompt="  ", parent_agent=parent, run_in_background=False))
         self.assertIn("error", result)
 
-    def test_task_missing_goal(self):
+    def test_task_missing_description(self):
         parent = _make_mock_parent()
-        result = json.loads(delegate_task(tasks=[{"prompt": "no goal here"}], parent_agent=parent, run_in_background=False))
+        result = json.loads(
+            delegate_task(
+                tasks=[{"prompt": "no description here"}],
+                parent_agent=parent,
+                run_in_background=False,
+            )
+        )
         self.assertIn("error", result)
 
     @patch("tools.delegate_tool._run_single_child")
@@ -360,7 +366,7 @@ class TestDelegateTask(unittest.TestCase):
         parent = _make_mock_parent()
 
         result = json.loads(
-            delegate_task(tasks='[{"goal": "bad}', parent_agent=parent, run_in_background=False)
+            delegate_task(tasks='[{"description": "bad"', parent_agent=parent, run_in_background=False)
         )
 
         self.assertIn("error", result)
@@ -375,7 +381,10 @@ class TestDelegateTask(unittest.TestCase):
         }
         parent = _make_mock_parent()
         limit = _get_max_concurrent_children()
-        tasks = [{"goal": f"Task {i}"} for i in range(limit + 2)]
+        tasks = [
+            {"description": f"Task {i}", "prompt": f"Complete task {i}."}
+            for i in range(limit + 2)
+        ]
         result = json.loads(delegate_task(tasks=tasks, parent_agent=parent, run_in_background=False))
         # Should return an error instead of silently truncating
         self.assertIn("error", result)

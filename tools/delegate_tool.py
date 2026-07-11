@@ -461,8 +461,8 @@ def _get_max_async_children() -> int:
     ``delegation.max_concurrent_children`` — one cap governs both a single
     synchronous batch's parallelism and how many background delegation units
     may run at once. When at capacity, a new async dispatch is REJECTED (not
-    queued) so a runaway model can't pile up unbounded background work; the
-    caller falls back to running the work synchronously.
+    queued or run synchronously) so a runaway model cannot bypass the cap or
+    pile up unbounded background work.
 
     A leftover ``max_async_children`` in config.yaml is ignored (the config
     migration removes it, folding a raised value into
@@ -3134,12 +3134,10 @@ def delegate_task(
                 except Exception:
                     pass
 
-        # Fire subagent_stop hooks once per child, serialised on the parent thread.
-        # This keeps Python-plugin and shell-hook callbacks off of the worker threads
-        # that ran the children, so hook authors don't need to reason about
-        # concurrent invocation.  Role was captured into the entry dict in
-        # _run_single_child (or the fabricated-entry branches above) before the
-        # child was closed.
+        # Fire subagent_stop hooks once per child, serialised on the invoking
+        # thread for synchronous nested calls and on the async batch owner for
+        # top-level detached calls. Hook payloads expose completion/session
+        # metadata only; caller-defined role state no longer exists.
         _parent_session_id = getattr(parent_agent, "session_id", None)
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
@@ -3221,8 +3219,9 @@ def delegate_task(
         # is a no-op, so a background dispatch would silently never re-enter the
         # conversation (issue #10760). Fall back to SYNCHRONOUS execution: the
         # work still runs and its result returns in this same response, which is
-        # strictly better than a handle that never resolves. Mirrors the
-        # pool-at-capacity inline fallback below.
+        # strictly better than a handle that never resolves. This delivery-path
+        # fallback is distinct from async-capacity rejection, which remains
+        # fail-closed and never starts replacement work.
         try:
             from gateway.session_context import async_delivery_supported
             _async_ok = async_delivery_supported()
