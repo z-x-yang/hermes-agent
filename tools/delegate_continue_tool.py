@@ -7,7 +7,6 @@ import time
 import uuid
 from typing import Any, Optional
 
-from agent.subagent_context_policy import build_context_policy_capsule
 from agent.subagent_governance import load_governance_snapshot
 from tools.registry import registry
 from tools.tool_effects import build_authority_snapshot
@@ -203,13 +202,6 @@ def _build_continuation_child(
             "refusing continuation."
         )
 
-    context_policy_capsule = build_context_policy_capsule(
-        profile=profile,
-        goal=prompt,
-        context=None,
-        parent_agent=parent_agent,
-        workspace_path=record.workspace_path,
-    )
     child = _build_child_agent(
         task_index=0,
         goal=prompt,
@@ -231,7 +223,6 @@ def _build_continuation_child(
         workspace_path_override=record.workspace_path,
         register_with_parent=register_with_parent,
         governance_snapshot=governance_snapshot,
-        context_policy_capsule=context_policy_capsule,
     )
 
     prior_file_writes = tuple(

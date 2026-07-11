@@ -32,37 +32,38 @@ def test_builtin_profile_round_trip(name):
     assert profile.model == "inherit"
 
 
-def test_all_profiles_share_the_complete_result_contract():
-    required = (
-        "outcome",
-        "evidence",
-        "actions",
-        "files_changed",
-        "tests_run",
-        "verification",
-        "blockers",
-        "open_questions",
-        "confidence",
-        "limitations",
-        "side_effects",
-        "recommended_next_step",
-    )
-    contracts = []
-    for name in ("Explore", "Plan", "general-purpose"):
-        contract = get_subagent_profile(name).result_contract
-        contracts.append(contract)
-        assert all(field in contract for field in required), (name, contract)
-    assert len(set(contracts)) == 3
-    assert "searches/lookups" in contracts[0]
-    assert "implementation-plan" in contracts[1]
-    assert "executed actions" in contracts[2]
+def test_profiles_use_claude_like_type_specific_final_guidance():
+    explore = get_subagent_profile("Explore").system_instructions
+    plan = get_subagent_profile("Plan").system_instructions
+    gp = get_subagent_profile("general-purpose").system_instructions
+
+    for prompt in (explore, plan, gp):
+        assert "recommended_next_step" not in prompt
+        assert "files_changed" not in prompt
+        assert "side_effects" not in prompt
+    assert "clearly and concisely" in explore
+    assert "absolute file paths" in explore
+    assert "### Critical Files for Implementation" in plan
+    assert "3-5" in plan
+    assert "exact return requirements in the task prompt" in gp
+
+
+def test_profile_metadata_has_no_redundant_capability_booleans_or_context_capsule():
+    profile = get_subagent_profile("general-purpose")
+    for removed in (
+        "result_contract",
+        "context_policy",
+        "can_write_files",
+        "can_external_side_effects",
+        "can_delegate",
+        "default_scheduling",
+    ):
+        assert not hasattr(profile, removed)
 
 
 def test_read_only_profiles_remain_hard_no_external_side_effect():
     for name in ("Explore", "Plan"):
         profile = get_subagent_profile(name)
-        assert profile.can_write_files is False
-        assert profile.can_external_side_effects is False
         assert "terminal" not in profile.allowed_tool_names
         assert "process" not in profile.allowed_tool_names
         assert "web_search" not in profile.allowed_tool_names
@@ -205,10 +206,8 @@ def test_explore_materializes_readonly_aliases_from_raw_parent_authority(monkeyp
     assert policy.allowed_names.isdisjoint(raw_names)
 
 
-def test_general_purpose_truthfully_reports_raw_shell_external_effect_capability():
+def test_general_purpose_truthfully_describes_raw_shell_external_effect_capability():
     profile = get_subagent_profile("general-purpose")
-    assert profile.can_external_side_effects is True
-    assert profile.can_delegate is True
     assert profile.allowed_tool_names is None
     assert "exact parent tool surface" in profile.system_instructions
     assert "Named external-side-effect tools are not available" not in (

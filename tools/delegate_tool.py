@@ -32,10 +32,8 @@ from concurrent.futures import (
 )
 from typing import Any, Dict, List, Optional
 
-from agent.subagent_context_policy import (
-    ContextPolicyCapsule,
-    build_context_policy_capsule,
-)
+from agent.coding_context import build_coding_workspace_block
+from agent.prompt_builder import build_context_files_prompt
 from agent.subagent_governance import GovernanceSnapshot, load_governance_snapshot
 from toolsets import TOOLSETS
 from tools.subagent_profiles import (
@@ -580,7 +578,11 @@ def _resolve_scheduling(
         return scheduling
     if is_batch or subagent_type is None:
         return "background"
-    return get_subagent_profile(subagent_type).default_scheduling
+    return (
+        "background"
+        if subagent_type == DEFAULT_SUBAGENT_TYPE
+        else "foreground"
+    )
 
 
 def _resolve_foreground_timeouts(
@@ -807,6 +809,15 @@ def _governance_diagnostics(snapshot: GovernanceSnapshot) -> Dict[str, Any]:
         "profile_home": str(snapshot.profile_home),
         "fingerprint": snapshot.fingerprint,
         "total_bytes": snapshot.total_bytes,
+        "sources": [
+            {
+                "label": source.label,
+                "path": str(source.path),
+                "byte_length": source.byte_length,
+                "sha256": source.sha256,
+            }
+            for source in (snapshot.soul, snapshot.memory, snapshot.user)
+        ],
     }
 
 
@@ -824,14 +835,13 @@ def _governance_source_block(source, *, trust_label: str) -> str:
 def _build_child_system_prompt(
     *,
     profile,
-    role: str,
+    allow_delegation: bool,
     workspace_path: str,
     child_depth: int,
     max_spawn_depth: int,
     governance_snapshot: Optional[GovernanceSnapshot] = None,
-    context_policy_capsule: Optional[ContextPolicyCapsule] = None,
 ) -> str:
-    """Build trusted child context without delegated goal or context data."""
+    """Build trusted child context without delegated task data."""
     trusted_prefix = ""
     if governance_snapshot is not None:
         snapshot_metadata = json.dumps(
@@ -877,70 +887,54 @@ def _build_child_system_prompt(
     ]
     if workspace_path and str(workspace_path).strip():
         sections.append(f"Workspace: {workspace_path}")
-    if context_policy_capsule is not None:
-        sections.append(
-            "CONTEXT_POLICY_CAPSULE "
-            + json.dumps(
-                {
-                    "policy": context_policy_capsule.policy,
-                    "workspace_path": context_policy_capsule.workspace_path,
-                    "project_routes": list(context_policy_capsule.project_routes),
-                    "workspace_metadata": context_policy_capsule.workspace_metadata,
-                    "must_query_project_memory": (
-                        context_policy_capsule.must_query_project_memory
-                    ),
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
+    if (
+        profile is not None
+        and profile.name == "general-purpose"
+        and workspace_path
+        and str(workspace_path).strip()
+    ):
+        project_context = build_context_files_prompt(
+            cwd=workspace_path,
+            skip_soul=True,
         )
+        workspace_snapshot = build_coding_workspace_block(workspace_path)
+        if project_context:
+            sections.append(project_context)
+        if workspace_snapshot:
+            sections.append(workspace_snapshot)
     sections.append(
-        f"Role: {role}; depth={child_depth}; max_spawn_depth={max_spawn_depth}."
+        "Delegation available: "
+        f"{'true' if allow_delegation else 'false'}; "
+        f"depth={child_depth}; max_spawn_depth={max_spawn_depth}."
     )
-    if profile is not None:
-        sections.append("Required result contract: " + profile.result_contract)
     sections.append(
         "Do not perform actions outside the task scope. Return only your final "
-        "summary; intermediate tool traces stay in your context."
+        "message; intermediate tool traces stay in your context."
     )
 
-    if role == "orchestrator":
+    if allow_delegation:
         child_note = (
-            "Your own children MUST be leaves (cannot delegate further) "
-            "because they would be at the depth floor — you cannot pass "
-            "role='orchestrator' to your own delegate_task calls."
+            "Your own children cannot delegate further because they would be at "
+            "the configured depth floor."
             if child_depth + 1 >= max_spawn_depth
-            else "Your own children can themselves be orchestrators or leaves, "
-            "depending on the `role` you pass to delegate_task. Default is "
-            "'leaf'; pass role='orchestrator' explicitly when a child "
-            "needs to further decompose its work."
+            else "Your own children receive delegation only when their profile, "
+            "the exact authority ceiling, and the next depth all permit it."
         )
         sections.append(
-            "## Subagent Spawning (Orchestrator Role)\n"
-            "You have access to the `delegate_task` tool and CAN spawn "
-            "your own subagents to parallelize independent work.\n\n"
-            "WHEN to delegate:\n"
-            "- The goal decomposes into 2+ independent subtasks that can "
-            "run in parallel (e.g. research A and B simultaneously).\n"
-            "- A subtask is reasoning-heavy and would flood your context "
-            "with intermediate data.\n\n"
-            "WHEN NOT to delegate:\n"
-            "- Single-step mechanical work — do it directly.\n"
-            "- Trivial tasks you can execute in one or two tool calls.\n"
-            "- Re-delegating your entire assigned goal to one worker "
-            "(that's just pass-through with no value added).\n\n"
-            "Coordinate your workers' results and synthesize them before "
-            "reporting back to your parent. You are responsible for the "
-            "final summary, not your workers.\n\n"
-            f"NOTE: You are at depth {child_depth}. The delegation tree "
-            f"is capped at max_spawn_depth={max_spawn_depth}. {child_note}"
+            "## Subagent Spawning\n"
+            "You can use `delegate_task` to parallelize independent work.\n\n"
+            "Delegate when 2+ independent subtasks can run in parallel or a "
+            "reasoning-heavy subtask would flood your context. Do not delegate "
+            "single-step work or pass your entire assigned task through to one "
+            "child. Synthesize child results before reporting to your parent.\n\n"
+            f"You are at depth {child_depth}; max_spawn_depth={max_spawn_depth}. "
+            f"{child_note}"
         )
     runtime_block = "\n\n".join(
         section.strip() for section in sections if section.strip()
     )
     if trusted_prefix:
-        return trusted_prefix + "\n\n## Immutable runtime/profile/context capsule\n\n" + runtime_block
+        return trusted_prefix + "\n\n## Immutable runtime/profile/project context\n\n" + runtime_block
     return runtime_block
 
 
@@ -1298,7 +1292,6 @@ def _build_child_agent(
     workspace_path_override: Optional[str] = None,
     register_with_parent: bool = True,
     governance_snapshot: Optional[GovernanceSnapshot] = None,
-    context_policy_capsule: Optional[ContextPolicyCapsule] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1337,7 +1330,7 @@ def _build_child_agent(
 
     child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
     max_spawn = _get_max_spawn_depth()
-    profile_allows_delegation = profile.can_delegate
+    profile_allows_delegation = profile.name == DEFAULT_SUBAGENT_TYPE
     parent_allows_delegation = bool(
         exact_parent_names is not None and "delegate_task" in exact_parent_names
     )
@@ -1405,22 +1398,13 @@ def _build_child_agent(
     workspace_hint = workspace_path_override or _resolve_workspace_hint(parent_agent)
     if governance_snapshot is None:
         governance_snapshot = load_governance_snapshot()
-    if context_policy_capsule is None:
-        context_policy_capsule = build_context_policy_capsule(
-            profile=profile,
-            goal=goal,
-            context=context,
-            parent_agent=parent_agent,
-            workspace_path=workspace_hint or "",
-        )
     child_prompt = _build_child_system_prompt(
         profile=profile,
-        role=effective_role,
+        allow_delegation=effective_role == "orchestrator",
         workspace_path=workspace_hint or "",
         child_depth=child_depth,
         max_spawn_depth=max_spawn,
         governance_snapshot=governance_snapshot,
-        context_policy_capsule=context_policy_capsule,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1654,7 +1638,6 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._subagent_profile = profile
     setattr(child, "_governance_diagnostics", _governance_diagnostics(governance_snapshot))
-    setattr(child, "_context_policy_capsule", context_policy_capsule)
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
@@ -2837,7 +2820,7 @@ def delegate_task(
         profile = get_subagent_profile(subagent_type)
     except ValueError as exc:
         return json.dumps({"error": str(exc)})
-    if role == "orchestrator" and not profile.can_delegate:
+    if role == "orchestrator" and profile.name != DEFAULT_SUBAGENT_TYPE:
         return json.dumps(
             {"error": f"subagent_type={subagent_type} cannot use role=orchestrator"}
         )
@@ -2978,7 +2961,7 @@ def delegate_task(
         except ValueError as exc:
             return json.dumps({"error": str(exc)})
         task_role = task.get("role") or top_role
-        if task_role == "orchestrator" and not task_profile.can_delegate:
+        if task_role == "orchestrator" and task_profile.name != DEFAULT_SUBAGENT_TYPE:
             return json.dumps(
                 {
                     "error": (

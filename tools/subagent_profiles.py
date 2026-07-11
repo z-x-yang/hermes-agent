@@ -1,24 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Final, Mapping, Optional
+from typing import Any, Final, FrozenSet, Mapping, Optional
 
 
 @dataclass(frozen=True)
 class SubagentProfile:
     name: str
     description: str
-    model: str
-    context_policy: str
-    allowed_tool_names: frozenset[str] | None
-    can_write_files: bool
-    can_external_side_effects: bool
-    can_delegate: bool
-    default_scheduling: str
-    foreground_wait_timeout_seconds: int
-    child_run_timeout_seconds: int
     system_instructions: str
-    result_contract: str
+    model: str
+    provider: Optional[str]
+    allowed_tool_names: Optional[FrozenSet[str]]
+    default_wait_timeout_seconds: int
+    default_run_timeout_seconds: int
 
 
 @dataclass(frozen=True)
@@ -69,17 +64,21 @@ _DATA_SOURCE_READ_INSTRUCTIONS = (
     "move, delete, flag, or mark mail."
 )
 
-_COMPLETE_RESULT_FIELDS = (
-    "Return all fields: outcome; evidence; actions; files_changed; tests_run; "
-    "verification; blockers; open_questions; confidence; limitations; "
-    "side_effects; recommended_next_step. Use empty lists or 'none' when a "
-    "field does not apply; never omit fields."
+EXPLORE_FINAL = (
+    "Report findings clearly and concisely in one final message. Include absolute "
+    "file paths and relevant symbols or line ranges for claims the parent must verify."
 )
 
+PLAN_FINAL = (
+    "Return an actionable implementation plan without making changes. End with "
+    "`### Critical Files for Implementation` and list 3-5 files that are central "
+    "to the plan, each with a one-line reason."
+)
 
-def _result_contract(profile_guidance: str) -> str:
-    return f"{_COMPLETE_RESULT_FIELDS} {profile_guidance}"
-
+GENERAL_FINAL = (
+    "Return one concise final message that follows the exact return requirements in "
+    "the task prompt. The parent will verify claimed changes and side effects."
+)
 
 _PROFILES = {
     "Explore": SubagentProfile(
@@ -88,25 +87,18 @@ _PROFILES = {
             "Search and understand code/files or permitted data sources without "
             "changes; use for focused lookup and exploration."
         ),
-        model="inherit",
-        context_policy="lean",
-        allowed_tool_names=_READ_ONLY_TOOLS,
-        can_write_files=False,
-        can_external_side_effects=False,
-        can_delegate=False,
-        default_scheduling="foreground",
-        foreground_wait_timeout_seconds=900,
-        child_run_timeout_seconds=1800,
         system_instructions=(
             "You are the Explore subagent. Search and understand files/code. "
             "Do not review, plan implementation, or modify anything. "
             + _DATA_SOURCE_READ_INSTRUCTIONS
+            + " "
+            + EXPLORE_FINAL
         ),
-        result_contract=_result_contract(
-            "For Explore, evidence cites source/file/symbol/line handles; actions "
-            "enumerate searches/lookups; files_changed, tests_run, and side_effects "
-            "are normally empty."
-        ),
+        model="inherit",
+        provider=None,
+        allowed_tool_names=_READ_ONLY_TOOLS,
+        default_wait_timeout_seconds=900,
+        default_run_timeout_seconds=1800,
     ),
     "Plan": SubagentProfile(
         name="Plan",
@@ -114,25 +106,18 @@ _PROFILES = {
             "Research the codebase/data sources and prepare implementation-plan "
             "inputs; use for planning research without edits."
         ),
-        model="inherit",
-        context_policy="project_summary",
-        allowed_tool_names=_READ_ONLY_TOOLS,
-        can_write_files=False,
-        can_external_side_effects=False,
-        can_delegate=False,
-        default_scheduling="foreground",
-        foreground_wait_timeout_seconds=1800,
-        child_run_timeout_seconds=3600,
         system_instructions=(
             "You are the Plan subagent. Research the codebase for a later plan. "
             "Do not modify files or claim implementation is complete. "
             + _DATA_SOURCE_READ_INSTRUCTIONS
+            + " "
+            + PLAN_FINAL
         ),
-        result_contract=_result_contract(
-            "For Plan, outcome is the implementation-plan shape; evidence names "
-            "critical files; actions summarize planning research; verification "
-            "assesses feasibility without claiming execution."
-        ),
+        model="inherit",
+        provider=None,
+        allowed_tool_names=_READ_ONLY_TOOLS,
+        default_wait_timeout_seconds=1800,
+        default_run_timeout_seconds=3600,
     ),
     "general-purpose": SubagentProfile(
         name="general-purpose",
@@ -140,15 +125,6 @@ _PROFILES = {
             "Handle complex multi-step work, including edits, tests, "
             "terminal/process, or permitted external actions."
         ),
-        model="inherit",
-        context_policy="normal",
-        allowed_tool_names=None,
-        can_write_files=True,
-        can_external_side_effects=True,
-        can_delegate=True,
-        default_scheduling="background",
-        foreground_wait_timeout_seconds=1800,
-        child_run_timeout_seconds=7200,
         system_instructions=(
             "You are a general-purpose subagent. Complete the scoped task with "
             "repo-local actions and tests. You may use the exact parent tool surface "
@@ -156,13 +132,14 @@ _PROFILES = {
             "the user/task scope and normal tool contracts permit them. Raw "
             "terminal/process access can also reach external systems: this is not a "
             "no-side-effect sandbox. Follow normal tool and terminal approvals. Do "
-            "not re-delegate the whole task."
+            "not re-delegate the whole task. "
+            + GENERAL_FINAL
         ),
-        result_contract=_result_contract(
-            "For general-purpose, actions list executed actions; files_changed and "
-            "tests_run name concrete artifacts/commands; verification reports real "
-            "outputs; side_effects include externally verifiable handles/status."
-        ),
+        model="inherit",
+        provider=None,
+        allowed_tool_names=None,
+        default_wait_timeout_seconds=1800,
+        default_run_timeout_seconds=7200,
     ),
 }
 
@@ -200,7 +177,7 @@ def resolve_profile_config(
             "foreground_wait_timeout_seconds",
             delegation_config.get(
                 "foreground_wait_timeout_seconds",
-                profile.foreground_wait_timeout_seconds,
+                profile.default_wait_timeout_seconds,
             ),
         )
     )
@@ -218,7 +195,7 @@ def resolve_profile_config(
                 "child_run_timeout_seconds",
                 delegation_config.get(
                     "child_run_timeout_seconds",
-                    profile.child_run_timeout_seconds,
+                    profile.default_run_timeout_seconds,
                 ),
             )
         ),
