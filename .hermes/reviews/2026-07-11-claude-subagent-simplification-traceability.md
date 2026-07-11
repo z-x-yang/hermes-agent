@@ -102,10 +102,12 @@ The simplification leaves these runtime gates intact:
 
 ## Code anchors and scoped commits
 
-- `0479b5a7b` — profile-specific prompts and GP project context.
-- `88c8cd9ca` — static single/Batch schema.
+- `284e15afd` — profile-specific prompts and GP project context.
+- `562dfdf2c` — static single/Batch schema.
 - `39fedc48d` — runtime-derived nesting; role state removed.
 - `04623fd03` — profile-fixed lifecycle and boolean continuation input.
+- `9e1e4c8c2` — EN/ZH docs, bundled skill, and this trace.
+- `04df3d54d` — live continuation adapter fix and UI/ACP/Desktop consumer migration.
 - `tools/delegate_tool.py`
 - `tools/delegate_continue_tool.py`
 - `tools/subagent_profiles.py`
@@ -113,14 +115,32 @@ The simplification leaves these runtime gates intact:
 - `tools/async_delegation.py`
 - `agent/subagent_tool_policy.py`
 
-## Fresh evidence before final review
+## Fresh verification evidence
 
-- High-signal delegation/lifecycle/race gate: **340 passed**.
-- Documentation contract RED→GREEN: simplified EN/ZH contract assertion passes.
-- Task-specific Ruff and `py_compile` gates passed after Tasks 1–4.
-- Static readback confirms no dynamic schema override, no retained role field, and exact simplified function signatures.
+- Final expanded high-signal gate (delegation, continuation, provider/effect/race, Tool Search/MCP, skills/media dispatch, compression/display/plugin/CLI consumers): **1438 passed, 1 skipped, 1 known config-sensitive node deselected** in 48.77s.
+- Live continuation adapter regression plus Python UI/hook consumer gate: **65 passed**; the regression first reproduced the reviewer finding as `TypeError: ... unexpected keyword argument 'scheduling'`, then passed after `run_agent.py` forwarded `run_in_background`.
+- ACP renderer gate: **72 passed**.
+- Desktop stream consumer: **6 passed**; Desktop TypeScript typecheck and focused ESLint exit 0.
+- Final full current `tests/tools`: **20 failed, 7577 passed, 64 skipped** in 377.28s.
+- Detached `00cd0985b` baseline `tests/tools`: **20 failed, 7607 passed, 64 skipped** in 404.43s.
+- The final current and detached-baseline failed node-ID sets are **identical**. They contain only the same 20 pre-existing/config/environment-sensitive nodes; no delegation-owned node fails. An earlier current run had three fewer Tool Search failures, demonstrating those nodes are order-sensitive rather than branch regressions.
+- The unrelated atomic environment-snapshot concurrency test independently failed 3/3 in both current and baseline checkouts; it is not delegation-owned and did not fail in the final full run.
+- Documentation contract: **17 passed**; EN and zh-Hans Docusaurus production builds both emitted `[SUCCESS]` (repository-wide pre-existing broken-anchor warnings remain).
+- Final Ruff, `py_compile`, focused Desktop ESLint/typecheck, baseline-range `git diff --check`, and worktree `git diff --check` all exit 0.
+- Static readback confirms exact simplified function/schema signatures, no dynamic delegation schema override, no retained role field, and profile-specific prompt guidance.
 
-These are intermediate candidate facts. Task 6 must still add current-vs-detached-baseline full `tests/tools` node-ID differential, docs production build, final static checks, and independent review findings before any merge/restart decision.
+## Independent review and controller disposition
+
+Two bounded fresh-context Codex passes used the entire review budget:
+
+1. correctness/security — reviewer ran 32 focused checks and returned `BLOCKED` on one High finding;
+2. design-contract — reviewer ran 182 focused checks, classified the snapshot `EXACT 6 / INTENTIONAL 12 / PARTIAL 1 / MISSING 0 / DIVERGENT 1`, and returned `BLOCKED` on the same finding plus the then-uncommitted trace.
+
+The shared blocker was real: `run_agent.AIAgent._dispatch_delegate_continue()` still passed removed `scheduling=` to the simplified continuation function. Controller reproduction reached the real adapter and failed before the fix. Commit `04df3d54d` now forwards `run_in_background`; the same adapter test and the expanded high-signal gate pass. Reviewer non-blocking notes about the stale single-task spinner and capacity-fallback comment were also verified and fixed. UI/ACP/Desktop/compression/plugin consumers were swept for the removed `goal`/`role` surface and migrated with behavioral tests.
+
+No third Codex pass was run because the approved two-pass ceiling was exhausted. Controller-owned final disposition after the verified fixes is `EXACT 8 / INTENTIONAL 12 / PARTIAL 0 / MISSING 0 / DIVERGENT 0`; there are no unresolved review blockers.
+
+Independence profile: reviewer context was fresh/different; model family/provider route relative to the controller were not observable; no human/domain-expert sign-off was present.
 
 ## Rollout boundary
 
