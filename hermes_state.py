@@ -4450,6 +4450,15 @@ class SessionDB:
         """Count CJK characters in text."""
         return sum(1 for ch in text if cls._is_cjk_codepoint(ord(ch)))
 
+    @staticmethod
+    def _search_projection_sql(alias: str = "m") -> str:
+        """Return the legacy searchable message projection for *alias*."""
+        return (
+            f"coalesce({alias}.content,'') || ' ' || "
+            f"coalesce({alias}.tool_name,'') || ' ' || "
+            f"coalesce({alias}.tool_calls,'')"
+        )
+
     def search_messages(
         self,
         query: str,
@@ -4592,7 +4601,16 @@ class SessionDB:
             )
 
             _trigram_succeeded = False
-            if cjk_count >= 3 and not _any_short_cjk and self._trigram_available:
+            _trigram_roles = set(role_filter or ())
+            _trigram_role_scope = bool(_trigram_roles) and _trigram_roles.issubset(
+                {"user", "assistant"}
+            )
+            if (
+                cjk_count >= 3
+                and not _any_short_cjk
+                and self._trigram_available
+                and _trigram_role_scope
+            ):
                 # Trigram FTS5 path — quote each non-operator token to handle
                 # FTS5 special chars (%, *, etc.) while preserving boolean
                 # operators (AND, OR, NOT) for multi-term queries.
@@ -4656,15 +4674,18 @@ class SessionDB:
                     t for t in raw_query.split()
                     if t.upper() not in {"AND", "OR", "NOT"}
                 ] or [raw_query]
+                projection_sql = self._search_projection_sql("m")
                 token_clauses = []
                 like_params: list = []
                 for tok in non_op_tokens:
                     esc = tok.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                     token_clauses.append(
-                        "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"
+                        f"({projection_sql} LIKE ? ESCAPE '\\')"
                     )
-                    like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
+                    like_params.append(f"%{esc}%")
                 like_where = [f"({' OR '.join(token_clauses)})"]
+                if not include_inactive:
+                    like_where.append("(m.active = 1 OR m.compacted = 1)")
                 if source_filter is not None:
                     like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
                     like_params.extend(source_filter)
@@ -4674,11 +4695,15 @@ class SessionDB:
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
+                snippet_token = non_op_tokens[0]
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
-                           substr(m.content,
-                                  max(1, instr(m.content, ?) - 40),
-                                  120) AS snippet,
+                           replace(
+                               substr({projection_sql},
+                                      max(1, instr({projection_sql}, ?) - 40),
+                                      120),
+                               ?, '>>>' || ? || '<<<'
+                           ) AS snippet,
                            m.content, m.timestamp, m.tool_name,
                            s.source, s.model, s.started_at AS session_started
                     FROM messages m
@@ -4688,8 +4713,8 @@ class SessionDB:
                     LIMIT ? OFFSET ?
                 """
                 like_params.extend([limit, offset])
-                # instr() for snippet uses first search token
-                like_params = [non_op_tokens[0]] + like_params
+                # instr()/replace() use the first search token for the snippet.
+                like_params = [snippet_token, snippet_token, snippet_token] + like_params
                 with self._lock:
                     like_cursor = self._conn.execute(like_sql, like_params)
                     matches = [dict(row) for row in like_cursor.fetchall()]
@@ -4764,10 +4789,6 @@ class SessionDB:
                 match["context"] = context_msgs
             except Exception:
                 match["context"] = []
-
-        # Remove full content from result (snippet is enough, saves tokens)
-        for match in matches:
-            match.pop("content", None)
 
         return matches
 

@@ -1518,6 +1518,181 @@ class TestCJKSearchFallback:
     the query contains CJK characters.
     """
 
+    def test_metadata_only_cjk_all_roles_uses_full_projection(self, db):
+        db.create_session(session_id="tool-session", source="cli")
+        message_id = db.append_message(
+            "tool-session",
+            role="tool",
+            content="visible body",
+            tool_name="runner",
+        )
+        db._conn.execute(
+            "UPDATE messages SET tool_calls=? WHERE id=?",
+            ('{"query":"工具调用关键词"}', message_id),
+        )
+        db._conn.commit()
+
+        rows = db.search_messages("调用关", role_filter=None)
+
+        assert [row["id"] for row in rows] == [message_id]
+        assert rows[0]["content"] == "visible body"
+        assert "调用关" in rows[0]["snippet"].replace(">>>", "").replace("<<<", "")
+
+    def test_tool_cjk_uses_like_and_preserves_filters(self, db):
+        db.create_session(session_id="included", source="cli")
+        db.create_session(session_id="compacted", source="cli")
+        db.create_session(session_id="rewound", source="cli")
+        db.create_session(session_id="excluded", source="telegram")
+
+        included_id = db.append_message(
+            "included", role="tool", content="active body", tool_name="工具关键词"
+        )
+        compacted_id = db.append_message(
+            "compacted", role="tool", content="compacted body",
+        )
+        rewound_id = db.append_message(
+            "rewound", role="tool", content="rewound body", tool_name="工具关键词"
+        )
+        db.append_message(
+            "excluded", role="tool", content="excluded body", tool_name="工具关键词"
+        )
+        db._conn.execute(
+            "UPDATE messages SET active=0, compacted=1, tool_calls=? WHERE id=?",
+            ('{"query":"工具关键词"}', compacted_id),
+        )
+        db._conn.execute(
+            "UPDATE messages SET active=0, compacted=0 WHERE id=?", (rewound_id,)
+        )
+        db._conn.commit()
+
+        rows = db.search_messages(
+            "工具关",
+            role_filter=["tool"],
+            exclude_sources=["telegram"],
+            include_inactive=False,
+        )
+
+        assert {row["id"] for row in rows} == {included_id, compacted_id}
+        assert all("工具关" in row["snippet"] for row in rows)
+        assert {row["content"] for row in rows} == {"active body", "compacted body"}
+
+        inactive_rows = db.search_messages(
+            "工具关",
+            role_filter=["tool"],
+            exclude_sources=["telegram"],
+            include_inactive=True,
+        )
+        assert {row["id"] for row in inactive_rows} == {
+            included_id, compacted_id, rewound_id,
+        }
+
+    def test_cjk_trigram_requires_explicit_user_assistant_role_subset(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="assistant", content="选择路由关键词")
+
+        def executed_sql(role_filter):
+            statements = []
+            db._conn.set_trace_callback(statements.append)
+            try:
+                db.search_messages("路由关", role_filter=role_filter)
+            finally:
+                db._conn.set_trace_callback(None)
+            return "\n".join(statements)
+
+        for roles in (["assistant"], ["user", "assistant"]):
+            assert "FROM messages_fts_trigram" in executed_sql(roles)
+
+        for roles in (
+            None,
+            [],
+            ["tool"],
+            ["system"],
+            ["session_meta"],
+            ["user", "tool"],
+            ["user", "assistant", "tool", "system", "session_meta"],
+        ):
+            sql = executed_sql(roles)
+            assert "FROM messages_fts_trigram" not in sql
+            assert "coalesce(m.tool_calls,'')" in sql
+
+    def test_cjk_like_treats_percent_underscore_and_escape_as_literals(self, db):
+        db.create_session(session_id="literal", source="cli")
+        db.create_session(session_id="wildcard-neighbor", source="cli")
+        literal_id = db.append_message(
+            "literal", role="tool", content=r"工具100%_完成\路径"
+        )
+        db.append_message(
+            "wildcard-neighbor", role="tool", content="工具100XX完成路径"
+        )
+
+        percent_rows = db.search_messages("工具100%_完成", role_filter=["tool"])
+        escape_rows = db.search_messages(r"完成\路径", role_filter=["tool"])
+
+        assert [row["id"] for row in percent_rows] == [literal_id]
+        assert [row["id"] for row in escape_rows] == [literal_id]
+
+    def test_v1_v2_search_message_id_parity(self, tmp_path):
+        from state_db_fts import create_fts_v1, rebuild_fts
+
+        v1_path = tmp_path / "v1.db"
+        v2_path = tmp_path / "v2.db"
+        seed = SessionDB(v1_path)
+        seed.close()
+        conn = sqlite3.connect(v1_path)
+        for trigger in (
+            "messages_fts_insert", "messages_fts_delete", "messages_fts_update",
+            "messages_fts_trigram_insert", "messages_fts_trigram_delete",
+            "messages_fts_trigram_update",
+        ):
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        conn.execute("DROP TABLE messages_fts_trigram")
+        conn.execute("DROP TABLE messages_fts")
+        conn.execute("DROP VIEW messages_fts_trigram_content_v2")
+        conn.execute("DROP VIEW messages_fts_unicode_content_v2")
+        conn.execute("DELETE FROM state_meta WHERE key='fts_schema_version'")
+        create_fts_v1(conn)
+        rebuild_fts(conn, "v1_inline")
+        conn.commit()
+        conn.close()
+
+        v1 = SessionDB(v1_path)
+        v2 = SessionDB(v2_path)
+        try:
+            for candidate in (v1, v2):
+                candidate.create_session(session_id="s1", source="cli")
+                candidate.append_message(
+                    "s1", role="user", content="representative englishneedle"
+                )
+                assistant_id = candidate.append_message(
+                    "s1", role="assistant", content="assistant body"
+                )
+                tool_id = candidate.append_message(
+                    "s1", role="tool", content="tool body"
+                )
+                candidate._conn.execute(
+                    "UPDATE messages SET tool_calls=? WHERE id=?",
+                    ('{"query":"助手调用关键词"}', assistant_id),
+                )
+                candidate._conn.execute(
+                    "UPDATE messages SET tool_calls=? WHERE id=?",
+                    ('{"query":"工具调用关键词"}', tool_id),
+                )
+                candidate._conn.commit()
+
+            cases = (
+                ("englishneedle", ["user", "assistant"]),
+                ("调用关", ["user", "assistant"]),
+                ("工具调", ["tool"]),
+                ("调用", None),
+            )
+            for query, roles in cases:
+                v1_ids = {row["id"] for row in v1.search_messages(query, role_filter=roles)}
+                v2_ids = {row["id"] for row in v2.search_messages(query, role_filter=roles)}
+                assert v2_ids == v1_ids, (query, roles, v1_ids, v2_ids)
+        finally:
+            v1.close()
+            v2.close()
+
     def test_cjk_detection_covers_all_ranges(self):
         from hermes_state import SessionDB
         f = SessionDB._contains_cjk
