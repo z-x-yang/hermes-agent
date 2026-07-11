@@ -229,30 +229,17 @@ def test_strategy_b_rebuild_when_dedup_insufficient(tmp_path, monkeypatch):
     _build_healthy_db(db_path)
     _corrupt_duplicate_fts(db_path)
 
-    # Make every health verification report "still broken" until the drop-FTS
-    # pass has actually removed the messages_fts schema, so the routine
-    # escalates past the in-place-rebuild and dedup passes to strat 2 (drop FTS
-    # + VACUUM) and runs its real SQL against the file. Keyed on whether the FTS
-    # schema is still present rather than a call counter, so it stays correct as
-    # earlier verification call sites are added/removed.
+    # Force the initial, in-place rebuild, and dedup verification gates to
+    # report failure. The owner-aware drop/recreate pass now immediately restores
+    # v2 objects, so object absence is no longer a valid success signal.
     real_check = hermes_state._db_opens_cleanly
     calls = {"n": 0}
 
     def flaky_check(path, **kwargs):
         calls["n"] += 1
-        try:
-            probe = sqlite3.connect(str(path))
-            still_has_fts = probe.execute(
-                "SELECT COUNT(*) FROM sqlite_master "
-                "WHERE name LIKE 'messages_fts%'"
-            ).fetchone()[0]
-            probe.close()
-        except sqlite3.DatabaseError:
-            # sqlite_master still malformed (pre-dedup) — treat as broken.
-            return "pretend still broken (schema unreadable)"
-        if still_has_fts:
-            return "pretend in-place/dedup passes were insufficient"
-        return real_check(path)
+        if calls["n"] <= 2:
+            return "pretend earlier repair strategy was insufficient"
+        return real_check(path, **kwargs)
 
     monkeypatch.setattr(hermes_state, "_db_opens_cleanly", flaky_check)
     report = repair_state_db_schema(db_path)

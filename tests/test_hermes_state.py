@@ -55,6 +55,12 @@ class _NoFtsExistingTableConnection(sqlite3.Connection):
 class _NoTrigramCursor(sqlite3.Cursor):
     """Simulate a SQLite build with FTS5 but without the trigram tokenizer."""
 
+    def execute(self, sql, parameters=()):
+        probe = sql.strip()
+        if "tokenize='trigram'" in probe or probe == "SELECT * FROM messages_fts_trigram LIMIT 0":
+            raise sqlite3.OperationalError("no such tokenizer: trigram")
+        return super().execute(sql, parameters)
+
     def executescript(self, sql_script):
         if "tokenize='trigram'" in sql_script:
             raise sqlite3.OperationalError("no such tokenizer: trigram")
@@ -628,7 +634,11 @@ class TestSessionLifecycle:
             assert migrated_db._fts_enabled is True
             assert migrated_db._trigram_available is False
             assert migrated_db._fts_table_exists("messages_fts") is True
-            assert migrated_db._fts_table_exists("messages_fts_trigram") is False
+            # A verified marker-2 database is never downgraded or dropped merely
+            # because this runtime cannot use trigram. The physical owner remains
+            # v2 while search records trigram as unavailable for fallback routing.
+            assert migrated_db._fts_table_exists("messages_fts_trigram") is True
+            assert migrated_db.get_meta("fts_schema_version") == "2"
 
             # Existing messages must be searchable via base FTS.
             results = migrated_db.search_messages("legacy message")
@@ -4181,13 +4191,11 @@ class TestFTS5ToolCallIndexing:
 
 
 class TestFTS5ToolCallMigration:
-    """v11 migration: pre-existing state.db with old external-content FTS tables
-    must be re-indexed so tool_name / tool_calls become searchable after upgrade."""
+    """Unmarked external-content schemas are ambiguous and fail closed."""
 
-    def test_v10_to_v11_upgrade_backfills_tool_fields(self, tmp_path):
-        """Simulate an existing user: build a v10-shaped DB by hand, insert a
-        row with tool_calls, then open via SessionDB (which runs migrations).
-        After upgrade, the tool_calls token must be searchable."""
+    def test_unmarked_legacy_external_schema_is_not_migrated_on_startup(self, tmp_path):
+        """An external schema without marker 2 must remain byte/schema-stable and
+        require explicit migration tooling rather than startup ownership guessing."""
         import sqlite3
 
         db_path = tmp_path / "legacy.db"
@@ -4261,22 +4269,21 @@ class TestFTS5ToolCallMigration:
         assert legacy_hits == [], "sanity: legacy FTS must NOT contain tool_name"
         conn.close()
 
-        # Now open via SessionDB — migration runs.
-        session_db = SessionDB(db_path=db_path)
+        # Startup must refuse this contradictory external/no-marker ownership
+        # state before any schema-version or FTS write.
+        with pytest.raises(RuntimeError, match="inconsistent FTS schema"):
+            SessionDB(db_path=db_path)
+
+        conn = sqlite3.connect(str(db_path))
         try:
-            assert len(session_db.search_messages("LEGACYTOOL")) == 1, \
-                "v11 migration must backfill tool_name into FTS"
-            assert len(session_db.search_messages("LEGACYARG")) == 1, \
-                "v11 migration must backfill tool_calls JSON into FTS"
-            # schema_version bumped
-            from hermes_state import SCHEMA_VERSION
-            row = session_db._conn.execute(
+            assert conn.execute(
                 "SELECT version FROM schema_version LIMIT 1"
-            ).fetchone()
-            version = row["version"] if hasattr(row, "keys") else row[0]
-            assert version == SCHEMA_VERSION
+            ).fetchone()[0] == 10
+            assert conn.execute(
+                "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'LEGACYTOOL'"
+            ).fetchall() == []
         finally:
-            session_db.close()
+            conn.close()
 
 
 # ---------------------------------------------------------------------------

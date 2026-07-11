@@ -31,6 +31,14 @@ from state_db_maintenance import (
     MaintenancePermit,
     assert_state_db_maintenance_access,
 )
+from state_db_fts import (
+    FTS_V2_TRIGGER_SQL,
+    create_fts_v1,
+    create_fts_v2,
+    detect_fts_schema,
+    execute_ddl,
+    rebuild_fts,
+)
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -639,14 +647,9 @@ def repair_state_db_schema(
     try:
         conn = sqlite3.connect(str(db_path), isolation_level=None)
         try:
-            for table_name in ("messages_fts", "messages_fts_trigram"):
-                try:
-                    conn.execute(
-                        f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')"
-                    )
-                except sqlite3.OperationalError:
-                    # Table absent (FTS disabled / trigram off) — skip it.
-                    continue
+            kind = detect_fts_schema(conn)
+            if kind in ("v1_inline", "v2_external"):
+                rebuild_fts(conn, kind)
         finally:
             conn.close()
         if _db_opens_cleanly(db_path, permit=permit) is None:
@@ -699,6 +702,30 @@ def repair_state_db_schema(
             conn.execute("PRAGMA writable_schema=OFF")
             conn.commit()
             conn.execute("VACUUM")
+            has_meta = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='state_meta'"
+            ).fetchone() is not None
+            marker = (
+                conn.execute(
+                    "SELECT value FROM state_meta WHERE key='fts_schema_version'"
+                ).fetchone()
+                if has_meta
+                else None
+            )
+            marker_value = None if marker is None else str(marker[0])
+            if marker_value == "2":
+                kind = "v2_external"
+            elif marker_value in (None, "1"):
+                kind = "v1_inline"
+            else:
+                raise RuntimeError(f"unsupported FTS schema marker: {marker_value!r}")
+            conn.execute("BEGIN IMMEDIATE")
+            if kind == "v2_external":
+                create_fts_v2(conn)
+            else:
+                create_fts_v1(conn)
+            rebuild_fts(conn, kind)
+            conn.commit()
         finally:
             conn.close()
         reason = _db_opens_cleanly(db_path, permit=permit)
@@ -934,6 +961,7 @@ class SessionDB:
         self._write_count = 0
         self._fts_enabled = False
         self._trigram_available = False
+        self._fts_effective_schema = "missing"
         self._fts_unavailable_warned = False
         self._conn = None
         try:
@@ -1008,6 +1036,16 @@ class SessionDB:
                     raise
                 _connect_and_init()
         except Exception as exc:
+            if self._conn is not None:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
             # not available."  Callers that catch this exception keep their
@@ -1104,26 +1142,26 @@ class SessionDB:
         cursor: sqlite3.Cursor,
         *,
         include_trigram: bool = True,
+        kind: str = "v1_inline",
     ) -> None:
+        if kind == "v2_external":
+            if include_trigram:
+                rebuild_fts(cursor.connection, kind)  # type: ignore[arg-type]
+            else:
+                cursor.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+                cursor.execute(
+                    "INSERT INTO messages_fts(messages_fts, rank) "
+                    "VALUES('integrity-check', 1)"
+                )
+            return
+        if include_trigram:
+            rebuild_fts(cursor.connection, kind)  # type: ignore[arg-type]
+            return
         cursor.execute("DELETE FROM messages_fts")
         cursor.execute(
             "INSERT INTO messages_fts(rowid, content) "
-            "SELECT id, "
-            "COALESCE(content, '') || ' ' || "
-            "COALESCE(tool_name, '') || ' ' || "
-            "COALESCE(tool_calls, '') "
-            "FROM messages"
-        )
-        if not include_trigram:
-            return
-        cursor.execute("DELETE FROM messages_fts_trigram")
-        cursor.execute(
-            "INSERT INTO messages_fts_trigram(rowid, content) "
-            "SELECT id, "
-            "COALESCE(content, '') || ' ' || "
-            "COALESCE(tool_name, '') || ' ' || "
-            "COALESCE(tool_calls, '') "
-            "FROM messages"
+            "SELECT id, COALESCE(content, '') || ' ' || "
+            "COALESCE(tool_name, '') || ' ' || COALESCE(tool_calls, '') FROM messages"
         )
 
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
@@ -1387,8 +1425,16 @@ class SessionDB:
         (transforming existing rows) which cannot be handled declaratively.
         """
         cursor = self._conn.cursor()
-
-        cursor.executescript(SCHEMA_SQL)
+        had_messages = cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'"
+        ).fetchone() is not None
+        detected_fts = detect_fts_schema(self._conn)
+        if detected_fts == "inconsistent":
+            raise RuntimeError(
+                "inconsistent FTS schema/marker; run explicit fts-status or repair"
+            )
+        cursor.execute("BEGIN IMMEDIATE")
+        execute_ddl(self._conn, SCHEMA_SQL)
 
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
@@ -1412,7 +1458,7 @@ class SessionDB:
 
         # Deferred indexes that reference the reconciler-added ``active``
         # column (idx_messages_session_active) — same ordering constraint.
-        cursor.executescript(DEFERRED_INDEX_SQL)
+        execute_ddl(self._conn, DEFERRED_INDEX_SQL)
 
         fts5_available = self._sqlite_supports_fts5(cursor)
         fts_migrations_complete = True
@@ -1440,7 +1486,7 @@ class SessionDB:
             # backfills, index changes tied to a specific version step) stay
             # in a version-gated chain. Column additions are handled by
             # _reconcile_columns() above and no longer need entries here.
-            if current_version < 10 and SCHEMA_VERSION == 10:
+            if current_version < 10 and SCHEMA_VERSION == 10 and detected_fts != "v2_external":
                 # v10: trigram FTS5 table for CJK/substring search. The
                 # virtual table + triggers are created unconditionally via
                 # FTS_TRIGRAM_SQL below, but existing rows need a one-time
@@ -1468,7 +1514,7 @@ class SessionDB:
                         fts_migrations_complete = False
                 else:
                     fts_migrations_complete = False
-            if current_version < 11:
+            if current_version < 11 and detected_fts != "v2_external":
                 # v11: re-index FTS5 tables to cover tool_name + tool_calls and
                 # switch from external-content to inline mode. Existing DBs have
                 # old-schema FTS tables and triggers that IF NOT EXISTS won't
@@ -1582,24 +1628,55 @@ class SessionDB:
             pass  # Index already exists
 
         if fts5_available:
-            # FTS5 setup. Run the DDL even when the virtual table exists so
-            # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
-            # an earlier no-FTS5 runtime.
+            # A brand-new database is born as v2, including its ownership marker,
+            # before the surrounding initialization transaction commits. Existing
+            # databases remain on their detected owner and only repair missing
+            # owner triggers; startup never migrates v1 to v2.
             triggers_need_repair = self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
-            self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
-
-            # Trigram FTS5 for CJK/substring search. This is optional relative
-            # to the main FTS table; if it cannot be created, CJK search falls
-            # back to LIKE.
-            if self._fts_enabled:
-                trigram_enabled = self._ensure_fts_schema(
-                    cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                )
+            if not had_messages:
+                try:
+                    create_fts_v2(self._conn)
+                except sqlite3.OperationalError as exc:
+                    if not self._is_trigram_unavailable_error(exc):
+                        raise
+                    self._warn_trigram_unavailable(exc)
+                    cursor.execute("DROP TABLE IF EXISTS messages_fts")
+                    cursor.execute("DROP VIEW IF EXISTS messages_fts_trigram_content_v2")
+                    cursor.execute("DROP VIEW IF EXISTS messages_fts_unicode_content_v2")
+                    self._fts_enabled = self._ensure_fts_schema(
+                        cursor, "messages_fts", FTS_SQL
+                    )
+                    self._fts_effective_schema = "v1_inline"
+                    self._trigram_available = False
+                else:
+                    cursor.execute(
+                        "INSERT INTO state_meta(key, value) VALUES('fts_schema_version', '2')"
+                    )
+                    self._fts_effective_schema = "v2_external"
+                    self._fts_enabled = True
+                    self._trigram_available = True
+            else:
+                self._fts_effective_schema = detected_fts
+                if detected_fts == "v2_external":
+                    execute_ddl(self._conn, FTS_V2_TRIGGER_SQL)
+                    self._fts_enabled = True
+                    trigram_enabled = self._fts_table_probe(
+                        cursor, "messages_fts_trigram"
+                    ) is True
+                else:
+                    self._fts_enabled = self._ensure_fts_schema(
+                        cursor, "messages_fts", FTS_SQL
+                    )
+                    self._fts_effective_schema = "v1_inline"
+                    trigram_enabled = self._ensure_fts_schema(
+                        cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                    ) if self._fts_enabled else False
                 self._trigram_available = trigram_enabled
-                if triggers_need_repair:
+                if triggers_need_repair and self._fts_enabled:
                     self._rebuild_fts_indexes(
                         cursor,
                         include_trigram=trigram_enabled,
+                        kind=self._fts_effective_schema,
                     )
 
         self._conn.commit()
