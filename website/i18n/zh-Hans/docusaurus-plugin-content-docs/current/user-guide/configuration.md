@@ -1660,7 +1660,7 @@ delegation:
 
 ### 调度与超时语义
 
-使用 `auto` 时，单个 `Explore` 或 `Plan` 在前台运行；`general-purpose`、模型发起的旧版通用调用以及多任务批次在后台运行。嵌套/编排委派只能同步前台执行。
+使用 `auto` 时，单个 `Explore` 或 `Plan` 在前台运行；`general-purpose` 和多任务批次在后台运行。省略/传空 `subagent_type` 会解析为 `general-purpose`；只有 direct-Python 且未指定调度的兼容路径保持同步。嵌套/编排委派只能同步前台执行。
 
 `foreground_wait_timeout_seconds` 与 `child_run_timeout_seconds` 是彼此独立、以配置为准的控制项：
 
@@ -1691,7 +1691,7 @@ delegation:
 
 `max_concurrent_children` 同时限制单个批次中的任务数和并发后台委派单元数（默认 `3`，下限 `1`，无硬性上限）。环境变量 `DELEGATION_MAX_CONCURRENT_CHILDREN` 可以覆盖它。超出上限的批次会返回明确错误，不会被截断。一个成功接收的批次只占一个后台单元、返回一个 handle，并在稍后注入一次汇总结果。
 
-`max_spawn_depth` 默认 `1`（扁平），下限为 `1`，没有硬性上限。设为 `2` 可让旧版通用编排者或显式配置的 `general-purpose` 编排者生成叶子子智能体。`Explore` 和 `Plan` 会拒绝编排者角色；`general-purpose` 只有显式指定该角色时才不再是 leaf。最终有效的编排者只会额外获得 `delegate_task`。`orchestrator_enabled: false` 会强制所有子智能体变成 leaf。每增加一层都可能成倍增加费用和并发量，请谨慎提高。参见[子智能体委派 → 嵌套编排](features/delegation.md#嵌套编排)。
+`max_spawn_depth` 默认 `1`（扁平），下限为 `1`，没有硬性上限。设为 `2` 可让显式配置的 `general-purpose` 编排者生成叶子子智能体。`Explore` 和 `Plan` 会拒绝编排者角色；`general-purpose` 只有显式指定该角色时才不再是 leaf。最终有效的编排者只会额外获得 `delegate_task`。`orchestrator_enabled: false` 会强制所有子智能体变成 leaf。每增加一层都可能成倍增加费用和并发量，请谨慎提高。参见[子智能体委派 → 嵌套编排](features/delegation.md#嵌套编排)。
 
 ## 澄清
 

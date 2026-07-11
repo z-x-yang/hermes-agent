@@ -7,7 +7,9 @@ Covers two robustness gaps left unaddressed when #54843 merged:
 """
 from __future__ import annotations
 
+import json
 import re
+from unittest.mock import patch
 
 import tools.web_tools as wt
 
@@ -52,3 +54,33 @@ def test_small_page_not_truncated_no_footer(tmp_path, monkeypatch):
     assert not truncated
     assert model_text == content
     assert "[TRUNCATED]" not in model_text
+
+
+def test_web_search_readonly_skips_debug_artifacts(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    class FakeProvider:
+        name = "fake"
+        display_name = "Fake"
+
+        def supports_search(self):
+            return True
+
+        def search(self, query, limit):
+            return {
+                "success": True,
+                "data": {
+                    "web": [{"title": "Hit", "url": "https://example.com"}]
+                },
+            }
+
+    with patch("tools.web_tools._ensure_web_plugins_loaded"), \
+         patch("tools.web_tools._get_search_backend_chain", return_value=["fake"]), \
+         patch("agent.web_search_registry.get_provider", return_value=FakeProvider()), \
+         patch.object(wt._debug, "log_call", side_effect=AssertionError("debug write")), \
+         patch.object(wt._debug, "save", side_effect=AssertionError("debug save")):
+        result = json.loads(wt.web_search_readonly("query", limit=1))
+
+    assert result["success"] is True
+    assert result["data"]["web"][0]["title"] == "Hit"
+    assert not (tmp_path / ".hermes").exists()

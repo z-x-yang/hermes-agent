@@ -1,8 +1,12 @@
+from pathlib import Path
+
 import pytest
 
 from tools.subagent_profiles import (
+    DEFAULT_SUBAGENT_TYPE,
     SUPPORTED_SUBAGENT_TYPES,
     get_subagent_profile,
+    resolve_subagent_type,
     resolve_profile_config,
 )
 
@@ -15,11 +19,43 @@ def test_only_claude_aligned_builtin_types_are_exposed():
     )
 
 
+def test_omitted_type_resolves_to_general_purpose():
+    assert DEFAULT_SUBAGENT_TYPE == "general-purpose"
+    assert resolve_subagent_type(None) == "general-purpose"
+    assert resolve_subagent_type("") == "general-purpose"
+
+
 @pytest.mark.parametrize("name", SUPPORTED_SUBAGENT_TYPES)
 def test_builtin_profile_round_trip(name):
     profile = get_subagent_profile(name)
     assert profile.name == name
     assert profile.model == "inherit"
+
+
+def test_all_profiles_share_the_complete_result_contract():
+    required = (
+        "outcome",
+        "evidence",
+        "actions",
+        "files_changed",
+        "tests_run",
+        "verification",
+        "blockers",
+        "open_questions",
+        "confidence",
+        "limitations",
+        "side_effects",
+        "recommended_next_step",
+    )
+    contracts = []
+    for name in ("Explore", "Plan", "general-purpose"):
+        contract = get_subagent_profile(name).result_contract
+        contracts.append(contract)
+        assert all(field in contract for field in required), (name, contract)
+    assert len(set(contracts)) == 3
+    assert "searches/lookups" in contracts[0]
+    assert "implementation-plan" in contracts[1]
+    assert "executed actions" in contracts[2]
 
 
 def test_read_only_profiles_remain_hard_no_external_side_effect():
@@ -29,15 +65,214 @@ def test_read_only_profiles_remain_hard_no_external_side_effect():
         assert profile.can_external_side_effects is False
         assert "terminal" not in profile.allowed_tool_names
         assert "process" not in profile.allowed_tool_names
+        assert "web_search" not in profile.allowed_tool_names
+        assert "web_extract" not in profile.allowed_tool_names
+        assert "vision_analyze" not in profile.allowed_tool_names
+        assert profile.allowed_tool_names is not None
+        assert {
+            "web_search_readonly",
+            "web_extract_readonly",
+            "skills_list_readonly",
+            "skill_view_readonly",
+        }.issubset(profile.allowed_tool_names)
+        assert {
+            "mcp_notion_ai_notion_ai_ask",
+            "mcp_apple_mail_search_messages",
+            "mcp_apple_mail_get_message",
+            "mcp_apple_mail_get_thread",
+            "mcp_apple_mail_fetch_attachment",
+        }.issubset(profile.allowed_tool_names)
+        assert "mcp_apple_mail_send_email" not in profile.allowed_tool_names
+        assert "mcp_apple_mail_delete_message" not in profile.allowed_tool_names
+        assert "mcp_apple_mail_mark_as_read" not in profile.allowed_tool_names
+        assert "mode=readonly" in profile.system_instructions
+        assert "Never send, reply, forward, move, delete, flag, or mark mail" in (
+            profile.system_instructions
+        )
+
+
+def test_readonly_aliases_activate_skill_prompt_capability_detection():
+    from agent.system_prompt import (
+        _adapt_skills_prompt_for_readonly_aliases,
+        _has_skill_read_tools,
+    )
+
+    names = {"skills_list_readonly", "skill_view_readonly", "web_search_readonly"}
+    assert _has_skill_read_tools(names)
+    assert not _has_skill_read_tools({"read_file", "search_files"})
+
+    prompt = _adapt_skills_prompt_for_readonly_aliases(
+        "load skill_view(name); use skills_list and web_search; "
+        "If a skill has issues, fix it with skill_manage(action='patch').\n",
+        names,
+    )
+    assert "skill_view_readonly" in prompt
+    assert "skills_list_readonly" in prompt
+    assert "web_search_readonly" in prompt
+    assert "skill_manage" not in prompt
+
+
+def _force_web_tools_available(monkeypatch, registry):
+    for name in (
+        "web_search",
+        "web_extract",
+        "web_search_readonly",
+        "web_extract_readonly",
+    ):
+        entry = registry.get_entry(name)
+        assert entry is not None
+        monkeypatch.setattr(entry, "check_fn", lambda: True)
+
+
+def test_readonly_aliases_are_no_spill_reads_derived_from_raw_tools(monkeypatch):
+    import tools.skills_tool  # noqa: F401 — register aliases
+    import tools.web_tools  # noqa: F401 — register aliases
+    from tools.registry import registry
+    from tools.tool_effects import ResultRetention, ToolEffect
+
+    _force_web_tools_available(monkeypatch, registry)
+
+    expected = {
+        "web_search_readonly": ("web_search", ToolEffect.READ_REMOTE),
+        "web_extract_readonly": ("web_extract", ToolEffect.READ_REMOTE),
+        "skills_list_readonly": ("skills_list", ToolEffect.READ_LOCAL),
+        "skill_view_readonly": ("skill_view", ToolEffect.READ_LOCAL),
+    }
+    for alias, (raw, effect) in expected.items():
+        metadata = registry.resolved_policy_metadata(alias)
+        assert metadata is not None
+        _, descriptor = metadata
+        assert descriptor.effects == frozenset({effect})
+        assert descriptor.retention is ResultRetention.NO_SPILL
+        assert descriptor.required_parent_any_of == frozenset(
+            {registry.resolved_policy_identity(raw)}
+        )
+
+
+def test_explore_materializes_readonly_aliases_from_raw_parent_authority(monkeypatch):
+    from types import SimpleNamespace
+
+    import tools.skills_tool  # noqa: F401 — register aliases
+    import tools.web_tools  # noqa: F401 — register aliases
+    from agent.subagent_tool_policy import build_child_tool_policy
+    from tools.registry import registry
+    from tools.tool_effects import build_authority_snapshot
+
+    _force_web_tools_available(monkeypatch, registry)
+
+    raw_names = {"web_search", "web_extract", "skills_list", "skill_view"}
+    alias_names = {
+        "web_search_readonly",
+        "web_extract_readonly",
+        "skills_list_readonly",
+        "skill_view_readonly",
+    }
+    raw_ids = []
+    alias_ids = []
+    for name in raw_names:
+        identity = registry.resolved_policy_identity(name)
+        assert isinstance(identity, str)
+        raw_ids.append(identity)
+    for name in alias_names:
+        identity = registry.resolved_policy_identity(name)
+        assert isinstance(identity, str)
+        alias_ids.append(identity)
+
+    parent = SimpleNamespace(
+        _parent_tool_authority_snapshot=build_authority_snapshot(
+            raw_ids,
+            registry_generation=registry._generation,
+        )
+    )
+    child = SimpleNamespace(
+        _parent_tool_authority_snapshot=build_authority_snapshot(
+            alias_ids,
+            registry_generation=registry._generation,
+        )
+    )
+    profile_allowed_names = get_subagent_profile("Explore").allowed_tool_names
+    assert profile_allowed_names is not None
+
+    policy = build_child_tool_policy(
+        child=child,
+        parent=parent,
+        profile_name="Explore",
+        profile_allowed_names=profile_allowed_names,
+    )
+
+    assert policy.allowed_names is not None
+    assert alias_names.issubset(policy.allowed_names)
+    assert policy.allowed_names.isdisjoint(raw_names)
 
 
 def test_general_purpose_truthfully_reports_raw_shell_external_effect_capability():
     profile = get_subagent_profile("general-purpose")
     assert profile.can_external_side_effects is True
     assert profile.can_delegate is True
-    assert {"terminal", "process"}.issubset(profile.allowed_tool_names)
+    assert profile.allowed_tool_names is None
+    assert "exact parent tool surface" in profile.system_instructions
+    assert "Named external-side-effect tools are not available" not in (
+        profile.system_instructions
+    )
     assert "not a no-side-effect sandbox" in profile.system_instructions
-    assert "normal terminal approvals" in profile.system_instructions
+    assert "normal tool and terminal approvals" in profile.system_instructions
+
+
+def test_delegation_pattern_docs_match_general_purpose_authority():
+    root = Path(__file__).resolve().parents[2]
+    pattern_docs = [
+        root / "website/docs/guides/delegation-patterns.md",
+        root
+        / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/guides"
+        / "delegation-patterns.md",
+    ]
+    all_docs = pattern_docs + [
+        root / "website/docs/user-guide/features/delegation.md",
+        root
+        / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/features"
+        / "delegation.md",
+        root
+        / "website/docs/user-guide/skills/bundled/autonomous-ai-agents"
+        / "autonomous-ai-agents-hermes-agent.md",
+        root
+        / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/skills/bundled/autonomous-ai-agents"
+        / "autonomous-ai-agents-hermes-agent.md",
+    ]
+    stale_claims = (
+        "excludes named messaging",
+        "排除命名的消息",
+        "Closed repo-local worker policy",
+        "封闭的仓库内工作策略",
+        "Legacy generic children",
+        "后台池已经满了，Hermes 会同步执行",
+        "Synchronous subagent spawn",
+        "同步生成子代理",
+    )
+    for path in all_docs:
+        text = path.read_text(encoding="utf-8")
+        assert not any(claim in text for claim in stale_claims), path
+    for path in pattern_docs:
+        text = path.read_text(encoding="utf-8")
+        assert "exact current-parent tool authority" in text or (
+            "current parent 精确工具权限" in text
+        )
+    result_fields = (
+        "outcome",
+        "evidence",
+        "actions",
+        "files_changed",
+        "tests_run",
+        "verification",
+        "blockers",
+        "open_questions",
+        "confidence",
+        "limitations",
+        "side_effects",
+        "recommended_next_step",
+    )
+    for path in all_docs[2:4]:
+        text = path.read_text(encoding="utf-8")
+        assert all(field in text for field in result_fields), path
 
 
 def test_unknown_profile_fails_closed():

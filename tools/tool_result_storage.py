@@ -23,6 +23,7 @@ Defense against context-window overflow operates at three levels:
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -34,6 +35,7 @@ from tools.budget_config import (
     BudgetConfig,
     DEFAULT_BUDGET,
 )
+from tools.tool_effects import ResultRetention
 
 logger = logging.getLogger(__name__)
 PERSISTED_OUTPUT_TAG = "<persisted-output>"
@@ -141,6 +143,91 @@ def _build_persisted_message(
     return msg
 
 
+def project_result_for_retention(
+    content: str,
+    retention: ResultRetention,
+    *,
+    excerpt_chars: int = 256,
+) -> str:
+    """Return the bounded projection visible to observers/persistence sinks."""
+    if retention is not ResultRetention.HANDLE_ONLY:
+        return content
+    encoded = content.encode("utf-8")
+    return json.dumps(
+        {
+            "retention": "handle_only",
+            "handle": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "size_chars": len(content),
+            "size_bytes": len(encoded),
+            "excerpt": content[: max(0, excerpt_chars)],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def bound_live_result_for_retention(
+    content: str,
+    retention: ResultRetention,
+    *,
+    max_chars: int,
+) -> str:
+    """Keep live HANDLE_ONLY content useful while enforcing a hard char cap."""
+    if retention is not ResultRetention.HANDLE_ONLY or len(content) <= max_chars:
+        return content
+    if max_chars <= 0:
+        return ""
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    marker = (
+        "\n...[HANDLE_ONLY content truncated; "
+        f"sha256={digest}; omitted={{omitted}} chars]...\n"
+    )
+    # Resolve the omitted count once using the final marker length.
+    provisional = marker.format(omitted=len(content))
+    available = max_chars - len(provisional)
+    if available <= 0:
+        return provisional[:max_chars]
+    head_chars = (available + 1) // 2
+    tail_chars = available - head_chars
+    omitted = len(content) - head_chars - tail_chars
+    final_marker = marker.format(omitted=omitted)
+    # omitted digit width can change the marker by a few chars; rebalance once.
+    available = max(0, max_chars - len(final_marker))
+    head_chars = (available + 1) // 2
+    tail_chars = available - head_chars
+    omitted = len(content) - head_chars - tail_chars
+    final_marker = marker.format(omitted=omitted)
+    return content[:head_chars] + final_marker + (
+        content[-tail_chars:] if tail_chars else ""
+    )
+
+
+def project_messages_for_retention(
+    messages: list[dict],
+    retention_by_tool_call_id: dict[str, ResultRetention] | None,
+) -> list[dict]:
+    """Copy and project sensitive tool messages for persistence sinks."""
+    if not retention_by_tool_call_id:
+        return messages
+    projected = list(messages)
+    changed = False
+    for index, message in enumerate(messages):
+        call_id = str(message.get("tool_call_id", ""))
+        retention = retention_by_tool_call_id.get(
+            call_id, ResultRetention.DEFAULT
+        )
+        content = message.get("content")
+        if retention is ResultRetention.HANDLE_ONLY and isinstance(content, str):
+            replacement = dict(message)
+            replacement["content"] = project_result_for_retention(
+                content, ResultRetention.HANDLE_ONLY
+            )
+            projected[index] = replacement
+            changed = True
+    return projected if changed else messages
+
+
 def maybe_persist_tool_result(
     content: str,
     tool_name: str,
@@ -148,6 +235,7 @@ def maybe_persist_tool_result(
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
     threshold: int | float | None = None,
+    retention: ResultRetention = ResultRetention.DEFAULT,
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
@@ -166,6 +254,19 @@ def maybe_persist_tool_result(
     Returns:
         Original content if small, or <persisted-output> replacement.
     """
+    if retention is ResultRetention.HANDLE_ONLY:
+        resolved_threshold = (
+            threshold if threshold is not None else config.resolve_threshold(tool_name)
+        )
+        max_chars = config.default_result_size
+        if resolved_threshold != float("inf"):
+            max_chars = min(max_chars, int(resolved_threshold))
+        return bound_live_result_for_retention(
+            content, retention, max_chars=max_chars
+        )
+    if retention is ResultRetention.NO_SPILL:
+        return content
+
     effective_threshold = threshold if threshold is not None else config.resolve_threshold(tool_name)
 
     if effective_threshold == float("inf"):
@@ -204,6 +305,7 @@ def enforce_turn_budget(
     tool_messages: list[dict],
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
+    retention_by_tool_call_id: dict[str, ResultRetention] | None = None,
 ) -> list[dict]:
     """Layer 3: enforce aggregate budget across all tool results in a turn.
 
@@ -219,7 +321,13 @@ def enforce_turn_budget(
         content = msg.get("content", "")
         size = len(content)
         total_size += size
-        if PERSISTED_OUTPUT_TAG not in content:
+        retention = (retention_by_tool_call_id or {}).get(
+            str(msg.get("tool_call_id", "")), ResultRetention.DEFAULT
+        )
+        if (
+            PERSISTED_OUTPUT_TAG not in content
+            and retention is ResultRetention.DEFAULT
+        ):
             candidates.append((i, size))
 
     if total_size <= config.turn_budget:

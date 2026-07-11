@@ -21,6 +21,87 @@ from tools.skills_tool import (
 )
 
 
+def test_skills_list_readonly_does_not_create_missing_directory(tmp_path):
+    missing = tmp_path / "missing-skills"
+    with patch("tools.skills_tool.SKILLS_DIR", missing):
+        result = json.loads(skills_tool_module.skills_list_readonly())
+
+    assert result["success"] is True
+    assert result["skills"] == []
+    assert not missing.exists()
+
+
+def test_skill_view_readonly_is_pure_local_read(tmp_path):
+    _make_skill(
+        tmp_path,
+        "readonly-skill",
+        frontmatter_extra=(
+            "required_environment_variables:\n"
+            "  - name: SHOULD_NOT_CAPTURE\n"
+        ),
+        body="Literal inline command: !`printf SHOULD_NOT_RUN`",
+    )
+
+    with (
+        patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+        patch(
+            "tools.skills_tool._capture_required_environment_variables",
+            side_effect=AssertionError("secret capture"),
+        ),
+        patch(
+            "agent.skill_preprocessing.preprocess_skill_content",
+            side_effect=AssertionError("inline shell preprocessing"),
+        ),
+        patch(
+            "hermes_cli.plugins.discover_plugins",
+            side_effect=AssertionError("plugin discovery"),
+        ),
+        patch(
+            "tools.skill_usage.bump_use", side_effect=AssertionError("usage bump")
+        ),
+        patch(
+            "tools.skill_usage.bump_view", side_effect=AssertionError("view bump")
+        ),
+        patch(
+            "tools.skill_manager_tool.mark_background_review_skill_read",
+            side_effect=AssertionError("read telemetry"),
+        ),
+    ):
+        result = json.loads(
+            skills_tool_module.skill_view_readonly("readonly-skill")
+        )
+
+    assert result["success"] is True
+    assert "!`printf SHOULD_NOT_RUN`" in result["content"]
+    assert result["required_environment_variables"][0]["name"] == "SHOULD_NOT_CAPTURE"
+
+
+def test_skill_view_readonly_does_not_discover_or_clean_plugin_registry(tmp_path):
+    stale = tmp_path / "missing-plugin-skill" / "SKILL.md"
+
+    class FakePluginManager:
+        def find_plugin_skill(self, name):
+            return stale
+
+        def remove_plugin_skill(self, name):
+            raise AssertionError("registry cleanup")
+
+    with (
+        patch(
+            "hermes_cli.plugins.discover_plugins",
+            side_effect=AssertionError("plugin discovery"),
+        ),
+        patch(
+            "hermes_cli.plugins.get_plugin_manager",
+            return_value=FakePluginManager(),
+        ),
+    ):
+        result = json.loads(skills_tool_module.skill_view_readonly("plugin:ghost"))
+
+    assert result["success"] is False
+    assert "left the stale registry unchanged" in result["error"]
+
+
 def _make_skill(
     skills_dir, name, frontmatter_extra="", body="Step 1: Do the thing.", category=None
 ):

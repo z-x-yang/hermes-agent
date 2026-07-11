@@ -526,6 +526,8 @@ def _truncate_with_footer(
     content: str,
     url: str,
     char_limit: int,
+    *,
+    spill_to_disk: bool = True,
 ) -> tuple[str, bool]:
     """Return (model_text, was_truncated) for one page's clean content.
 
@@ -553,7 +555,7 @@ def _truncate_with_footer(
         tail = tail[nl + 1:]
 
     total = len(content)
-    stored_path = _store_full_text(url, content)
+    stored_path = _store_full_text(url, content) if spill_to_disk else None
     shown = len(head) + len(tail)
 
     footer_lines = [
@@ -574,10 +576,15 @@ def _truncate_with_footer(
             f"offset={middle_start_line} limit=200  (the file is the complete page; "
             f"raise/lower offset to page through it)."
         )
-    else:
+    elif spill_to_disk:
         footer_lines.append(
             "Full text could not be stored; re-run web_extract on a more "
             "specific URL or use browser_navigate for the complete page."
+        )
+    else:
+        footer_lines.append(
+            "Full text was not persisted by this read-only tool; re-run on a "
+            "more specific URL for the omitted middle."
         )
     footer_lines.append("─" * 29)
 
@@ -625,7 +632,12 @@ def _ensure_web_plugins_loaded() -> None:
         logger.warning("Web plugin discovery failed (non-fatal): %s", exc)
 
 
-def web_search_tool(query: str, limit: int = 5) -> str:
+def web_search_tool(
+    query: str,
+    limit: int = 5,
+    *,
+    persist_debug: bool = True,
+) -> str:
     """
     Search the web for information using available search API backend.
 
@@ -767,8 +779,9 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
         debug_call_data["final_response_size"] = len(result_json)
-        _debug.log_call("web_search_tool", debug_call_data)
-        _debug.save()
+        if persist_debug:
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
         return result_json
 
     except Exception as e:
@@ -776,8 +789,9 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         logger.debug("%s", error_msg)
 
         debug_call_data["error"] = error_msg
-        _debug.log_call("web_search_tool", debug_call_data)
-        _debug.save()
+        if persist_debug:
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
 
         return tool_error(error_msg)
 
@@ -786,6 +800,9 @@ async def web_extract_tool(
     urls: List[str],
     format: str = None,
     char_limit: Optional[int] = None,
+    *,
+    persist_debug: bool = True,
+    spill_to_disk: bool = True,
 ) -> str:
     """
     Extract content from specific web pages using available extraction API backend.
@@ -976,7 +993,12 @@ async def web_extract_tool(
             if not raw_content:
                 continue
             clean = convert_base64_images_to_links(raw_content)
-            model_text, truncated = _truncate_with_footer(clean, url, effective_char_limit)
+            model_text, truncated = _truncate_with_footer(
+                clean,
+                url,
+                effective_char_limit,
+                spill_to_disk=spill_to_disk,
+            )
             result["content"] = model_text
             if truncated:
                 debug_call_data["pages_truncated"] += 1
@@ -1016,8 +1038,9 @@ async def web_extract_tool(
         debug_call_data["processing_applied"].append("base64_image_conversion")
         
         # Log debug information
-        _debug.log_call("web_extract_tool", debug_call_data)
-        _debug.save()
+        if persist_debug:
+            _debug.log_call("web_extract_tool", debug_call_data)
+            _debug.save()
         
         return cleaned_result
             
@@ -1026,10 +1049,30 @@ async def web_extract_tool(
         logger.debug("%s", error_msg)
         
         debug_call_data["error"] = error_msg
-        _debug.log_call("web_extract_tool", debug_call_data)
-        _debug.save()
+        if persist_debug:
+            _debug.log_call("web_extract_tool", debug_call_data)
+            _debug.save()
         
         return tool_error(error_msg)
+
+
+def web_search_readonly(query: str, limit: int = 5) -> str:
+    """Search the web without writing debug artifacts or generic cache files."""
+    return web_search_tool(query, limit=limit, persist_debug=False)
+
+
+async def web_extract_readonly(
+    urls: List[str],
+    char_limit: Optional[int] = DEFAULT_EXTRACT_CHAR_LIMIT,
+) -> str:
+    """Extract bounded page text without debug artifacts or full-text spill."""
+    return await web_extract_tool(
+        urls,
+        "markdown",
+        char_limit=char_limit,
+        persist_debug=False,
+        spill_to_disk=False,
+    )
 
 
 # Convenience function to check web backend availability
@@ -1223,4 +1266,87 @@ registry.register(
     is_async=True,
     emoji="📄",
     max_result_size_chars=100_000,
+)
+
+
+def _web_search_readonly_handler(args, **kw):
+    return web_search_readonly(args.get("query", ""), limit=args.get("limit", 5))
+
+
+async def _web_extract_readonly_handler(args, **kw):
+    urls = args.get("urls", [])
+    return await web_extract_readonly(
+        urls[:5] if isinstance(urls, list) else [],
+        char_limit=args.get("char_limit", DEFAULT_EXTRACT_CHAR_LIMIT),
+    )
+
+
+from tools.tool_effects import (  # noqa: E402 — descriptors depend on raw registration
+    ResultRetention,
+    ToolEffect,
+    builtin_policy_descriptor,
+)
+
+WEB_SEARCH_READONLY_SCHEMA = json.loads(json.dumps(WEB_SEARCH_SCHEMA))
+WEB_SEARCH_READONLY_SCHEMA["name"] = "web_search_readonly"
+WEB_SEARCH_READONLY_SCHEMA["description"] = (
+    "Search the web without writing debug artifacts or generic cache files."
+)
+WEB_EXTRACT_READONLY_SCHEMA = json.loads(json.dumps(WEB_EXTRACT_SCHEMA))
+WEB_EXTRACT_READONLY_SCHEMA["name"] = "web_extract_readonly"
+WEB_EXTRACT_READONLY_SCHEMA["description"] = (
+    "Extract bounded web page content without writing debug artifacts, cache, or spill files."
+)
+WEB_EXTRACT_READONLY_SCHEMA["parameters"]["properties"]["char_limit"]["description"] = (
+    "Optional per-page character budget (default 15000). Larger pages are "
+    "head+tail truncated and the omitted text is not persisted."
+)
+
+_web_search_entry = registry.get_entry("web_search")
+_web_extract_entry = registry.get_entry("web_extract")
+_web_search_source_identity = (
+    _web_search_entry.policy_identity if _web_search_entry is not None else None
+)
+_web_extract_source_identity = (
+    _web_extract_entry.policy_identity if _web_extract_entry is not None else None
+)
+if not _web_search_source_identity or not _web_extract_source_identity:
+    raise RuntimeError("raw web tool policy identities must exist before readonly aliases")
+
+registry.register(
+    name="web_search_readonly",
+    toolset="web",
+    schema=WEB_SEARCH_READONLY_SCHEMA,
+    handler=_web_search_readonly_handler,
+    check_fn=check_web_api_key,
+    requires_env=_web_requires_env(),
+    emoji="🔍",
+    max_result_size_chars=100_000,
+    descriptor=builtin_policy_descriptor(
+        name="web_search_readonly",
+        schema=WEB_SEARCH_READONLY_SCHEMA,
+        handler=_web_search_readonly_handler,
+        effects={ToolEffect.READ_REMOTE},
+        retention=ResultRetention.NO_SPILL,
+        required_parent_any_of={_web_search_source_identity},
+    ),
+)
+registry.register(
+    name="web_extract_readonly",
+    toolset="web",
+    schema=WEB_EXTRACT_READONLY_SCHEMA,
+    handler=_web_extract_readonly_handler,
+    check_fn=check_web_api_key,
+    requires_env=_web_requires_env(),
+    is_async=True,
+    emoji="📄",
+    max_result_size_chars=100_000,
+    descriptor=builtin_policy_descriptor(
+        name="web_extract_readonly",
+        schema=WEB_EXTRACT_READONLY_SCHEMA,
+        handler=_web_extract_readonly_handler,
+        effects={ToolEffect.READ_REMOTE},
+        retention=ResultRetention.NO_SPILL,
+        required_parent_any_of={_web_extract_source_identity},
+    ),
 )

@@ -2279,6 +2279,61 @@ class TestExecuteToolCalls:
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
 
+    def test_sequential_delegate_continue_uses_live_parent_and_emits_one_post_hook(
+        self, agent, monkeypatch
+    ):
+        agent.valid_tool_names.add("delegate_continue")
+        agent.session_id = "parent-live"
+        agent._current_turn_id = "turn-continue"
+        agent._current_api_request_id = "request-continue"
+        captured_args = []
+        hook_calls = []
+
+        def _dispatch(args):
+            captured_args.append(dict(args))
+            return json.dumps({"status": "completed", "agent_id": args["agent_id"]})
+
+        def _capture_hook(hook_name, **kwargs):
+            hook_calls.append((hook_name, kwargs))
+            return []
+
+        agent._dispatch_delegate_continue = _dispatch
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _capture_hook)
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
+
+        tc = _mock_tool_call(
+            name="delegate_continue",
+            arguments=json.dumps({
+                "agent_id": "agent-1",
+                "prompt": "continue with the same child",
+                "scheduling": "foreground",
+            }),
+            call_id="continue-1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=AssertionError("delegate_continue fell through to registry dispatch"),
+        ):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert captured_args == [{
+            "agent_id": "agent-1",
+            "prompt": "continue with the same child",
+            "scheduling": "foreground",
+        }]
+        assert json.loads(messages[-1]["content"]) == {
+            "status": "completed",
+            "agent_id": "agent-1",
+        }
+        post_calls = [kwargs for name, kwargs in hook_calls if name == "post_tool_call"]
+        assert len(post_calls) == 1
+        assert post_calls[0]["tool_name"] == "delegate_continue"
+        assert post_calls[0]["tool_call_id"] == "continue-1"
+        assert post_calls[0]["session_id"] == "parent-live"
+
     def test_sequential_memory_remove_notifies_provider_with_tool_result(self, agent):
         old_text = "stale preference entry"
         tc = _mock_tool_call(

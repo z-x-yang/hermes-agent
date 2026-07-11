@@ -10,20 +10,53 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.subagent_tool_policy import ToolNamePolicy
+from tools.registry import registry
 from tools.subagent_sessions import (
     RetainedSubagentSession,
     clear_retained_subagent_sessions,
     get_retained_subagent_session,
     retain_subagent_session,
 )
+from tools.tool_effects import ResultRetention, ToolEffect, build_authority_snapshot
 
 
 def setup_function():
     clear_retained_subagent_sessions()
 
 
+def _set_authority(agent, names) -> None:
+    import model_tools  # noqa: F401
+
+    identities = {
+        identity
+        for name in names
+        if isinstance((identity := registry.resolved_policy_identity(name)), str)
+    }
+    agent._parent_tool_authority_snapshot = build_authority_snapshot(
+        identities, registry_generation=registry._generation
+    )
+
+
+def _attach_policy(agent, names, profile_name: str):
+    names = frozenset(names)
+    _set_authority(agent, names)
+    allowed_effects = None
+    if profile_name in {"Explore", "Plan"}:
+        allowed_effects = frozenset(
+            {ToolEffect.READ_LOCAL, ToolEffect.READ_REMOTE}
+        )
+    agent._subagent_tool_policy = ToolNamePolicy(
+        allowed_names=names,
+        allowed_effects=allowed_effects,
+        authority_snapshot=agent._parent_tool_authority_snapshot,
+        profile_name=profile_name,
+    )
+    return agent
+
+
 def _parent(session_id: str = "parent-1", *, enabled_toolsets=None):
-    return SimpleNamespace(
+    parent = SimpleNamespace(
         session_id=session_id,
         model="model-a",
         provider="openrouter",
@@ -57,10 +90,33 @@ def _parent(session_id: str = "parent-1", *, enabled_toolsets=None):
         _current_turn_id="turn-1",
         _current_api_request_id="req-1",
     )
+    _set_authority(parent, parent.valid_tool_names)
+    return parent
 
 
 def _record(**overrides):
     now = time.time()
+    from agent.subagent_governance import load_governance_snapshot
+    import model_tools  # noqa: F401
+
+    governance = load_governance_snapshot()
+    effective_names = frozenset(
+        {
+            "terminal",
+            "process",
+            "read_file",
+            "write_file",
+            "patch",
+            "search_files",
+            "web_search",
+            "web_extract",
+        }
+    )
+    original_identities = frozenset(
+        identity
+        for name in effective_names
+        if isinstance((identity := registry.resolved_policy_identity(name)), str)
+    )
     data = {
         "agent_id": "agent-1",
         "parent_session_id": "parent-1",
@@ -72,18 +128,11 @@ def _record(**overrides):
         "conversation_history": [{"role": "user", "content": "first"}],
         "created_at": now,
         "expires_at": now + 60,
-        "effective_allowed_tool_names": frozenset(
-            {
-                "terminal",
-                "process",
-                "read_file",
-                "write_file",
-                "patch",
-                "search_files",
-                "web_search",
-                "web_extract",
-            }
-        ),
+        "effective_allowed_tool_names": effective_names,
+        "profile_id": governance.profile_id,
+        "canonical_profile_home": str(governance.profile_home.resolve()),
+        "original_policy_identities": original_identities,
+        "original_governance_fingerprint": governance.fingerprint,
     }
     data.update(overrides)
     return RetainedSubagentSession(**data)
@@ -374,6 +423,10 @@ def test_delegate_continue_schema_is_narrow_and_registered():
     }:
         assert forbidden not in props
     assert DELEGATE_CONTINUE_SCHEMA["parameters"]["required"] == ["agent_id", "prompt"]
+    description = DELEGATE_CONTINUE_SCHEMA["description"]
+    assert "instead of spawning a new child" in description
+    assert "completed delegate_task result returned an agent_id" in description
+    assert "same retained history" in description
     assert "delegate_continue" in TOOLSETS["delegation"]["tools"]
 
     definitions = registry.get_definitions({"delegate_continue"})
@@ -431,7 +484,128 @@ def test_delegate_continue_reuses_history_and_updates_retained_record(monkeypatc
     assert "continue the same investigation" in captured["user_message"]
     updated = get_retained_subagent_session("agent-1")
     assert updated.subagent_type == "Explore"
+    assert updated.status == "completed"
+    assert updated.updated_at > updated.created_at
     assert updated.conversation_history[-1] == {"role": "assistant", "content": "continued"}
+
+
+def test_continuation_reloads_modified_current_active_governance(monkeypatch, tmp_path):
+    import agent.subagent_governance as governance
+    import tools.delegate_continue_tool as continue_tool
+    from tools.delegate_tool import _build_child_system_prompt
+
+    memories = tmp_path / "memories"
+    memories.mkdir()
+    (tmp_path / "SOUL.md").write_text("SOUL-V1\n", encoding="utf-8")
+    (memories / "MEMORY.md").write_text("MEMORY-CANARY\n", encoding="utf-8")
+    (memories / "USER.md").write_text("USER-CANARY\n", encoding="utf-8")
+    monkeypatch.setattr(governance, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(governance, "get_active_profile_name", lambda: "active-test")
+
+    prompts = []
+    fingerprints = []
+
+    def fake_build_child_agent(*_args, **kwargs):
+        snapshot = kwargs["governance_snapshot"]
+        fingerprints.append(snapshot.fingerprint)
+        prompts.append(
+            _build_child_system_prompt(
+                profile=kwargs["profile"],
+                role=kwargs["role"],
+                workspace_path=kwargs["workspace_path_override"],
+                child_depth=1,
+                max_spawn_depth=1,
+                governance_snapshot=snapshot,
+                context_policy_capsule=kwargs["context_policy_capsule"],
+            )
+        )
+        return _attach_policy(
+            SimpleNamespace(valid_tool_names={"read_file"}),
+            {"read_file"},
+            kwargs["profile"].name,
+        )
+
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", fake_build_child_agent)
+    record = _record(
+        subagent_type="Explore",
+        workspace_path=str(tmp_path),
+        effective_allowed_tool_names=frozenset({"read_file"}),
+        profile_id="active-test",
+        canonical_profile_home=str(tmp_path.resolve()),
+    )
+    parent = _parent()
+
+    continue_tool._build_continuation_child(record, prompt="first", parent_agent=parent)
+    (tmp_path / "SOUL.md").write_text("SOUL-V2-MODIFIED\n", encoding="utf-8")
+    continue_tool._build_continuation_child(record, prompt="second", parent_agent=parent)
+
+    assert "SOUL-V1\n" in prompts[0]
+    assert "SOUL-V2-MODIFIED\n" in prompts[1]
+    assert "SOUL-V1\n" not in prompts[1]
+    assert fingerprints[0] != fingerprints[1]
+
+
+def test_continuation_rejects_profile_or_canonical_home_drift_before_child_build(
+    monkeypatch,
+):
+    import tools.delegate_continue_tool as continue_tool
+
+    record = _record(profile_id="retained-profile")
+    latest = SimpleNamespace(
+        profile_id="different-profile",
+        profile_home=record.canonical_profile_home,
+        fingerprint="b" * 64,
+    )
+    backend_calls = []
+    monkeypatch.setattr(continue_tool, "load_governance_snapshot", lambda: latest)
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_agent",
+        lambda *_args, **_kwargs: backend_calls.append(True),
+    )
+
+    with pytest.raises(ValueError, match="profile changed"):
+        continue_tool._build_continuation_child(
+            record,
+            prompt="continue",
+            parent_agent=_parent(),
+        )
+    assert backend_calls == []
+
+
+def test_continuation_intersects_original_and_current_exact_policy_identities(
+    monkeypatch,
+):
+    import tools.delegate_continue_tool as continue_tool
+
+    current = continue_tool.load_governance_snapshot()
+    kept = "policy:" + "1" * 64
+    original_only = "policy:" + "2" * 64
+    replacement = "policy:" + "3" * 64
+    record = _record(
+        effective_allowed_tool_names=frozenset({"read_file"}),
+        original_policy_identities=frozenset({kept, original_only}),
+    )
+    child = SimpleNamespace(valid_tool_names={"read_file"})
+    child._subagent_tool_policy = ToolNamePolicy(
+        allowed_names=frozenset({"read_file"}),
+        allowed_effects=None,
+        authority_snapshot=build_authority_snapshot(
+            {kept, replacement}, registry_generation=registry._generation
+        ),
+        profile_name="general-purpose",
+    )
+    monkeypatch.setattr(continue_tool, "load_governance_snapshot", lambda: current)
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", lambda *_a, **_k: child)
+
+    rebuilt = continue_tool._build_continuation_child(
+        record,
+        prompt="continue",
+        parent_agent=_parent(),
+    )
+
+    assert rebuilt._subagent_tool_policy.authority_snapshot.policy_identities == {
+        kept
+    }
 
 
 def test_continuation_runtime_pins_retained_workspace_and_clears_task_override(
@@ -849,7 +1023,7 @@ def test_top_level_async_continue_is_never_parent_lifecycle_owned(
     assert responses
 
 
-@pytest.mark.parametrize("sync_path", ["nested", "stateless", "capacity"])
+@pytest.mark.parametrize("sync_path", ["nested", "stateless"])
 def test_sync_continue_fallbacks_remain_parent_attached_while_running(
     monkeypatch, sync_path
 ):
@@ -935,7 +1109,7 @@ def test_sync_continue_fallbacks_remain_parent_attached_while_running(
     assert responses[0]["status"] == "completed"
 
 
-@pytest.mark.parametrize("sync_path", ["nested", "stateless", "capacity"])
+@pytest.mark.parametrize("sync_path", ["nested", "stateless"])
 def test_delegate_continue_releases_claim_after_sync_fallbacks(monkeypatch, sync_path):
     from tools.delegate_continue_tool import delegate_continue
 
@@ -967,6 +1141,46 @@ def test_delegate_continue_releases_claim_after_sync_fallbacks(monkeypatch, sync
             delegate_continue("agent-1", prompt, scheduling, parent_agent=parent)
         )
         assert result["status"] == "completed"
+
+
+def test_delegate_continue_capacity_rejection_runs_no_child_and_releases_claim(
+    monkeypatch,
+):
+    from tools.delegate_continue_tool import delegate_continue
+
+    executions = []
+    dispatches = []
+
+    monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
+    monkeypatch.setattr(
+        "tools.delegate_continue_tool._run_continuation_entry",
+        lambda *_args, **_kwargs: executions.append(True),
+    )
+
+    def reject(**_kwargs):
+        dispatches.append(True)
+        return {"status": "rejected", "error": "capacity"}
+
+    monkeypatch.setattr(
+        "tools.async_delegation.dispatch_async_delegation_batch", reject
+    )
+    retain_subagent_session(_record())
+
+    first = json.loads(
+        delegate_continue("agent-1", "first", "background", parent_agent=_parent())
+    )
+    second = json.loads(
+        delegate_continue("agent-1", "retry", "background", parent_agent=_parent())
+    )
+
+    assert first == second == {
+        "status": "rejected",
+        "mode": "background",
+        "agent_id": "agent-1",
+        "error": "capacity",
+    }
+    assert executions == []
+    assert len(dispatches) == 2
 
 
 def test_delegate_continue_releases_claim_when_dispatch_raises(monkeypatch):
@@ -1004,7 +1218,12 @@ def test_delegate_continue_releases_claim_when_dispatch_raises(monkeypatch):
     second = json.loads(
         delegate_continue("agent-1", "retry", "background", parent_agent=_parent())
     )
-    assert second["status"] == "completed"
+    assert second == {
+        "status": "rejected",
+        "mode": "background",
+        "agent_id": "agent-1",
+        "error": "capacity",
+    }
 
 
 def test_claimed_retained_session_survives_midflight_ttl_then_expires(monkeypatch):
@@ -1171,6 +1390,10 @@ def test_delegate_continue_foreground_parent_interrupt_returns_without_late_queu
         allow_finish.set()
         future.result(timeout=2)
         assert process_registry.completion_queue.empty()
+        retained = get_retained_subagent_session("agent-1")
+        assert retained.conversation_history == [
+            {"role": "user", "content": "first"}
+        ]
     finally:
         allow_finish.set()
         async_delegation._reset_for_tests()
@@ -1353,6 +1576,41 @@ def test_delegate_continue_rejects_invalid_scheduling():
     assert result["error"] == "Invalid scheduling: later"
 
 
+def test_build_continuation_child_warns_after_prior_file_writes(monkeypatch):
+    from tools.delegate_continue_tool import _build_continuation_child
+
+    child = _attach_policy(
+        SimpleNamespace(
+            valid_tool_names={"read_file"},
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "read_file", "parameters": {}},
+                }
+            ],
+            ephemeral_system_prompt="base",
+        ),
+        {"read_file"},
+        "general-purpose",
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_agent",
+        lambda **_kwargs: child,
+    )
+    data = dataclasses.asdict(_record())
+    data["files_written"] = ("/tmp/repo/changed.py",)
+
+    built = _build_continuation_child(
+        SimpleNamespace(**data),
+        prompt="keep editing",
+        parent_agent=_parent(),
+    )
+
+    assert "workspace may have changed" in built.ephemeral_system_prompt
+    assert "verify the current diff/state" in built.ephemeral_system_prompt
+    assert "/tmp/repo/changed.py" in built.ephemeral_system_prompt
+
+
 def test_build_continuation_child_preserves_explore_capability_ceiling(monkeypatch):
     from tools.delegate_continue_tool import _build_continuation_child
     from toolsets import TOOLSETS
@@ -1376,6 +1634,7 @@ def test_build_continuation_child_preserves_explore_capability_ceiling(monkeypat
                 {"type": "function", "function": {"name": name, "parameters": {}}}
                 for name in sorted(self.valid_tool_names)
             ]
+            _set_authority(self, self.valid_tool_names)
             created.append(self)
 
     monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
@@ -1420,6 +1679,7 @@ def test_build_continuation_child_preserves_original_effective_tool_ceiling(monk
                 {"type": "function", "function": {"name": name, "parameters": {}}}
                 for name in sorted(self.valid_tool_names)
             ]
+            _set_authority(self, self.valid_tool_names)
 
     monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
     record = _record(
@@ -1457,10 +1717,12 @@ def test_build_continuation_child_intersects_exact_current_parent_tool_names(mon
                 {"type": "function", "function": {"name": name, "parameters": {}}}
                 for name in sorted(self.valid_tool_names)
             ]
+            _set_authority(self, self.valid_tool_names)
 
     monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
     parent = _parent(enabled_toolsets=["file"])
     parent.valid_tool_names = {"read_file"}
+    _set_authority(parent, parent.valid_tool_names)
     record = _record(
         subagent_type="general-purpose",
         effective_allowed_tool_names=frozenset(
@@ -1480,13 +1742,24 @@ def test_build_continuation_child_intersects_exact_current_parent_tool_names(mon
 
 @pytest.mark.parametrize("subagent_type", [None, "general-purpose"])
 @pytest.mark.parametrize(
-    ("original_has_delegate_task", "orchestrator_enabled", "expected_role"),
-    [(True, True, "orchestrator"), (False, True, "orchestrator"), (True, False, "leaf")],
+    (
+        "original_has_delegate_task",
+        "parent_has_delegate_task",
+        "orchestrator_enabled",
+        "expected_role",
+    ),
+    [
+        (True, True, True, "orchestrator"),
+        (False, True, True, "leaf"),
+        (True, False, True, "leaf"),
+        (True, True, False, "leaf"),
+    ],
 )
-def test_orchestrator_continuation_preserves_only_original_delegate_task_exception(
+def test_orchestrator_continuation_requires_original_and_current_delegate_task(
     monkeypatch,
     subagent_type,
     original_has_delegate_task,
+    parent_has_delegate_task,
     orchestrator_enabled,
     expected_role,
 ):
@@ -1509,6 +1782,7 @@ def test_orchestrator_continuation_preserves_only_original_delegate_task_excepti
                 {"type": "function", "function": {"name": name, "parameters": {}}}
                 for name in sorted(self.valid_tool_names)
             ]
+            _set_authority(self, self.valid_tool_names)
 
     monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
     monkeypatch.setattr(
@@ -1519,8 +1793,14 @@ def test_orchestrator_continuation_preserves_only_original_delegate_task_excepti
     retained_names = {"read_file", "delegate_continue"}
     if original_has_delegate_task:
         retained_names.add("delegate_task")
-    parent = _parent(enabled_toolsets=["file"])
-    parent.valid_tool_names = {"read_file"}
+    parent_toolsets = ["file"]
+    parent_names = {"read_file"}
+    if parent_has_delegate_task:
+        parent_toolsets.append("delegation")
+        parent_names.add("delegate_task")
+    parent = _parent(enabled_toolsets=parent_toolsets)
+    parent.valid_tool_names = parent_names
+    _set_authority(parent, parent.valid_tool_names)
 
     child = _build_continuation_child(
         _record(
@@ -1533,7 +1813,7 @@ def test_orchestrator_continuation_preserves_only_original_delegate_task_excepti
     )
 
     expected_names = {"read_file"}
-    if original_has_delegate_task and orchestrator_enabled:
+    if original_has_delegate_task and parent_has_delegate_task and orchestrator_enabled:
         expected_names.add("delegate_task")
     assert child._delegate_role == expected_role
     assert child.valid_tool_names == expected_names
@@ -1583,7 +1863,11 @@ def test_build_continuation_child_isolates_retained_provider_transport(monkeypat
 
     def fake_build_child_agent(**kwargs):
         captured.update(kwargs)
-        return SimpleNamespace(**kwargs)
+        return _attach_policy(
+            SimpleNamespace(valid_tool_names={"read_file"}),
+            {"read_file"},
+            kwargs["profile"].name,
+        )
 
     monkeypatch.setattr("tools.delegate_tool._build_child_agent", fake_build_child_agent)
 
@@ -1626,6 +1910,24 @@ def test_run_single_child_retains_completed_general_purpose_session(monkeypatch)
                 "api_calls": 1,
                 "messages": [
                     {"role": "user", "content": kwargs["user_message"]},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "read-1",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": '{"path":"x.py"}',
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "read-1",
+                        "content": "source",
+                    },
                     {"role": "assistant", "content": "done"},
                 ],
             }
@@ -1638,11 +1940,24 @@ def test_run_single_child_retains_completed_general_purpose_session(monkeypatch)
 
     monkeypatch.setattr(dt, "_get_retained_session_ttl", lambda: 60)
     monkeypatch.setattr(dt, "_get_max_retained_subagents", lambda: 64)
+    monkeypatch.setattr(
+        dt.file_state,
+        "writes_since",
+        lambda *_args, **_kwargs: {"sa-test": ["/tmp/repo/changed.py"]},
+    )
+    governance = dt.load_governance_snapshot()
+    child = _attach_policy(FakeChild(), {"read_file"}, "general-purpose")
+    child._governance_diagnostics = {
+        "profile_id": governance.profile_id,
+        "profile_home": str(governance.profile_home),
+        "fingerprint": governance.fingerprint,
+        "total_bytes": governance.total_bytes,
+    }
 
     entry = dt._run_single_child(
         task_index=0,
         goal="implement",
-        child=FakeChild(),
+        child=child,
         parent_agent=_parent(),
         context=None,
         child_timeout_override=30,
@@ -1653,13 +1968,178 @@ def test_run_single_child_retains_completed_general_purpose_session(monkeypatch)
     )
 
     assert entry["status"] == "completed"
+    assert entry["retention_status"] == "retained"
     assert entry["agent_id"] == "child-session"
     record = get_retained_subagent_session("child-session")
+    assert record.status == "completed"
+    assert record.updated_at == record.created_at
+    assert record.files_written == ("/tmp/repo/changed.py",)
+    assert record.tool_trace_metadata[0][0] == "read_file"
     assert record.subagent_type == "general-purpose"
     assert record.role == "leaf"
     assert record.workspace_path == "/tmp/repo"
     assert record.effective_allowed_tool_names == frozenset({"read_file"})
+    assert record.profile_id == governance.profile_id
+    assert record.canonical_profile_home == str(governance.profile_home.resolve())
+    assert record.original_policy_identities == (
+        child._subagent_tool_policy.authority_snapshot.policy_identities
+    )
+    assert record.original_governance_fingerprint == governance.fingerprint
     assert record.conversation_history[-1] == {"role": "assistant", "content": "done"}
+
+
+def test_run_single_child_surfaces_retention_failure(monkeypatch):
+    import tools.delegate_tool as dt
+    import tools.subagent_sessions as sessions
+
+    governance = dt.load_governance_snapshot()
+    child = _attach_policy(
+        _CompletedRetainableChild(), {"read_file"}, "general-purpose"
+    )
+    child._governance_diagnostics = {
+        "profile_id": governance.profile_id,
+        "profile_home": str(governance.profile_home),
+        "fingerprint": governance.fingerprint,
+        "total_bytes": governance.total_bytes,
+    }
+    monkeypatch.setattr(
+        sessions,
+        "retain_subagent_session",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("retained transcript capacity reached")
+        ),
+    )
+
+    entry = dt._run_single_child(
+        task_index=0,
+        goal="implement",
+        child=child,
+        parent_agent=_parent(),
+        context=None,
+        child_timeout_override=30,
+        retain_session=True,
+        subagent_type="general-purpose",
+        role="leaf",
+        workspace_path="/tmp/repo",
+    )
+
+    assert entry["status"] == "completed"
+    assert entry["retention_status"] == "failed"
+    assert entry["retention_error"] == "retained transcript capacity reached"
+    assert "agent_id" not in entry
+    assert "retained_until" not in entry
+
+
+def test_initial_retained_history_projects_handle_only_tool_results(monkeypatch):
+    import tools.delegate_tool as dt
+
+    sensitive_body = "A" * 400 + "RAW_BODY_CANARY"
+
+    class SensitiveChild(_CompletedRetainableChild):
+        _subagent_tool_result_retention_by_call_id = {
+            "sensitive-call": ResultRetention.HANDLE_ONLY
+        }
+
+        def run_conversation(self, **kwargs):
+            return {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+                "messages": [
+                    {"role": "user", "content": kwargs["user_message"]},
+                    {
+                        "role": "tool",
+                        "name": "mcp_notion_ai_notion_ai_ask",
+                        "tool_call_id": "sensitive-call",
+                        "content": sensitive_body,
+                    },
+                    {"role": "assistant", "content": "done"},
+                ],
+            }
+
+    governance = dt.load_governance_snapshot()
+    child = _attach_policy(SensitiveChild(), {"read_file"}, "general-purpose")
+    child._governance_diagnostics = {
+        "profile_id": governance.profile_id,
+        "profile_home": str(governance.profile_home),
+        "fingerprint": governance.fingerprint,
+        "total_bytes": governance.total_bytes,
+    }
+    dt._run_single_child(
+        task_index=0,
+        goal="read notion",
+        child=child,
+        parent_agent=_parent(),
+        context=None,
+        child_timeout_override=30,
+        retain_session=True,
+        subagent_type="general-purpose",
+        role="leaf",
+        workspace_path="/tmp/repo",
+    )
+
+    stored_history = get_retained_subagent_session(
+        "child-session"
+    ).conversation_history
+    tool_content = next(
+        message["content"] for message in stored_history if message["role"] == "tool"
+    )
+    projection = json.loads(tool_content)
+    assert "RAW_BODY_CANARY" not in tool_content
+    assert projection["retention"] == "handle_only"
+    assert projection["handle"].startswith("sha256:")
+
+
+def test_continued_retained_history_projects_handle_only_tool_results(monkeypatch):
+    from tools.delegate_continue_tool import _run_continuation_entry
+
+    sensitive_body = "B" * 400 + "RAW_CONTINUATION_CANARY"
+
+    class SensitiveContinuationChild:
+        model = "model-a"
+        provider = "openrouter"
+        _subagent_tool_result_retention_by_call_id = {
+            "continued-sensitive-call": ResultRetention.HANDLE_ONLY
+        }
+
+        def run_conversation(self, **kwargs):
+            return {
+                "final_response": "continued",
+                "api_calls": 1,
+                "messages": kwargs["conversation_history"]
+                + [
+                    {
+                        "role": "tool",
+                        "name": "mcp_apple_mail_get_message",
+                        "tool_call_id": "continued-sensitive-call",
+                        "content": sensitive_body,
+                    },
+                    {"role": "assistant", "content": "continued"},
+                ],
+            }
+
+        def close(self):
+            pass
+
+    retain_subagent_session(_record())
+    monkeypatch.setattr(
+        "tools.delegate_continue_tool._build_continuation_child",
+        lambda *_args, **_kwargs: SensitiveContinuationChild(),
+    )
+    _run_continuation_entry(
+        get_retained_subagent_session("agent-1"),
+        "continue reading mail",
+        _parent(),
+    )
+
+    stored_history = get_retained_subagent_session("agent-1").conversation_history
+    tool_content = next(
+        message["content"] for message in stored_history if message["role"] == "tool"
+    )
+    projection = json.loads(tool_content)
+    assert "RAW_CONTINUATION_CANARY" not in tool_content
+    assert projection["retention"] == "handle_only"
+    assert projection["handle"].startswith("sha256:")
 
 
 def test_run_single_child_does_not_retain_without_parent_session_id(monkeypatch):

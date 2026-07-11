@@ -162,9 +162,9 @@ def dispatch_async_delegation(
         Optional callable to signal the child to stop (used on shutdown /
         explicit cancel).
     max_async_children
-        Concurrency cap. When at capacity the dispatch is REJECTED (the caller
-        should fall back to sync or tell the user) rather than queued, so a
-        runaway model can't pile up unbounded background work.
+        Concurrency cap. When at capacity the dispatch is REJECTED rather than
+        queued or converted into inline work, so a runaway model cannot exceed
+        the global child cap.
 
     Returns
     -------

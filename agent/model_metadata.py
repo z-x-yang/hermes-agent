@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -22,6 +23,14 @@ from utils import atomic_json_write, base_url_host_matches, base_url_hostname
 from hermes_constants import OPENROUTER_MODELS_URL
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class VerifiedContextLimit:
+    """A context limit whose source is authoritative for one provider route."""
+
+    tokens: int
+    source: str
 
 
 def _resolve_requests_verify() -> bool | str:
@@ -1887,7 +1896,63 @@ def _resolve_nous_context_length(
     return None, ""
 
 
-def get_model_context_length(
+_verified_context_limit_cache: Dict[
+    tuple[str, str, str], VerifiedContextLimit
+] = {}
+
+
+def _verified_context_cache_key(
+    model: str, base_url: str, provider: str
+) -> tuple[str, str, str]:
+    return (
+        _strip_provider_prefix(model or "").strip().lower(),
+        (base_url or "").strip().rstrip("/").lower(),
+        (provider or "").strip().lower(),
+    )
+
+
+def get_verified_model_context_length(
+    model: str,
+    base_url: str = "",
+    api_key: str = "",
+    config_context_length: int | None = None,
+    provider: str = "",
+    custom_providers: list | None = None,
+) -> VerifiedContextLimit | None:
+    """Resolve an explicitly route-bound context limit for governance.
+
+    Existing public callers retain ``get_model_context_length() -> int``.  The
+    governance seam accepts only explicit per-route configuration.  Generic
+    resolver integers, fuzzy/static catalog matches, and fallback constants are
+    deliberately not promoted to proof for private/custom/relay routes.
+    """
+    if (
+        isinstance(config_context_length, int)
+        and not isinstance(config_context_length, bool)
+        and config_context_length > 0
+    ):
+        return VerifiedContextLimit(config_context_length, "config")
+
+    if custom_providers and base_url and model:
+        try:
+            from hermes_cli.config import get_custom_provider_context_length
+
+            custom_limit = get_custom_provider_context_length(
+                model=model,
+                base_url=base_url,
+                custom_providers=custom_providers,
+            )
+            if isinstance(custom_limit, int) and custom_limit > 0:
+                return VerifiedContextLimit(custom_limit, "custom_provider_config")
+        except Exception:
+            pass
+
+    return _verified_context_limit_cache.get(
+        _verified_context_cache_key(model, base_url, provider)
+    )
+
+
+def _resolve_model_context_length(
     model: str,
     base_url: str = "",
     api_key: str = "",
@@ -2272,6 +2337,52 @@ def get_model_context_length(
 
     # 9. Default fallback — 256K
     return DEFAULT_FALLBACK_CONTEXT
+
+
+def get_model_context_length(
+    model: str,
+    base_url: str = "",
+    api_key: str = "",
+    config_context_length: int | None = None,
+    provider: str = "",
+    custom_providers: list | None = None,
+) -> int:
+    """Public int resolver that also records route-bound proof when available."""
+    resolved = _resolve_model_context_length(
+        model,
+        base_url=base_url,
+        api_key=api_key,
+        config_context_length=config_context_length,
+        provider=provider,
+        custom_providers=custom_providers,
+    )
+    proof: VerifiedContextLimit | None = None
+    if (
+        isinstance(config_context_length, int)
+        and not isinstance(config_context_length, bool)
+        and config_context_length > 0
+    ):
+        proof = VerifiedContextLimit(resolved, "config")
+    elif custom_providers and base_url and model:
+        try:
+            from hermes_cli.config import get_custom_provider_context_length
+
+            custom_limit = get_custom_provider_context_length(
+                model=model,
+                base_url=base_url,
+                custom_providers=custom_providers,
+            )
+            if custom_limit == resolved:
+                proof = VerifiedContextLimit(resolved, "custom_provider_config")
+        except Exception:
+            pass
+
+    cache_key = _verified_context_cache_key(model, base_url, provider)
+    if proof is None:
+        _verified_context_limit_cache.pop(cache_key, None)
+    else:
+        _verified_context_limit_cache[cache_key] = proof
+    return resolved
 
 
 async def get_model_context_length_async(

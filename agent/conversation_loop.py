@@ -769,6 +769,7 @@ def run_conversation(
         
         api_call_count += 1
         agent._api_call_count = api_call_count
+        provider_backend_invoked_this_iteration = False
         agent._touch_activity(f"starting API call #{api_call_count}")
 
         # Grace call: the budget is exhausted but we gave the model one
@@ -1197,6 +1198,13 @@ def run_conversation(
                     _original_api_kwargs = _llm_request_mw.original_payload
                     _llm_middleware_trace = _llm_request_mw.trace
                 except Exception:
+                    governance = getattr(agent, "_governance_diagnostics", None)
+                    if isinstance(governance, dict) and governance.get("fingerprint"):
+                        from agent.subagent_governance import GovernancePreflightError
+
+                        raise GovernancePreflightError(
+                            "governance_transport_unverifiable"
+                        ) from None
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
 
@@ -1206,65 +1214,55 @@ def run_conversation(
                     active_system_prompt=active_system_prompt or "",
                 )
 
-                try:
-                    from hermes_cli.plugins import (
-                        has_hook,
-                        invoke_hook as _invoke_hook,
-                    )
-                    if has_hook("pre_api_request"):
-                        request_messages = api_kwargs.get("messages")
-                        if not isinstance(request_messages, list):
-                            request_messages = api_kwargs.get("input")
-                        if not isinstance(request_messages, list):
-                            request_messages = api_messages
-                        # Shallow-copy the outer list so plugins that retain the
-                        # reference for async snapshotting don't observe later
-                        # mutations of api_messages.  The inner dicts are not
-                        # mutated by the agent loop, so a shallow copy is
-                        # sufficient; a deepcopy would walk every tool result
-                        # and base64 image on every API call.
-                        #
-                        # The ``request_messages`` and ``conversation_history``
-                        # kwargs below are pre-existing raw passthroughs
-                        # consumed by the bundled langfuse plugin
-                        # (``plugins/observability/langfuse/__init__.py:_coerce_request_messages``).
-                        # They predate ``request`` and are intentionally NOT
-                        # sanitised — secrets are not expected here because
-                        # ``api_kwargs`` is the same object passed to the
-                        # provider client.  New consumers should read the
-                        # sanitised view from ``request["body"]["messages"]``.
-                        _request_payload = agent._api_request_payload_for_hook(api_kwargs)
-                        _invoke_hook(
-                            "pre_api_request",
-                            task_id=effective_task_id,
-                            turn_id=turn_id,
-                            api_request_id=api_request_id,
-                            session_id=agent.session_id or "",
-                            user_message=original_user_message,
-                            conversation_history=list(messages),
-                            platform=agent.platform or "",
-                            model=agent.model,
-                            provider=agent.provider,
-                            base_url=agent.base_url,
-                            api_mode=agent.api_mode,
-                            api_call_count=api_call_count,
-                            request_messages=list(request_messages)
-                            if isinstance(request_messages, list)
-                            else [],
-                            message_count=len(api_messages),
-                            tool_count=len(agent.tools or []),
-                            approx_input_tokens=approx_tokens,
-                            request_char_count=total_chars,
-                            max_tokens=agent.max_tokens,
-                            started_at=api_start_time,
-                            middleware_trace=list(_llm_middleware_trace),
-                            request=_request_payload,
+                def _emit_pre_api_observers(final_api_kwargs):
+                    """Run body-bearing observers only after governed fit approval."""
+                    try:
+                        from hermes_cli.plugins import (
+                            has_hook,
+                            invoke_hook as _invoke_hook,
                         )
-                except Exception:
-                    pass
+                        if has_hook("pre_api_request"):
+                            request_messages = final_api_kwargs.get("messages")
+                            if not isinstance(request_messages, list):
+                                request_messages = final_api_kwargs.get("input")
+                            if not isinstance(request_messages, list):
+                                request_messages = api_messages
+                            _request_payload = agent._api_request_payload_for_hook(
+                                final_api_kwargs
+                            )
+                            _invoke_hook(
+                                "pre_api_request",
+                                task_id=effective_task_id,
+                                turn_id=turn_id,
+                                api_request_id=api_request_id,
+                                session_id=agent.session_id or "",
+                                user_message=original_user_message,
+                                conversation_history=list(messages),
+                                platform=agent.platform or "",
+                                model=agent.model,
+                                provider=agent.provider,
+                                base_url=agent.base_url,
+                                api_mode=agent.api_mode,
+                                api_call_count=api_call_count,
+                                request_messages=list(request_messages)
+                                if isinstance(request_messages, list)
+                                else [],
+                                message_count=len(api_messages),
+                                tool_count=len(agent.tools or []),
+                                approx_input_tokens=approx_tokens,
+                                request_char_count=total_chars,
+                                max_tokens=agent.max_tokens,
+                                started_at=api_start_time,
+                                middleware_trace=list(_llm_middleware_trace),
+                                request=_request_payload,
+                            )
+                    except Exception:
+                        pass
 
-                if env_var_enabled("HERMES_DUMP_REQUESTS"):
-                    agent._dump_api_request_debug(api_kwargs, reason="preflight")
+                    if env_var_enabled("HERMES_DUMP_REQUESTS"):
+                        agent._dump_api_request_debug(
+                            final_api_kwargs, reason="preflight"
+                        )
 
                 # Always prefer the streaming path — even without stream
                 # consumers.  Streaming gives us fine-grained health
@@ -1321,6 +1319,14 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    nonlocal provider_backend_invoked_this_iteration
+                    from agent.subagent_governance import (
+                        assert_governance_request_fits,
+                    )
+
+                    assert_governance_request_fits(agent, next_api_kwargs)
+                    _emit_pre_api_observers(next_api_kwargs)
+                    provider_backend_invoked_this_iteration = True
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -2325,6 +2331,40 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+
+                from agent.subagent_governance import GovernancePreflightError
+
+                if isinstance(api_error, GovernancePreflightError):
+                    # The outer loop charges one logical call before entering this
+                    # provider chain.  Keep that charge while another fallback can
+                    # still be attempted.  Refund exactly once only when the chain
+                    # terminates without any provider backend invocation.
+                    if agent._try_activate_fallback():
+                        active_system_prompt = _sync_failover_system_message(
+                            agent, api_messages, active_system_prompt
+                        )
+                        retry_count = 0
+                        compression_attempts = 0
+                        _retry.primary_recovery_attempted = False
+                        continue
+
+                    if not provider_backend_invoked_this_iteration:
+                        api_call_count = max(0, api_call_count - 1)
+                        agent._api_call_count = api_call_count
+                        try:
+                            agent.iteration_budget.refund()
+                        except Exception:
+                            pass
+                    agent._cleanup_task_resources(effective_task_id)
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": api_error.code,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": api_error.code,
+                    }
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:

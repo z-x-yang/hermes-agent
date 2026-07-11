@@ -531,37 +531,9 @@ def _compute_tool_definitions(
     except Exception as e:  # pragma: no cover — defensive
         logger.warning("Schema sanitization skipped: %s", e)
 
-    # ── Tool Search (progressive disclosure) ────────────────────────────
-    # Conditionally replace MCP + plugin (non-core) tools with three bridge
-    # tools (tool_search / tool_describe / tool_call) when the deferrable
-    # surface exceeds the configured threshold (default 10% of context
-    # window). Core Hermes tools (toolsets._HERMES_CORE_TOOLS) are NEVER
-    # deferred. See tools/tool_search.py for full design notes.
-    #
-    # This is deliberately the last step before returning — sanitization
-    # has already normalized schemas, and the assembly is idempotent in
-    # case some caller invokes get_tool_definitions twice.
-    try:
-        from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
-        ts_cfg = _load_ts_config()
-        if not skip_tool_search_assembly and ts_cfg.enabled != "off":
-            context_length = _resolve_active_context_length()
-            assembly = assemble_tool_defs(
-                filtered_tools,
-                context_length=context_length,
-                config=ts_cfg,
-            )
-            if assembly.activated and not quiet_mode:
-                print(
-                    f"🔎 Tool Search: {assembly.deferred_count} MCP/plugin tools deferred "
-                    f"(~{assembly.deferred_tokens} tokens) behind tool_search/describe/call. "
-                    f"Threshold ~{assembly.threshold_tokens} tokens."
-                )
-            filtered_tools = assembly.tool_defs
-    except Exception as e:  # pragma: no cover — never break tool loading
-        logger.warning("Tool search assembly skipped: %s", e)
-
-    return filtered_tools
+    if skip_tool_search_assembly:
+        return filtered_tools
+    return assemble_resolved_tool_definitions(filtered_tools, quiet_mode=quiet_mode)
 
 
 def _resolve_active_context_length() -> int:
@@ -640,6 +612,35 @@ def _resolve_active_context_length() -> int:
     except Exception as e:
         logger.debug("Could not resolve active context length: %s", e)
         return 0
+
+
+def assemble_resolved_tool_definitions(
+    resolved_tools: List[Dict[str, Any]],
+    *,
+    quiet_mode: bool = False,
+) -> List[Dict[str, Any]]:
+    """Apply Tool Search to one already-resolved, sanitized tool snapshot."""
+    try:
+        from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
+
+        ts_cfg = _load_ts_config()
+        if ts_cfg.enabled == "off":
+            return resolved_tools
+        assembly = assemble_tool_defs(
+            resolved_tools,
+            context_length=_resolve_active_context_length(),
+            config=ts_cfg,
+        )
+        if assembly.activated and not quiet_mode:
+            print(
+                f"🔎 Tool Search: {assembly.deferred_count} MCP/plugin tools deferred "
+                f"(~{assembly.deferred_tokens} tokens) behind tool_search/describe/call. "
+                f"Threshold ~{assembly.threshold_tokens} tokens."
+            )
+        return assembly.tool_defs
+    except Exception as e:  # pragma: no cover — never break tool loading
+        logger.warning("Tool search assembly skipped: %s", e)
+        return resolved_tools
 
 
 # =============================================================================
@@ -972,6 +973,8 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    agent: Any = None,
+    authorized_call: Any = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1076,7 +1079,31 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                agent=agent,
             )
+
+    _subagent_policy = getattr(agent, "_subagent_tool_policy", None) if agent is not None else None
+    try:
+        if authorized_call is not None:
+            from agent.subagent_tool_policy import verify_authorized_tool_call
+
+            function_args = verify_authorized_tool_call(
+                authorized_call, function_name, function_args
+            )
+            skip_tool_request_middleware = True
+        elif _subagent_policy is not None and _subagent_policy.is_readonly:
+            from agent.subagent_tool_policy import (
+                authorize_subagent_call,
+                thaw_authorized_args,
+            )
+
+            authorized_call = authorize_subagent_call(
+                agent, function_name, function_args
+            )
+            function_args = thaw_authorized_args(authorized_call)
+            skip_tool_request_middleware = True
+    except Exception as authorization_error:
+        return json.dumps({"error": str(authorization_error)}, ensure_ascii=False)
 
     _tool_original_args = dict(function_args)
     if not skip_tool_request_middleware:
@@ -1097,6 +1124,20 @@ def handle_function_call(
             _tool_middleware_trace = _tool_request_mw.trace
         except Exception as _mw_err:
             logger.debug("tool_request middleware error: %s", _mw_err)
+
+    if _subagent_policy is not None and authorized_call is None:
+        try:
+            from agent.subagent_tool_policy import (
+                authorize_subagent_call,
+                thaw_authorized_args,
+            )
+
+            authorized_call = authorize_subagent_call(
+                agent, function_name, function_args
+            )
+            function_args = thaw_authorized_args(authorized_call)
+        except Exception as authorization_error:
+            return json.dumps({"error": str(authorization_error)}, ensure_ascii=False)
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:
@@ -1201,6 +1242,7 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        authorization=authorized_call,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1209,20 +1251,24 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        authorization=authorized_call,
                     )
-            from hermes_cli.middleware import run_tool_execution_middleware
+            if _subagent_policy is not None and _subagent_policy.is_readonly:
+                result = _dispatch(function_args)
+            else:
+                from hermes_cli.middleware import run_tool_execution_middleware
 
-            result = run_tool_execution_middleware(
-                function_name,
-                function_args,
-                _dispatch,
-                original_args=_tool_original_args,
-                task_id=task_id or "",
-                session_id=session_id or "",
-                tool_call_id=tool_call_id or "",
-                turn_id=turn_id or "",
-                api_request_id=api_request_id or "",
-            )
+                result = run_tool_execution_middleware(
+                    function_name,
+                    function_args,
+                    _dispatch,
+                    original_args=_tool_original_args,
+                    task_id=task_id or "",
+                    session_id=session_id or "",
+                    tool_call_id=tool_call_id or "",
+                    turn_id=turn_id or "",
+                    api_request_id=api_request_id or "",
+                )
         finally:
             if _approval_tokens is not None and reset_current_observability_context is not None:
                 try:
@@ -1230,11 +1276,23 @@ def handle_function_call(
                 except Exception:
                     pass
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
+        observer_result = result
+        handle_only = False
+        if authorized_call is not None:
+            from tools.tool_effects import ResultRetention
+
+            handle_only = authorized_call.retention is ResultRetention.HANDLE_ONLY
+            if handle_only and isinstance(result, str):
+                from tools.tool_result_storage import project_result_for_retention
+
+                observer_result = project_result_for_retention(
+                    result, ResultRetention.HANDLE_ONLY
+                )
 
         _emit_post_tool_call_hook(
             function_name=function_name,
             function_args=function_args,
-            result=result,
+            result=observer_result,
             task_id=task_id,
             session_id=session_id,
             tool_call_id=tool_call_id,
@@ -1255,12 +1313,14 @@ def handle_function_call(
         try:
             from hermes_cli.plugins import has_hook, invoke_hook
             if has_hook("transform_tool_result"):
-                status, error_type, error_message = _tool_result_observer_fields(result)
+                status, error_type, error_message = _tool_result_observer_fields(
+                    observer_result
+                )
                 hook_results = invoke_hook(
                     "transform_tool_result",
                     tool_name=function_name,
                     args=function_args,
-                    result=result,
+                    result=observer_result,
                     task_id=task_id or "",
                     session_id=session_id or "",
                     tool_call_id=tool_call_id or "",
@@ -1273,10 +1333,24 @@ def handle_function_call(
                 )
                 for hook_result in hook_results:
                     if isinstance(hook_result, str):
-                        result = hook_result
+                        if not handle_only:
+                            result = hook_result
                         break
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
+
+        if handle_only and isinstance(result, str):
+            from tools.budget_config import DEFAULT_BUDGET
+            from tools.tool_effects import ResultRetention
+            from tools.tool_result_storage import (
+                bound_live_result_for_retention,
+            )
+
+            result = bound_live_result_for_retention(
+                result,
+                ResultRetention.HANDLE_ONLY,
+                max_chars=DEFAULT_BUDGET.default_result_size,
+            )
 
         return result
 

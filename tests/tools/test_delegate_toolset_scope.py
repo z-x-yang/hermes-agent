@@ -7,8 +7,29 @@ arbitrary toolsets.
 """
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
-from tools.delegate_tool import _strip_blocked_tools, _emit_parent_console
+from tools.delegate_tool import (
+    _build_child_agent,
+    _emit_parent_console,
+    _strip_blocked_tools,
+)
+from tools.registry import registry
+from tools.subagent_profiles import get_subagent_profile
+from tools.tool_effects import build_authority_snapshot
+
+
+def _set_authority(agent, names) -> None:
+    import model_tools  # noqa: F401
+
+    identities = {
+        identity
+        for name in names
+        if isinstance((identity := registry.resolved_policy_identity(name)), str)
+    }
+    agent._parent_tool_authority_snapshot = build_authority_snapshot(
+        identities, registry_generation=registry._generation
+    )
 
 
 class TestToolsetIntersection:
@@ -46,12 +67,15 @@ class TestToolsetIntersection:
         assert "file" in child
         assert "web" in child
 
-    def test_strip_blocked_removes_delegation(self):
-        """Blocked toolsets (delegation, clarify, etc.) are always removed."""
-        child = _strip_blocked_tools(["terminal", "delegation", "clarify", "memory"])
+    def test_strip_blocked_removes_control_plane_only(self):
+        """Leaf control-plane toolsets are removed without shrinking GP actions."""
+        child = _strip_blocked_tools(
+            ["terminal", "delegation", "clarify", "memory", "code_execution"]
+        )
         assert "delegation" not in child
         assert "clarify" not in child
-        assert "memory" not in child
+        assert "memory" in child
+        assert "code_execution" in child
         assert "terminal" in child
 
     def test_empty_intersection_yields_empty_toolsets(self):
@@ -63,6 +87,146 @@ class TestToolsetIntersection:
         scoped = [t for t in requested if t in parent_toolsets]
 
         assert scoped == []
+
+    def test_builder_normalizes_omitted_profile_to_general_purpose(
+        self, monkeypatch
+    ):
+        parent = MagicMock()
+        parent._delegate_depth = 0
+        parent.valid_tool_names = {"read_file"}
+        parent.enabled_toolsets = {"file"}
+        parent._active_children = []
+        parent._active_children_lock = None
+        child = MagicMock()
+        child.valid_tool_names = {"read_file", "write_file"}
+        _set_authority(parent, parent.valid_tool_names)
+        _set_authority(child, child.valid_tool_names)
+
+        with patch("run_agent.AIAgent", return_value=child):
+            built = _build_child_agent(
+                task_index=0,
+                goal="inspect",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=5,
+                task_count=1,
+                parent_agent=parent,
+                profile=None,
+            )
+
+        assert built._subagent_profile.name == "general-purpose"
+        assert built.valid_tool_names == {"read_file"}
+
+    def test_leaf_exact_policy_is_independent_of_composite_toolset_shape(self):
+        parent_names = {
+            "read_file",
+            "memory",
+            "execute_code",
+            "clarify",
+            "delegate_task",
+            "delegate_continue",
+        }
+        expected = {"read_file", "memory", "execute_code"}
+
+        def build(enabled_toolsets):
+            parent = MagicMock()
+            parent._delegate_depth = 0
+            parent.valid_tool_names = set(parent_names)
+            parent.enabled_toolsets = enabled_toolsets
+            parent._active_children = []
+            parent._active_children_lock = None
+            child = MagicMock()
+            child.valid_tool_names = (
+                set(parent_names) if "hermes-cli" in enabled_toolsets else set(expected)
+            )
+            _set_authority(parent, parent_names)
+            _set_authority(child, child.valid_tool_names)
+            with patch("run_agent.AIAgent", return_value=child):
+                return _build_child_agent(
+                    task_index=0,
+                    goal="work",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=5,
+                    task_count=1,
+                    parent_agent=parent,
+                    role="leaf",
+                    profile=get_subagent_profile("general-purpose"),
+                )
+
+        composite = build({"hermes-cli"})
+        decomposed = build(
+            {
+                "file",
+                "memory",
+                "cronjob",
+                "code_execution",
+                "messaging",
+                "clarify",
+                "delegation",
+            }
+        )
+        assert composite.valid_tool_names == expected
+        assert decomposed.valid_tool_names == expected
+
+    def test_orchestrator_never_unions_delegate_task_beyond_parent(self, monkeypatch):
+        import tools.delegate_tool as dt
+
+        parent = MagicMock()
+        parent._delegate_depth = 0
+        parent.valid_tool_names = {"read_file"}
+        parent.enabled_toolsets = {"file"}
+        parent._active_children = []
+        parent._active_children_lock = None
+        child = MagicMock()
+        child.valid_tool_names = {"read_file", "delegate_task"}
+
+        monkeypatch.setattr(dt, "_get_orchestrator_enabled", lambda: True)
+        monkeypatch.setattr(dt, "_get_max_spawn_depth", lambda: 2)
+        with patch("run_agent.AIAgent", return_value=child):
+            built = _build_child_agent(
+                task_index=0,
+                goal="inspect",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=5,
+                task_count=1,
+                parent_agent=parent,
+                role="orchestrator",
+                profile=get_subagent_profile("general-purpose"),
+            )
+
+        assert "delegate_task" not in built.valid_tool_names
+        assert built._delegate_role == "leaf"
+
+    def test_general_purpose_without_parent_exact_names_fails_closed(
+        self, monkeypatch
+    ):
+        parent = MagicMock()
+        parent._delegate_depth = 0
+        parent.enabled_toolsets = {"terminal"}
+        parent._active_children = []
+        parent._active_children_lock = None
+        child = MagicMock()
+        child.valid_tool_names = {"terminal"}
+
+        with patch("run_agent.AIAgent", return_value=child):
+            built = _build_child_agent(
+                task_index=0,
+                goal="inspect",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=5,
+                task_count=1,
+                parent_agent=parent,
+                profile=get_subagent_profile("general-purpose"),
+            )
+
+        assert built.valid_tool_names == set()
 
 
 class TestEmitParentConsole:

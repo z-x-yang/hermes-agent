@@ -686,29 +686,39 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
 
-def skills_list(category: str = None, task_id: str = None) -> str:
-    """
-    List all available skills (progressive disclosure tier 1 - minimal metadata).
+def _skills_list_impl(
+    category: str = None,
+    *,
+    create_missing_directory: bool,
+) -> str:
+    """List skills with explicit control over the legacy directory-creation side effect.
 
     Returns only name + description to minimize token usage. Use skill_view() to
     load full content, tags, related files, etc.
 
     Args:
         category: Optional category filter (e.g., "mlops")
-        task_id: Optional task identifier used to probe the active backend
+        create_missing_directory: Preserve the raw tool's legacy mkdir behavior.
 
     Returns:
         JSON string with minimal skill info: name, description, category
     """
     try:
         if not SKILLS_DIR.exists():
-            SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+            if create_missing_directory:
+                SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+                message = (
+                    f"No skills found. Skills directory created at "
+                    f"{display_hermes_home()}/skills/"
+                )
+            else:
+                message = "No skills found; read-only listing did not create a directory."
             return json.dumps(
                 {
                     "success": True,
                     "skills": [],
                     "categories": [],
-                    "message": f"No skills found. Skills directory created at {display_hermes_home()}/skills/",
+                    "message": message,
                 },
                 ensure_ascii=False,
             )
@@ -752,6 +762,16 @@ def skills_list(category: str = None, task_id: str = None) -> str:
 
     except Exception as e:
         return tool_error(str(e), success=False)
+
+
+def skills_list(category: str = None, task_id: str = None) -> str:
+    """List skills, preserving the raw tool's legacy directory creation."""
+    return _skills_list_impl(category, create_missing_directory=True)
+
+
+def skills_list_readonly(category: str = None) -> str:
+    """List skills without creating directories or emitting telemetry."""
+    return _skills_list_impl(category, create_missing_directory=False)
 
 
 # ── Plugin skill serving ──────────────────────────────────────────────────
@@ -971,6 +991,8 @@ def skill_view(
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    *,
+    readonly: bool = False,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -1024,22 +1046,28 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
-            discover_plugins()  # idempotent
+            if not readonly:
+                discover_plugins()  # idempotent; readonly callers consume current index only
             pm = get_plugin_manager()
             plugin_skill_md = pm.find_plugin_skill(name)
 
             if plugin_skill_md is not None:
                 if not plugin_skill_md.exists():
-                    # Stale registry entry — file deleted out of band
-                    pm.remove_plugin_skill(name)
+                    # Stale registry cleanup is a mutation; readonly callers only report it.
+                    if not readonly:
+                        pm.remove_plugin_skill(name)
                     return json.dumps(
                         {
                             "success": False,
                             "error": (
                                 f"Skill '{name}' file no longer exists at "
-                                f"{plugin_skill_md}. The registry entry has "
-                                f"been cleaned up — try again after the "
-                                f"plugin is reloaded."
+                                f"{plugin_skill_md}. "
+                                + (
+                                    "The registry entry has been cleaned up — try again after "
+                                    "the plugin is reloaded."
+                                    if not readonly
+                                    else "The read-only lookup left the stale registry unchanged."
+                                )
                             ),
                         },
                         ensure_ascii=False,
@@ -1049,7 +1077,7 @@ def skill_view(
                     namespace,
                     bare,
                     file_path=file_path,
-                    preprocess=preprocess,
+                    preprocess=preprocess and not readonly,
                     session_id=task_id,
                 )
 
@@ -1387,16 +1415,17 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
-            try:
-                from tools.skill_manager_tool import mark_background_review_skill_read
+            if not readonly:
+                try:
+                    from tools.skill_manager_tool import mark_background_review_skill_read
 
-                mark_background_review_skill_read(target_file)
-            except Exception:
-                logger.debug(
-                    "Could not record background-review skill read for %s",
-                    target_file,
-                    exc_info=True,
-                )
+                    mark_background_review_skill_read(target_file)
+                except Exception:
+                    logger.debug(
+                        "Could not record background-review skill read for %s",
+                        target_file,
+                        exc_info=True,
+                    )
 
             return json.dumps(
                 {
@@ -1500,11 +1529,18 @@ def skill_view(
             if not e.get("optional")
             and not _is_env_var_persisted(e["name"], env_snapshot)
         ]
-        capture_result = _capture_required_environment_variables(
-            skill_name,
-            missing_required_env_vars,
-        )
-        if missing_required_env_vars:
+        if readonly:
+            capture_result = {
+                "missing_names": [entry["name"] for entry in missing_required_env_vars],
+                "setup_skipped": False,
+                "gateway_setup_hint": None,
+            }
+        else:
+            capture_result = _capture_required_environment_variables(
+                skill_name,
+                missing_required_env_vars,
+            )
+        if missing_required_env_vars and not readonly:
             env_snapshot = load_env()
         remaining_missing_required_envs = _remaining_required_environment_names(
             required_env_vars,
@@ -1521,7 +1557,7 @@ def skill_view(
             for e in required_env_vars
             if e["name"] not in remaining_missing_required_envs
         ]
-        if available_env_names:
+        if available_env_names and not readonly:
             try:
                 from tools.env_passthrough import register_env_passthrough
 
@@ -1540,7 +1576,16 @@ def skill_view(
         if not isinstance(required_cred_files_raw, list):
             required_cred_files_raw = []
         missing_cred_files: list = []
-        if required_cred_files_raw:
+        if required_cred_files_raw and readonly:
+            missing_cred_files = [
+                str(path)
+                for path in required_cred_files_raw
+                if isinstance(path, str)
+                and not Path(os.path.expanduser(path)).exists()
+            ]
+            if missing_cred_files:
+                setup_needed = True
+        elif required_cred_files_raw:
             try:
                 from tools.credential_files import register_credential_files
 
@@ -1555,7 +1600,7 @@ def skill_view(
                 )
 
         rendered_content = content
-        if preprocess:
+        if preprocess and not readonly:
             try:
                 from agent.skill_preprocessing import preprocess_skill_content
 
@@ -1601,16 +1646,17 @@ def skill_view(
         if capture_result["gateway_setup_hint"]:
             result["gateway_setup_hint"] = capture_result["gateway_setup_hint"]
 
-        try:
-            from tools.skill_manager_tool import mark_background_review_skill_read
+        if not readonly:
+            try:
+                from tools.skill_manager_tool import mark_background_review_skill_read
 
-            mark_background_review_skill_read(skill_md)
-        except Exception:
-            logger.debug(
-                "Could not record background-review skill read for %s",
-                skill_md,
-                exc_info=True,
-            )
+                mark_background_review_skill_read(skill_md)
+            except Exception:
+                logger.debug(
+                    "Could not record background-review skill read for %s",
+                    skill_md,
+                    exc_info=True,
+                )
 
         if setup_needed:
             missing_items = [
@@ -1640,6 +1686,14 @@ def skill_view(
         return tool_error(str(e), success=False)
 
 
+def skill_view_readonly(name: str, file_path: str = None) -> str:
+    """Read a skill without discovery, setup, preprocessing, cleanup, or telemetry."""
+    return skill_view(
+        name,
+        file_path=file_path,
+        preprocess=False,
+        readonly=True,
+    )
 
 
 if __name__ == "__main__":
@@ -1765,4 +1819,71 @@ registry.register(
     handler=_skill_view_with_bump,
     check_fn=check_skills_requirements,
     emoji="📚",
+)
+
+
+def _skills_list_readonly_handler(args, **kw):
+    return skills_list_readonly(category=args.get("category"))
+
+
+def _skill_view_readonly_handler(args, **kw):
+    return skill_view_readonly(
+        args.get("name", ""),
+        file_path=args.get("file_path"),
+    )
+
+
+from tools.tool_effects import (  # noqa: E402 — descriptors depend on raw registration
+    ResultRetention,
+    ToolEffect,
+    builtin_policy_descriptor,
+)
+
+SKILLS_LIST_READONLY_SCHEMA = json.loads(json.dumps(SKILLS_LIST_SCHEMA))
+SKILLS_LIST_READONLY_SCHEMA["name"] = "skills_list_readonly"
+SKILLS_LIST_READONLY_SCHEMA["description"] = (
+    "List available skills without discovery, setup, telemetry, or filesystem writes."
+)
+SKILL_VIEW_READONLY_SCHEMA = json.loads(json.dumps(SKILL_VIEW_SCHEMA))
+SKILL_VIEW_READONLY_SCHEMA["name"] = "skill_view_readonly"
+SKILL_VIEW_READONLY_SCHEMA["description"] = (
+    "Read skill content without discovery, setup, preprocessing, cleanup, or telemetry."
+)
+
+_skills_list_source_identity = registry.resolved_policy_identity("skills_list")
+_skill_view_source_identity = registry.resolved_policy_identity("skill_view")
+if not _skills_list_source_identity or not _skill_view_source_identity:
+    raise RuntimeError("raw skill tool policy identities must exist before readonly aliases")
+
+registry.register(
+    name="skills_list_readonly",
+    toolset="skills",
+    schema=SKILLS_LIST_READONLY_SCHEMA,
+    handler=_skills_list_readonly_handler,
+    check_fn=check_skills_requirements,
+    emoji="📚",
+    descriptor=builtin_policy_descriptor(
+        name="skills_list_readonly",
+        schema=SKILLS_LIST_READONLY_SCHEMA,
+        handler=_skills_list_readonly_handler,
+        effects={ToolEffect.READ_LOCAL},
+        retention=ResultRetention.NO_SPILL,
+        required_parent_any_of={_skills_list_source_identity},
+    ),
+)
+registry.register(
+    name="skill_view_readonly",
+    toolset="skills",
+    schema=SKILL_VIEW_READONLY_SCHEMA,
+    handler=_skill_view_readonly_handler,
+    check_fn=check_skills_requirements,
+    emoji="📚",
+    descriptor=builtin_policy_descriptor(
+        name="skill_view_readonly",
+        schema=SKILL_VIEW_READONLY_SCHEMA,
+        handler=_skill_view_readonly_handler,
+        effects={ToolEffect.READ_LOCAL},
+        retention=ResultRetention.NO_SPILL,
+        required_parent_any_of={_skill_view_source_identity},
+    ),
 )

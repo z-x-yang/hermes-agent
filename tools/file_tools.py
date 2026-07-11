@@ -1961,6 +1961,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
 # Schemas + Registry
 # ---------------------------------------------------------------------------
 from tools.registry import registry, tool_error
+from tools.tool_effects import ResultRetention, ToolEffect, builtin_policy_descriptor
 
 
 def _check_file_reqs():
@@ -2125,7 +2126,37 @@ def _handle_search_files(args, **kw):
         output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
 
 
-registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
+registry.register(
+    name="read_file",
+    toolset="file",
+    schema=READ_FILE_SCHEMA,
+    handler=_handle_read_file,
+    check_fn=_check_file_reqs,
+    emoji="📖",
+    max_result_size_chars=100_000,
+    descriptor=builtin_policy_descriptor(
+        name="read_file",
+        schema=READ_FILE_SCHEMA,
+        handler=_handle_read_file,
+        effects={ToolEffect.READ_LOCAL},
+        retention=ResultRetention.NO_SPILL,
+    ),
+)
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
-registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)
+registry.register(
+    name="search_files",
+    toolset="file",
+    schema=SEARCH_FILES_SCHEMA,
+    handler=_handle_search_files,
+    check_fn=_check_file_reqs,
+    emoji="🔎",
+    max_result_size_chars=100_000,
+    descriptor=builtin_policy_descriptor(
+        name="search_files",
+        schema=SEARCH_FILES_SCHEMA,
+        handler=_handle_search_files,
+        effects={ToolEffect.READ_LOCAL},
+        retention=ResultRetention.NO_SPILL,
+    ),
+)

@@ -15,14 +15,27 @@ Import chain (circular-import safe):
 """
 
 import ast
+import copy
 import importlib
 import json
 import logging
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
+
+from tools.tool_effects import (
+    ResultRetention,
+    ToolEffect,
+    ToolPolicyDescriptor,
+    build_authority_snapshot,
+    builtin_policy_descriptor,
+    derive_policy_identity,
+    schema_digest,
+    validate_policy_descriptor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,11 +95,15 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "policy_descriptor", "policy_identity", "entry_generation",
+        "metadata_only",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 policy_descriptor=None, policy_identity=None,
+                 entry_generation=None, metadata_only=False):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -105,6 +122,10 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.policy_descriptor = policy_descriptor
+        self.policy_identity = policy_identity
+        self.entry_generation = entry_generation
+        self.metadata_only = metadata_only
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +273,7 @@ class ToolRegistry:
         """
         check_results: Dict[Callable, bool] = {}
         for entry in entries:
-            if entry.toolset != toolset:
+            if entry.toolset != toolset or entry.metadata_only:
                 continue
             if not entry.check_fn:
                 return True
@@ -266,6 +287,78 @@ class ToolRegistry:
         """Return a registered tool entry by name, or None."""
         with self._lock:
             return self._tools.get(name)
+
+    def authority_snapshot_for_definitions(self, definitions: List[dict]):
+        """Freeze exact policy identities for already-resolved definitions.
+
+        The registry lock binds entry lookup and generation capture.  A schema
+        transformed by dynamic overrides or sanitization receives a resolved
+        identity derived from that final schema rather than the static
+        registration schema.
+        """
+        with self._lock:
+            identities = set()
+            for definition in definitions:
+                function_schema = definition.get("function")
+                if not isinstance(function_schema, dict):
+                    raise ValueError("resolved tool definition must contain a function schema")
+                name = function_schema.get("name")
+                entry = self._tools.get(name)
+                if entry is None:
+                    raise ValueError(f"resolved tool {name!r} has no registered policy metadata")
+                resolved_digest = schema_digest(function_schema)
+                descriptor = entry.policy_descriptor
+                if descriptor.schema_digest != resolved_digest:
+                    descriptor = replace(descriptor, schema_digest=resolved_digest)
+                identities.add(
+                    derive_policy_identity(
+                        descriptor,
+                        entry_generation=entry.entry_generation,
+                    )
+                )
+            return build_authority_snapshot(identities, self._generation)
+
+    def resolved_policy_metadata(self, name: str):
+        """Return the current resolved policy identity/descriptor atomically."""
+        for _attempt in range(2):
+            with self._lock:
+                start_generation = self._generation
+            definitions = self.get_definitions({name}, quiet=True)
+            definition = next(
+                (
+                    item
+                    for item in definitions
+                    if (item.get("function") or {}).get("name") == name
+                ),
+                None,
+            )
+            if definition is None:
+                return None
+            function_schema = definition.get("function")
+            if not isinstance(function_schema, dict):
+                raise ValueError("resolved tool definition must contain a function schema")
+            with self._lock:
+                entry = self._tools.get(name)
+                if entry is None:
+                    return None
+                if self._generation != start_generation:
+                    continue
+                descriptor = entry.policy_descriptor
+                if descriptor is None:
+                    raise ValueError(f"tool {name!r} has no policy descriptor")
+                resolved_digest = schema_digest(function_schema)
+                if descriptor.schema_digest != resolved_digest:
+                    descriptor = replace(descriptor, schema_digest=resolved_digest)
+                identity = derive_policy_identity(
+                    descriptor,
+                    entry_generation=entry.entry_generation,
+                )
+                return identity, descriptor
+        raise RuntimeError("tool registry changed while resolving policy metadata")
+
+    def resolved_policy_identity(self, name: str) -> Optional[str]:
+        metadata = self.resolved_policy_metadata(name)
+        return metadata[0] if metadata is not None else None
 
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
@@ -367,6 +460,8 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        descriptor: ToolPolicyDescriptor | None = None,
+        metadata_only: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -376,6 +471,21 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        registered_schema_digest = schema_digest(schema)
+        if descriptor is None:
+            descriptor = builtin_policy_descriptor(
+                name=name,
+                schema=schema,
+                handler=handler,
+                effects={ToolEffect.UNKNOWN},
+                requires_confirmation=False,
+                retention=ResultRetention.DEFAULT,
+            )
+        validate_policy_descriptor(
+            descriptor,
+            expected_schema_digest=registered_schema_digest,
+        )
+
         with self._lock:
             existing = self._tools.get(name)
             if existing and existing.toolset != toolset:
@@ -424,10 +534,15 @@ class ToolRegistry:
                         name, toolset, existing.toolset,
                     )
                     return
+            entry_generation = self._generation + 1
+            policy_identity = derive_policy_identity(
+                descriptor,
+                entry_generation=entry_generation,
+            )
             self._tools[name] = ToolEntry(
                 name=name,
                 toolset=toolset,
-                schema=schema,
+                schema=copy.deepcopy(schema),
                 handler=handler,
                 check_fn=check_fn,
                 requires_env=requires_env or [],
@@ -436,6 +551,10 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                policy_descriptor=descriptor,
+                policy_identity=policy_identity,
+                entry_generation=entry_generation,
+                metadata_only=metadata_only,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -518,6 +637,42 @@ class ToolRegistry:
     # Schema retrieval
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _resolved_function_schema(entry: ToolEntry) -> dict:
+        """Resolve one entry's current model-facing function schema.
+
+        Authorization and final dispatch both call this helper so dynamic schema
+        overrides participate in the same policy identity at both boundaries.
+        """
+        schema_with_name = {**entry.schema, "name": entry.name}
+        if entry.dynamic_schema_overrides is not None:
+            try:
+                overrides = entry.dynamic_schema_overrides()
+                if isinstance(overrides, dict):
+                    schema_with_name.update(overrides)
+            except Exception as exc:
+                logger.warning(
+                    "dynamic_schema_overrides for tool %s raised %s; "
+                    "using static schema",
+                    entry.name,
+                    exc,
+                )
+        return schema_with_name
+
+    def _resolved_policy_identity_for_entry(self, entry: ToolEntry) -> str:
+        descriptor = entry.policy_descriptor
+        if descriptor is None:
+            raise ValueError(f"tool {entry.name!r} has no policy descriptor")
+        resolved_digest = schema_digest(self._resolved_function_schema(entry))
+        if descriptor.schema_digest != resolved_digest:
+            descriptor = replace(descriptor, schema_digest=resolved_digest)
+        if not isinstance(entry.entry_generation, int):
+            raise ValueError(f"tool {entry.name!r} has no entry generation")
+        return derive_policy_identity(
+            descriptor,
+            entry_generation=entry.entry_generation,
+        )
+
     def get_definitions(self, tool_names: Set[str], quiet: bool = False) -> List[dict]:
         """Return OpenAI-format tool schemas for the requested tool names.
 
@@ -537,7 +692,7 @@ class ToolRegistry:
         entries_by_name = {entry.name: entry for entry in self._snapshot_entries()}
         for name in sorted(tool_names):
             entry = entries_by_name.get(name)
-            if not entry:
+            if not entry or entry.metadata_only:
                 continue
             if entry.check_fn:
                 if entry.check_fn not in check_results:
@@ -546,24 +701,7 @@ class ToolRegistry:
                     if not quiet:
                         logger.debug("Tool %s unavailable (check failed)", name)
                     continue
-            # Ensure schema always has a "name" field — use entry.name as fallback
-            schema_with_name = {**entry.schema, "name": entry.name}
-            # Apply runtime-dynamic overrides (e.g. delegate_task description
-            # depends on current delegation.max_concurrent_children /
-            # max_spawn_depth). Caller side (model_tools.get_tool_definitions)
-            # already keys its memo on config.yaml mtime + size, so changes
-            # to delegation.* in config invalidate the cache automatically.
-            if entry.dynamic_schema_overrides is not None:
-                try:
-                    overrides = entry.dynamic_schema_overrides()
-                    if isinstance(overrides, dict):
-                        schema_with_name.update(overrides)
-                except Exception as exc:
-                    logger.warning(
-                        "dynamic_schema_overrides for tool %s raised %s; "
-                        "using static schema",
-                        name, exc,
-                    )
+            schema_with_name = self._resolved_function_schema(entry)
             result.append({"type": "function", "function": schema_with_name})
         return result
 
@@ -578,9 +716,22 @@ class ToolRegistry:
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
         """
-        entry = self.get_entry(name)
-        if not entry:
-            return json.dumps({"error": f"Unknown tool: {name}"})
+        authorization = kwargs.pop("authorization", None)
+        with self._lock:
+            entry = self._tools.get(name)
+            if not entry:
+                return json.dumps({"error": f"Unknown tool: {name}"})
+            if authorization is not None:
+                from agent.subagent_tool_policy import verify_authorized_tool_call
+
+                args = verify_authorized_tool_call(
+                    authorization,
+                    name,
+                    args,
+                    current_policy_identity=self._resolved_policy_identity_for_entry(
+                        entry
+                    ),
+                )
         try:
             if entry.is_async:
                 from model_tools import _run_async

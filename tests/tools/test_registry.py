@@ -5,7 +5,10 @@ import threading
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from tools.registry import ToolRegistry, _module_registers_tools, discover_builtin_tools
+from tools.tool_effects import ResultRetention, ToolEffect, builtin_policy_descriptor
 
 
 def _dummy_handler(args, **kwargs):
@@ -46,6 +49,96 @@ class TestRegisterAndDispatch:
         )
         result = json.loads(reg.dispatch("echo", {"msg": "hi"}))
         assert result == {"msg": "hi"}
+
+
+class TestPolicyMetadata:
+    def test_legacy_registration_defaults_to_unknown_without_name_inference(self):
+        reg = ToolRegistry()
+        schema = {
+            **_make_schema("looks_readonly"),
+            "annotations": {"readOnlyHint": True},
+        }
+        reg.register(
+            name="looks_readonly", toolset="test", schema=schema, handler=_dummy_handler
+        )
+
+        entry = reg.get_entry("looks_readonly")
+        assert entry.policy_descriptor.effects == frozenset({ToolEffect.UNKNOWN})
+        assert entry.policy_descriptor.retention is ResultRetention.DEFAULT
+        assert entry.policy_descriptor.requires_confirmation is False
+
+    def test_explicit_sensitive_retention_survives_lookup(self):
+        reg = ToolRegistry()
+        schema = _make_schema("sensitive")
+        descriptor = builtin_policy_descriptor(
+            name="sensitive",
+            schema=schema,
+            handler=_dummy_handler,
+            effects={ToolEffect.READ_LOCAL},
+            retention=ResultRetention.HANDLE_ONLY,
+        )
+        reg.register(
+            name="sensitive",
+            toolset="test",
+            schema=schema,
+            handler=_dummy_handler,
+            descriptor=descriptor,
+        )
+
+        entry = reg.get_entry("sensitive")
+        assert entry.policy_descriptor == descriptor
+        assert entry.policy_identity.startswith("policy:")
+
+    def test_same_name_same_schema_replacement_changes_entry_policy_identity(self):
+        reg = ToolRegistry()
+        schema = _make_schema("same")
+        reg.register(name="same", toolset="test", schema=schema, handler=_dummy_handler)
+        first = reg.get_entry("same")
+        reg.register(name="same", toolset="test", schema=schema, handler=_dummy_handler)
+        second = reg.get_entry("same")
+
+        assert second.entry_generation > first.entry_generation
+        assert second.policy_identity != first.policy_identity
+
+    def test_schema_mutation_changes_digest_and_policy_identity(self):
+        reg = ToolRegistry()
+        schema = _make_schema("mutable")
+        reg.register(name="mutable", toolset="test", schema=schema, handler=_dummy_handler)
+        first = reg.get_entry("mutable")
+        changed = {**schema, "description": "changed"}
+        reg.register(name="mutable", toolset="test", schema=changed, handler=_dummy_handler)
+        second = reg.get_entry("mutable")
+
+        assert second.policy_descriptor.schema_digest != first.policy_descriptor.schema_digest
+        assert second.policy_identity != first.policy_identity
+
+    def test_descriptor_schema_mismatch_is_rejected(self):
+        reg = ToolRegistry()
+        schema = _make_schema("strict")
+        descriptor = builtin_policy_descriptor(
+            name="strict",
+            schema=schema,
+            handler=_dummy_handler,
+            effects={ToolEffect.READ_LOCAL},
+        )
+        descriptor = descriptor.__class__(
+            effects=descriptor.effects,
+            requires_confirmation=descriptor.requires_confirmation,
+            retention=descriptor.retention,
+            source_identity=descriptor.source_identity,
+            schema_digest="0" * 64,
+            policy_version=descriptor.policy_version,
+            argument_resolver=descriptor.argument_resolver,
+            required_parent_any_of=descriptor.required_parent_any_of,
+        )
+        with pytest.raises(ValueError, match="schema digest"):
+            reg.register(
+                name="strict",
+                toolset="test",
+                schema=schema,
+                handler=_dummy_handler,
+                descriptor=descriptor,
+            )
 
 
 class TestGetDefinitions:

@@ -1599,6 +1599,26 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 provider=agent.provider,
                 api_mode=agent.api_mode,
             )
+            if isinstance(
+                getattr(agent, "_governance_diagnostics", None), dict
+            ) and agent._governance_diagnostics.get("fingerprint"):
+                from agent.model_metadata import get_verified_model_context_length
+
+                _fb_verified_limit = get_verified_model_context_length(
+                    agent.model,
+                    base_url=agent.base_url,
+                    api_key=_fb_ctx_api_key,
+                    provider=agent.provider,
+                    config_context_length=_fb_config_context_length,
+                    custom_providers=getattr(agent, "_custom_providers", None),
+                )
+                agent._governance_context_limit_proof = {
+                    "model": agent.model,
+                    "provider": agent.provider,
+                    "base_url": agent.base_url,
+                    "api_mode": agent.api_mode,
+                    "limit": _fb_verified_limit,
+                }
 
         # Keep the prompt's self-identity in sync with the model actually
         # answering, so "what model are you?" doesn't report the primary.

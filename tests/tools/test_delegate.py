@@ -84,6 +84,7 @@ class TestDelegateRequirements(unittest.TestCase):
             "on_foreground_wait_timeout",
             "model",
             "provider",
+            "background",
         }
         for field in hidden_policy_fields:
             self.assertNotIn(field, props)
@@ -97,10 +98,11 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", task_props)
         self.assertNotIn("maxItems", props["tasks"])  # runtime-configurable limit
 
+        subagent_type_description = props["subagent_type"]["description"]
         subagent_type_schema = {
             "type": "string",
             "enum": ["Explore", "Plan", "general-purpose"],
-            "description": "Built-in subagent type. Omit to preserve legacy generic delegation.",
+            "description": subagent_type_description,
         }
         scheduling_schema = {
             "type": "string",
@@ -120,6 +122,14 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertEqual(task_props["subagent_type"], subagent_type_schema)
         self.assertEqual(task_props["scheduling"], scheduling_schema)
         self.assertEqual(task_props["retain_session"], retain_session_schema)
+        for text in (subagent_type_description, task_props["subagent_type"]["description"]):
+            self.assertIn("Explore", text)
+            self.assertIn("Plan", text)
+            self.assertIn("general-purpose", text)
+            self.assertIn("Search and understand", text)
+            self.assertIn("prepare implementation-plan inputs", text)
+            self.assertIn("including edits", text)
+            self.assertIn("Omit to use general-purpose", text)
 
     def test_schema_description_advertises_runtime_limits(self):
         """The model must see the user's actual concurrency / spawn-depth caps,
@@ -159,6 +169,40 @@ class TestDelegateRequirements(unittest.TestCase):
             self.assertNotIn("default 3", surface)
             self.assertNotIn("default 2", surface)
 
+    def test_model_facing_description_teaches_profile_routing_and_resume(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        overrides = _build_dynamic_schema_overrides()
+        description = overrides["description"]
+        type_description = overrides["parameters"]["properties"][
+            "subagent_type"
+        ]["description"]
+
+        for text in (description, type_description):
+            self.assertIn("Explore", text)
+            self.assertIn("Plan", text)
+            self.assertIn("general-purpose", text)
+        self.assertIn("focused lookup", type_description)
+        self.assertIn("planning research", type_description)
+        self.assertIn("edits, tests, terminal/process", type_description)
+        self.assertIn("delegate_continue", description)
+        self.assertIn("retained agent_id", description)
+        self.assertIn("instead of spawning a new child", description)
+        self.assertIn("general-purpose is retained by default", description)
+        self.assertIn("Explore and Plan are one-shot by default", description)
+        self.assertIn("complete active-profile governance", description)
+        self.assertIn("exact parent-authorized action plane", description)
+        self.assertIn(
+            "CANNOT call: delegate_task, delegate_continue, clarify",
+            description,
+        )
+        self.assertNotIn(
+            "delegate_task, clarify, memory, send_message, execute_code",
+            description,
+        )
+        self.assertNotIn("while generic,", description)
+        self.assertNotIn("NO memory of your conversation", description)
+
     def test_schema_overrides_applied_via_get_definitions(self):
         """Registry.get_definitions() must apply dynamic_schema_overrides so
         the model API call sees current values, not the static import-time text.
@@ -175,6 +219,9 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn(f"up to {_get_max_concurrent_children()}", fn["description"])
         self.assertIn(f"max_spawn_depth={_get_max_spawn_depth()}", fn["description"])
         effective_props = fn["parameters"]["properties"]
+        self.assertIn("Default to Chinese", fn["description"])
+        self.assertNotIn("default to English", fn["description"])
+        self.assertNotIn("toolsets", fn["description"])
         effective_task_props = effective_props["tasks"]["items"]["properties"]
         for field in {
             "toolsets",
@@ -185,6 +232,7 @@ class TestDelegateRequirements(unittest.TestCase):
             "on_foreground_wait_timeout",
             "model",
             "provider",
+            "background",
         }:
             self.assertNotIn(field, effective_props)
             self.assertNotIn(field, effective_task_props)
@@ -232,7 +280,10 @@ class TestChildSystemPrompt(unittest.TestCase):
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
-        self.assertEqual(sorted(result), ["file", "terminal"])
+        self.assertEqual(
+            sorted(result),
+            ["code_execution", "file", "memory", "terminal"],
+        )
 
     def test_preserves_allowed_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "web", "browser"])
@@ -242,16 +293,12 @@ class TestStripBlockedTools(unittest.TestCase):
         result = _strip_blocked_tools([])
         self.assertEqual(result, [])
 
-    def test_strips_cronjob_toolset(self):
-        """Regression for issue #43466: child subagents must not inherit
-        the cronjob toolset from a parent running on a gateway platform.
-        Without this guard, a delegated child could schedule new cron jobs
-        under the parent's identity.
-        """
+    def test_preserves_parent_authorized_cronjob_toolset(self):
+        """GP action tools survive toolset cleanup; exact parent policy still caps them."""
         result = _strip_blocked_tools(
             ["terminal", "file", "cronjob", "web"]
         )
-        self.assertNotIn("cronjob", result)
+        self.assertIn("cronjob", result)
         self.assertIn("terminal", result)
         self.assertIn("file", result)
         self.assertIn("web", result)
@@ -1140,8 +1187,10 @@ class TestSubagentCostRollup(unittest.TestCase):
 
 class TestBlockedTools(unittest.TestCase):
     def test_blocked_tools_constant(self):
-        for tool in ["delegate_task", "clarify", "memory", "send_message", "execute_code"]:
-            self.assertIn(tool, DELEGATE_BLOCKED_TOOLS)
+        self.assertEqual(
+            DELEGATE_BLOCKED_TOOLS,
+            {"delegate_task", "delegate_continue", "clarify"},
+        )
 
     def test_constants(self):
         from tools.delegate_tool import (
@@ -1194,6 +1243,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["provider"], "custom")
         self.assertEqual(creds["base_url"], "http://localhost:1234/v1")
         self.assertEqual(creds["api_key"], "local-key")
+        self.assertTrue(creds["credential_pinned"])
         self.assertEqual(creds["api_mode"], "chat_completions")
 
     def test_direct_endpoint_auto_detects_anthropic_messages_suffix(self):
@@ -1253,9 +1303,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         creds = _resolve_delegation_credentials(cfg, parent)
         self.assertEqual(creds["api_mode"], "anthropic_messages")
 
-    def test_direct_endpoint_returns_none_api_key_when_not_configured(self):
-        # When base_url is set without api_key, api_key should be None so
-        # _build_child_agent inherits the parent's key (effective_api_key = override or parent).
+    def test_direct_endpoint_uses_openai_env_key_when_api_key_not_configured(self):
         parent = _make_mock_parent(depth=0)
         cfg = {
             "model": "qwen2.5-coder",
@@ -1263,12 +1311,12 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         }
         with patch.dict(os.environ, {"OPENAI_API_KEY": "env-openai-key"}, clear=False):
             creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertIsNone(creds["api_key"])
+        self.assertEqual(creds["api_key"], "env-openai-key")
         self.assertEqual(creds["provider"], "custom")
 
-    def test_direct_endpoint_no_raise_when_only_provider_env_key_present(self):
-        # Even if OPENAI_API_KEY is absent, no ValueError — _build_child_agent uses parent key.
+    def test_direct_endpoint_without_endpoint_key_fails_closed(self):
         parent = _make_mock_parent(depth=0)
+        parent.api_key = "parent-openrouter-key"
         cfg = {
             "model": "qwen2.5-coder",
             "base_url": "http://localhost:1234/v1",
@@ -1281,10 +1329,48 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             },
             clear=False,
         ):
+            with self.assertRaisesRegex(ValueError, "direct endpoint.*API key"):
+                _resolve_delegation_credentials(cfg, parent)
+
+    def test_direct_endpoint_can_reuse_parent_key_only_for_same_endpoint(self):
+        parent = _make_mock_parent(depth=0)
+        parent.base_url = "https://same.example/v1/"
+        parent.api_key = "same-endpoint-key"
+        cfg = {
+            "model": "qwen2.5-coder",
+            "base_url": "https://same.example/v1",
+        }
+        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
             creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertIsNone(creds["api_key"])
+        self.assertEqual(creds["api_key"], "same-endpoint-key")
         self.assertEqual(creds["provider"], "custom")
 
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("run_agent.AIAgent")
+    def test_child_builder_rejects_parent_key_for_different_override_endpoint(
+        self, MockAgent, _mock_config
+    ):
+        parent = _make_mock_parent(depth=0)
+        parent.api_key = "parent-openrouter-key"
+        parent.valid_tool_names = {"read_file"}
+        parent.enabled_toolsets = {"file"}
+        MockAgent.return_value = MagicMock(valid_tool_names={"read_file"})
+
+        with self.assertRaisesRegex(ValueError, "different endpoint.*API key"):
+            _build_child_agent(
+                task_index=0,
+                goal="must not leak parent key",
+                context=None,
+                toolsets=None,
+                model="child-model",
+                max_iterations=5,
+                task_count=1,
+                parent_agent=parent,
+                override_provider="custom",
+                override_base_url="https://other.example/v1",
+                override_api_key=None,
+            )
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_resolution_failure_raises_valueerror(self, mock_resolve):
@@ -1680,6 +1766,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             "base_url": "https://openrouter.ai/api/v1",
             "api_key": "sk-or-batch",
             "api_mode": "chat_completions",
+            "credential_pinned": True,
         }
         parent = _make_mock_parent(depth=0)
 
@@ -1703,6 +1790,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
                 self.assertEqual(call.kwargs.get("override_provider"), "openrouter")
                 self.assertEqual(call.kwargs.get("override_base_url"), "https://openrouter.ai/api/v1")
                 self.assertEqual(call.kwargs.get("override_api_key"), "sk-or-batch")
+                self.assertTrue(call.kwargs.get("pin_override_credential"))
                 self.assertEqual(call.kwargs.get("override_api_mode"), "chat_completions")
 
     @patch("tools.delegate_tool._load_config")
@@ -1915,6 +2003,39 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
             )
 
             self.assertEqual(mock_child._credential_pool, mock_pool)
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("tools.delegate_tool._resolve_child_credential_pool")
+    def test_build_child_agent_keeps_pinned_direct_key_out_of_rotation_pool(
+        self, mock_resolve_pool, _mock_config
+    ):
+        parent = _make_mock_parent()
+        parent.valid_tool_names = {"read_file"}
+        parent.enabled_toolsets = {"file"}
+        mock_resolve_pool.return_value = MagicMock(name="endpoint_pool")
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock(valid_tool_names={"read_file"})
+            mock_child._credential_pool = MagicMock(name="constructor_pool")
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Keep explicit endpoint key pinned",
+                context=None,
+                toolsets=None,
+                model="child-model",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="custom",
+                override_base_url="https://endpoint-b.example.com/v1",
+                override_api_key="explicit-endpoint-key",
+                pin_override_credential=True,
+            )
+
+        self.assertIsNone(mock_child._credential_pool)
+        mock_resolve_pool.assert_not_called()
 
     @patch("tools.delegate_tool._load_config", return_value={})
     def test_build_child_agent_preserves_mcp_toolsets_by_default(self, mock_cfg):
@@ -2352,7 +2473,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
         unknown_type = json.loads(
             delegate_task(goal="test", subagent_type="review-readonly", parent_agent=parent)
         )
-        self.assertIn("Unknown subagent_type", unknown_type["error"])
+        self.assertIn("Unsupported subagent_type", unknown_type["error"])
 
         invalid_role = json.loads(
             delegate_task(
@@ -2904,6 +3025,7 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
             "api_key": None, "api_mode": None, "model": None,
         }
         parent = _make_mock_parent(depth=0)
+        parent.valid_tool_names = {"delegate_task", "read_file"}
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
             mock_child.run_conversation.return_value = {
@@ -3004,6 +3126,7 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
         }
         parent = _make_mock_parent(depth=0)
         parent.enabled_toolsets = ["terminal", "file"]
+        parent.valid_tool_names = {"delegate_task", "read_file", "terminal"}
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = _make_role_mock_child()
             MockAgent.return_value = mock_child
@@ -3135,6 +3258,7 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
         }
         parent = _make_mock_parent(depth=0)
         parent.enabled_toolsets = ["terminal", "file", "delegation"]
+        parent.valid_tool_names = {"delegate_task", "read_file", "terminal"}
         built_toolsets = []
 
         def _factory(*a, **kw):
@@ -3158,31 +3282,28 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 2})
-    def test_intersection_preserves_delegation_bound(
+    def test_intersection_does_not_restore_delegation_beyond_parent(
         self, mock_cfg, mock_creds
     ):
-        """Design decision: orchestrator capability is granted by role,
-        NOT inherited from the parent's toolset. A parent without
-        'delegation' in its enabled_toolsets can still spawn an
-        orchestrator child — the re-add in _build_child_agent runs
-        unconditionally for orchestrators (when max_spawn_depth allows).
-
-        If you want to change to "parent must have delegation too",
-        update _build_child_agent to check parent_toolsets before the
-        re-add and update this test to match.
+        """An orchestrator request cannot restore delegation after the parent
+        exact-name ceiling removes it, even when depth and kill-switch gates pass.
         """
         mock_creds.return_value = {
             "provider": None, "base_url": None,
             "api_key": None, "api_mode": None, "model": None,
         }
         parent = _make_mock_parent(depth=0)
-        parent.enabled_toolsets = ["terminal", "file"]  # no delegation
+        parent.enabled_toolsets = ["terminal", "file"]
+        parent.valid_tool_names = {"read_file"}
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = _make_role_mock_child()
+            mock_child.valid_tool_names = {"read_file", "delegate_task"}
             MockAgent.return_value = mock_child
             delegate_task(goal="test", role="orchestrator",
                           parent_agent=parent)
-            self.assertIn("delegation", MockAgent.call_args[1]["enabled_toolsets"])
+            self.assertNotIn("delegation", MockAgent.call_args[1]["enabled_toolsets"])
+            self.assertNotIn("delegate_task", mock_child.valid_tool_names)
+            self.assertEqual(mock_child._delegate_role, "leaf")
 
 
 class TestOrchestratorEndToEnd(unittest.TestCase):
@@ -3211,6 +3332,7 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
         }
         parent = _make_mock_parent(depth=0)
         parent.enabled_toolsets = ["terminal", "file", "delegation"]
+        parent.valid_tool_names = {"delegate_task", "read_file", "terminal"}
 
         # (enabled_toolsets, _delegate_role) for each agent built
         built_agents: list = []
@@ -3222,6 +3344,9 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
             prompt = kw.get("ephemeral_system_prompt", "") or ""
             is_orchestrator = "Orchestrator Role" in prompt
             m = _make_role_mock_child()
+            m.valid_tool_names = {"read_file", "terminal"}
+            if "delegation" in (kw.get("enabled_toolsets") or []):
+                m.valid_tool_names.add("delegate_task")
             built_agents.append({
                 "enabled_toolsets": list(kw.get("enabled_toolsets") or []),
                 "is_orchestrator_prompt": is_orchestrator,
@@ -3406,6 +3531,71 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertEqual(kwargs["fallback_model"], [fallback_entry])
+
+    def test_child_inherits_parent_runtime_after_parent_has_fallen_back(self):
+        parent = _make_mock_parent(depth=0)
+        parent.provider = "gptcodex"
+        parent.model = "gpt-5.5"
+        parent.base_url = "https://relay.example/v1"
+        parent.api_key = "relay-runtime-key"
+        parent._client_kwargs = {
+            "base_url": "https://relay.example/v1",
+            "api_key": "relay-runtime-key",
+        }
+        fallback_entry = {"provider": "openrouter", "model": "openai/gpt-5.5"}
+        parent._fallback_chain = [fallback_entry]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="inherit the active fallback runtime",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["provider"], "gptcodex")
+        self.assertEqual(kwargs["model"], "gpt-5.5")
+        self.assertEqual(kwargs["base_url"], "https://relay.example/v1")
+        self.assertEqual(kwargs["api_key"], "relay-runtime-key")
+        self.assertEqual(kwargs["fallback_model"], [fallback_entry])
+
+    @patch("tools.delegate_tool._resolve_child_credential_pool")
+    def test_pinned_direct_primary_still_receives_parent_fallback_chain(
+        self, mock_resolve_pool
+    ):
+        parent = _make_mock_parent(depth=0)
+        fallback_entry = {"provider": "gptcodex", "model": "gpt-5.5"}
+        parent._fallback_chain = [fallback_entry]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child._credential_pool = MagicMock(name="constructor_pool")
+            MockAgent.return_value = mock_child
+            _build_child_agent(
+                task_index=0,
+                goal="keep fallback after a pinned direct primary",
+                context=None,
+                toolsets=None,
+                model="primary-model",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="custom",
+                override_base_url="https://primary.example/v1",
+                override_api_key="primary-endpoint-key",
+                pin_override_credential=True,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["fallback_model"], [fallback_entry])
+        self.assertIsNone(mock_child._credential_pool)
+        mock_resolve_pool.assert_not_called()
 
     def test_child_gets_no_fallback_when_parent_chain_empty(self):
         """When parent._fallback_chain is empty, fallback_model is None."""

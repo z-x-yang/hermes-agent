@@ -642,19 +642,23 @@ Four systems run alongside the main conversation loop. Quick reference
 here; full developer notes live in `AGENTS.md`, user-facing docs under
 `website/docs/user-guide/features/`.
 
-### Delegation (`delegate_task`)
+### Delegation (`delegate_task` / `delegate_continue`)
 
-Synchronous subagent spawn — the parent waits for the child's summary
-before continuing its own loop. Isolated context + terminal session.
+Hermes exposes exactly `Explore`, `Plan`, and `general-purpose`; omitting the
+type resolves to `general-purpose`. `auto` waits for one Explore/Plan task,
+backgrounds general-purpose and batches, and preserves explicit foreground or
+background scheduling. A full background pool returns `rejected` without
+running a child synchronously.
 
-- **Single:** `delegate_task(goal, context)`.
+- **Single:** `delegate_task(goal, context, subagent_type=...)`.
 - **Batch:** `delegate_task(tasks=[{goal, ...}, ...])` runs children in
   parallel, capped by `delegation.max_concurrent_children` (default 3).
-- **Roles:** `leaf` (default; cannot re-delegate) vs `orchestrator`
-  (can spawn its own workers, bounded by `delegation.max_spawn_depth`).
-- **Not durable.** If the parent is interrupted, the child is
-  cancelled. For work that must outlive the turn, use `cronjob` or
-  `terminal(background=True, notify_on_complete=True)`.
+- **Continuation:** retained general-purpose results return `agent_id`; use
+  `delegate_continue` for the same work instead of spawning a fresh child.
+- **Roles:** `leaf` is the default; only an explicitly enabled
+  `general-purpose` orchestrator can spawn workers.
+- **Not durable.** A process/gateway restart loses running background work and
+  retained sessions. Use cron or a managed background process for durable work.
 
 Config: `delegation.*` in `config.yaml`.
 

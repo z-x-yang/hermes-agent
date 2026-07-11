@@ -161,6 +161,56 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _capture_parent_tool_authority(
+    resolved_definitions,
+    model_visible_definitions,
+    *,
+    registry=None,
+):
+    """Freeze dispatchable policy identities before Tool Search hides tools.
+
+    ``resolved_definitions`` is the enabled/disabled/check-filtered pre-Tool
+    Search assembly.  Deferred underlying tools remain authoritative.  Bridge
+    tools are included only when they are present in the final model-facing
+    assembly, so metadata-only bridge registrations cannot grant authority
+    while Tool Search is inactive.
+    """
+    if registry is None:
+        from tools.registry import registry
+    from tools.tool_search import BRIDGE_TOOL_NAMES
+
+    exact_definitions = [
+        definition
+        for definition in resolved_definitions
+        if (definition.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES
+    ]
+    exact_definitions.extend(
+        definition
+        for definition in model_visible_definitions
+        if (definition.get("function") or {}).get("name") in BRIDGE_TOOL_NAMES
+    )
+    return registry.authority_snapshot_for_definitions(exact_definitions)
+
+
+def _resolve_parent_tool_surfaces(
+    *,
+    enabled_toolsets,
+    disabled_toolsets,
+    quiet_mode: bool,
+):
+    """Resolve once, then derive model-visible Tool Search schemas from it."""
+    resolved = _ra().get_tool_definitions(
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
+        quiet_mode=quiet_mode,
+        skip_tool_search_assembly=True,
+    )
+    from model_tools import assemble_resolved_tool_definitions
+
+    visible = assemble_resolved_tool_definitions(resolved, quiet_mode=quiet_mode)
+    return resolved, visible
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -546,6 +596,9 @@ def init_agent(
     # Set on internal forks (e.g. background_review) that must keep ``tools[]``
     # byte-identical to a parent for provider cache parity.
     agent._skip_mcp_refresh = False
+    # Per-child result-retention index. Tool messages stay live in memory for
+    # the model, while persistence choke points project HANDLE_ONLY content.
+    agent._subagent_tool_result_retention_by_call_id = {}
     # Registry generation the current tool snapshot was derived from. Lets a
     # late/concurrent refresh reject a stale (older-generation) rebuild instead
     # of clobbering a newer one. Set adjacent to the tool snapshot below.
@@ -1052,18 +1105,36 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
-    # Get available tools with filtering. Capture the registry generation this
-    # snapshot is derived from FIRST, so a later concurrent refresh can tell
-    # whether it holds a newer or staler view (see refresh_agent_mcp_tools).
-    try:
-        from tools.registry import registry as _snapshot_registry
-        agent._tool_snapshot_generation = _snapshot_registry._generation
-    except Exception:
-        agent._tool_snapshot_generation = 0
-    agent.tools = _ra().get_tool_definitions(
-        enabled_toolsets=enabled_toolsets,
-        disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
+    # Resolve the complete dispatchable scope before Tool Search hides deferred
+    # definitions. Bind both definition passes to one stable registry
+    # generation; a concurrent MCP refresh retries once and otherwise fails
+    # closed rather than retaining a mixed-generation authority snapshot.
+    from tools.registry import registry as _snapshot_registry
+
+    for _authority_attempt in range(2):
+        _authority_start_generation = _snapshot_registry._generation
+        _resolved_parent_tools, agent.tools = _resolve_parent_tool_surfaces(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=agent.quiet_mode,
+        )
+        agent._parent_tool_authority_snapshot = _capture_parent_tool_authority(
+            _resolved_parent_tools,
+            agent.tools,
+            registry=_snapshot_registry,
+        )
+        if (
+            _authority_start_generation
+            == agent._parent_tool_authority_snapshot.registry_generation
+            == _snapshot_registry._generation
+        ):
+            break
+    else:
+        raise RuntimeError(
+            "tool registry changed while capturing parent authority snapshot"
+        )
+    agent._tool_snapshot_generation = (
+        agent._parent_tool_authority_snapshot.registry_generation
     )
     
     # Show tool configuration and store valid tool names for validation

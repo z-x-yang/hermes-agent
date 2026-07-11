@@ -68,6 +68,7 @@ def _install_fake_delegate_runtime(monkeypatch, run_child):
     def build_child(**kwargs):
         child = MagicMock()
         child._delegate_role = kwargs.get("role", "leaf")
+        child._subagent_profile = kwargs.get("profile")
         child._subagent_id = f"fake-{len(built)}"
         parent = kwargs.get("parent_agent")
         if parent is not None:
@@ -95,6 +96,31 @@ def _install_fake_delegate_runtime(monkeypatch, run_child):
 
 def test_auto_preserves_legacy_background_default():
     assert _resolve_scheduling(None, "auto", is_batch=False, is_subagent=False) == "background"
+
+
+def test_direct_python_omit_keeps_sync_but_uses_gp_profile(monkeypatch):
+    import tools.delegate_tool as dt
+
+    built = _install_fake_delegate_runtime(
+        monkeypatch,
+        lambda task_index, goal, **_kwargs: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": goal,
+        },
+    )
+
+    result = json.loads(
+        dt.delegate_task(
+            goal="inspect",
+            parent_agent=_parent(),
+            _dispatch_origin="python",
+        )
+    )
+
+    assert result["mode"] == "foreground"
+    assert result["results"][0]["subagent_type"] == "general-purpose"
+    assert built[0]._subagent_profile.name == "general-purpose"
 
 
 def test_auto_uses_foreground_for_single_explore_and_plan():
@@ -794,19 +820,18 @@ def test_foreground_on_stateless_endpoint_returns_completed_result_not_handle(mo
     assert ad.active_count() == 0
 
 
-def test_async_pool_rejection_runs_already_built_foreground_child_inline(monkeypatch):
+def test_async_pool_rejection_does_not_run_extra_child_inline(monkeypatch):
     import tools.delegate_tool as dt
 
-    attached_during_inline_run = []
+    run_count = 0
 
     def run_child(task_index, goal, **kwargs):
-        attached_during_inline_run.append(
-            kwargs["child"] in kwargs["parent_agent"]._active_children
-        )
+        nonlocal run_count
+        run_count += 1
         return {
             "task_index": task_index,
             "status": "completed",
-            "summary": "capacity fallback",
+            "summary": "should not run",
         }
 
     built = _install_fake_delegate_runtime(monkeypatch, run_child)
@@ -827,9 +852,11 @@ def test_async_pool_rejection_runs_already_built_foreground_child_inline(monkeyp
     )
 
     assert len(built) == 1
-    assert attached_during_inline_run == [True]
-    assert result["results"][0]["summary"] == "capacity fallback"
-    assert "pool was at capacity" in result["note"]
+    assert run_count == 0
+    assert result["status"] == "rejected"
+    assert "capacity reached" in result["error"]
+    assert "not started" in result["note"]
+    assert parent._active_children == []
 
 
 def test_pure_background_keeps_historical_no_blanket_run_cap(monkeypatch):
@@ -913,8 +940,6 @@ def test_model_schema_truthfully_describes_scheduling_and_batch_delivery():
     assert "one batch handle" in description
     assert "one consolidated completion" in description
 
-    background_description = DELEGATE_TASK_SCHEMA["parameters"]["properties"][
-        "background"
-    ]["description"]
-    assert "Use 'scheduling' instead" in background_description
-    assert "always run" not in background_description
+    props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+    assert "background" not in props
+    assert "always run in the background" not in description

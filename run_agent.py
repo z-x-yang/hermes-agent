@@ -1661,7 +1661,14 @@ class AIAgent:
         # retry/failure sentinels must not survive into the real transcript).
         self._drop_trailing_empty_response_scaffolding(messages)
         self._session_messages = messages
-        self._save_session_log(messages)
+        from tools.tool_result_storage import project_messages_for_retention
+
+        retention_index = getattr(
+            self, "_subagent_tool_result_retention_by_call_id", None
+        )
+        self._save_session_log(
+            project_messages_for_retention(messages, retention_index)
+        )
         self._flush_messages_to_session_db(messages, conversation_history)
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
@@ -1802,6 +1809,9 @@ class AIAgent:
                 id(item) for item in (conversation_history or [])
                 if isinstance(item, dict)
             }
+            retention_index = getattr(
+                self, "_subagent_tool_result_retention_by_call_id", None
+            )
 
             for _msg_idx, msg in enumerate(messages):
                 if not isinstance(msg, dict):
@@ -1827,6 +1837,23 @@ class AIAgent:
                     continue
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
+                if (
+                    role == "tool"
+                    and isinstance(content, str)
+                    and isinstance(retention_index, dict)
+                ):
+                    from tools.tool_effects import ResultRetention
+                    from tools.tool_result_storage import (
+                        project_result_for_retention,
+                    )
+
+                    retention = retention_index.get(
+                        str(msg.get("tool_call_id", "")),
+                        ResultRetention.DEFAULT,
+                    )
+                    content = project_result_for_retention(
+                        content, retention
+                    )
                 _row_timestamp = msg.get("timestamp")
                 # Apply the persist override to THIS row's written values only
                 # (never to the live dict). Match the original guard: text-only
@@ -5679,7 +5706,8 @@ class AIAgent:
                      tool_call_id: Optional[str] = None, messages: list = None,
                      pre_tool_block_checked: bool = False,
                      skip_tool_request_middleware: bool = False,
-                     tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None) -> str:
+                     tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None,
+                     authorized_call: Any = None) -> str:
         """Forwarder — see ``agent.agent_runtime_helpers.invoke_tool``."""
         from agent.agent_runtime_helpers import invoke_tool
         return invoke_tool(
@@ -5692,6 +5720,7 @@ class AIAgent:
             pre_tool_block_checked,
             skip_tool_request_middleware,
             tool_request_middleware_trace,
+            authorized_call,
         )
 
     @staticmethod

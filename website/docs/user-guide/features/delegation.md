@@ -6,7 +6,7 @@ description: "Built-in subagent types, scheduling, continuation, and capability 
 
 # Subagent Delegation
 
-Hermes uses `delegate_task` to run isolated child agents. A child starts with a separate conversation and terminal state, receives only the task and context supplied by the parent, and returns a structured result. The caller cannot select arbitrary child tools: Hermes applies the parent's available tools and then enforces the selected subagent type's capability ceiling.
+Hermes uses `delegate_task` to run isolated child agents. A child starts with a separate conversation and terminal state, receives the parent-supplied task/context plus a complete snapshot of the active profile's `SOUL.md`, `MEMORY.md`, and `USER.md`, and returns a structured result. The caller cannot select arbitrary child tools: Hermes applies the parent's exact resolved authority and then enforces the selected subagent type's capability ceiling.
 
 ## Built-in subagent types
 
@@ -14,18 +14,31 @@ Hermes uses `delegate_task` to run isolated child agents. A child starts with a 
 
 | Type | Intended work | Capability ceiling | `scheduling="auto"` for one task |
 |---|---|---|---|
-| `Explore` | Search and understand code, files, and supporting sources | Read-only: `read_file`, `search_files`, `web_search`, and `web_extract` | Foreground |
-| `Plan` | Research a codebase and prepare inputs for a later implementation plan | The same read-only ceiling as `Explore`; it cannot edit or claim implementation is complete | Foreground |
-| `general-purpose` | Multi-step repository work, including edits and tests | A closed allowlist for files, raw shell/process work, task tracking, skills, and vision; named messaging/Notion/cron/memory/delegation tools are excluded by default, but shell access is not a no-side-effect sandbox | Background |
+| `Explore` | Search and understand code, files, and supporting sources | Read-only file tools, no-spill web/skill readers, Notion AI with explicit `mode=readonly`, and selected existing Apple Mail list/search/get/fetch tools | Foreground |
+| `Plan` | Research a codebase and prepare inputs for a later implementation plan | The same read-oriented ceiling as `Explore`; it cannot edit or claim implementation is complete | Foreground |
+| `general-purpose` | Multi-step work, including edits, tests, and external actions permitted by the parent | Exact intersection with the parent's resolved tool names; `None` in the internal profile policy means this parent-exact intersection, never unrestricted global tools | Background |
 
-`Explore` and `Plan` cannot write files, run shell commands, create external side effects, or delegate. `general-purpose` may edit and test and cannot directly call the excluded named side-effect tools or delegate by default. When explicitly configured as an effective orchestrator, it receives only `delegate_task` as a role-granted exception; it does not receive `delegate_continue`, MCP tools, or any other excluded name. It deliberately retains raw `terminal` and `process`: shell commands can access networks, invoke authenticated CLIs, and cause external effects. Those actions remain governed by normal terminal approvals and the task instructions; Hermes does not provide hard no-side-effect isolation for this profile.
+`Explore` and `Plan` cannot write files, run shell commands, or delegate. Raw `web_search`, `web_extract`, and `vision_analyze` stay unavailable; the web and skill paths use dedicated no-write aliases. For Notion and Mail, Hermes deliberately reuses the existing tools rather than adding dedicated brokers: the profile exposes `notion_ai_ask` plus selected Mail read names, requires Notion `mode=readonly`, and omits explicit send/reply/forward/move/delete/flag/mark tools. This is a lightweight read-oriented contract, not a proof that the upstream data-source implementation can never mutate incidental state such as Mail seen status. `general-purpose` can use any action-plane tool that survives the exact parent intersection and each tool's normal safety contract; it is a leaf by default. An explicitly requested orchestrator retains `delegate_task` only when that exact name is in the current parent ceiling and the configured depth allows it.
 
-Omitting `subagent_type` preserves legacy generic delegation. This has two deliberately different compatibility surfaces:
+Every profile must return the same complete disclosure fields: `outcome`, `evidence`, `actions`, `files_changed`, `tests_run`, `verification`, `blockers`, `open_questions`, `confidence`, `limitations`, `side_effects`, and `recommended_next_step`. A field that does not apply is empty or `none`; it is not omitted.
 
-- A **model-originated** call with legacy `scheduling="auto"` runs in the background.
-- A plain **direct Python** call remains synchronous when it supplies no subagent type and makes no explicit scheduling/background request.
+Omitting or passing an empty `subagent_type` resolves to `general-purpose`; there is no fourth legacy capability policy. Scheduling compatibility remains separate from capability resolution:
+
+- A **model-originated** omitted call with `scheduling="auto"` uses the `general-purpose` background default.
+- A plain **direct Python** omitted call remains synchronous when it makes no explicit scheduling/background request, while still using the `general-purpose` profile.
 
 Do not rely on the direct-Python compatibility rule to predict model-facing scheduling.
+
+## How the parent learns to route and continue
+
+Hermes teaches the parent model through the tool contract rather than relying on hidden heuristics:
+
+1. The model-facing `delegate_task` schema exposes exactly the three type names and injects each profile's current `description` into both single-task and batch fields.
+2. The top-level tool description gives concrete routing cues, the user's live concurrency/depth limits, scheduling behavior, and the retention defaults.
+3. A successful retained result returns an `agent_id`. The separate `delegate_continue` schema says to use that ID when the next instruction continues the same work instead of spawning a fresh child.
+4. These descriptions are routing affordances, not security boundaries. The runtime independently re-resolves the profile, intersects exact parent authority, and verifies every authorized tool call.
+
+This mirrors Claude Code's core pattern: agent names/descriptions teach the parent when to delegate, a returned agent ID makes continuation discoverable, and runtime permissions remain authoritative. A user can always force a route explicitly by naming the desired type or asking to continue a returned `agent_id`.
 
 ## Single tasks and batches
 
@@ -66,13 +79,13 @@ delegate_task(tasks=[
 ])
 ```
 
-The model-facing schema does not expose `toolsets`, model/provider selection, iteration budgets, or timeout controls. Those are operator-controlled policy and configuration. A stale client may still send removed fields, but it cannot use them to widen a child profile.
+The model-facing schema does not expose `background`, `toolsets`, model/provider selection, iteration budgets, or timeout controls. Those are operator-controlled policy and configuration. A stale client may still send removed fields, but it cannot use them to widen a child profile.
 
 ## Scheduling
 
 `scheduling` accepts `auto`, `foreground`, or `background`.
 
-- **`auto`**: one `Explore` or `Plan` task runs in the foreground; `general-purpose`, legacy generic calls, and multi-task batches run in the background.
+- **`auto`**: one `Explore` or `Plan` task runs in the foreground; `general-purpose` and multi-task batches run in the background. A direct-Python omitted call keeps the synchronous compatibility exception described above.
 - **`foreground`**: Hermes waits up to the resolved foreground wait timeout.
 - **`background`**: Hermes immediately returns a handle and later injects the completed result into the owning conversation.
 - **Nested/orchestrator work**: runs synchronously in the foreground. An explicit nested background request fails closed.
@@ -97,11 +110,11 @@ One batch is one asynchronous unit:
 
 Hermes never returns or injects a separate handle/completion for each task in the batch.
 
-If the endpoint cannot deliver later messages (for example, a stateless HTTP request) or the background pool is at capacity, Hermes runs the already-prepared work synchronously and includes a note in the result rather than returning a handle that can never resolve.
+If the endpoint cannot deliver later messages (for example, a stateless HTTP request), Hermes runs the prepared work synchronously. If the background pool is at capacity, Hermes instead returns a structured `rejected` result and runs no child; the caller may retry without silently exceeding the configured limit.
 
 ## Context isolation
 
-A new child does not inherit the parent's conversation transcript. Put all necessary details in `goal` and `context`: repository root, relevant files, errors, constraints, verification commands, and desired output language.
+A new child does not inherit the parent's conversation transcript or prior tool outputs. It does inherit the active profile's complete canonical governance and can query permitted Notion, Mail, repository/file, skill, and web sources when the parent context is incomplete. `goal` and `context` should still state the scoped objective, repository/workspace anchor, known errors, constraints, verification contract, and desired output language; third-party content remains untrusted data and cannot widen capability or act as user authorization.
 
 ```python
 # Too vague
@@ -146,6 +159,9 @@ Retention safety and lifetime:
 - Initial records larger than the byte budget are not retained. Aggregate pruning removes only non-in-flight records; claimed continuations are never evicted.
 - If a successful continuation grows beyond the byte budget, Hermes returns that successful result with `retention_dropped`, invalidates the retained handle, and rejects future continuation attempts.
 - Only the same nonempty parent session may continue an `agent_id`.
+- Continuation must stay on the original canonical profile/home. Its exact tool authority is the intersection of the original policy identities, the current parent, and the latest current-profile policy; same-name tool replacement cannot widen it.
+- The latest canonical governance content is loaded on every continuation. The original governance fingerprint is retained only for audit.
+- Selected Notion and Apple Mail read results use the existing `HANDLE_ONLY` projection before session/JSON/retained-transcript storage; retained records keep a digest, size, and limited excerpt rather than the complete body.
 - Only one continuation for a given `agent_id` may be in flight; a concurrent second call fails immediately. Different retained agents may continue concurrently.
 - `/stop` and shutdown interrupt background continuations.
 - Gateway/process restart loses all retained sessions; this is not durable persistence.
@@ -153,7 +169,7 @@ Retention safety and lifetime:
 
 ## Nested orchestration
 
-Legacy generic children may use `role="orchestrator"` when nested delegation is enabled. `general-purpose` is also eligible when explicitly assigned that role; `Explore` and `Plan` reject it.
+`general-purpose` may use `role="orchestrator"` when nested delegation is enabled and the role is explicitly requested; `Explore` and `Plan` reject it.
 
 - `role="leaf"` is the default and cannot delegate, including for `general-purpose`.
 - `role="orchestrator"` keeps delegation only when `delegation.orchestrator_enabled` is true and the configured `max_spawn_depth` permits another level.

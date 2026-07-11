@@ -130,6 +130,43 @@ class TestEndToEnd:
         assert "para 2999 " in content
 
 
+    def test_web_extract_readonly_truncates_without_debug_or_disk_spill(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        big = "\n".join(f"readonly {i} " + "z" * 80 for i in range(3000))
+
+        class FakeProvider:
+            name = "fake"
+            display_name = "Fake"
+
+            def supports_extract(self):
+                return True
+
+            async def extract(self, urls, **kwargs):
+                return [{"url": urls[0], "title": "Big", "content": big}]
+
+        with patch("tools.web_tools._ensure_web_plugins_loaded"), \
+             patch("tools.web_tools._get_extract_backend", return_value="fake"), \
+             patch("tools.web_tools.async_is_safe_url", new=_AsyncTrue()), \
+             patch("agent.web_search_registry.get_provider", return_value=FakeProvider()), \
+             patch.object(wt._debug, "log_call", side_effect=AssertionError("debug write")), \
+             patch.object(wt._debug, "save", side_effect=AssertionError("debug save")), \
+             patch("tools.web_tools._store_full_text", side_effect=AssertionError("spill")):
+            result = json.loads(asyncio.run(
+                wt.web_extract_readonly(
+                    ["https://example.com/readonly"], char_limit=5000
+                )
+            ))
+
+        content = result["results"][0]["content"]
+        assert "[TRUNCATED]" in content
+        assert "Full text saved to:" not in content
+        assert "readonly 0 " in content
+        assert "readonly 2999 " in content
+        assert not (tmp_path / ".hermes").exists()
+
+
 def _make_awaitable(value):
     async def _coro(*a, **k):
         return value

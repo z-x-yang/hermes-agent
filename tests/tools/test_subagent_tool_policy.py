@@ -18,7 +18,9 @@ from agent.tool_executor import (
 )
 from run_agent import AIAgent
 from tools.delegate_tool import _build_child_agent
+from tools.registry import registry
 from tools.subagent_profiles import get_subagent_profile
+from tools.tool_effects import build_authority_snapshot
 
 
 def _tool(name: str) -> dict:
@@ -26,6 +28,22 @@ def _tool(name: str) -> dict:
         "type": "function",
         "function": {"name": name, "description": name, "parameters": {}},
     }
+
+
+def _set_authority(agent, names) -> set[str]:
+    # Core registrations are side effects of importing model_tools in the real
+    # agent-init path; mirror that ordering before resolving test identities.
+    import model_tools  # noqa: F401
+
+    resolved = {
+        identity
+        for name in names
+        if isinstance((identity := registry.resolved_policy_identity(name)), str)
+    }
+    agent._parent_tool_authority_snapshot = build_authority_snapshot(
+        resolved, registry_generation=registry._generation
+    )
+    return resolved
 
 
 def _parent_agent() -> MagicMock:
@@ -47,6 +65,13 @@ def _parent_agent() -> MagicMock:
     parent._print_fn = None
     parent.tool_progress_callback = None
     parent.thinking_callback = None
+    parent.valid_tool_names = {
+        "read_file",
+        "write_file",
+        "terminal",
+        "mcp_apple_mail_send_email",
+    }
+    _set_authority(parent, parent.valid_tool_names)
     return parent
 
 
@@ -67,6 +92,7 @@ def _child_agent() -> MagicMock:
     child._skip_mcp_refresh = False
     child._session_init_model_config = None
     child.session_id = "child-session"
+    _set_authority(child, child.valid_tool_names)
     return child
 
 
@@ -95,7 +121,9 @@ def test_explore_definitions_exclude_write_and_external_tools():
     assert agent.valid_tool_names == {"read_file"}
     assert [tool["function"]["name"] for tool in agent.tools] == ["read_file"]
     assert agent._subagent_tool_policy is policy
-    assert agent._skip_mcp_refresh is True
+    # Governed children may refresh, but refresh is filtered by their original
+    # exact authority instead of being disabled wholesale.
+    assert agent._skip_mcp_refresh is False
 
 
 def test_direct_hallucinated_tool_name_is_execution_blocked():
@@ -110,14 +138,19 @@ def test_direct_hallucinated_tool_name_is_execution_blocked():
     assert "blocked by subagent capability policy" in message
 
 
-def test_general_purpose_blocks_named_external_tools_but_keeps_raw_shell():
+def test_general_purpose_name_policy_does_not_remove_parent_authorized_actions():
     profile = get_subagent_profile("general-purpose")
     policy = ToolNamePolicy(allowed_names=profile.allowed_tool_names)
     agent = SimpleNamespace(_subagent_tool_policy=policy)
 
-    for repo_local_name in ("write_file", "patch", "terminal", "process"):
-        assert tool_policy_block_message(agent, repo_local_name) is None
-    assert tool_policy_block_message(agent, "mcp_notion_ai_notion_ai_ask")
+    for tool_name in (
+        "write_file",
+        "patch",
+        "terminal",
+        "process",
+        "mcp_notion_ai_notion_ai_ask",
+    ):
+        assert tool_policy_block_message(agent, tool_name) is None
 
 
 def test_profiled_child_filters_visible_and_runtime_tool_names():
@@ -141,7 +174,7 @@ def test_profiled_child_filters_visible_and_runtime_tool_names():
     assert child.valid_tool_names == {"read_file"}
     assert [tool["function"]["name"] for tool in child.tools] == ["read_file"]
     assert child._subagent_tool_policy.allowed_names == frozenset({"read_file"})
-    assert child._skip_mcp_refresh is True
+    assert child._skip_mcp_refresh is False
 
 
 @pytest.mark.parametrize("profile_name", [None, "general-purpose"])
@@ -149,6 +182,7 @@ def test_initial_child_intersects_exact_current_parent_tool_names(profile_name):
     parent = _parent_agent()
     parent.enabled_toolsets = ["file"]
     parent.valid_tool_names = {"read_file"}
+    _set_authority(parent, parent.valid_tool_names)
     child = _child_agent()
     profile = get_subagent_profile(profile_name) if profile_name else None
 
@@ -175,6 +209,7 @@ def test_initial_child_keeps_exact_empty_parent_tool_names_fail_closed(profile_n
     parent = _parent_agent()
     parent.enabled_toolsets = ["file"]
     parent.valid_tool_names = set()
+    _set_authority(parent, parent.valid_tool_names)
     child = _child_agent()
     profile = get_subagent_profile(profile_name) if profile_name else None
 
@@ -199,7 +234,7 @@ def test_initial_child_keeps_exact_empty_parent_tool_names_fail_closed(profile_n
 def test_general_purpose_orchestrator_gets_only_loaded_delegate_task_role_exception():
     parent = _parent_agent()
     parent.enabled_toolsets = ["file"]
-    parent.valid_tool_names = {"read_file"}
+    parent.valid_tool_names = {"read_file", "delegate_task"}
     child = _child_agent()
     child.valid_tool_names |= {"delegate_task", "delegate_continue"}
     child.tools.extend([_tool("delegate_task"), _tool("delegate_continue")])
@@ -209,6 +244,8 @@ def test_general_purpose_orchestrator_gets_only_loaded_delegate_task_role_except
         patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
         patch("tools.delegate_tool._get_max_spawn_depth", return_value=2),
     ):
+        _set_authority(parent, parent.valid_tool_names)
+        _set_authority(child, child.valid_tool_names)
         built = _build_child_agent(
             task_index=0,
             goal="Orchestrate one worker layer",
@@ -237,9 +274,11 @@ def test_general_purpose_orchestrator_role_exception_requires_live_runtime_gates
     parent = _parent_agent()
     parent.enabled_toolsets = ["file"]
     parent.valid_tool_names = {"read_file"}
+    _set_authority(parent, parent.valid_tool_names)
     child = _child_agent()
     child.valid_tool_names |= {"delegate_task", "delegate_continue"}
     child.tools.extend([_tool("delegate_task"), _tool("delegate_continue")])
+    _set_authority(child, child.valid_tool_names)
     orchestrator_enabled = bounded_gate != "kill_switch"
     max_spawn_depth = 1 if bounded_gate == "depth" else 2
 
@@ -293,8 +332,15 @@ def test_initial_child_can_skip_parent_lifecycle_registration():
     assert child not in parent._active_children
 
 
-def test_legacy_child_has_no_hard_allowlist_policy():
+def test_omitted_profile_uses_general_purpose_policy_not_fourth_legacy_policy():
     parent = _parent_agent()
+    parent.valid_tool_names = {
+        "read_file",
+        "write_file",
+        "terminal",
+        "mcp_apple_mail_send_email",
+    }
+    _set_authority(parent, parent.valid_tool_names)
     child = _child_agent()
 
     with patch("run_agent.AIAgent", return_value=child):
@@ -310,12 +356,12 @@ def test_legacy_child_has_no_hard_allowlist_policy():
             profile=None,
         )
 
-    assert "_subagent_tool_policy" not in child.__dict__
+    assert child._subagent_tool_policy.profile_name == "general-purpose"
+    assert child._subagent_profile.name == "general-purpose"
     assert child.valid_tool_names == {
         "read_file",
         "write_file",
         "terminal",
-        "mcp_apple_mail_send_email",
     }
     assert child._skip_mcp_refresh is False
 
@@ -363,6 +409,186 @@ def _assistant_tool_call(name: str, arguments: dict, call_id: str = "call-1"):
     )
 
 
+@pytest.mark.parametrize(
+    "executor",
+    [execute_tool_calls_sequential, execute_tool_calls_concurrent],
+)
+def test_readonly_executor_dispatches_authorized_read_once_without_middleware(
+    executor_agent, monkeypatch, executor
+):
+    from tools.registry import registry
+    from tools.tool_effects import (
+        ResultRetention,
+        ToolEffect,
+        build_authority_snapshot,
+        builtin_policy_descriptor,
+    )
+
+    name = "task6_executor_read"
+    schema = _tool(name)["function"]
+    backend_calls = []
+
+    def handler(args, **kwargs):
+        backend_calls.append(dict(args))
+        return json.dumps({"ok": True, "value": args.get("value")})
+
+    registry.register(
+        name=name,
+        toolset="task6-test",
+        schema=schema,
+        handler=handler,
+        descriptor=builtin_policy_descriptor(
+            name=name,
+            schema=schema,
+            handler=handler,
+            effects={ToolEffect.READ_LOCAL},
+            retention=ResultRetention.NO_SPILL,
+        ),
+        override=True,
+    )
+    try:
+        identity = registry.resolved_policy_identity(name)
+        assert isinstance(identity, str)
+        executor_agent.tools.append(_tool(name))
+        executor_agent.valid_tool_names.add(name)
+        apply_tool_policy_to_agent(
+            executor_agent,
+            ToolNamePolicy(
+                allowed_names=frozenset({name}),
+                allowed_effects=frozenset(
+                    {ToolEffect.READ_LOCAL, ToolEffect.READ_REMOTE}
+                ),
+                authority_snapshot=build_authority_snapshot(
+                    {identity}, registry_generation=registry._generation
+                ),
+                profile_name="Explore",
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            MagicMock(side_effect=AssertionError("request middleware ran")),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            MagicMock(side_effect=AssertionError("execution middleware ran")),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            lambda *args, **kwargs: None,
+        )
+        messages = []
+
+        executor(
+            executor_agent,
+            _assistant_tool_call(name, {"value": "safe"}, "read-call"),
+            messages,
+            "task-1",
+        )
+
+        assert backend_calls == [{"value": "safe"}]
+        assert (
+            executor_agent._subagent_tool_result_retention_by_call_id[
+                "read-call"
+            ]
+            is ResultRetention.NO_SPILL
+        )
+        assert len(messages) == 1
+        assert json.loads(messages[0]["content"])["ok"] is True
+    finally:
+        registry.deregister(name)
+
+
+@pytest.mark.parametrize(
+    "executor",
+    [execute_tool_calls_sequential, execute_tool_calls_concurrent],
+)
+def test_effect_denial_stops_before_backend_hooks_checkpoint_and_persistence(
+    executor_agent, monkeypatch, executor
+):
+    from tools.registry import registry
+    from tools.tool_effects import (
+        ResultRetention,
+        ToolEffect,
+        build_authority_snapshot,
+        builtin_policy_descriptor,
+    )
+
+    name = "task6_executor_unknown"
+    schema = _tool(name)["function"]
+    backend_calls = []
+
+    def handler(args, **kwargs):
+        backend_calls.append(dict(args))
+        return "must not run"
+
+    registry.register(
+        name=name,
+        toolset="task6-test",
+        schema=schema,
+        handler=handler,
+        descriptor=builtin_policy_descriptor(
+            name=name,
+            schema=schema,
+            handler=handler,
+            effects={ToolEffect.UNKNOWN},
+            retention=ResultRetention.NO_SPILL,
+        ),
+        override=True,
+    )
+    try:
+        identity = registry.resolved_policy_identity(name)
+        assert isinstance(identity, str)
+        executor_agent.tools.append(_tool(name))
+        executor_agent.valid_tool_names.add(name)
+        apply_tool_policy_to_agent(
+            executor_agent,
+            ToolNamePolicy(
+                allowed_names=frozenset({name}),
+                allowed_effects=frozenset(
+                    {ToolEffect.READ_LOCAL, ToolEffect.READ_REMOTE}
+                ),
+                authority_snapshot=build_authority_snapshot(
+                    {identity}, registry_generation=registry._generation
+                ),
+                profile_name="Explore",
+            ),
+        )
+        pre_hook = MagicMock(
+            side_effect=AssertionError("capability denial reached pre hook")
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_block_message", pre_hook
+        )
+        persist_result = MagicMock(
+            side_effect=lambda **kwargs: kwargs["content"]
+        )
+        monkeypatch.setattr(
+            "agent.tool_executor.maybe_persist_tool_result", persist_result
+        )
+        executor_agent._flush_messages_to_session_db = MagicMock()
+        executor_agent._checkpoint_mgr.ensure_checkpoint = MagicMock(
+            side_effect=AssertionError("capability denial reached checkpoint")
+        )
+        messages = []
+
+        executor(
+            executor_agent,
+            _assistant_tool_call(name, {"value": "blocked"}, "denied-call"),
+            messages,
+            "task-1",
+        )
+
+        assert backend_calls == []
+        pre_hook.assert_not_called()
+        executor_agent._checkpoint_mgr.ensure_checkpoint.assert_not_called()
+        persist_result.assert_not_called()
+        executor_agent._flush_messages_to_session_db.assert_not_called()
+        assert len(messages) == 1
+        assert "effect" in messages[0]["content"]
+    finally:
+        registry.deregister(name)
+
+
 def _capture_terminal_events(monkeypatch):
     hook_calls = []
     monkeypatch.setattr(
@@ -377,11 +603,9 @@ def _assert_capability_block(messages, hook_calls, *, tool_name: str, call_id: s
     assert len(messages) == 1
     assert messages[0]["tool_call_id"] == call_id
     assert "blocked by subagent capability policy" in messages[0]["content"]
-    post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
-    assert post_call[1]["tool_name"] == tool_name
-    assert post_call[1]["tool_call_id"] == call_id
-    assert post_call[1]["status"] == "blocked"
-    assert post_call[1]["error_type"] == "subagent_capability_block"
+    # Capability denial is fail-closed before every third-party hook,
+    # including observational post hooks.
+    assert hook_calls == []
 
 
 def test_concurrent_executor_blocks_denied_direct_tool_before_hooks_and_invoke(

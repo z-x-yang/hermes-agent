@@ -710,6 +710,53 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
     return name, raw_args, None
 
 
+# Bridge definitions are synthesized only when Tool Search activates, so these
+# entries are metadata-only: they make exact policy identity lookup possible
+# without exposing bridge tools while Tool Search is disabled.
+def _register_bridge_policy_metadata() -> None:
+    from tools.registry import registry
+    from tools.tool_effects import ResultRetention, ToolEffect, builtin_policy_descriptor
+
+    schemas = {
+        item["function"]["name"]: item["function"]
+        for item in bridge_tool_schemas(0)
+    }
+    handlers = {
+        TOOL_SEARCH_NAME: dispatch_tool_search,
+        TOOL_DESCRIBE_NAME: dispatch_tool_describe,
+        TOOL_CALL_NAME: resolve_underlying_call,
+    }
+    for name, handler in handlers.items():
+        effects = (
+            {ToolEffect.READ_LOCAL}
+            if name in {TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME}
+            else {ToolEffect.UNKNOWN}
+        )
+        retention = (
+            ResultRetention.NO_SPILL
+            if name in {TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME}
+            else ResultRetention.DEFAULT
+        )
+        schema = schemas[name]
+        registry.register(
+            name=name,
+            toolset="tool-search",
+            schema=schema,
+            handler=handler,
+            metadata_only=True,
+            descriptor=builtin_policy_descriptor(
+                name=name,
+                schema=schema,
+                handler=handler,
+                effects=effects,
+                retention=retention,
+            ),
+        )
+
+
+_register_bridge_policy_metadata()
+
+
 __all__ = [
     "TOOL_SEARCH_NAME",
     "TOOL_DESCRIBE_NAME",

@@ -4161,6 +4161,39 @@ def _existing_tool_names() -> List[str]:
     return names
 
 
+def _notion_ai_ask_effects(args):
+    """Treat only explicit readonly Notion AI calls as remote reads."""
+    from tools.tool_effects import ToolEffect
+
+    mode = str(args.get("mode") or "").strip().lower()
+    if mode == "readonly":
+        return frozenset({ToolEffect.READ_REMOTE})
+    return frozenset({ToolEffect.WRITE_REMOTE})
+
+
+def _mcp_effect_policy(registered_name: str):
+    """Classify the small existing MCP read surface approved for readonly children."""
+    from tools.subagent_profiles import (
+        APPLE_MAIL_READ_TOOL_NAMES,
+        NOTION_PROMPT_READ_TOOL_NAMES,
+    )
+    from tools.tool_effects import ResultRetention, ToolEffect
+
+    if registered_name in APPLE_MAIL_READ_TOOL_NAMES:
+        return (
+            frozenset({ToolEffect.READ_REMOTE}),
+            None,
+            ResultRetention.HANDLE_ONLY,
+        )
+    if registered_name in NOTION_PROMPT_READ_TOOL_NAMES:
+        return (
+            frozenset({ToolEffect.UNKNOWN}),
+            _notion_ai_ask_effects,
+            ResultRetention.HANDLE_ONLY,
+        )
+    return frozenset({ToolEffect.UNKNOWN}), None, ResultRetention.DEFAULT
+
+
 def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
     """Register tools from an already-connected server into the registry.
 
@@ -4174,9 +4207,18 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         List of registered prefixed tool names.
     """
     from tools.registry import registry
+    from tools.tool_effects import mcp_policy_descriptor
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
+    initialize_result = getattr(server, "initialize_result", None)
+    server_info = None
+    if initialize_result is not None:
+        server_info = getattr(initialize_result, "serverInfo", None)
+        if server_info is None:
+            server_info = getattr(initialize_result, "server_info", None)
+    server_info_name = getattr(server_info, "name", None)
+    server_info_version = getattr(server_info, "version", None)
 
     # Selective tool loading: honour include/exclude lists from config.
     # Rules (matching issue #690 spec):
@@ -4205,6 +4247,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
         schema = _convert_mcp_schema(name, mcp_tool)
         tool_name_prefixed = schema["name"]
+        effects, argument_resolver, retention = _mcp_effect_policy(tool_name_prefixed)
 
         # Guard against collisions with built-in (non-MCP) tools.
         existing_toolset = registry.get_toolset_for_tool(tool_name_prefixed)
@@ -4224,6 +4267,17 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=_make_check_fn(name),
             is_async=False,
             description=schema["description"],
+            descriptor=mcp_policy_descriptor(
+                registered_name=tool_name_prefixed,
+                remote_tool_name=mcp_tool.name,
+                schema=schema,
+                config=config,
+                server_info_name=server_info_name,
+                server_info_version=server_info_version,
+                effects=effects,
+                argument_resolver=argument_resolver,
+                retention=retention,
+            ),
         )
         _track_mcp_tool_server(tool_name_prefixed, name)
         registered_names.append(tool_name_prefixed)
@@ -4261,6 +4315,14 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],
+            descriptor=mcp_policy_descriptor(
+                registered_name=util_name,
+                remote_tool_name=handler_key,
+                schema=schema,
+                config=config,
+                server_info_name=server_info_name,
+                server_info_version=server_info_version,
+            ),
         )
         _track_mcp_tool_server(util_name, name)
         registered_names.append(util_name)
@@ -4721,6 +4783,9 @@ def refresh_agent_mcp_tools(
         )
         or []
     )
+    from agent.subagent_tool_policy import filter_tool_definitions_for_policy
+
+    new_defs = filter_tool_definitions_for_policy(agent, new_defs)
     new_names = {t["function"]["name"] for t in new_defs}
 
     # Re-append the post-build injected families that get_tool_definitions does
@@ -4732,6 +4797,9 @@ def refresh_agent_mcp_tools(
     # half-swap. ``staged_engine_names`` are the context-engine routing names
     # this rebuild actually appended (matching agent_init's dedup-aware add).
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+    new_defs = filter_tool_definitions_for_policy(agent, new_defs)
+    new_names = {t["function"]["name"] for t in new_defs}
+    staged_engine_names.intersection_update(new_names)
 
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a

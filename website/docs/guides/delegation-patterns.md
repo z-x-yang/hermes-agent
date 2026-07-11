@@ -16,9 +16,9 @@ For the full contract, see [Subagent Delegation](/user-guide/features/delegation
 |---|---|---|
 | Locate code, trace a call path, gather file:line evidence | `Explore` | Read-only and foreground by default |
 | Research a change before writing an implementation plan | `Plan` | Read-only, plan-oriented result contract, foreground by default |
-| Edit repository files, run tests, or complete multi-step repo-local work | `general-purpose` | Closed repo-local worker policy, background by default |
+| Edit files, run tests, use terminal/process, or complete dependent multi-step work | `general-purpose` | Exact parent tool ceiling, background by default |
 
-Do not ask `Explore` or `Plan` to edit. `general-purpose` excludes named messaging, publishing, scheduling, Notion, cron, and memory-write tools, and the model cannot widen that allowlist with `toolsets`. It still has raw `terminal` and `process`, so shell commands can reach external systems; treat normal terminal approvals and explicit task instructions as the governing boundary, not a hard no-side-effect sandbox.
+Do not ask `Explore` or `Plan` to edit. `general-purpose` receives only the exact current-parent tool authority that survives runtime policy checks; it can use named external tools when the parent has them and the user/task scope plus each tool's confirmation contract permits the action. It also has raw `terminal` and `process`, so it is not a hard no-side-effect sandbox. The model cannot widen this ceiling with `toolsets`.
 
 ## Pattern: focused exploration before acting
 
@@ -136,7 +136,7 @@ A continuation keeps the original type, role, workspace hint, model/provider met
 
 ## Pattern: nested orchestration only when needed
 
-Nested delegation is available to legacy generic orchestrators and to `general-purpose` only when it is explicitly configured with `role="orchestrator"`. `Explore` and `Plan` always reject the orchestrator role:
+Nested delegation is available to `general-purpose` only when it is explicitly configured with `role="orchestrator"`. `Explore` and `Plan` always reject the orchestrator role:
 
 ```python
 delegate_task(
@@ -153,7 +153,7 @@ delegate_task(
 
 - Single `Explore`/`Plan` + `auto` → foreground.
 - Single `general-purpose` + `auto` → background.
-- Model-originated legacy generic + `auto` → background.
+- Omitted/empty `subagent_type` resolves to `general-purpose`; model-originated `auto` → background.
 - Multi-task batch + `auto` → background, one handle/result.
 - Nested/orchestrator delegation → synchronous foreground.
 - Direct Python legacy call with no type or explicit scheduling/background request → synchronous compatibility path.

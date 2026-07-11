@@ -11,7 +11,15 @@ freezing any particular tool list.
 import threading
 import types
 
+from agent.subagent_tool_policy import ToolNamePolicy, apply_tool_policy_to_agent
 from tools import mcp_tool
+from tools.registry import registry
+from tools.tool_effects import (
+    ResultRetention,
+    ToolEffect,
+    build_authority_snapshot,
+    builtin_policy_descriptor,
+)
 
 
 def _tool(name):
@@ -25,6 +33,69 @@ def _agent(tool_names, *, enabled=None, disabled=None):
     a.enabled_toolsets = enabled
     a.disabled_toolsets = disabled
     return a
+
+
+def _register_read_tool(name):
+    schema = _tool(name)["function"]
+
+    def handler(args, **kwargs):
+        return "ok"
+
+    registry.register(
+        name=name,
+        toolset="task6-refresh-test",
+        schema=schema,
+        handler=handler,
+        descriptor=builtin_policy_descriptor(
+            name=name,
+            schema=schema,
+            handler=handler,
+            effects={ToolEffect.READ_REMOTE},
+            retention=ResultRetention.NO_SPILL,
+        ),
+        override=True,
+    )
+
+
+def test_governed_refresh_rejects_new_identity_outside_original_ceiling(monkeypatch):
+    original = "task6_refresh_original"
+    late = "task6_refresh_late"
+    _register_read_tool(original)
+    _register_read_tool(late)
+    try:
+        original_identity = registry.resolved_policy_identity(original)
+        assert original_identity is not None
+        agent = _agent([original])
+        apply_tool_policy_to_agent(
+            agent,
+            ToolNamePolicy(
+                allowed_names=frozenset({original}),
+                allowed_effects=frozenset(
+                    {ToolEffect.READ_LOCAL, ToolEffect.READ_REMOTE}
+                ),
+                authority_snapshot=build_authority_snapshot(
+                    {original_identity}, registry_generation=registry._generation
+                ),
+                profile_name="Explore",
+            ),
+        )
+
+        import model_tools
+
+        monkeypatch.setattr(
+            model_tools,
+            "get_tool_definitions",
+            lambda **kw: [_tool(original), _tool(late)],
+        )
+
+        added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+        assert added == set()
+        assert agent.valid_tool_names == {original}
+        assert [tool["function"]["name"] for tool in agent.tools] == [original]
+    finally:
+        registry.deregister(original)
+        registry.deregister(late)
 
 
 def test_refresh_adds_late_landing_tools(monkeypatch):

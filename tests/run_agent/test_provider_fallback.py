@@ -5,8 +5,11 @@ the new list-based ``fallback_providers`` config format and chain
 advancement through multiple providers.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.model_metadata import VerifiedContextLimit
+from agent.subagent_governance import assert_governance_request_fits
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
 
 
@@ -291,6 +294,155 @@ class TestFallbackChainAdvancement:
 
         assert seen_caps == [80_000]
         assert agent.context_compressor.context_length == 80_000
+
+
+class _RateLimitError(Exception):
+    status_code = 429
+    body = {"error": {"message": "rate limited"}}
+
+
+def test_governed_child_rechecks_smaller_fallback_before_backend():
+    """Primary may call once; an oversized fallback must remain backend-zero."""
+    fallback = [{
+        "provider": "zai",
+        "model": "glm-4.7",
+        "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+        "context_length": 2_200,
+    }]
+    agent = _make_agent(fallback_model=fallback)
+    agent._cached_system_prompt = "complete-governance-canary"
+    agent._use_prompt_caching = False
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    agent.max_tokens = 100
+    agent._api_max_retries = 1
+    agent._governance_diagnostics = {"fingerprint": "governance-fingerprint"}
+    agent.context_compressor.context_length = 200_000
+    agent._governance_context_limit_proof = {
+        "model": agent.model,
+        "provider": agent.provider,
+        "base_url": agent.base_url,
+        "api_mode": agent.api_mode,
+        "limit": VerifiedContextLimit(200_000, "primary-test-proof"),
+    }
+
+    backend_attempts = []
+
+    def _backend(_api_kwargs):
+        backend_attempts.append((agent.provider, agent.model))
+        if len(backend_attempts) == 1:
+            raise _RateLimitError("rate limited")
+        raise AssertionError("fallback backend must not run")
+
+    fallback_client = _mock_client(
+        base_url="https://open.bigmodel.cn/api/coding/paas/v4"
+    )
+    with (
+        patch.object(agent, "_interruptible_api_call", side_effect=_backend),
+        patch.object(
+            agent,
+            "_interruptible_streaming_api_call",
+            side_effect=lambda kwargs, **_extra: _backend(kwargs),
+        ),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("agent.agent_runtime_helpers.time.sleep"),
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fallback_client, "glm-4.7"),
+        ),
+        patch(
+            "hermes_cli.model_normalize.normalize_model_for_provider",
+            side_effect=lambda model, provider: model,
+        ),
+        patch("agent.model_metadata.get_model_context_length", return_value=2_200),
+        patch(
+            "agent.subagent_governance.assert_governance_request_fits",
+            wraps=assert_governance_request_fits,
+        ) as preflight,
+    ):
+        result = agent.run_conversation("task-payload-canary")
+
+    assert backend_attempts == [("", "")]
+    assert preflight.call_count == 2
+    assert result["error"] == "governance_context_too_large"
+    assert result["api_calls"] == 1
+    proof = agent._governance_context_limit_proof
+    assert proof["model"] == "glm-4.7"
+    assert proof["provider"] == "zai"
+    assert proof["base_url"] == "https://open.bigmodel.cn/api/coding/paas/v4"
+    assert proof["api_mode"] == agent.api_mode
+    assert proof["limit"] == VerifiedContextLimit(2_200, "config")
+
+
+def test_governed_child_relay_fallback_with_explicit_context_reaches_backend():
+    fallback_url = "https://private-relay.example.test/v1"
+    fallback = [{
+        "provider": "custom-relay",
+        "model": "private-relay-model",
+        "base_url": fallback_url,
+        "context_length": 80_000,
+    }]
+    agent = _make_agent(fallback_model=fallback)
+    agent._cached_system_prompt = "complete-governance-canary"
+    agent._use_prompt_caching = False
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    agent.max_tokens = 100
+    agent._governance_diagnostics = {"fingerprint": "governance-fingerprint"}
+    backend_routes = []
+
+    def _response():
+        message = SimpleNamespace(
+            content="relay-ok", tool_calls=None, reasoning_content=None
+        )
+        return SimpleNamespace(
+            id="relay-response",
+            choices=[SimpleNamespace(message=message, finish_reason="stop")],
+            model="private-relay-model",
+            usage=None,
+        )
+
+    def _backend(_kwargs):
+        backend_routes.append((agent.provider, agent.model, agent.base_url))
+        return _response()
+
+    fallback_client = _mock_client(base_url=fallback_url)
+    with (
+        patch.object(agent, "_interruptible_api_call", side_effect=_backend),
+        patch.object(
+            agent,
+            "_interruptible_streaming_api_call",
+            side_effect=lambda kwargs, **_extra: _backend(kwargs),
+        ),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fallback_client, "private-relay-model"),
+        ),
+        patch(
+            "hermes_cli.model_normalize.normalize_model_for_provider",
+            side_effect=lambda model, provider: model,
+        ),
+        patch("agent.model_metadata.get_model_context_length", return_value=80_000),
+    ):
+        result = agent.run_conversation("task-payload-canary")
+
+    assert result["completed"] is True
+    assert result["api_calls"] == 1
+    assert backend_routes == [
+        ("custom-relay", "private-relay-model", fallback_url)
+    ]
+    assert agent._governance_context_limit_proof == {
+        "model": "private-relay-model",
+        "provider": "custom-relay",
+        "base_url": fallback_url,
+        "api_mode": agent.api_mode,
+        "limit": VerifiedContextLimit(80_000, "config"),
+    }
 
 
 # ── Pool-rotation vs fallback gating (#11314) ────────────────────────────

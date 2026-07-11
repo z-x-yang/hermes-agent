@@ -61,6 +61,46 @@ def _ra():
     return run_agent
 
 
+_SKILL_READ_TOOL_NAMES = frozenset(
+    {
+        "skills_list",
+        "skill_view",
+        "skill_manage",
+        "skills_list_readonly",
+        "skill_view_readonly",
+    }
+)
+
+
+def _has_skill_read_tools(valid_tool_names: Any) -> bool:
+    """Return whether the active surface can discover and read skills."""
+    return bool(set(valid_tool_names or ()) & _SKILL_READ_TOOL_NAMES)
+
+
+def _adapt_skills_prompt_for_readonly_aliases(
+    prompt: str,
+    valid_tool_names: Any,
+) -> str:
+    """Name only tools the readonly child can call and remove write advice."""
+    names = set(valid_tool_names or ())
+    if "skill_view_readonly" not in names or "skill_view" in names:
+        return prompt
+    prompt = prompt.replace("skill_view", "skill_view_readonly")
+    prompt = prompt.replace("skills_list", "skills_list_readonly")
+    prompt = prompt.replace("web_search", "web_search_readonly")
+    prompt = prompt.replace(
+        "If a skill has issues, fix it with skill_manage(action='patch').\n",
+        "",
+    )
+    prompt = prompt.replace(
+        "After difficult/iterative tasks, offer to save as a skill. "
+        "If a skill you loaded was missing steps, had wrong commands, or needed "
+        "pitfalls you discovered, update it before finishing.\n",
+        "",
+    )
+    return prompt
+
+
 def _resolve_platform_hint(agent: Any, platform_key: str, default_hint: str) -> str:
     """Apply a per-platform prompt-hint override to the default hint.
 
@@ -163,7 +203,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+    stable_parts.append(
+        _adapt_skills_prompt_for_readonly_aliases(
+            HERMES_AGENT_HELP_GUIDANCE,
+            agent.valid_tool_names,
+        )
+    )
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
@@ -258,7 +303,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
-    has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
+    has_skills_tools = _has_skill_read_tools(agent.valid_tool_names)
     if has_skills_tools:
         avail_toolsets = {
             toolset
@@ -284,6 +329,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
+        )
+        skills_prompt = _adapt_skills_prompt_for_readonly_aliases(
+            skills_prompt,
+            agent.valid_tool_names,
         )
     else:
         skills_prompt = ""

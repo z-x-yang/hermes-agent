@@ -629,14 +629,15 @@ terminal(command="tmux new-session -d -s resumed 'hermes --resume 20260225_14305
 
 四个系统与主对话循环并行运行。此处为快速参考；完整开发者说明位于 `AGENTS.md`，面向用户的文档位于 `website/docs/user-guide/features/`。
 
-### 委派（`delegate_task`）
+### 委派（`delegate_task` / `delegate_continue`）
 
-同步子 agent 生成——父 agent 等待子 agent 的摘要后再继续自身循环。隔离的上下文和终端会话。
+Hermes 只暴露 `Explore`、`Plan` 和 `general-purpose`；省略类型会解析为 `general-purpose`。`auto` 会等待单个 Explore/Plan，后台运行 general-purpose 和批次，并保留显式 foreground/background 选择。后台池已满时返回 `rejected`，不会偷偷同步执行 child。
 
-- **单个：** `delegate_task(goal, context)`。
+- **单个：** `delegate_task(goal, context, subagent_type=...)`。
 - **批量：** `delegate_task(tasks=[{goal, ...}, ...])` 并行运行子任务，上限由 `delegation.max_concurrent_children`（默认 3）控制。
-- **角色：** `leaf`（默认；不能再委派）vs `orchestrator`（可以生成自己的 worker，受 `delegation.max_spawn_depth` 限制）。
-- **非持久化。** 如果父 agent 被中断，子 agent 会被取消。对于必须在当前轮次之后继续的工作，使用 `cronjob` 或 `terminal(background=True, notify_on_complete=True)`。
+- **续聊：** retained general-purpose 结果会返回 `agent_id`；同一工作应使用 `delegate_continue`，不要新建 child。
+- **角色：** 默认是 `leaf`；只有显式启用的 general-purpose orchestrator 可以继续生成 worker。
+- **不持久：** process/gateway 重启会丢失后台工作和 retained session；需要持久化时使用 cron 或受管后台进程。
 
 配置：`config.yaml` 中的 `delegation.*`。
 

@@ -1948,7 +1948,7 @@ delegation:
 
 ### Scheduling and timeout semantics
 
-A single `Explore` or `Plan` task uses foreground scheduling under `auto`; `general-purpose`, model-originated legacy generic calls, and multi-task batches use background scheduling. Nested/orchestrator delegation is synchronous and foreground-only.
+A single `Explore` or `Plan` task uses foreground scheduling under `auto`; `general-purpose` and multi-task batches use background scheduling. Omitted/empty `subagent_type` resolves to `general-purpose`; only the direct-Python no-scheduling compatibility path remains synchronous. Nested/orchestrator delegation is synchronous and foreground-only.
 
 `foreground_wait_timeout_seconds` and `child_run_timeout_seconds` are independent, config-authoritative controls:
 
@@ -1971,7 +1971,7 @@ Retention is same-parent only, permits one in-flight continuation per `agent_id`
 
 By default, subagents inherit the parent agent's provider and model. Shared `delegation.provider`/`delegation.model` values override that default; `delegation.agents.<type>.provider`/`model` can override one built-in type. Setting only `model` keeps the selected provider's credentials.
 
-For a direct endpoint, set `delegation.base_url`, `delegation.api_key`, and `delegation.model`. A direct endpoint takes precedence over `delegation.provider`; if `api_key` is omitted, Hermes falls back to `OPENAI_API_KEY`. `api_mode` may be `chat_completions`, `codex_responses`, or `anthropic_messages`; leaving it empty enables URL/provider detection.
+For a direct endpoint, set `delegation.base_url`, `delegation.api_key`, and `delegation.model`. A direct endpoint takes precedence over `delegation.provider`. Credential precedence is explicit `delegation.api_key`, then `OPENAI_API_KEY`; only when the configured URL is the exact active parent endpoint may Hermes reuse the parent key. A different endpoint without an endpoint-scoped key fails closed, so provider keys such as `OPENROUTER_API_KEY` are never forwarded to it. `api_mode` may be `chat_completions`, `codex_responses`, or `anthropic_messages`; leaving it empty enables URL/provider detection.
 
 Retained records do not store credentials or custom `base_url` values. A continuation resolves credentials again from current trusted configuration, so exact custom-endpoint fidelity after configuration changes is not guaranteed.
 
@@ -1979,7 +1979,7 @@ Retained records do not store credentials or custom `base_url` values. A continu
 
 `max_concurrent_children` caps both tasks in one batch and concurrent background delegation units (default `3`, floor `1`, no ceiling). `DELEGATION_MAX_CONCURRENT_CHILDREN` is the environment-variable override. Oversized batches fail with a clear error rather than being truncated. One accepted batch consumes one background unit, returns one handle, and later injects one consolidated result.
 
-`max_spawn_depth` defaults to `1` (flat), has a floor of `1`, and has no hard upper ceiling. Raise it to `2` to allow a legacy generic orchestrator or an explicitly configured `general-purpose` orchestrator to spawn leaves. `Explore` and `Plan` reject the orchestrator role; `general-purpose` remains a leaf unless that role is explicit. An effective orchestrator receives only `delegate_task` as a role-granted exception. `orchestrator_enabled: false` forces every child to leaf. Each additional level can multiply cost and concurrency; raise it deliberately. See [Subagent Delegation → Nested orchestration](features/delegation.md#nested-orchestration).
+`max_spawn_depth` defaults to `1` (flat), has a floor of `1`, and has no hard upper ceiling. Raise it to `2` to allow an explicitly configured `general-purpose` orchestrator to spawn leaves. `Explore` and `Plan` reject the orchestrator role; `general-purpose` remains a leaf unless that role is explicit. An effective orchestrator receives only `delegate_task` as a role-granted exception. `orchestrator_enabled: false` forces every child to leaf. Each additional level can multiply cost and concurrency; increase it deliberately. See [Subagent Delegation → Nested orchestration](features/delegation.md#nested-orchestration).
 
 ## Clarify
 

@@ -8,6 +8,10 @@ import time
 from typing import Any, Optional
 
 
+class RetainedClaimCancelled(RuntimeError):
+    """An interrupted claim attempted to commit late retained state."""
+
+
 @dataclass(frozen=True)
 class RetainedSubagentSession:
     """Short-lived in-process metadata for a resumable child agent session.
@@ -27,12 +31,24 @@ class RetainedSubagentSession:
     conversation_history: list[dict[str, Any]]
     created_at: float
     expires_at: float
+    profile_id: str
+    canonical_profile_home: str
+    original_policy_identities: frozenset[str]
+    original_governance_fingerprint: str
     effective_allowed_tool_names: frozenset[str] = frozenset()
+    claim_generation: int = 0
+    updated_at: float = 0.0
+    status: str = "completed"
+    tool_trace_metadata: tuple[tuple[str, int, int, str], ...] = ()
+    files_written: tuple[str, ...] = ()
 
 
 _lock = threading.RLock()
 _records: dict[str, RetainedSubagentSession] = {}
 _in_flight: set[str] = set()
+_active_claim_generations: dict[str, int] = {}
+_claim_generation_counters: dict[str, int] = {}
+_cancelled_claims: set[tuple[str, int]] = set()
 _invalidated: dict[str, str] = {}
 _DEFAULT_MAX_RETAINED_SUBAGENT_BYTES = 16777216
 
@@ -46,6 +62,9 @@ def _copy_record(record: RetainedSubagentSession) -> RetainedSubagentSession:
         record,
         conversation_history=_copy_history(record.conversation_history),
         effective_allowed_tool_names=frozenset(record.effective_allowed_tool_names),
+        original_policy_identities=frozenset(record.original_policy_identities),
+        tool_trace_metadata=tuple(record.tool_trace_metadata),
+        files_written=tuple(record.files_written),
     )
 
 
@@ -115,6 +134,18 @@ def retain_subagent_session(
             "Retained subagent session has no original effective tool ceiling; "
             "refusing retention."
         )
+    if not record.profile_id or not record.canonical_profile_home:
+        raise RuntimeError(
+            "Retained subagent session has no canonical profile binding; refusing retention."
+        )
+    if not record.original_policy_identities:
+        raise RuntimeError(
+            "Retained subagent session has no original exact authority; refusing retention."
+        )
+    if not record.original_governance_fingerprint:
+        raise RuntimeError(
+            "Retained subagent session has no governance fingerprint; refusing retention."
+        )
     copied = _copy_record(record)
     record_bytes = _serialized_history_bytes(copied.conversation_history)
     byte_budget = max(1, int(max_total_bytes or 1))
@@ -180,11 +211,26 @@ def claim_retained_subagent_session(agent_id: str) -> RetainedSubagentSession:
                 f"Retained subagent continuation already in progress: {agent_id}"
             )
         _in_flight.add(agent_id)
-        return record
+        generation = _claim_generation_counters.get(agent_id, 0) + 1
+        _claim_generation_counters[agent_id] = generation
+        _active_claim_generations[agent_id] = generation
+        return replace(record, claim_generation=generation)
+
+
+def cancel_retained_subagent_claim(agent_id: str, claim_generation: int) -> bool:
+    """Atomically cancel one exact in-flight claim generation."""
+    with _lock:
+        if _active_claim_generations.get(agent_id) != claim_generation:
+            return False
+        _cancelled_claims.add((agent_id, claim_generation))
+        return True
 
 
 def release_retained_subagent_session(agent_id: str) -> None:
     with _lock:
+        generation = _active_claim_generations.pop(agent_id, None)
+        if generation is not None:
+            _cancelled_claims.discard((agent_id, generation))
         _in_flight.discard(agent_id)
 
 
@@ -200,6 +246,7 @@ def update_retained_history(
     history: list[dict[str, Any]],
     *,
     max_total_bytes: int = _DEFAULT_MAX_RETAINED_SUBAGENT_BYTES,
+    claim_generation: Optional[int] = None,
 ) -> Optional[str]:
     """Update a transcript, or invalidate it if the byte budget cannot fit it.
 
@@ -210,6 +257,16 @@ def update_retained_history(
     history_bytes = _serialized_history_bytes(copied_history)
     byte_budget = max(1, int(max_total_bytes or 1))
     with _lock:
+        if claim_generation is not None:
+            active_generation = _active_claim_generations.get(agent_id)
+            if (
+                active_generation != claim_generation
+                or (agent_id, claim_generation) in _cancelled_claims
+            ):
+                raise RetainedClaimCancelled(
+                    "Interrupted retained subagent claim cannot commit late history: "
+                    f"{agent_id} generation {claim_generation}"
+                )
         record = get_retained_subagent_session(agent_id)
         reason = _budget_drop_reason(agent_id)
         if history_bytes > byte_budget:
@@ -226,7 +283,12 @@ def update_retained_history(
                 return reason
             _records.pop(oldest.agent_id, None)
 
-        _records[agent_id] = replace(record, conversation_history=copied_history)
+        _records[agent_id] = replace(
+            record,
+            conversation_history=copied_history,
+            updated_at=time.time(),
+            status="completed",
+        )
         return None
 
 
@@ -234,4 +296,7 @@ def clear_retained_subagent_sessions() -> None:
     with _lock:
         _records.clear()
         _in_flight.clear()
+        _active_claim_generations.clear()
+        _claim_generation_counters.clear()
+        _cancelled_claims.clear()
         _invalidated.clear()

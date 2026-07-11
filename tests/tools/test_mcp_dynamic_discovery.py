@@ -8,10 +8,11 @@ import pytest
 
 from tools.mcp_tool import MCPServerTask, _register_server_tools
 from tools.registry import ToolRegistry
+from tools.tool_effects import ResultRetention, ToolEffect
 
 
-def _make_mcp_tool(name: str, desc: str = ""):
-    return SimpleNamespace(name=name, description=desc, inputSchema=None)
+def _make_mcp_tool(name: str, desc: str = "", **extra):
+    return SimpleNamespace(name=name, description=desc, inputSchema=None, **extra)
 
 
 class TestRegisterServerTools:
@@ -34,6 +35,195 @@ class TestRegisterServerTools:
             assert "mcp_my_srv_my_tool" in mock_registry.get_all_tool_names()
             assert validate_toolset("my_srv") is True
             assert "mcp_my_srv_my_tool" in resolve_toolset("my_srv")
+
+    def test_mcp_identity_binds_server_info_and_strips_transport_secrets(self, mock_registry):
+        server = MCPServerTask("secure_srv")
+        server._tools = [
+            _make_mcp_tool(
+                "lookup",
+                annotations=SimpleNamespace(readOnlyHint=True),
+            )
+        ]
+        server.session = MagicMock()
+        server.initialize_result = SimpleNamespace(
+            serverInfo=SimpleNamespace(name="remote-index", version="2.4.1")
+        )
+        config = {
+            "url": "https://user:password@example.test/mcp?token=top-secret",
+            "headers": {"Authorization": "Bearer top-secret"},
+        }
+
+        with patch("tools.registry.registry", mock_registry):
+            _register_server_tools("secure_srv", server, config)
+
+        entry = mock_registry.get_entry("mcp_secure_srv_lookup")
+        identity = entry.policy_descriptor.source_identity
+        assert entry.policy_descriptor.effects == frozenset({ToolEffect.UNKNOWN})
+        assert "remote-index" not in identity
+        assert "2.4.1" not in identity
+        assert "password" not in identity
+        assert "top-secret" not in identity
+        assert "Bearer" not in identity
+
+        upgraded_registry = ToolRegistry()
+        server.initialize_result = SimpleNamespace(
+            serverInfo=SimpleNamespace(name="remote-index", version="2.4.2")
+        )
+        with patch("tools.registry.registry", upgraded_registry):
+            _register_server_tools("secure_srv", server, config)
+        upgraded_identity = upgraded_registry.get_entry(
+            "mcp_secure_srv_lookup"
+        ).policy_descriptor.source_identity
+        assert upgraded_identity != identity
+
+    def test_notion_ai_ask_is_read_only_only_when_mode_is_readonly(self, mock_registry):
+        server = MCPServerTask("notion-ai")
+        server._tools = [_make_mcp_tool("notion_ai_ask")]
+        server.session = MagicMock()
+
+        with patch("tools.registry.registry", mock_registry):
+            _register_server_tools("notion-ai", server, {})
+
+        descriptor = mock_registry.get_entry(
+            "mcp_notion_ai_notion_ai_ask"
+        ).policy_descriptor
+        assert descriptor.argument_resolver is not None
+        assert descriptor.argument_resolver({"mode": "readonly"}) == frozenset(
+            {ToolEffect.READ_REMOTE}
+        )
+        assert descriptor.argument_resolver({"mode": "write"}) == frozenset(
+            {ToolEffect.WRITE_REMOTE}
+        )
+        assert descriptor.argument_resolver({}) == frozenset(
+            {ToolEffect.WRITE_REMOTE}
+        )
+        assert descriptor.retention is ResultRetention.HANDLE_ONLY
+
+    def test_only_named_apple_mail_read_tools_gain_read_effects(self, mock_registry):
+        server = MCPServerTask("apple-mail")
+        server._tools = [
+            _make_mcp_tool("search_messages"),
+            _make_mcp_tool("fetch_attachment"),
+            _make_mcp_tool("send_email"),
+            _make_mcp_tool("delete_message"),
+        ]
+        server.session = MagicMock()
+
+        with patch("tools.registry.registry", mock_registry):
+            _register_server_tools("apple-mail", server, {})
+
+        for name in ("search_messages", "fetch_attachment"):
+            descriptor = mock_registry.get_entry(
+                f"mcp_apple_mail_{name}"
+            ).policy_descriptor
+            assert descriptor.effects == frozenset({ToolEffect.READ_REMOTE})
+            assert descriptor.retention is ResultRetention.HANDLE_ONLY
+        for name in ("send_email", "delete_message"):
+            descriptor = mock_registry.get_entry(
+                f"mcp_apple_mail_{name}"
+            ).policy_descriptor
+            assert descriptor.effects == frozenset({ToolEffect.UNKNOWN})
+            assert descriptor.retention is ResultRetention.DEFAULT
+
+    def test_explore_policy_exposes_existing_data_reads_but_not_mail_writes(
+        self, mock_registry
+    ):
+        from agent.subagent_tool_policy import build_child_tool_policy
+        from tools.subagent_profiles import get_subagent_profile
+        from tools.tool_effects import build_authority_snapshot
+
+        notion = MCPServerTask("notion-ai")
+        notion._tools = [_make_mcp_tool("notion_ai_ask")]
+        notion.session = MagicMock()
+        mail = MCPServerTask("apple-mail")
+        mail._tools = [
+            _make_mcp_tool("search_messages"),
+            _make_mcp_tool("get_message"),
+            _make_mcp_tool("send_email"),
+        ]
+        mail.session = MagicMock()
+
+        with patch("tools.registry.registry", mock_registry):
+            _register_server_tools("notion-ai", notion, {})
+            _register_server_tools("apple-mail", mail, {})
+            for entry in mock_registry._tools.values():
+                entry.check_fn = lambda: True
+            identities = {
+                entry.policy_identity
+                for entry in mock_registry._tools.values()
+            }
+            snapshot = build_authority_snapshot(
+                identities,
+                registry_generation=mock_registry._generation,
+            )
+            profile = get_subagent_profile("Explore")
+            policy = build_child_tool_policy(
+                child=SimpleNamespace(_parent_tool_authority_snapshot=snapshot),
+                parent=SimpleNamespace(_parent_tool_authority_snapshot=snapshot),
+                profile_name="Explore",
+                profile_allowed_names=profile.allowed_tool_names,
+            )
+
+        assert policy.allowed_names is not None
+        assert "mcp_notion_ai_notion_ai_ask" in policy.allowed_names
+        assert "mcp_apple_mail_search_messages" in policy.allowed_names
+        assert "mcp_apple_mail_get_message" in policy.allowed_names
+        assert "mcp_apple_mail_send_email" not in policy.allowed_names
+
+    def test_same_name_refresh_gets_new_policy_identity(self, mock_registry):
+        server = MCPServerTask("refresh_srv")
+        server._tools = [_make_mcp_tool("lookup")]
+        server.session = MagicMock()
+        server.initialize_result = SimpleNamespace(
+            serverInfo=SimpleNamespace(name="remote-index", version="1.0")
+        )
+        with patch("tools.registry.registry", mock_registry):
+            _register_server_tools("refresh_srv", server, {"command": "safe-server"})
+            first = mock_registry.get_entry("mcp_refresh_srv_lookup")
+            _register_server_tools("refresh_srv", server, {"command": "safe-server"})
+            second = mock_registry.get_entry("mcp_refresh_srv_lookup")
+
+        assert second.entry_generation > first.entry_generation
+        assert second.policy_identity != first.policy_identity
+
+    def test_missing_server_version_is_explicit_unknown(self, mock_registry):
+        server = MCPServerTask("legacy_srv")
+        server._tools = [_make_mcp_tool("lookup")]
+        server.session = MagicMock()
+        server.initialize_result = SimpleNamespace(
+            serverInfo=SimpleNamespace(name="legacy-index")
+        )
+
+        with patch("tools.registry.registry", mock_registry):
+            _register_server_tools("legacy_srv", server, {"command": "safe-server"})
+
+        identity = mock_registry.get_entry(
+            "mcp_legacy_srv_lookup"
+        ).policy_descriptor.source_identity
+        assert "legacy-index" not in identity
+        assert "unknown" not in identity
+
+        explicit_unknown_registry = ToolRegistry()
+        server.initialize_result = SimpleNamespace(
+            serverInfo=SimpleNamespace(name="legacy-index", version="unknown")
+        )
+        with patch("tools.registry.registry", explicit_unknown_registry):
+            _register_server_tools("legacy_srv", server, {"command": "safe-server"})
+        explicit_unknown_identity = explicit_unknown_registry.get_entry(
+            "mcp_legacy_srv_lookup"
+        ).policy_descriptor.source_identity
+        assert explicit_unknown_identity == identity
+
+        versioned_registry = ToolRegistry()
+        server.initialize_result = SimpleNamespace(
+            serverInfo=SimpleNamespace(name="legacy-index", version="1.0")
+        )
+        with patch("tools.registry.registry", versioned_registry):
+            _register_server_tools("legacy_srv", server, {"command": "safe-server"})
+        versioned_identity = versioned_registry.get_entry(
+            "mcp_legacy_srv_lookup"
+        ).policy_descriptor.source_identity
+        assert versioned_identity != identity
 
 
 class TestRefreshTools:

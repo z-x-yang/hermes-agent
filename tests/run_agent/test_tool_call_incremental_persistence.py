@@ -23,6 +23,7 @@ makes the corresponding assertion fail.
 """
 
 import copy
+import json
 from types import SimpleNamespace
 from pathlib import Path
 import tempfile
@@ -30,6 +31,7 @@ from unittest.mock import MagicMock, patch
 
 from agent.tool_dispatch_helpers import make_tool_result_message
 from run_agent import AIAgent
+from tools.tool_effects import ResultRetention
 
 
 def _make_tool_defs(*names: str) -> list:
@@ -250,3 +252,63 @@ def test_execute_tool_calls_concurrent_flushes_each_tool_result_in_order():
     # production flush call breaks one of these assertions.
     assert flushed_tool_ids == ["c1", "c2"]
     assert flush_lengths == [1, 2]
+
+
+def test_incremental_session_db_chokepoint_projects_handle_only_once_without_mutating_live_message():
+    from agent.tool_executor import _flush_session_db_after_tool_progress
+
+    agent = _make_agent()
+    agent._session_db = MagicMock()
+    agent._session_db_created = True
+    agent._last_flushed_db_idx = 0
+    setattr(
+        agent,
+        "_subagent_tool_result_retention_by_call_id",
+        {"sensitive-call": ResultRetention.HANDLE_ONLY},
+    )
+    live_content = "private-db-body-" * 100
+    messages = [
+        make_tool_result_message(
+            "sensitive_read", live_content, "sensitive-call"
+        )
+    ]
+
+    _flush_session_db_after_tool_progress(
+        agent, messages, stage="handle-only test"
+    )
+
+    assert messages[0]["content"] == live_content
+    persisted = agent._session_db.append_message.call_args.kwargs["content"]
+    projection = json.loads(persisted)
+    assert projection["retention"] == "handle_only"
+    assert projection["excerpt"].startswith("private-db-body-")
+    assert live_content not in persisted
+
+
+def test_json_snapshot_chokepoint_projects_handle_only_without_mutating_live_message():
+    agent = _make_agent()
+    setattr(
+        agent,
+        "_subagent_tool_result_retention_by_call_id",
+        {"sensitive-call": ResultRetention.HANDLE_ONLY},
+    )
+    live_content = "private-json-body-" * 100
+    messages = [
+        make_tool_result_message(
+            "sensitive_read", live_content, "sensitive-call"
+        )
+    ]
+    logged = []
+    agent._flush_messages_to_session_db = MagicMock()
+
+    with patch.object(
+        agent,
+        "_save_session_log",
+        side_effect=lambda messages=None: logged.append(copy.deepcopy(messages)),
+    ):
+        agent._persist_session(messages)
+
+    assert messages[0]["content"] == live_content
+    projection = json.loads(logged[0][0]["content"])
+    assert projection["retention"] == "handle_only"
+    assert live_content not in logged[0][0]["content"]

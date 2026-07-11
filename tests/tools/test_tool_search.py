@@ -275,6 +275,134 @@ class TestRetrieval:
 
 
 class TestAssembly:
+    def test_parent_tool_surfaces_resolve_once_before_assembly(self, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        import agent.agent_init as agent_init
+        import model_tools
+
+        resolved = [_td("visible"), _td("mcp_hidden")]
+        visible = [_td("visible"), _td("tool_search")]
+        get_definitions = Mock(return_value=resolved)
+        assemble = Mock(return_value=visible)
+        monkeypatch.setattr(
+            agent_init,
+            "_ra",
+            lambda: SimpleNamespace(get_tool_definitions=get_definitions),
+        )
+        monkeypatch.setattr(
+            model_tools,
+            "assemble_resolved_tool_definitions",
+            assemble,
+            raising=False,
+        )
+
+        actual_resolved, actual_visible = agent_init._resolve_parent_tool_surfaces(
+            enabled_toolsets=["test"],
+            disabled_toolsets=None,
+            quiet_mode=True,
+        )
+
+        assert actual_resolved is resolved
+        assert actual_visible is visible
+        get_definitions.assert_called_once_with(
+            enabled_toolsets=["test"],
+            disabled_toolsets=None,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        assemble.assert_called_once_with(resolved, quiet_mode=True)
+
+    def test_builtin_file_and_catalog_bridges_have_explicit_read_metadata(self):
+        from tools import file_tools  # noqa: F401
+        from tools import tool_search  # noqa: F401
+        from tools.registry import registry
+        from tools.tool_effects import ResultRetention, ToolEffect
+
+        for name in ("read_file", "search_files", "tool_search", "tool_describe"):
+            descriptor = registry.get_entry(name).policy_descriptor
+            assert descriptor.effects == frozenset({ToolEffect.READ_LOCAL})
+            assert descriptor.retention is ResultRetention.NO_SPILL
+
+        for name in ("write_file", "patch", "tool_call"):
+            descriptor = registry.get_entry(name).policy_descriptor
+            assert descriptor.effects == frozenset({ToolEffect.UNKNOWN})
+
+    def test_raw_web_skills_terminal_and_process_are_not_promoted_to_read(self):
+        from tools import process_registry  # noqa: F401
+        from tools import skills_tool  # noqa: F401
+        from tools import terminal_tool  # noqa: F401
+        from tools import web_tools  # noqa: F401
+        from tools.registry import registry
+        from tools.tool_effects import ToolEffect
+
+        for name in (
+            "web_search",
+            "web_extract",
+            "skill_view",
+            "terminal",
+            "process",
+        ):
+            assert registry.get_entry(name).policy_descriptor.effects == frozenset(
+                {ToolEffect.UNKNOWN}
+            )
+
+    def test_parent_authority_uses_full_resolved_scope_before_deferral(self):
+        from agent.agent_init import _capture_parent_tool_authority
+        from tools.registry import ToolRegistry
+
+        reg = ToolRegistry()
+        for name in (
+            "visible",
+            "deferred_hidden",
+            "disabled_global",
+            "tool_search",
+            "tool_describe",
+            "tool_call",
+        ):
+            reg.register(
+                name=name,
+                toolset="test",
+                schema=_td(name)["function"],
+                handler=lambda args: args,
+            )
+
+        resolved = [_td("visible"), _td("deferred_hidden")]
+        model_visible = [
+            _td("visible"),
+            _td("tool_search"),
+            _td("tool_describe"),
+            _td("tool_call"),
+        ]
+        snapshot = _capture_parent_tool_authority(
+            resolved, model_visible, registry=reg
+        )
+        expected_names = {
+            "visible",
+            "deferred_hidden",
+            "tool_search",
+            "tool_describe",
+            "tool_call",
+        }
+        expected = {
+            reg.get_entry(name).policy_identity for name in expected_names
+        }
+
+        assert snapshot.policy_identities == frozenset(expected)
+        assert reg.get_entry("disabled_global").policy_identity not in snapshot.policy_identities
+        assert "deferred_hidden" not in {
+            td["function"]["name"] for td in model_visible
+        }
+
+        reg.register(
+            name="later",
+            toolset="test",
+            schema=_td("later")["function"],
+            handler=lambda args: args,
+        )
+        assert snapshot.policy_identities == frozenset(expected)
+
     def test_no_deferrable_returns_unchanged(self):
         """Pure-core toolset: pass-through, no bridge tools added."""
         from tools.tool_search import assemble_tool_defs, ToolSearchConfig

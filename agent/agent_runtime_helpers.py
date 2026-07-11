@@ -2126,7 +2126,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False,
                  skip_tool_request_middleware: bool = False,
-                 tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None) -> str:
+                 tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
+                 authorized_call: Any = None) -> str:
     """Invoke a single tool and return the result string. No display logic.
 
     Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
@@ -2135,6 +2136,14 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     """
     if not isinstance(function_args, dict):
         function_args = {}
+
+    _subagent_policy = getattr(agent, "_subagent_tool_policy", None)
+    if authorized_call is None and _subagent_policy is not None and _subagent_policy.is_readonly:
+        from agent.subagent_tool_policy import authorize_subagent_call, thaw_authorized_args
+
+        authorized_call = authorize_subagent_call(agent, function_name, function_args)
+        function_args = thaw_authorized_args(authorized_call)
+        skip_tool_request_middleware = True
 
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
@@ -2154,6 +2163,12 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             _tool_middleware_trace = _tool_request_mw.trace
     except Exception as _mw_err:
         logger.debug("tool_request middleware error: %s", _mw_err)
+
+    if authorized_call is None and _subagent_policy is not None:
+        from agent.subagent_tool_policy import authorize_subagent_call, thaw_authorized_args
+
+        authorized_call = authorize_subagent_call(agent, function_name, function_args)
+        function_args = thaw_authorized_args(authorized_call)
 
     # Check plugin hooks for a block directive before executing anything.
     block_message: Optional[str] = None
@@ -2334,14 +2349,29 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
+                agent=agent,
+                authorized_call=authorized_call,
             )
+
+    def _execute_authorized(next_args: dict) -> Any:
+        resolved_args = next_args if isinstance(next_args, dict) else function_args
+        if authorized_call is not None:
+            from agent.subagent_tool_policy import verify_authorized_tool_call
+
+            resolved_args = verify_authorized_tool_call(
+                authorized_call, function_name, resolved_args
+            )
+        return _execute(resolved_args)
+
+    if _subagent_policy is not None and _subagent_policy.is_readonly:
+        return _execute_authorized(function_args)
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
     return run_tool_execution_middleware(
         function_name,
         function_args,
-        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
+        _execute_authorized,
         original_args=function_args,
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",
