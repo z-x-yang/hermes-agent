@@ -90,6 +90,37 @@ def test_final_payload_serialization_includes_messages_system_and_exact_tool_sch
     assert "exact-canary" not in repr(diagnostics)
 
 
+def test_codex_responses_without_output_cap_uses_verified_dynamic_remainder():
+    agent = _agent(context_length=20_000)
+    agent.api_mode = "codex_responses"
+    agent.max_tokens = None
+    api_kwargs = {
+        "model": "test-model",
+        "input": [{"role": "user", "content": "live-default-path"}],
+    }
+    expected = json.dumps(
+        api_kwargs, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    input_upper_bound = len(expected) + 2_048
+
+    with patch(
+        "agent.model_metadata.get_verified_model_context_length",
+        return_value=_verified(),
+    ):
+        fit = assert_governance_request_fits(agent, api_kwargs)
+
+    assert fit == GovernanceRequestFit(
+        serialized_utf8_bytes=len(expected),
+        input_token_upper_bound=input_upper_bound,
+        output_reserve_tokens=20_000 - input_upper_bound,
+        context_limit_tokens=20_000,
+    )
+    assert (
+        agent._governance_request_fit_diagnostics["output_reserve_source"]
+        == "provider_dynamic_remainder"
+    )
+
+
 def test_unknown_context_limit_default_is_not_proof_for_governed_child():
     agent = _agent(context_length=256_000)
     governance_before = dict(agent._governance_diagnostics)

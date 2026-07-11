@@ -102,17 +102,8 @@ def assert_governance_request_fits(
     except (TypeError, ValueError, UnicodeError):
         _deny("governance_transport_unverifiable")
 
-    output_reserve = None
-    for field in _OUTPUT_CAP_FIELDS:
-        if field in provider_request:
-            output_reserve = _positive_int(provider_request[field])
-            break
-    if output_reserve is None and not any(
-        field in provider_request for field in _OUTPUT_CAP_FIELDS
-    ):
-        output_reserve = _positive_int(getattr(agent, "max_tokens", None))
-    if output_reserve is None:
-        _deny("governance_transport_unverifiable")
+    serialized_bytes = len(serialized)
+    input_upper_bound = serialized_bytes + 2_048
 
     compressor = getattr(agent, "context_compressor", None)
     compressor_limit = _positive_int(getattr(compressor, "context_length", None))
@@ -143,8 +134,32 @@ def assert_governance_request_fits(
     if proof is None or _positive_int(proof.tokens) != compressor_limit:
         _deny("governance_transport_unverifiable")
 
-    serialized_bytes = len(serialized)
-    input_upper_bound = serialized_bytes + 2_048
+    output_reserve = None
+    output_reserve_source = None
+    for field in _OUTPUT_CAP_FIELDS:
+        if field not in provider_request:
+            continue
+        output_reserve = _positive_int(provider_request[field])
+        if output_reserve is None:
+            _deny("governance_transport_unverifiable")
+        output_reserve_source = f"request:{field}"
+        break
+
+    if output_reserve is None and getattr(agent, "api_mode", None) == "codex_responses":
+        # Codex backends intentionally omit max_output_tokens. Their effective
+        # output allowance is the verified context window remainder after the
+        # final provider-visible input, so use that exact remainder rather than
+        # inventing a caller/config cap that the transport would not send.
+        output_reserve = compressor_limit - input_upper_bound
+        if output_reserve <= 0:
+            _deny("governance_context_too_large")
+        output_reserve_source = "provider_dynamic_remainder"
+    elif output_reserve is None:
+        output_reserve = _positive_int(getattr(agent, "max_tokens", None))
+        if output_reserve is None:
+            _deny("governance_transport_unverifiable")
+        output_reserve_source = "agent_max_tokens"
+
     fit = GovernanceRequestFit(
         serialized_utf8_bytes=serialized_bytes,
         input_token_upper_bound=input_upper_bound,
@@ -156,6 +171,7 @@ def assert_governance_request_fits(
         "serialized_utf8_bytes": serialized_bytes,
         "input_token_upper_bound": input_upper_bound,
         "output_reserve_tokens": output_reserve,
+        "output_reserve_source": output_reserve_source,
         "context_limit_tokens": compressor_limit,
         "model": str(getattr(agent, "model", "") or ""),
         "provider": str(getattr(agent, "provider", "") or ""),
