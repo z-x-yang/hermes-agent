@@ -334,7 +334,8 @@ class TestDelegationCleanup:
 
         result = _run_single_child(
             task_index=0,
-            goal="test goal",
+            description="test goal",
+            prompt="test goal",
             child=child,
             parent_agent=parent,
         )

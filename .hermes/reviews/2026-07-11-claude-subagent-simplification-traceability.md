@@ -1,7 +1,7 @@
 # Claude-like Subagent Simplification — Traceability
 
-Date: 2026-07-11  
-Branch: `feat/claude-subagent-simplification`  
+Date: 2026-07-11
+Branch: `feat/claude-subagent-simplification`
 Scope boundary: candidate only; **not merged to local main and Gateway not restarted**.
 
 ## Decision
