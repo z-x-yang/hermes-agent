@@ -12,7 +12,7 @@ from tools.async_delegation import (
     dispatch_async_delegation_batch,
     wait_for_async_delegation,
 )
-from tools.delegate_tool import _resolve_scheduling
+from tools.delegate_tool import _resolve_run_in_background
 
 
 @pytest.fixture(autouse=True)
@@ -31,7 +31,6 @@ def _dispatch(runner, injected, *, mode="foreground_waiting"):
         goals=["test goal"],
         context="context",
         toolsets=None,
-        role="leaf",
         model="test-model",
         session_key="session",
         runner=runner,
@@ -67,7 +66,6 @@ def _install_fake_delegate_runtime(monkeypatch, run_child):
 
     def build_child(**kwargs):
         child = MagicMock()
-        child._delegate_role = kwargs.get("role", "leaf")
         child._subagent_profile = kwargs.get("profile")
         child._subagent_id = f"fake-{len(built)}"
         parent = kwargs.get("parent_agent")
@@ -94,103 +92,25 @@ def _install_fake_delegate_runtime(monkeypatch, run_child):
     return built
 
 
-def test_auto_preserves_legacy_background_default():
-    assert _resolve_scheduling(None, "auto", is_batch=False, is_subagent=False) == "background"
+def test_top_level_omission_defaults_background():
+    assert _resolve_run_in_background(None, is_subagent=False) is True
 
 
-def test_direct_python_omit_keeps_sync_but_uses_gp_profile(monkeypatch):
-    import tools.delegate_tool as dt
-
-    built = _install_fake_delegate_runtime(
-        monkeypatch,
-        lambda task_index, goal, **_kwargs: {
-            "task_index": task_index,
-            "status": "completed",
-            "summary": goal,
-        },
-    )
-
-    result = json.loads(
-        dt.delegate_task(
-            goal="inspect",
-            parent_agent=_parent(),
-            _dispatch_origin="python",
-        )
-    )
-
-    assert result["mode"] == "foreground"
-    assert result["results"][0]["subagent_type"] == "general-purpose"
-    assert built[0]._subagent_profile.name == "general-purpose"
+def test_top_level_explicit_background_boolean_is_respected():
+    assert _resolve_run_in_background(True, is_subagent=False) is True
+    assert _resolve_run_in_background(False, is_subagent=False) is False
 
 
-def test_auto_uses_foreground_for_single_explore_and_plan():
-    assert _resolve_scheduling("Explore", "auto", False, False) == "foreground"
-    assert _resolve_scheduling("Plan", "auto", False, False) == "foreground"
+def test_nested_omission_and_false_are_foreground_but_true_fails():
+    assert _resolve_run_in_background(None, is_subagent=True) is False
+    assert _resolve_run_in_background(False, is_subagent=True) is False
+    with pytest.raises(ValueError, match="Nested delegation cannot run in the background"):
+        _resolve_run_in_background(True, is_subagent=True)
 
 
-def test_auto_uses_background_for_general_purpose_and_batches():
-    assert _resolve_scheduling("general-purpose", "auto", False, False) == "background"
-    assert _resolve_scheduling("Explore", "auto", True, False) == "background"
-
-
-def test_explicit_general_purpose_orchestrator_is_eligible_under_runtime_gates(
-    monkeypatch,
-):
-    import tools.delegate_tool as dt
-
-    built = _install_fake_delegate_runtime(
-        monkeypatch,
-        lambda task_index, goal, **_kwargs: {
-            "task_index": task_index,
-            "status": "completed",
-            "summary": goal,
-        },
-    )
-    monkeypatch.setattr(dt, "_get_orchestrator_enabled", lambda: True)
-    monkeypatch.setattr(dt, "_get_max_spawn_depth", lambda: 2)
-
-    result = json.loads(
-        dt.delegate_task(
-            goal="orchestrate one worker layer",
-            subagent_type="general-purpose",
-            role="orchestrator",
-            scheduling="foreground",
-            parent_agent=_parent(),
-        )
-    )
-
-    assert result["results"][0]["status"] == "completed"
-    assert built[0]._delegate_role == "orchestrator"
-
-
-@pytest.mark.parametrize("subagent_type", ["Explore", "Plan"])
-def test_read_only_profiles_still_fail_fast_for_explicit_orchestrator(
-    monkeypatch, subagent_type
-):
-    import tools.delegate_tool as dt
-
-    built = _install_fake_delegate_runtime(
-        monkeypatch,
-        lambda task_index, goal, **_kwargs: {
-            "task_index": task_index,
-            "status": "completed",
-            "summary": "unexpected",
-        },
-    )
-
-    result = json.loads(
-        dt.delegate_task(
-            goal="must stay read only",
-            subagent_type=subagent_type,
-            role="orchestrator",
-            parent_agent=_parent(),
-        )
-    )
-
-    assert result["error"] == (
-        f"subagent_type={subagent_type} cannot use role=orchestrator"
-    )
-    assert built == []
+def test_non_boolean_background_value_fails_closed():
+    with pytest.raises(ValueError, match="must be a boolean"):
+        _resolve_run_in_background("background", is_subagent=False)
 
 
 def test_generic_foreground_timeouts_use_global_then_general_purpose_defaults():
@@ -204,13 +124,6 @@ def test_generic_foreground_timeouts_use_global_then_general_purpose_defaults():
             "child_run_timeout_seconds": 333,
         },
     ) == (222, 333)
-
-
-def test_nested_auto_and_foreground_stay_foreground_but_background_fails():
-    assert _resolve_scheduling("general-purpose", "auto", False, True) == "foreground"
-    assert _resolve_scheduling("Explore", "foreground", False, True) == "foreground"
-    with pytest.raises(ValueError, match="Nested/orchestrator delegation must run foreground"):
-        _resolve_scheduling("Explore", "background", False, True)
 
 
 def test_completion_before_wait_is_claimed_without_async_injection():
@@ -305,7 +218,6 @@ def test_parent_interrupt_claims_foreground_and_suppresses_late_delivery():
         goals=["interruptible foreground"],
         context=None,
         toolsets=None,
-        role="leaf",
         model="test-model",
         session_key="session",
         runner=lambda: (
@@ -366,7 +278,7 @@ def test_delegate_task_foreground_parent_interrupt_returns_inline_without_late_q
     parent = _parent()
     response = []
 
-    def run_child(task_index, goal, **_kwargs):
+    def run_child(task_index, description, **_kwargs):
         run_started.set()
         assert allow_finish.wait(2)
         return {
@@ -389,9 +301,9 @@ def test_delegate_task_foreground_parent_interrupt_returns_inline_without_late_q
         target=lambda: response.append(
             json.loads(
                 dt.delegate_task(
-                    goal="interrupt me",
+                    description="interrupt me", prompt="interrupt me",
                     subagent_type="Explore",
-                    scheduling="foreground",
+                    run_in_background=False,
                     parent_agent=parent,
                 )
             )
@@ -423,7 +335,6 @@ def test_completed_foreground_result_wins_over_already_set_parent_interrupt():
         goals=["already complete"],
         context=None,
         toolsets=None,
-        role="leaf",
         model="test-model",
         session_key="session",
         runner=lambda: {
@@ -467,7 +378,6 @@ def test_unclaimed_foreground_completion_is_not_pruned_before_wait(monkeypatch):
             goals=[f"background {i}"],
             context=None,
             toolsets=None,
-            role="leaf",
             model="test-model",
             session_key="session",
             runner=lambda: {"results": [], "total_duration_seconds": 0.0},
@@ -502,7 +412,7 @@ def test_list_async_delegations_excludes_runtime_sync_fields():
     gate.set()
 
 
-def test_run_agent_model_dispatch_uses_scheduling_resolver_not_forced_background():
+def test_run_agent_model_dispatch_forwards_static_background_boolean():
     from unittest.mock import patch
     import run_agent
 
@@ -515,31 +425,19 @@ def test_run_agent_model_dispatch_uses_scheduling_resolver_not_forced_background
     with patch("tools.delegate_tool.delegate_task", fake_delegate):
         run_agent.AIAgent._dispatch_delegate_task(
             _parent(),
-            {"goal": "inspect", "subagent_type": "Explore", "scheduling": "auto"},
+            {
+                "description": "inspect code",
+                "prompt": "inspect the implementation",
+                "subagent_type": "Explore",
+                "run_in_background": False,
+            },
         )
 
-    assert captured["scheduling"] == "auto"
-    assert captured["_dispatch_origin"] == "model"
-    assert "background" not in captured
-
-
-def test_direct_python_legacy_auto_remains_synchronous(monkeypatch):
-    import tools.delegate_tool as dt
-
-    _install_fake_delegate_runtime(
-        monkeypatch,
-        lambda task_index, goal, **kwargs: {
-            "task_index": task_index,
-            "status": "completed",
-            "summary": f"sync: {goal}",
-        },
-    )
-
-    result = json.loads(dt.delegate_task(goal="legacy", parent_agent=_parent()))
-
-    assert result["results"][0]["summary"] == "sync: legacy"
-    assert "delegation_id" not in result
-    assert process_registry.completion_queue.empty()
+    assert captured["description"] == "inspect code"
+    assert captured["prompt"] == "inspect the implementation"
+    assert captured["run_in_background"] is False
+    assert "scheduling" not in captured
+    assert "_dispatch_origin" not in captured
 
 
 def test_explicit_foreground_quick_completion_returns_inline_with_profile_run_cap(monkeypatch):
@@ -547,7 +445,7 @@ def test_explicit_foreground_quick_completion_returns_inline_with_profile_run_ca
 
     seen = []
 
-    def run_child(task_index, goal, **kwargs):
+    def run_child(task_index, description, **kwargs):
         seen.append(kwargs.get("child_timeout_override"))
         return {
             "task_index": task_index,
@@ -558,9 +456,9 @@ def test_explicit_foreground_quick_completion_returns_inline_with_profile_run_ca
     _install_fake_delegate_runtime(monkeypatch, run_child)
     result = json.loads(
         dt.delegate_task(
-            goal="inspect",
+            description="inspect", prompt="inspect",
             subagent_type="Explore",
-            scheduling="foreground",
+            run_in_background=False,
             parent_agent=_parent(),
         )
     )
@@ -575,7 +473,7 @@ def test_foreground_wait_timeout_backgrounds_same_delegation_then_delivers_once(
 
     gate = threading.Event()
 
-    def run_child(task_index, goal, **kwargs):
+    def run_child(task_index, description, **kwargs):
         gate.wait(timeout=2)
         return {
             "task_index": task_index,
@@ -595,9 +493,9 @@ def test_foreground_wait_timeout_backgrounds_same_delegation_then_delivers_once(
 
     timed_out = json.loads(
         dt.delegate_task(
-            goal="slow inspect",
+            description="slow inspect", prompt="slow inspect",
             subagent_type="Explore",
-            scheduling="foreground",
+            run_in_background=False,
             parent_agent=_parent(),
         )
     )
@@ -624,45 +522,53 @@ def test_nested_explicit_background_fails_before_child_construction(monkeypatch)
 
     built = _install_fake_delegate_runtime(
         monkeypatch,
-        lambda task_index, goal, **kwargs: {
+        lambda task_index, description, **kwargs: {
             "task_index": task_index,
             "status": "completed",
             "summary": "unexpected",
         },
     )
+    monkeypatch.setattr(dt, "_get_max_spawn_depth", lambda: 2)
     result = json.loads(
         dt.delegate_task(
-            goal="worker",
-            scheduling="background",
+            description="worker",
+            prompt="run worker",
+            run_in_background=True,
             parent_agent=_parent(depth=1),
         )
     )
 
-    assert "Nested/orchestrator delegation must run foreground" in result["error"]
+    assert result["error"] == "Nested delegation cannot run in the background."
     assert built == []
     assert ad.active_count() == 0
 
 
-def test_nested_per_task_background_fails_before_depth_or_child_checks(monkeypatch):
+def test_nested_batch_rejects_removed_per_task_scheduling(monkeypatch):
     import tools.delegate_tool as dt
 
     built = _install_fake_delegate_runtime(
         monkeypatch,
-        lambda task_index, goal, **kwargs: {
+        lambda task_index, description, **kwargs: {
             "task_index": task_index,
             "status": "completed",
             "summary": "unexpected",
         },
     )
+    monkeypatch.setattr(dt, "_get_max_spawn_depth", lambda: 2)
     result = json.loads(
         dt.delegate_task(
-            tasks=[{"goal": "worker", "scheduling": "background"}],
+            tasks=[
+                {
+                    "description": "worker",
+                    "prompt": "run worker",
+                    "scheduling": "background",
+                }
+            ],
             parent_agent=_parent(depth=1),
-            _dispatch_origin="model",
         )
     )
 
-    assert result["error"] == "Nested/orchestrator delegation must run foreground"
+    assert "unsupported fields: scheduling" in result["error"]
     assert built == []
 
 
@@ -671,7 +577,7 @@ def test_nested_auto_runs_synchronously_without_async_delivery(monkeypatch):
 
     _install_fake_delegate_runtime(
         monkeypatch,
-        lambda task_index, goal, **kwargs: {
+        lambda task_index, description, **kwargs: {
             "task_index": task_index,
             "status": "completed",
             "summary": "nested inline",
@@ -681,10 +587,10 @@ def test_nested_auto_runs_synchronously_without_async_delivery(monkeypatch):
 
     result = json.loads(
         dt.delegate_task(
-            goal="worker",
-            scheduling="auto",
+            description="worker", prompt="worker",
+            run_in_background=None,
             parent_agent=_parent(depth=1),
-            _dispatch_origin="model",
+
         )
     )
 
@@ -699,7 +605,7 @@ def test_nested_foreground_uses_profile_child_run_cap(monkeypatch):
 
     seen = []
 
-    def run_child(task_index, goal, **kwargs):
+    def run_child(task_index, description, **kwargs):
         seen.append(kwargs.get("child_timeout_override"))
         return {
             "task_index": task_index,
@@ -712,11 +618,11 @@ def test_nested_foreground_uses_profile_child_run_cap(monkeypatch):
 
     result = json.loads(
         dt.delegate_task(
-            goal="inspect",
+            description="inspect", prompt="inspect",
             subagent_type="Explore",
-            scheduling="auto",
+            run_in_background=None,
             parent_agent=_parent(depth=1),
-            _dispatch_origin="model",
+
         )
     )
 
@@ -730,7 +636,7 @@ def test_legacy_model_auto_dispatches_background(monkeypatch):
 
     gate = threading.Event()
 
-    def run_child(task_index, goal, **kwargs):
+    def run_child(task_index, description, **kwargs):
         assert kwargs["child_timeout_override"] is None
         gate.wait(timeout=2)
         return {"task_index": task_index, "status": "completed", "summary": "model bg"}
@@ -738,9 +644,9 @@ def test_legacy_model_auto_dispatches_background(monkeypatch):
     _install_fake_delegate_runtime(monkeypatch, run_child)
     dispatched = json.loads(
         dt.delegate_task(
-            goal="legacy model call",
+            description="legacy model call", prompt="legacy model call",
             parent_agent=_parent(),
-            _dispatch_origin="model",
+
         )
     )
 
@@ -760,7 +666,7 @@ def test_model_auto_background_falls_back_inline_when_async_delivery_is_unsuppor
 
     _install_fake_delegate_runtime(
         monkeypatch,
-        lambda task_index, goal, **kwargs: {
+        lambda task_index, description, **kwargs: {
             "task_index": task_index,
             "status": "completed",
             "summary": "inline safe",
@@ -770,9 +676,9 @@ def test_model_auto_background_falls_back_inline_when_async_delivery_is_unsuppor
 
     result = json.loads(
         dt.delegate_task(
-            goal="legacy model call",
+            description="legacy model call", prompt="legacy model call",
             parent_agent=_parent(),
-            _dispatch_origin="model",
+
         )
     )
 
@@ -788,7 +694,7 @@ def test_foreground_on_stateless_endpoint_returns_completed_result_not_handle(mo
 
     seen = []
 
-    def run_child(task_index, goal, **kwargs):
+    def run_child(task_index, description, **kwargs):
         seen.append(kwargs["child_timeout_override"])
         return {
             "task_index": task_index,
@@ -806,11 +712,11 @@ def test_foreground_on_stateless_endpoint_returns_completed_result_not_handle(mo
 
     result = json.loads(
         dt.delegate_task(
-            goal="inspect",
+            description="inspect", prompt="inspect",
             subagent_type="Explore",
-            scheduling="foreground",
+            run_in_background=False,
             parent_agent=_parent(),
-            _dispatch_origin="model",
+
         )
     )
 
@@ -825,7 +731,7 @@ def test_async_pool_rejection_does_not_run_extra_child_inline(monkeypatch):
 
     run_count = 0
 
-    def run_child(task_index, goal, **kwargs):
+    def run_child(task_index, description, **kwargs):
         nonlocal run_count
         run_count += 1
         return {
@@ -844,9 +750,9 @@ def test_async_pool_rejection_does_not_run_extra_child_inline(monkeypatch):
     parent = _parent()
     result = json.loads(
         dt.delegate_task(
-            goal="inspect",
+            description="inspect", prompt="inspect",
             subagent_type="Explore",
-            scheduling="foreground",
+            run_in_background=False,
             parent_agent=parent,
         )
     )
@@ -865,14 +771,14 @@ def test_pure_background_keeps_historical_no_blanket_run_cap(monkeypatch):
     gate = threading.Event()
     seen = []
 
-    def run_child(task_index, goal, **kwargs):
+    def run_child(task_index, description, **kwargs):
         seen.append(("child_timeout_override" in kwargs, kwargs.get("child_timeout_override")))
         gate.wait(timeout=2)
         return {"task_index": task_index, "status": "completed", "summary": "done"}
 
     _install_fake_delegate_runtime(monkeypatch, run_child)
     dispatched = json.loads(
-        dt.delegate_task(goal="legacy bg", background=True, parent_agent=_parent())
+        dt.delegate_task(description="legacy bg", prompt="legacy bg", run_in_background=True, parent_agent=_parent())
     )
     assert dispatched["status"] == "dispatched"
     gate.set()
@@ -887,26 +793,26 @@ def test_mixed_explicit_foreground_batch_uses_each_profile_run_cap(monkeypatch):
 
     seen = {}
 
-    def run_child(task_index, goal, **kwargs):
-        seen[goal] = kwargs.get("child_timeout_override")
-        return {"task_index": task_index, "status": "completed", "summary": goal}
+    def run_child(task_index, description, **kwargs):
+        seen[description] = kwargs.get("child_timeout_override")
+        return {"task_index": task_index, "status": "completed", "summary": description}
 
     _install_fake_delegate_runtime(monkeypatch, run_child)
     result = json.loads(
         dt.delegate_task(
             tasks=[
                 {
-                    "goal": "explore",
+                    "description": "explore",
+                    "prompt": "explore the implementation",
                     "subagent_type": "Explore",
-                    "scheduling": "foreground",
                 },
                 {
-                    "goal": "plan",
+                    "description": "plan",
+                    "prompt": "plan the implementation",
                     "subagent_type": "Plan",
-                    "scheduling": "foreground",
                 },
             ],
-            scheduling="foreground",
+            run_in_background=False,
             parent_agent=_parent(),
         )
     )
@@ -930,16 +836,15 @@ def test_timeout_fields_are_not_model_facing():
         assert field not in task_props
 
 
-def test_model_schema_truthfully_describes_scheduling_and_batch_delivery():
-    from tools.delegate_tool import DELEGATE_TASK_SCHEMA, _build_top_level_description
+def test_model_schema_truthfully_describes_background_and_batch_delivery():
+    from tools.delegate_tool import DELEGATE_TASK_SCHEMA
 
-    description = _build_top_level_description()
-    assert "BOTH MODES RUN IN THE BACKGROUND" not in description
-    assert "scheduling='foreground'" in description
-    assert "scheduling='background'" in description
+    description = DELEGATE_TASK_SCHEMA["description"]
+    assert "run_in_background=false" in description
     assert "one batch handle" in description
     assert "one consolidated completion" in description
 
     props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
     assert "background" not in props
-    assert "always run in the background" not in description
+    assert "scheduling" not in props
+    assert props["run_in_background"] == {"type": "boolean"}

@@ -40,11 +40,7 @@ DELEGATE_CONTINUE_SCHEMA = {
                 "type": "string",
                 "description": "Follow-up instruction for the same retained subagent session.",
             },
-            "scheduling": {
-                "type": "string",
-                "enum": ["auto", "foreground", "background"],
-                "description": "Whether to wait, background, or use the retained subagent type default.",
-            },
+            "run_in_background": {"type": "boolean"},
         },
         "required": ["agent_id", "prompt"],
     },
@@ -449,20 +445,28 @@ def _unwrap_foreground_payload(payload: str) -> str:
 def delegate_continue(
     agent_id: str,
     prompt: str,
-    scheduling: str = "auto",
+    run_in_background: Optional[bool] = None,
     *,
     parent_agent=None,
 ) -> str:
     if parent_agent is None:
         return _tool_error("delegate_continue requires a parent agent context.")
-    if scheduling not in {"auto", "foreground", "background"}:
-        return _tool_error(f"Invalid scheduling: {scheduling}")
-
     parent_session_id = str(getattr(parent_agent, "session_id", "") or "")
     if not parent_session_id:
         return _tool_error("delegate_continue requires a non-empty parent session id.")
     if not isinstance(prompt, str) or not prompt.strip():
         return _tool_error("prompt is required")
+
+    from tools.delegate_tool import _resolve_run_in_background
+
+    is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
+    try:
+        runs_in_background = _resolve_run_in_background(
+            run_in_background, is_subagent=is_subagent
+        )
+    except ValueError as exc:
+        return _tool_error(str(exc))
+    delivery_mode = "background" if runs_in_background else "foreground"
 
     try:
         record = claim_retained_subagent_session(agent_id)
@@ -487,20 +491,7 @@ def delegate_continue(
         _get_max_async_children,
         _load_config,
         _resolve_foreground_timeouts,
-        _resolve_scheduling,
     )
-
-    is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    try:
-        delivery_mode = _resolve_scheduling(
-            record.subagent_type,
-            scheduling,
-            is_batch=False,
-            is_subagent=is_subagent,
-        )
-    except ValueError as exc:
-        release_retained_subagent_session(agent_id)
-        return _tool_error(str(exc))
 
     foreground_wait_timeout_seconds: Optional[float] = None
     child_run_timeout_seconds: Optional[float] = None
@@ -556,7 +547,7 @@ def delegate_continue(
         combined = _sync_runner()
         entry = combined["results"][0]
         entry["note"] = (
-            f"scheduling={delivery_mode} cannot detach on this endpoint "
+            f"run_in_background={runs_in_background} cannot detach on this endpoint "
             "(stateless HTTP API), so the retained subagent ran synchronously."
         )
         return json.dumps(entry, ensure_ascii=False)
@@ -647,7 +638,7 @@ registry.register(
     handler=lambda args, **kw: delegate_continue(
         agent_id=args.get("agent_id", ""),
         prompt=args.get("prompt", ""),
-        scheduling=args.get("scheduling", "auto"),
+        run_in_background=args.get("run_in_background"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=lambda: True,

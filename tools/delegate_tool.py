@@ -524,11 +524,9 @@ def _get_max_retained_subagent_bytes() -> int:
         return 16777216
 
 
-def _should_retain_session(retain_session: Optional[bool], subagent_type: Optional[str]) -> bool:
-    """Resolve delegate_task retention default for one child."""
-    if retain_session is not None:
-        return is_truthy_value(retain_session, default=False)
-    return subagent_type == "general-purpose"
+def _should_retain_session(subagent_type: str) -> bool:
+    """Retain successful general-purpose children; other profiles are one-shot."""
+    return subagent_type == DEFAULT_SUBAGENT_TYPE
 
 
 def _get_child_timeout() -> Optional[float]:
@@ -573,30 +571,12 @@ def _get_child_timeout() -> Optional[float]:
     return DEFAULT_CHILD_TIMEOUT
 
 
-def _resolve_scheduling(
-    subagent_type: Optional[str],
-    scheduling: str,
-    is_batch: bool,
-    is_subagent: bool,
-) -> str:
-    """Temporary continuation adapter; delegate_task no longer exposes scheduling."""
-    if scheduling not in {"auto", "foreground", "background"}:
-        raise ValueError(f"Invalid scheduling: {scheduling}")
-    if is_subagent:
-        if scheduling == "background":
-            raise ValueError("Nested delegation cannot run in the background.")
-        return "foreground"
-    if scheduling != "auto":
-        return scheduling
-    if is_batch or subagent_type == DEFAULT_SUBAGENT_TYPE:
-        return "background"
-    return "foreground"
-
-
 def _resolve_run_in_background(
     requested: Optional[bool], *, is_subagent: bool
 ) -> bool:
     """Resolve one foreground/background choice for the whole delegation unit."""
+    if requested is not None and not isinstance(requested, bool):
+        raise ValueError("run_in_background must be a boolean when provided.")
     if is_subagent:
         if requested is True:
             raise ValueError("Nested delegation cannot run in the background.")
@@ -2128,7 +2108,6 @@ def _run_single_child(
     parent_agent=None,
     prompt: str = "",
     child_timeout_override: Optional[float] = None,
-    retain_session: Optional[bool] = None,
     subagent_type: Optional[str] = None,
     workspace_path: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -2560,7 +2539,11 @@ def _run_single_child(
                 logger.debug("Progress callback completion failed: %s", e)
 
         parent_session_id = str(getattr(parent_agent, "session_id", "") or "")
-        if retain_session and status == "completed" and parent_session_id:
+        if (
+            _should_retain_session(str(subagent_type or ""))
+            and status == "completed"
+            and parent_session_id
+        ):
             try:
                 from tools.subagent_sessions import (
                     RetainedSubagentSession,
@@ -2992,9 +2975,6 @@ def delegate_task(
                 parent_agent=parent_agent,
                 prompt=_t["prompt"],
                 child_timeout_override=child_timeout_overrides[_i],
-                retain_session=_should_retain_session(
-                    None, _t.get("subagent_type", subagent_type)
-                ),
                 subagent_type=_t.get("subagent_type", subagent_type),
                 workspace_path=_resolve_workspace_hint(parent_agent) or "",
             )
@@ -3020,9 +3000,6 @@ def delegate_task(
                         parent_agent=parent_agent,
                         prompt=t["prompt"],
                         child_timeout_override=child_timeout_overrides[i],
-                        retain_session=_should_retain_session(
-                            None, t.get("subagent_type", subagent_type)
-                        ),
                         subagent_type=t.get("subagent_type", subagent_type),
                         workspace_path=_resolve_workspace_hint(parent_agent) or "",
                     )
