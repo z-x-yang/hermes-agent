@@ -644,21 +644,15 @@ here; full developer notes live in `AGENTS.md`, user-facing docs under
 
 ### Delegation (`delegate_task` / `delegate_continue`)
 
-Hermes exposes exactly `Explore`, `Plan`, and `general-purpose`; omitting the
-type resolves to `general-purpose`. `auto` waits for one Explore/Plan task,
-backgrounds general-purpose and batches, and preserves explicit foreground or
-background scheduling. A full background pool returns `rejected` without
-running a child synchronously.
+Hermes exposes exactly `Explore`, `Plan`, and `general-purpose`; omission resolves to `general-purpose`. Single tasks use `description` + self-contained `prompt`; top-level omission defaults `run_in_background` to background, while nested omission is foreground and nested true fails closed.
 
-- **Single:** `delegate_task(goal, context, subagent_type=...)`.
-- **Batch:** `delegate_task(tasks=[{goal, ...}, ...])` runs children in
-  parallel, capped by `delegation.max_concurrent_children` (default 3).
-- **Continuation:** retained general-purpose results return `agent_id`; use
-  `delegate_continue` for the same work instead of spawning a fresh child.
-- **Roles:** `leaf` is the default; only an explicitly enabled
-  `general-purpose` orchestrator can spawn workers.
-- **Not durable.** A process/gateway restart loses running background work and
-  retained sessions. Use cron or a managed background process for durable work.
+- **Single:** `delegate_task(description=..., prompt=..., subagent_type=...)`.
+- **Batch:** items contain `description`, `prompt`, and optional `subagent_type`; one Batch has one handle and one consolidated completion.
+- **Lifecycle:** Explore/Plan are one-shot. Successful general-purpose work is automatically retained when a parent session and capacity exist.
+- **Continuation:** use `delegate_continue(agent_id, prompt, run_in_background=...)` for the same retained GP work.
+- **Context:** every profile receives complete governance; GP also loads project context/workspace snapshot, while Explore/Plan skip project context.
+- **Nesting:** runtime-derived from GP type, exact current-parent tool authority, depth, and kill switch—never a caller role.
+- **Not durable:** process/Gateway restart loses running background work and retained sessions; use cron or a managed process for durability.
 
 Config: `delegation.*` in `config.yaml`.
 

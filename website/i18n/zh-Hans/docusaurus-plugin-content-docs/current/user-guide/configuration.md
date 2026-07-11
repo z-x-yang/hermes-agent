@@ -1618,33 +1618,31 @@ checkpoints:
 
 ## 委托
 
-在 `delegation` 下配置子智能体能力、调度、保留、provider 路由、并发与嵌套：
+在 `delegation` 下配置 provider routing、并发、运行时派生 nesting、profile timeout 与 GP 自动保留。模型调用只使用 `description`、`prompt`、可选 `subagent_type` 和可选 `run_in_background`；下面的 operator controls 不向模型暴露。
 
 ```yaml
 delegation:
-  # 共享 provider/model 默认值；省略时继承父智能体。
+  # 共享 provider/model 默认值；省略时继承 parent。
   # model: "google/gemini-3-flash-preview"
   # provider: "openrouter"
-  # base_url: "http://localhost:1234/v1"  # 直接端点，优先于 provider
+  # base_url: "http://localhost:1234/v1"
   # api_key: "local-key"
-  # api_mode: ""                          # chat_completions、codex_responses 或 anthropic_messages；空 = 自动检测
+  # api_mode: ""
 
-  max_concurrent_children: 3              # 批次宽度与并发后台单元上限；下限 1，无硬性上限
-  max_spawn_depth: 1                      # 1 = 扁平；下限 1，无硬性上限
-  orchestrator_enabled: true              # false 会把所有子智能体强制为 leaf
+  max_concurrent_children: 3
+  max_spawn_depth: 1
+  orchestrator_enabled: true
 
-  # 全局后备值；下方各类型配置优先。
   # foreground_wait_timeout_seconds: 1800
   # child_run_timeout_seconds: 7200
-  max_foreground_wait_timeout_seconds: 7200  # 全局前台等待安全上限
+  max_foreground_wait_timeout_seconds: 7200
 
-  retained_subagent_ttl_seconds: 3600     # 进程内保留对话的有效期
-  max_retained_subagents: 64              # 进程内保留对话的记录数
-  max_retained_subagent_bytes: 16777216   # 序列化 transcript 聚合预算（16 MiB）
+  retained_subagent_ttl_seconds: 3600
+  max_retained_subagents: 64
+  max_retained_subagent_bytes: 16777216
 
   agents:
     Explore:
-      # model: "claude-haiku-4-5"          # 省略 = 使用共享/全局委派模型
       foreground_wait_timeout_seconds: 900
       child_run_timeout_seconds: 1800
     Plan:
@@ -1654,44 +1652,33 @@ delegation:
       foreground_wait_timeout_seconds: 1800
       child_run_timeout_seconds: 7200
 
-  # 旧版可选硬上限，纯后台任务也受它约束。
-  # child_timeout_seconds: 0               # 0 = 禁用；正值的下限为 30 秒
+  # 也作用于纯后台工作的旧可选 hard cap。
+  # child_timeout_seconds: 0
 ```
 
-### 调度与超时语义
+### 调度与超时
 
-使用 `auto` 时，单个 `Explore` 或 `Plan` 在前台运行；`general-purpose` 和多任务批次在后台运行。省略/传空 `subagent_type` 会解析为 `general-purpose`；只有 direct-Python 且未指定调度的兼容路径保持同步。嵌套/编排委派只能同步前台执行。
+`run_in_background` 是唯一 caller scheduling control：顶层省略时后台，顶层 `False` 前台等待；嵌套省略或 `False` 前台，嵌套 `True` 在 child 执行前拒绝；一个 Batch 共用一个顶层选择。
 
-`foreground_wait_timeout_seconds` 与 `child_run_timeout_seconds` 是彼此独立、以配置为准的控制项：
+`foreground_wait_timeout_seconds` 控制 parent 等待时间。超时后同一个 future 转到后台，并只投递一次 completion。`child_run_timeout_seconds` 只限制从前台启动的工作；`agents.<type>` 覆盖 global fallback，`max_foreground_wait_timeout_seconds` 是全局 wait ceiling。纯后台不套用 profile foreground run cap；显式 `child_timeout_seconds` 仍是独立 hard cap。
 
-- wait timeout 决定父智能体何时停止阻塞。超时后，Hermes 会把**同一个仍在运行的 future**交给后台投递，并在完成后只发送一次结果；不会重启子智能体。
-- run timeout 限制**从前台启动**的任务。`agents.<类型>` 的值优先于全局值；两者都未设置时使用上面列出的内置 profile 默认值。
-- `max_foreground_wait_timeout_seconds` 为最终解析出的等待时限设置全局上限。
-- 纯后台任务不会自动套用 profile 的 `child_run_timeout_seconds`。只有用户显式配置旧版 `child_timeout_seconds` 时，才会额外施加独立硬上限。
+### Profile 上下文与生命周期
 
-这些超时字段不会出现在模型可见的 `delegate_task` 或 `delegate_continue` schema 中，模型不能选择或放宽它们。前台等待超时固定采用后台接管，不存在可配置的超时动作。
+`Explore` 和 `Plan` 是一次性只读 profile：获得完整 governance，但跳过项目上下文和 workspace snapshot。`general-purpose` 获得完整 governance、项目上下文与 workspace/git snapshot；成功的 GP 仅在 parent session ID 非空且容量允许时自动保留。
 
-### 保留子智能体
+`delegate_continue` 只接受 `agent_id`、`prompt` 和可选 `run_in_background`。process-local store 受 `retained_subagent_ttl_seconds`、`max_retained_subagents` 和 `max_retained_subagent_bytes` 限制，Gateway/process 重启后丢失。过大的初始记录 fail closed；claimed continuation 不会被 prune；过大的成功 update 会保留 result，但删除并 invalidate retained handle。
 
-`retained_subagent_ttl_seconds`、`max_retained_subagents` 和 `max_retained_subagent_bytes` 分别按生命周期、记录数和 UTF-8 JSON transcript 聚合字节数限制短期、进程内的续接存储。`general-purpose` 只在任务成功完成、父会话 ID 非空且容量足够时默认保留；`Explore` 和 `Plan` 默认一次性使用，除非调用显式设置 `retain_session=true`。
+### Provider 与 model routing
 
-字节预算默认是 `16777216`（16 MiB），且仅由 operator 配置；两个模型可见的委派 schema 都不包含该字段。超大的初始记录会 fail closed。聚合裁剪只删除未在续接中的记录，绝不驱逐已 claim 的续接。如果成功续接的更新无法装入预算，结果仍会保留并带 `retention_dropped` 返回，但对应保留 handle 会失效。
+默认继承 parent provider/model。共享 `delegation.provider`/`model` 可覆盖默认值；`delegation.agents.<type>.provider`/`model` 可覆盖单个 profile。直接 `base_url` 优先于 provider；endpoint credential 不匹配时 fail closed，不会转发无关 provider key。provider fallback 的每次 attempt 都继续经过完整 governance 与 final payload-fit 检查。
 
-保留记录只能由同一个父会话使用；同一个 `agent_id` 同时只能有一个续接任务；Gateway 或进程重启后记录会丢失。无状态请求或父会话 ID 为空时不会返回可续接 ID。`delegate_continue` 会保留原类型、角色、工作区提示、模型/provider 元数据和能力上限，不能更改工具、角色、类型或超时配置。
+Retained record 不保存 credentials 或自定义 endpoint secret；continuation 从当前 trusted config 重新解析。
 
-### Provider 与模型路由
+### Width 与运行时派生 depth
 
-默认情况下，子智能体继承父智能体的 provider 和模型。共享的 `delegation.provider`/`delegation.model` 可以覆盖默认值；`delegation.agents.<类型>.provider`/`model` 可以只覆盖某个内置类型。仅设置 `model` 时，会继续使用所选 provider 的凭据。
+`max_concurrent_children` 同时限制 Batch width 和 concurrent background units（默认 `3`，下限 `1`）。超宽 Batch 会拒绝而不是截断；一个 accepted Batch 占一个 slot、返回一个 handle、发出一次 consolidated completion。
 
-使用直接端点时，设置 `delegation.base_url`、`delegation.api_key` 和 `delegation.model`。直接端点优先于 `delegation.provider`；省略 `api_key` 时，Hermes 只回退到 `OPENAI_API_KEY`。`api_mode` 可设为 `chat_completions`、`codex_responses` 或 `anthropic_messages`；留空时按 URL/provider 自动检测。
-
-保留记录不会存储凭据或自定义 `base_url`。续接时会从当前可信配置重新解析凭据，因此配置变化后不能保证精确复现旧的自定义端点。
-
-### 宽度与深度
-
-`max_concurrent_children` 同时限制单个批次中的任务数和并发后台委派单元数（默认 `3`，下限 `1`，无硬性上限）。环境变量 `DELEGATION_MAX_CONCURRENT_CHILDREN` 可以覆盖它。超出上限的批次会返回明确错误，不会被截断。一个成功接收的批次只占一个后台单元、返回一个 handle，并在稍后注入一次汇总结果。
-
-`max_spawn_depth` 默认 `1`（扁平），下限为 `1`，没有硬性上限。设为 `2` 可让显式配置的 `general-purpose` 编排者生成叶子子智能体。`Explore` 和 `Plan` 会拒绝编排者角色；`general-purpose` 只有显式指定该角色时才不再是 leaf。最终有效的编排者只会额外获得 `delegate_task`。`orchestrator_enabled: false` 会强制所有子智能体变成 leaf。每增加一层都可能成倍增加费用和并发量，请谨慎提高。参见[子智能体委派 → 嵌套编排](features/delegation.md#嵌套编排)。
+`max_spawn_depth=1` 保持 flat delegation。更高 depth 下，也只有 current parent 实际暴露 `delegate_task` 的 `general-purpose` child 才可能获得 nesting，并且必须 `orchestrator_enabled=true` 且仍有剩余 depth。`Explore` 和 `Plan` 永远不能委派。每增加一层都可能成倍增加成本和并发，请谨慎调整。
 
 ## 澄清
 

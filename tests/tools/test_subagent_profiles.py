@@ -217,19 +217,21 @@ def test_general_purpose_truthfully_describes_raw_shell_external_effect_capabili
     assert "normal tool and terminal approvals" in profile.system_instructions
 
 
-def test_delegation_pattern_docs_match_general_purpose_authority():
+def test_delegation_docs_match_simplified_contract():
     root = Path(__file__).resolve().parents[2]
-    pattern_docs = [
-        root / "website/docs/guides/delegation-patterns.md",
-        root
-        / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/guides"
-        / "delegation-patterns.md",
-    ]
-    all_docs = pattern_docs + [
+    docs = [
         root / "website/docs/user-guide/features/delegation.md",
         root
         / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/features"
         / "delegation.md",
+        root / "website/docs/guides/delegation-patterns.md",
+        root
+        / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/guides"
+        / "delegation-patterns.md",
+        root / "website/docs/user-guide/configuration.md",
+        root
+        / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide"
+        / "configuration.md",
         root
         / "website/docs/user-guide/skills/bundled/autonomous-ai-agents"
         / "autonomous-ai-agents-hermes-agent.md",
@@ -237,41 +239,56 @@ def test_delegation_pattern_docs_match_general_purpose_authority():
         / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/skills/bundled/autonomous-ai-agents"
         / "autonomous-ai-agents-hermes-agent.md",
     ]
-    stale_claims = (
-        "excludes named messaging",
-        "排除命名的消息",
-        "Closed repo-local worker policy",
-        "封闭的仓库内工作策略",
-        "Legacy generic children",
-        "后台池已经满了，Hermes 会同步执行",
-        "Synchronous subagent spawn",
-        "同步生成子代理",
+    required_claims = (
+        "description",
+        "prompt",
+        "run_in_background",
+        "Explore",
+        "Plan",
+        "general-purpose",
     )
-    for path in all_docs:
+    stale_claims = (
+        "retain_session",
+        'scheduling="auto"',
+        "scheduling='auto'",
+        'role="orchestrator"',
+        "recommended_next_step",
+    )
+    for path in docs:
         text = path.read_text(encoding="utf-8")
+        assert all(claim in text for claim in required_claims), path
         assert not any(claim in text for claim in stale_claims), path
+
+    feature_docs = docs[:2]
+    semantic_claims = (
+        "one batch handle",
+        "one consolidated completion",
+        "one-shot",
+        "automatically retained",
+        "project context",
+        "complete governance",
+        "runtime-derived",
+    )
+    zh_semantic_claims = (
+        "一个 batch handle",
+        "一次合并完成通知",
+        "一次性",
+        "自动保留",
+        "项目上下文",
+        "完整 governance",
+        "运行时派生",
+    )
+    en_text = feature_docs[0].read_text(encoding="utf-8")
+    zh_text = feature_docs[1].read_text(encoding="utf-8")
+    assert all(claim in en_text for claim in semantic_claims)
+    assert all(claim in zh_text for claim in zh_semantic_claims)
+
+    pattern_docs = docs[2:4]
     for path in pattern_docs:
         text = path.read_text(encoding="utf-8")
         assert "exact current-parent tool authority" in text or (
             "current parent 精确工具权限" in text
         )
-    result_fields = (
-        "outcome",
-        "evidence",
-        "actions",
-        "files_changed",
-        "tests_run",
-        "verification",
-        "blockers",
-        "open_questions",
-        "confidence",
-        "limitations",
-        "side_effects",
-        "recommended_next_step",
-    )
-    for path in all_docs[2:4]:
-        text = path.read_text(encoding="utf-8")
-        assert all(field in text for field in result_fields), path
 
 
 def test_unknown_profile_fails_closed():

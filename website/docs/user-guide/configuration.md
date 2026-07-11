@@ -1906,33 +1906,32 @@ checkpoints:
 
 ## Delegation
 
-Configure child capabilities, scheduling, retention, provider routing, concurrency, and nesting under `delegation`:
+Configure provider routing, concurrency, runtime-derived nesting, profile timeouts, and automatic GP retention under `delegation`. Model-facing calls use `description`, `prompt`, optional `subagent_type`, and optional `run_in_background`; operator controls below are not exposed to the model.
 
 ```yaml
 delegation:
-  # Shared provider/model defaults. Omitted values inherit from the parent.
+  # Shared provider/model defaults; omission inherits the parent.
   # model: "google/gemini-3-flash-preview"
   # provider: "openrouter"
-  # base_url: "http://localhost:1234/v1"  # Direct endpoint; takes precedence over provider
+  # base_url: "http://localhost:1234/v1"
   # api_key: "local-key"
-  # api_mode: ""                          # chat_completions, codex_responses, or anthropic_messages; empty = auto-detect
+  # api_mode: ""  # chat_completions, codex_responses, anthropic_messages, or auto
 
-  max_concurrent_children: 3              # Batch width and concurrent background-unit cap; floor 1, no ceiling
-  max_spawn_depth: 1                      # 1 = flat; floor 1, no ceiling
-  orchestrator_enabled: true              # false forces every child to leaf
+  max_concurrent_children: 3
+  max_spawn_depth: 1
+  orchestrator_enabled: true
 
-  # Global fallbacks. Per-agent values below take precedence.
+  # Optional global fallbacks; per-profile values take precedence.
   # foreground_wait_timeout_seconds: 1800
   # child_run_timeout_seconds: 7200
-  max_foreground_wait_timeout_seconds: 7200  # Global safety ceiling for foreground waiting
+  max_foreground_wait_timeout_seconds: 7200
 
-  retained_subagent_ttl_seconds: 3600     # In-process retained transcript lifetime
-  max_retained_subagents: 64              # In-process retained transcript count
-  max_retained_subagent_bytes: 16777216   # Aggregate serialized transcript budget (16 MiB)
+  retained_subagent_ttl_seconds: 3600
+  max_retained_subagents: 64
+  max_retained_subagent_bytes: 16777216
 
   agents:
     Explore:
-      # model: "claude-haiku-4-5"          # Omitted = shared/global delegation model
       foreground_wait_timeout_seconds: 900
       child_run_timeout_seconds: 1800
     Plan:
@@ -1942,44 +1941,39 @@ delegation:
       foreground_wait_timeout_seconds: 1800
       child_run_timeout_seconds: 7200
 
-  # Older optional hard cap for every child, including pure background work.
-  # child_timeout_seconds: 0               # 0 = disabled; positive values have a 30-second floor
+  # Older optional hard cap that also applies to pure background work.
+  # child_timeout_seconds: 0
 ```
 
 ### Scheduling and timeout semantics
 
-A single `Explore` or `Plan` task uses foreground scheduling under `auto`; `general-purpose` and multi-task batches use background scheduling. Omitted/empty `subagent_type` resolves to `general-purpose`; only the direct-Python no-scheduling compatibility path remains synchronous. Nested/orchestrator delegation is synchronous and foreground-only.
+`run_in_background` is the only caller scheduling control:
 
-`foreground_wait_timeout_seconds` and `child_run_timeout_seconds` are independent, config-authoritative controls:
+- top-level omission → background;
+- top-level `False` → foreground wait;
+- nested omission or `False` → foreground;
+- nested `True` → reject before child execution;
+- one Batch shares one top-level choice.
 
-- The wait timeout determines when the parent stops blocking. If it expires, Hermes hands the **same running future** to background delivery and produces exactly one later completion; it does not restart the child.
-- The run timeout caps work that **started in foreground**. The `agents.<type>` value overrides the global value, which otherwise falls back to that built-in profile's default shown above.
-- `max_foreground_wait_timeout_seconds` caps the resolved wait timeout globally.
-- Pure background jobs do not receive the profile `child_run_timeout_seconds` as a blanket cap. The older, explicitly configured `child_timeout_seconds` remains a separate opt-in hard cap.
+`foreground_wait_timeout_seconds` controls how long the parent waits. Expiry hands the same future to background delivery and emits exactly one later completion. `child_run_timeout_seconds` caps work that started in foreground; each `agents.<type>` value overrides the global fallback. `max_foreground_wait_timeout_seconds` is the global wait ceiling. Pure background work does not receive the profile foreground run cap; the older explicit `child_timeout_seconds` remains an independent hard cap.
 
-These timeout keys are deliberately absent from the model-facing `delegate_task` and `delegate_continue` schemas. The model cannot choose or relax them. Foreground-wait expiry always uses background handoff; there is no configurable timeout action.
+### Profile context and lifecycle
 
-### Retained subagents
+`Explore` and `Plan` are one-shot read-only profiles. They receive complete governance but skip project context/workspace snapshots. `general-purpose` receives complete governance plus project context and a workspace/git snapshot; successful GP work is automatically retained only when the parent session ID is nonempty and capacity is available.
 
-`retained_subagent_ttl_seconds`, `max_retained_subagents`, and `max_retained_subagent_bytes` bound the short-lived, in-process continuation store by lifetime, record count, and aggregate UTF-8 JSON transcript bytes. Completed `general-purpose` work is retained by default only when the parent session ID is nonempty and capacity is available. `Explore` and `Plan` are one-shot unless the call explicitly sets `retain_session=true`.
-
-The byte budget defaults to `16777216` (16 MiB) and is operator-only: it is absent from both model-facing delegation schemas. Oversized initial records fail closed. Aggregate pruning removes only non-in-flight records and never evicts a claimed continuation. If a successful continuation update cannot fit, its result is preserved and returned with `retention_dropped`, while the retained handle is invalidated.
-
-Retention is same-parent only, permits one in-flight continuation per `agent_id`, and is lost on gateway/process restart. Stateless or empty-session requests do not receive resumable IDs. `delegate_continue` preserves the original type, role, workspace hint, model/provider metadata, and capability ceiling; it cannot change tools, role, type, or timeout configuration.
+`delegate_continue` accepts `agent_id`, `prompt`, and optional `run_in_background`. The process-local store is bounded by `retained_subagent_ttl_seconds`, `max_retained_subagents`, and `max_retained_subagent_bytes`, and is lost on Gateway/process restart. Oversized initial records fail closed; claimed continuations are never evicted; an oversized successful update preserves the result but drops/invalidate the retained handle.
 
 ### Provider and model routing
 
-By default, subagents inherit the parent agent's provider and model. Shared `delegation.provider`/`delegation.model` values override that default; `delegation.agents.<type>.provider`/`model` can override one built-in type. Setting only `model` keeps the selected provider's credentials.
+By default, subagents inherit the parent provider/model. Shared `delegation.provider`/`model` overrides that default; `delegation.agents.<type>.provider`/`model` overrides one profile. A configured direct `base_url` takes precedence over `provider`; endpoint-scoped credential rules fail closed rather than forwarding an unrelated provider key. Provider fallback still runs each attempt through complete governance and final payload-fit checks.
 
-For a direct endpoint, set `delegation.base_url`, `delegation.api_key`, and `delegation.model`. A direct endpoint takes precedence over `delegation.provider`. Credential precedence is explicit `delegation.api_key`, then `OPENAI_API_KEY`; only when the configured URL is the exact active parent endpoint may Hermes reuse the parent key. A different endpoint without an endpoint-scoped key fails closed, so provider keys such as `OPENROUTER_API_KEY` are never forwarded to it. `api_mode` may be `chat_completions`, `codex_responses`, or `anthropic_messages`; leaving it empty enables URL/provider detection.
+Retained records do not store credentials or custom endpoint secrets. Continuation resolves credentials again from current trusted configuration.
 
-Retained records do not store credentials or custom `base_url` values. A continuation resolves credentials again from current trusted configuration, so exact custom-endpoint fidelity after configuration changes is not guaranteed.
+### Width and runtime-derived depth
 
-### Width and depth
+`max_concurrent_children` caps both Batch width and concurrent background units (default `3`, floor `1`). Oversized batches reject rather than truncate. One accepted Batch consumes one slot, returns one handle, and emits one consolidated completion.
 
-`max_concurrent_children` caps both tasks in one batch and concurrent background delegation units (default `3`, floor `1`, no ceiling). `DELEGATION_MAX_CONCURRENT_CHILDREN` is the environment-variable override. Oversized batches fail with a clear error rather than being truncated. One accepted batch consumes one background unit, returns one handle, and later injects one consolidated result.
-
-`max_spawn_depth` defaults to `1` (flat), has a floor of `1`, and has no hard upper ceiling. Raise it to `2` to allow an explicitly configured `general-purpose` orchestrator to spawn leaves. `Explore` and `Plan` reject the orchestrator role; `general-purpose` remains a leaf unless that role is explicit. An effective orchestrator receives only `delegate_task` as a role-granted exception. `orchestrator_enabled: false` forces every child to leaf. Each additional level can multiply cost and concurrency; increase it deliberately. See [Subagent Delegation → Nested orchestration](features/delegation.md#nested-orchestration).
+`max_spawn_depth=1` keeps delegation flat. At higher depths, only a `general-purpose` child whose current parent actually exposes `delegate_task` may receive nesting, and only while `orchestrator_enabled` is true and another depth remains. `Explore` and `Plan` never delegate. Each extra level can multiply cost and concurrency, so raise depth deliberately.
 
 ## Clarify
 

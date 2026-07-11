@@ -1,187 +1,108 @@
 ---
 sidebar_position: 13
 title: "委派与并行工作"
-description: "Explore、Plan、general-purpose、批次与保留续接的实用模式"
+description: "Explore、Plan、general-purpose、Batch 与 retained follow-up 的实用模式"
 ---
 
 # 委派与并行工作
 
-Hermes 可以把边界清晰的工作交给隔离的子智能体。选择内置类型可获得稳定的能力上限；把任务上下文写完整后，再由调度器决定父智能体是否需要等待。
+Hermes 通过 `delegate_task(description=..., prompt=...)` 委派隔离任务。选择最窄的内置 `subagent_type`，让 `prompt` 自包含；只有 parent 立刻依赖结果时才设 `run_in_background=False`。完整合同见[子代理委派](/user-guide/features/delegation)。
 
-完整契约请参阅[子智能体委派](/user-guide/features/delegation)。
+## 选择最窄的类型
 
-## 选择能力最窄的内置类型
-
-| 需求 | 类型 | 原因 |
+| 需求 | 类型 | 生命周期 |
 |---|---|---|
-| 定位代码、追踪调用路径、收集 file:line 证据 | `Explore` | 只读，默认前台运行 |
-| 在编写实施计划前调研改动范围 | `Plan` | 只读，按计划调研格式返回，默认前台运行 |
-| 编辑文件、运行测试、使用 terminal/process 或完成有依赖的多步骤任务 | `general-purpose` | 使用 parent 精确工具上限，默认后台运行 |
+| 定位代码、追踪调用链、收集文件/行证据 | `Explore` | 只读，一次性 |
+| 调研变更并识别关键实现文件 | `Plan` | 只读，一次性 |
+| 编辑、测试、terminal/process 或获准外部动作 | `general-purpose` | 成功后自动保留 |
 
-不要让 `Explore` 或 `Plan` 编辑文件。`general-purpose` 只能获得通过 runtime policy 检查后的 current parent 精确工具权限；当 parent 本身拥有命名外部工具，且用户/任务范围与工具自身确认合同允许时，它可以使用这些工具。它也有原始 `terminal` 和 `process`，因此不是硬性的无副作用沙箱；模型不能通过 `toolsets` 放宽这个上限。
+`general-purpose` 只能获得通过 current parent 精确工具权限和运行时 policy 检查的工具，不是 unrestricted worker，也不是“无外部副作用”的 sandbox。`Explore` 和 `Plan` 保留完整 governance，但跳过项目上下文；general-purpose 额外加载 repo project context 与 workspace/git snapshot。
 
-## 模式：行动前先做定向调查
-
-需要证据、又不希望产生改动时，使用 `Explore`：
+## 模式：行动前先调查
 
 ```python
 delegate_task(
-    goal="Trace how expired access tokens trigger refresh",
-    context="""Repository: /home/user/webapp.
-Start at src/auth/middleware.py. Return file:symbol:line evidence,
-what you searched, and any unresolved call edges.""",
+    description="trace token refresh",
+    prompt="""Repository: /home/user/webapp.
+从 src/auth/middleware.py 开始。返回 absolute path、symbol、line range
+和仍未解决的 call edge。不要修改任何内容。""",
     subagent_type="Explore",
+    run_in_background=False,
 )
 ```
 
-单个 `Explore` 在 `auto` 下前台运行。通常结果会直接返回；如果达到已配置的等待时限，同一个子智能体会转交后台继续执行，稍后只投递一次结果。
-
-## 模式：只调研计划输入，不实施
-
-需要为后续计划收集资料时，使用 `Plan`：
+## 模式：实现前规划调研
 
 ```python
 delegate_task(
-    goal="Research what must change to add rotating refresh tokens",
-    context="""Repository: /home/user/webapp.
-Identify critical files, existing tests, migration risks, security constraints,
-and open questions. Do not edit files.""",
+    description="plan token rotation",
+    prompt="""Repository: /home/user/webapp.
+识别 critical files、现有 tests、migration risk、security constraint 和
+open questions。以 ### Critical Files for Implementation 结尾。""",
     subagent_type="Plan",
+    run_in_background=False,
 )
 ```
 
-`Plan` 不能写文件，也不能运行 shell。它的输出供父智能体制定计划使用，不能视为已经完成实现的证据。
-
-## 模式：单个后台实现任务
-
-边界清晰、可以独立推进的仓库内任务适合 `general-purpose`：
+## 模式：一个实现 worker
 
 ```python
 delegate_task(
-    goal="Fix refresh-token reuse detection and add regression tests",
-    context="""Repository: /home/user/webapp.
-Relevant files: src/auth/tokens.py and tests/auth/test_tokens.py.
-Run: pytest tests/auth/test_tokens.py -q.
-Return changed files and exact test output.""",
+    description="fix token reuse",
+    prompt="""Repository: /home/user/webapp.
+修复 refresh-token reuse detection，增加 regression tests，并运行
+pytest tests/auth/test_tokens.py -q。返回改动文件和真实输出。""",
     subagent_type="general-purpose",
 )
 ```
 
-在 `auto` 下，Hermes 会立即返回后台 handle。父智能体应继续其他工作，不要轮询；完成结果稍后会注入所属会话。后台委派无法跨越 `/new`、`/stop`、进程关闭或重启持久存在。
+顶层省略 `run_in_background` 时默认后台执行。不要轮询；完成后只向 owning conversation 回流一次结果。
 
-## 模式：并行只读调研
+## 模式：并行独立任务
 
-互不依赖的只读问题很适合组成批次：
-
-```python
-delegate_task(tasks=[
-    {
-        "goal": "Map token creation and signing",
-        "context": "Repository: /home/user/webapp. Return file:line evidence.",
-        "subagent_type": "Explore",
-    },
-    {
-        "goal": "Map token validation and revocation",
-        "context": "Repository: /home/user/webapp. Return file:line evidence.",
-        "subagent_type": "Explore",
-    },
-    {
-        "goal": "Map authentication test coverage gaps",
-        "context": "Repository: /home/user/webapp. Read only; do not modify tests.",
-        "subagent_type": "Explore",
-    },
-])
-```
-
-多任务批次在 `auto` 下后台运行。整个 fan-out 只返回**一个 handle**，等所有子任务完成后只产生**一次汇总结果**；不会为每个任务分别生成 handle 或完成消息。
-
-如果任务数超过 `delegation.max_concurrent_children`，请拆成多个批次。Hermes 会拒绝过大的批次，不会静默截断。
-
-## 模式：并行编辑时明确文件所有权
-
-多个 `general-purpose` 子智能体可能操作同一个工作树，因此只有文件范围互不重叠时才适合并行：
+Hermes Batch 是为 Gateway UX 有意保留的扩展，只放彼此独立的任务：
 
 ```python
-delegate_task(tasks=[
-    {
-        "goal": "Update server token responses",
-        "context": "Repository: /home/user/webapp. Own only src/api/tokens.py and tests/api/test_tokens.py.",
-        "subagent_type": "general-purpose",
-    },
-    {
-        "goal": "Update Python SDK token parsing",
-        "context": "Repository: /home/user/webapp. Own only sdk/python/ and its tests.",
-        "subagent_type": "general-purpose",
-    },
-])
+delegate_task(
+    tasks=[
+        {
+            "description": "inspect signing",
+            "prompt": "Map token creation/signing and return path:line evidence.",
+            "subagent_type": "Explore",
+        },
+        {
+            "description": "inspect invalidation",
+            "prompt": "Map session invalidation and return path:line evidence.",
+            "subagent_type": "Explore",
+        },
+    ]
+)
 ```
 
-如果多个子智能体可能修改同一个文件、运行破坏性仓库命令，或依赖彼此尚未提交的输出，就不要并行。最终应由父智能体整合并验证完整 diff。
+一个 Batch 只有一个 handle、一个 async slot 和一次 consolidated completion。每个 item 只有 `description`、`prompt` 与可选 `subagent_type`；整个 group 共用顶层 `run_in_background`。
 
-## 模式：保留一条实现线程继续追问
+## 模式：继续 retained GP 工作
 
-`general-purpose` 成功完成后，只要父会话 ID 非空且容量足够，默认会保留其会话。使用返回的 `agent_id` 继续紧密相关的工作：
+成功的 general-purpose result 可能返回 `agent_id`：
 
 ```python
 delegate_continue(
-    agent_id="<agent_id>",
-    prompt="Address the remaining edge case from the failed parametrized test.",
-    scheduling="auto",
+    agent_id="<returned agent_id>",
+    prompt="Add the missing concurrency regression test and rerun the suite.",
+    run_in_background=False,
 )
 ```
 
-如果需要继续 `Explore` 或 `Plan`，初次调用时设置 `retain_session=true`。保留记录只存在于当前进程，受 TTL 和容量限制，而且只能由同一个父会话使用。同一个 `agent_id` 不能同时运行两个续接；重启后记录会丢失。
+Explore 和 Plan 是一次性任务。GP 自动保留，且 store 仅在当前进程内存在、受 budget 限制、重启即失效。只有同一 scope 的 follow-up 才用 continuation；新目标重新 `delegate_task`。
 
-续接会保留原来的类型、角色、工作区提示、模型/provider 元数据和能力上限。不能借此把 `Explore` 提升为编辑器，也不能修改工具、超时或所属父会话。
+## 模式：运行时派生嵌套
 
-## 模式：确有必要时再用嵌套编排
+不要请求 role。general-purpose child 只有在 parent 真实拥有该 exact authority、kill switch 开启且 depth 允许时才获得 `delegate_task`。嵌套省略时前台执行；嵌套 `run_in_background=True` 会在 child 启动前失败。
 
-嵌套委派只适用于显式设置 `role="orchestrator"` 的 `general-purpose`。`Explore` 和 `Plan` 始终拒绝编排者角色：
+## 不要这样做
 
-```python
-delegate_task(
-    goal="Survey three migration approaches and synthesize a recommendation",
-    context="Repository: /home/user/webapp.",
-    subagent_type="general-purpose",
-    role="orchestrator",
-)
-```
-
-`general-purpose` 默认仍是 leaf。只有最终通过运行时 gate 的编排者，才会在父级精确工具上限和 profile 上限之外额外获得 `delegate_task`；不会获得 `delegate_continue` 或其他委派/MCP 工具。这要求 `delegation.max_spawn_depth >= 2` 且 `delegation.orchestrator_enabled: true`。嵌套工作同步前台执行；显式要求嵌套后台运行会直接失败。每增加一层都可能成倍增加费用，因此在子任务已经明确时，应优先使用顶层批次。
-
-## 调度检查表
-
-- 单个 `Explore`/`Plan` + `auto` → 前台。
-- 单个 `general-purpose` + `auto` → 后台。
-- 省略/传空 `subagent_type` 会解析为 `general-purpose`；模型侧 `auto` → 后台。
-- 多任务批次 + `auto` → 后台，一个 handle、一次结果。
-- 嵌套/编排委派 → 同步前台。
-- 直接 Python 旧版调用，且未指定类型、调度或后台请求 → 走同步兼容路径。
-- 前台等待超时 → 同一个 future 转交后台，之后只投递一次完成结果。
-- 前台启动的任务使用配置的 child run cap；纯后台任务不会自动套用这项 profile 超时。
-
-## 上下文与验证检查表
-
-委派前请写明：
-
-- 仓库或工作区路径；
-- 精确的文件、symbol、错误信息或搜索目标；
-- 允许的范围，以及子智能体拥有的文件；
-- 测试或验证命令；
-- 输出语言和证据格式。
-
-完成后：
-
-- 查看真实 diff 或文件内容；
-- 由父智能体重新运行关键测试；
-- 把摘要视为自我报告，而不是独立证据；
-- 记住一个批次完成消息中可能包含多个子任务结果；
-- 只有在原能力上限仍然合适时才使用 `delegate_continue`。
-
-## 不适合委派的情况
-
-- 只需一次工具调用：直接调用工具。
-- 不需要复杂推理的机械式 API/工具流水线：使用 `execute_code`。
-- 需要用户澄清：子智能体不能使用 `clarify`。
-- 需要外部副作用：由获得明确授权的父智能体工具执行并核验结果。
-- 必须跨越 Gateway 生命周期长期运行：使用 cron 或独立管理的后台进程。
+- 不传已删除的 `goal`、`context`、per-item scheduling 或 explicit retention fields；
+- 不让 Explore/Plan 编辑或运行 shell；
+- 不把互相依赖的任务放进同一 Batch；
+- 不把 subagent self-report 当作 tests、文件改动或外部动作的最终证据，parent 必须验证；
+- 需要跨 `/new`、shutdown 或 Gateway restart 的工作不要用 delegation，应使用 cron 或受管理进程。

@@ -1,187 +1,108 @@
 ---
 sidebar_position: 13
 title: "Delegation & Parallel Work"
-description: "Practical patterns for Explore, Plan, general-purpose, batches, and retained follow-ups"
+description: "Practical patterns for Explore, Plan, general-purpose, Batch, and retained follow-ups"
 ---
 
 # Delegation & Parallel Work
 
-Hermes can hand focused work to isolated child agents. Choose a built-in type for a predictable capability ceiling, pass a self-contained task, and let the scheduler decide whether the parent should wait.
+Hermes delegates isolated work through `delegate_task(description=..., prompt=...)`. Choose the narrowest built-in `subagent_type`, make `prompt` self-contained, and use `run_in_background=False` only when the parent immediately depends on the result. For the complete contract, see [Subagent Delegation](/user-guide/features/delegation).
 
-For the full contract, see [Subagent Delegation](/user-guide/features/delegation).
+## Choose the narrowest type
 
-## Choose the narrowest built-in
-
-| Need | Type | Why |
+| Need | Type | Lifecycle |
 |---|---|---|
-| Locate code, trace a call path, gather file:line evidence | `Explore` | Read-only and foreground by default |
-| Research a change before writing an implementation plan | `Plan` | Read-only, plan-oriented result contract, foreground by default |
-| Edit files, run tests, use terminal/process, or complete dependent multi-step work | `general-purpose` | Exact parent tool ceiling, background by default |
+| Locate code, trace a call path, gather file/line evidence | `Explore` | read-only, one-shot |
+| Research a change and identify critical implementation files | `Plan` | read-only, one-shot |
+| Edit, test, use terminal/process, or perform permitted external actions | `general-purpose` | automatically retained after success |
 
-Do not ask `Explore` or `Plan` to edit. `general-purpose` receives only the exact current-parent tool authority that survives runtime policy checks; it can use named external tools when the parent has them and the user/task scope plus each tool's confirmation contract permits the action. It also has raw `terminal` and `process`, so it is not a hard no-side-effect sandbox. The model cannot widen this ceiling with `toolsets`.
+`general-purpose` receives only the exact current-parent tool authority that survives runtime policy checks. It is not an unrestricted worker and not a no-side-effect sandbox. `Explore` and `Plan` retain complete governance but skip project context; general-purpose additionally loads repository project context and a workspace/git snapshot.
 
 ## Pattern: focused exploration before acting
 
-Use `Explore` when the parent needs evidence without risking changes:
-
 ```python
 delegate_task(
-    goal="Trace how expired access tokens trigger refresh",
-    context="""Repository: /home/user/webapp.
-Start at src/auth/middleware.py. Return file:symbol:line evidence,
-what you searched, and any unresolved call edges.""",
+    description="trace token refresh",
+    prompt="""Repository: /home/user/webapp.
+Start at src/auth/middleware.py. Return absolute paths, symbols, line ranges,
+and unresolved call edges. Do not modify anything.""",
     subagent_type="Explore",
+    run_in_background=False,
 )
 ```
 
-A single `Explore` task uses foreground scheduling under `auto`. The parent receives the result inline unless the configured wait expires; in that case, the same child continues in the background and returns one later completion.
-
-## Pattern: planning research without implementation
-
-Use `Plan` to gather the inputs for a later plan:
+## Pattern: planning research
 
 ```python
 delegate_task(
-    goal="Research what must change to add rotating refresh tokens",
-    context="""Repository: /home/user/webapp.
+    description="plan token rotation",
+    prompt="""Repository: /home/user/webapp.
 Identify critical files, existing tests, migration risks, security constraints,
-and open questions. Do not edit files.""",
+and open questions. End with ### Critical Files for Implementation.""",
     subagent_type="Plan",
+    run_in_background=False,
 )
 ```
 
-`Plan` cannot write or run shell commands. Its output should inform the parent; it is not proof that implementation happened.
-
-## Pattern: one background implementation worker
-
-Use `general-purpose` for scoped repository work that can run independently:
+## Pattern: one implementation worker
 
 ```python
 delegate_task(
-    goal="Fix refresh-token reuse detection and add regression tests",
-    context="""Repository: /home/user/webapp.
-Relevant files: src/auth/tokens.py and tests/auth/test_tokens.py.
-Run: pytest tests/auth/test_tokens.py -q.
-Return changed files and exact test output.""",
+    description="fix token reuse",
+    prompt="""Repository: /home/user/webapp.
+Fix refresh-token reuse detection, add regression tests, and run
+pytest tests/auth/test_tokens.py -q. Return changed files and real output.""",
     subagent_type="general-purpose",
 )
 ```
 
-Under `auto`, Hermes returns a background handle immediately. Continue other work instead of polling; the completion is injected into the owning conversation later. Background delegation is not durable across `/new`, `/stop`, shutdown, or process restart.
+Top-level omission defaults `run_in_background` to true. Do not poll the worker; one completion re-enters the owning conversation.
 
-## Pattern: parallel read-only research
+## Pattern: parallel independent work
 
-Independent read-only questions are a good batch:
-
-```python
-delegate_task(tasks=[
-    {
-        "goal": "Map token creation and signing",
-        "context": "Repository: /home/user/webapp. Return file:line evidence.",
-        "subagent_type": "Explore",
-    },
-    {
-        "goal": "Map token validation and revocation",
-        "context": "Repository: /home/user/webapp. Return file:line evidence.",
-        "subagent_type": "Explore",
-    },
-    {
-        "goal": "Map authentication test coverage gaps",
-        "context": "Repository: /home/user/webapp. Read only; do not modify tests.",
-        "subagent_type": "Explore",
-    },
-])
-```
-
-A multi-task batch runs in the background under `auto`. The entire fan-out returns **one handle** and later produces **one consolidated result** after every child finishes. There are never per-task handles or per-task completion injections.
-
-Use separate batches if the number of tasks exceeds `delegation.max_concurrent_children`; Hermes rejects an oversized batch rather than truncating it.
-
-## Pattern: parallel edits with disjoint ownership
-
-Multiple `general-purpose` children can edit the same working tree, so split work only when file ownership is disjoint:
+Hermes Batch is an intentional Gateway UX extension. Use it only for independent tasks:
 
 ```python
-delegate_task(tasks=[
-    {
-        "goal": "Update server token responses",
-        "context": "Repository: /home/user/webapp. Own only src/api/tokens.py and tests/api/test_tokens.py.",
-        "subagent_type": "general-purpose",
-    },
-    {
-        "goal": "Update Python SDK token parsing",
-        "context": "Repository: /home/user/webapp. Own only sdk/python/ and its tests.",
-        "subagent_type": "general-purpose",
-    },
-])
+delegate_task(
+    tasks=[
+        {
+            "description": "inspect signing",
+            "prompt": "Map token creation/signing and return path:line evidence.",
+            "subagent_type": "Explore",
+        },
+        {
+            "description": "inspect invalidation",
+            "prompt": "Map session invalidation and return path:line evidence.",
+            "subagent_type": "Explore",
+        },
+    ]
+)
 ```
 
-Avoid parallel children that may edit the same file, run destructive repository commands, or depend on each other's uncommitted output. Let the parent integrate and verify the combined diff.
+One Batch uses one handle, one async slot, and one consolidated completion. Every item contains only `description`, `prompt`, and optional `subagent_type`; the group shares top-level `run_in_background`.
 
-## Pattern: retain one implementation thread
+## Pattern: continue retained GP work
 
-A successfully completed `general-purpose` child is retained by default when the parent has a nonempty session ID and capacity is available. Use its returned `agent_id` for a tightly related follow-up:
+A successful general-purpose result may return `agent_id`:
 
 ```python
 delegate_continue(
-    agent_id="<agent_id>",
-    prompt="Address the remaining edge case from the failed parametrized test.",
-    scheduling="auto",
+    agent_id="<returned agent_id>",
+    prompt="Add the missing concurrency regression test and rerun the suite.",
+    run_in_background=False,
 )
 ```
 
-Use `retain_session=true` if an `Explore` or `Plan` run must be continued. Retention is process-local, TTL/capacity bounded, and same-parent only. One `agent_id` cannot have two continuations in flight. A restart loses it.
+Explore and Plan are one-shot. GP retention is automatic, process-local, bounded, and restart-ephemeral. Continue only the same scoped work; use a fresh `delegate_task` for an unrelated objective.
 
-A continuation keeps the original type, role, workspace hint, model/provider metadata, and capability ceiling. It cannot be used to promote `Explore` into an editor, change tools or timeouts, or move work to another parent session.
+## Pattern: runtime-derived nesting
 
-## Pattern: nested orchestration only when needed
+Do not request a role. A general-purpose child receives `delegate_task` only when the parent really has that exact authority, the kill switch is enabled, and the configured depth permits another layer. Nested omission is foreground; nested `run_in_background=True` fails before child execution.
 
-Nested delegation is available to `general-purpose` only when it is explicitly configured with `role="orchestrator"`. `Explore` and `Plan` always reject the orchestrator role:
+## What not to do
 
-```python
-delegate_task(
-    goal="Survey three migration approaches and synthesize a recommendation",
-    context="Repository: /home/user/webapp.",
-    subagent_type="general-purpose",
-    role="orchestrator",
-)
-```
-
-`general-purpose` remains a leaf by default. An effective orchestrator receives only `delegate_task` beyond the exact current-parent/profile tool ceiling; it does not receive `delegate_continue` or other delegation/MCP tools. This requires `delegation.max_spawn_depth >= 2` and `delegation.orchestrator_enabled: true`. Nested work is synchronous/foreground; explicit background nesting fails closed. Each level can multiply cost, so prefer a top-level batch when the subtasks are already known.
-
-## Scheduling checklist
-
-- Single `Explore`/`Plan` + `auto` → foreground.
-- Single `general-purpose` + `auto` → background.
-- Omitted/empty `subagent_type` resolves to `general-purpose`; model-originated `auto` → background.
-- Multi-task batch + `auto` → background, one handle/result.
-- Nested/orchestrator delegation → synchronous foreground.
-- Direct Python legacy call with no type or explicit scheduling/background request → synchronous compatibility path.
-- Foreground wait expiry → the same future is handed to background delivery, then one later completion.
-- Foreground-started work gets the configured child run cap; pure background work does not inherit that profile cap as a blanket timeout.
-
-## Context and verification checklist
-
-Before delegating, include:
-
-- repository/workspace path;
-- exact files, symbols, errors, or search target;
-- allowed scope and files the child owns;
-- test or validation commands;
-- required output language and evidence format.
-
-After completion:
-
-- inspect the actual diff or files;
-- rerun important tests from the parent;
-- treat summaries as self-reports, not independent proof;
-- remember that one batch completion may contain several child results;
-- use `delegate_continue` only when preserving the original capability ceiling is appropriate.
-
-## When not to delegate
-
-- One direct tool call: call the tool.
-- Mechanical API/tool pipelines without substantial reasoning: use `execute_code`.
-- Work requiring user clarification: children cannot use `clarify`.
-- External side effects: perform them through an appropriately approved parent tool and verify the result.
-- Durable work that must survive gateway lifecycle changes: use cron or a separately managed background process.
+- Do not pass removed fields such as `goal`, `context`, per-item scheduling controls, or explicit retention controls.
+- Do not ask Explore or Plan to edit or run shell commands.
+- Do not put dependent tasks in one Batch.
+- Do not assume a subagent self-report proves tests, file changes, or external side effects—verify from the parent.
+- Do not use delegation for work that must survive `/new`, shutdown, or Gateway restart; use cron or a managed process.
