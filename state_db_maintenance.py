@@ -6,10 +6,12 @@ import hashlib
 import json
 import os
 import tempfile
-from dataclasses import asdict, dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 
@@ -50,10 +52,24 @@ class MaintenanceJournal:
     backup_path: str | None
     work_path: str | None
     candidate_path: str | None
-    fingerprints: dict[str, dict[str, int | str] | None]
+    fingerprints: Mapping[str, Mapping[str, int | str] | None]
     created_at: str
     updated_at: str
-    expected_row_counts: dict[str, int] = field(default_factory=dict)
+    expected_row_counts: Mapping[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        frozen_fingerprints = {
+            name: None if fingerprint is None else MappingProxyType(dict(fingerprint))
+            for name, fingerprint in self.fingerprints.items()
+        }
+        object.__setattr__(
+            self, "fingerprints", MappingProxyType(frozen_fingerprints)
+        )
+        object.__setattr__(
+            self,
+            "expected_row_counts",
+            MappingProxyType(dict(self.expected_row_counts)),
+        )
 
     @classmethod
     def new(cls, operation_id: str, db_path: Path) -> "MaintenanceJournal":
@@ -75,9 +91,22 @@ class MaintenanceJournal:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        value = asdict(self)
-        value["phase"] = self.phase.value
-        return value
+        return {
+            "version": self.version,
+            "operation_id": self.operation_id,
+            "phase": self.phase.value,
+            "db_path": self.db_path,
+            "backup_path": self.backup_path,
+            "work_path": self.work_path,
+            "candidate_path": self.candidate_path,
+            "fingerprints": {
+                name: None if fingerprint is None else dict(fingerprint)
+                for name, fingerprint in self.fingerprints.items()
+            },
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "expected_row_counts": dict(self.expected_row_counts),
+        }
 
     @classmethod
     def from_dict(cls, value: object) -> "MaintenanceJournal":
@@ -164,7 +193,7 @@ _ISSUED_PERMITS: set[MaintenancePermit] = set()
 
 def maintenance_journal_path(db_path: Path) -> Path:
     canonical = _canonical(db_path)
-    return canonical.with_name(f"{canonical.name}.maintenance.json")
+    return canonical.with_name("state-db-maintenance.json")
 
 
 def write_maintenance_journal(db_path: Path, record: MaintenanceJournal) -> None:

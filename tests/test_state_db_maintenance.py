@@ -1,3 +1,4 @@
+import json
 import os
 import stat
 from dataclasses import replace
@@ -35,6 +36,11 @@ def test_write_journal_is_0600_and_fsyncs_parent(tmp_path, monkeypatch):
     assert any(stat.S_ISDIR(mode) for mode in fsynced_modes)
 
 
+def test_journal_uses_exact_state_db_maintenance_basename(tmp_path):
+    db_path = tmp_path / "state.db"
+    assert maintenance_journal_path(db_path) == tmp_path / "state-db-maintenance.json"
+
+
 def test_journal_round_trip_preserves_required_fields(tmp_path):
     db = tmp_path / "state.db"
     original = replace(
@@ -47,6 +53,37 @@ def test_journal_round_trip_preserves_required_fields(tmp_path):
     )
     write_maintenance_journal(db, original)
     assert load_maintenance_journal(db) == original
+
+
+def test_journal_nested_mappings_and_input_aliases_are_immutable(tmp_path):
+    db = tmp_path / "state.db"
+    fingerprint = {"size": 12, "sha256": "abc"}
+    fingerprints = {"db": fingerprint}
+    expected_row_counts = {"messages": 7}
+    journal = replace(
+        MaintenanceJournal.new("op-1", db),
+        fingerprints=fingerprints,
+        expected_row_counts=expected_row_counts,
+    )
+    serialized = json.dumps(journal.to_dict(), sort_keys=True)
+
+    with pytest.raises(TypeError):
+        journal.fingerprints["wal"] = {"size": 1}
+    nested_fingerprint = journal.fingerprints["db"]
+    assert nested_fingerprint is not None
+    with pytest.raises(TypeError):
+        nested_fingerprint["size"] = 99
+    with pytest.raises(TypeError):
+        journal.expected_row_counts["messages"] = 99
+
+    fingerprints["wal"] = {"size": 1}
+    fingerprint["size"] = 99
+    expected_row_counts["messages"] = 99
+
+    assert json.dumps(journal.to_dict(), sort_keys=True) == serialized
+    write_maintenance_journal(db, journal)
+    with pytest.raises(MaintenanceBlockedError, match="issued permit required"):
+        assert_state_db_maintenance_access(db, write_capable=True)
 
 
 def test_nonterminal_journal_blocks_write_but_allows_read_only(tmp_path):
