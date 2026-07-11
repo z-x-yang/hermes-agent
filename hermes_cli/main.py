@@ -13491,7 +13491,7 @@ def main():
                 reason = _db_opens_cleanly(db_path)
             except MaintenanceBlockedError as exc:
                 print(f"✗ {exc}")
-                return
+                sys.exit(1)
             if reason is None:
                 print(f"✓ {db_path} opens cleanly — no repair needed.")
                 return
@@ -13505,7 +13505,7 @@ def main():
                 )
             except MaintenanceBlockedError as exc:
                 print(f"✗ {exc}")
-                return
+                sys.exit(1)
             if report.get("repaired"):
                 if report.get("backup_path"):
                     print(f"  backup: {report['backup_path']}")

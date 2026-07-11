@@ -1237,10 +1237,11 @@ def run_doctor(args):
             # Keep doctor diagnostics read-only while a nonterminal maintenance
             # journal owns the database. Outside maintenance, retain the write
             # probe that detects FTS corruption invisible to base-table reads.
+            _readonly_reason = None
             try:
                 _write_reason = _db_opens_cleanly(state_db_path)
             except MaintenanceBlockedError as maintenance_error:
-                _write_reason = _db_opens_cleanly(
+                _readonly_reason = _db_opens_cleanly(
                     state_db_path, write_probe=False
                 )
                 check_warn(
@@ -1249,6 +1250,16 @@ def run_doctor(args):
                 )
                 issues.append(str(maintenance_error))
                 _write_reason = None
+
+            if _readonly_reason is not None:
+                check_warn(
+                    f"{_DHH}/state.db fails a read-only health check "
+                    "(integrity/schema may be corrupt)",
+                    f"({_readonly_reason})",
+                )
+                issues.append(
+                    f"state.db read-only health failure: {_readonly_reason}"
+                )
 
             if _write_reason is not None:
                 check_warn(
