@@ -511,12 +511,11 @@ def test_continuation_reloads_modified_current_active_governance(monkeypatch, tm
         prompts.append(
             _build_child_system_prompt(
                 profile=kwargs["profile"],
-                role=kwargs["role"],
+                allow_delegation=kwargs["role"] == "orchestrator",
                 workspace_path=kwargs["workspace_path_override"],
                 child_depth=1,
                 max_spawn_depth=1,
                 governance_snapshot=snapshot,
-                context_policy_capsule=kwargs["context_policy_capsule"],
             )
         )
         return _attach_policy(
@@ -1956,10 +1955,10 @@ def test_run_single_child_retains_completed_general_purpose_session(monkeypatch)
 
     entry = dt._run_single_child(
         task_index=0,
-        goal="implement",
+        description="implement",
         child=child,
         parent_agent=_parent(),
-        context=None,
+        prompt="perform the delegated task",
         child_timeout_override=30,
         retain_session=True,
         subagent_type="general-purpose",
@@ -2012,10 +2011,10 @@ def test_run_single_child_surfaces_retention_failure(monkeypatch):
 
     entry = dt._run_single_child(
         task_index=0,
-        goal="implement",
+        description="implement",
         child=child,
         parent_agent=_parent(),
-        context=None,
+        prompt="perform the delegated task",
         child_timeout_override=30,
         retain_session=True,
         subagent_type="general-purpose",
@@ -2067,10 +2066,10 @@ def test_initial_retained_history_projects_handle_only_tool_results(monkeypatch)
     }
     dt._run_single_child(
         task_index=0,
-        goal="read notion",
+        description="read notion",
         child=child,
         parent_agent=_parent(),
-        context=None,
+        prompt="perform the delegated task",
         child_timeout_override=30,
         retain_session=True,
         subagent_type="general-purpose",
@@ -2150,10 +2149,10 @@ def test_run_single_child_does_not_retain_without_parent_session_id(monkeypatch)
 
     entry = dt._run_single_child(
         task_index=0,
-        goal="stateless request",
+        description="stateless request",
         child=_CompletedRetainableChild(),
         parent_agent=_parent(""),
-        context=None,
+        prompt="perform the delegated task",
         child_timeout_override=30,
         retain_session=True,
         subagent_type="general-purpose",

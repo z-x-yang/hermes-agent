@@ -204,8 +204,8 @@ def _build_continuation_child(
 
     child = _build_child_agent(
         task_index=0,
-        goal=prompt,
-        context=None,
+        description="Continue retained task",
+        prompt=prompt,
         toolsets=None,
         model=creds.get("model") or record.model or resolved_profile.model,
         max_iterations=max_iterations,
@@ -440,7 +440,7 @@ def _run_continuation_entry(
 def _build_continue_payload(prompt: str) -> str:
     from tools.delegate_tool import _build_child_task_payload
 
-    return _build_child_task_payload(prompt, None)
+    return _build_child_task_payload(prompt)
 
 
 def _combined_for_async(entry: dict[str, Any]) -> dict[str, Any]:

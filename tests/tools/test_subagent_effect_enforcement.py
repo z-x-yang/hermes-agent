@@ -286,7 +286,7 @@ def test_final_dispatch_uses_the_atomically_verified_entry(
     assert replacement_calls == []
 
 
-def test_dynamic_schema_tools_dispatch_with_the_resolved_identity(monkeypatch):
+def test_static_and_dynamic_schema_tools_dispatch_with_resolved_identity(monkeypatch):
     from agent.subagent_tool_policy import ToolNamePolicy, authorize_subagent_call
     from tools.registry import ToolRegistry
 
@@ -296,7 +296,10 @@ def test_dynamic_schema_tools_dispatch_with_the_resolved_identity(monkeypatch):
 
     source_registry = registry
     cases = {
-        "delegate_task": {"goal": "inspect"},
+        "delegate_task": {
+            "description": "inspect code",
+            "prompt": "inspect the implementation",
+        },
         "image_generate": {"prompt": "draw"},
         "video_generate": {"prompt": "animate"},
     }
@@ -304,7 +307,10 @@ def test_dynamic_schema_tools_dispatch_with_the_resolved_identity(monkeypatch):
     for name, args in cases.items():
         source_entry = source_registry.get_entry(name)
         assert source_entry is not None
-        assert source_entry.dynamic_schema_overrides is not None
+        if name == "delegate_task":
+            assert source_entry.dynamic_schema_overrides is None
+        else:
+            assert source_entry.dynamic_schema_overrides is not None
         local = ToolRegistry()
         calls = []
 
@@ -312,15 +318,19 @@ def test_dynamic_schema_tools_dispatch_with_the_resolved_identity(monkeypatch):
             calls.append((_name, dict(call_args)))
             return json.dumps({"ok": _name})
 
-        local.register(
-            name=name,
-            toolset=source_entry.toolset,
-            schema=source_entry.schema,
-            handler=handler,
-            check_fn=lambda: True,
-            dynamic_schema_overrides=source_entry.dynamic_schema_overrides,
-            descriptor=source_entry.policy_descriptor,
-        )
+        register_kwargs = {
+            "name": name,
+            "toolset": source_entry.toolset,
+            "schema": source_entry.schema,
+            "handler": handler,
+            "check_fn": lambda: True,
+            "descriptor": source_entry.policy_descriptor,
+        }
+        if source_entry.dynamic_schema_overrides is not None:
+            register_kwargs["dynamic_schema_overrides"] = (
+                source_entry.dynamic_schema_overrides
+            )
+        local.register(**register_kwargs)
         definitions = local.get_definitions({name})
         snapshot = local.authority_snapshot_for_definitions(definitions)
         child = SimpleNamespace(

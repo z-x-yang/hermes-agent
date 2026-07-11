@@ -105,8 +105,8 @@ class TestToolsetIntersection:
         with patch("run_agent.AIAgent", return_value=child):
             built = _build_child_agent(
                 task_index=0,
-                goal="inspect",
-                context=None,
+                description="inspect",
+                prompt=None,
                 toolsets=None,
                 model=None,
                 max_iterations=5,
@@ -145,8 +145,8 @@ class TestToolsetIntersection:
             with patch("run_agent.AIAgent", return_value=child):
                 return _build_child_agent(
                     task_index=0,
-                    goal="work",
-                    context=None,
+                    description="work",
+                    prompt=None,
                     toolsets=None,
                     model=None,
                     max_iterations=5,
@@ -188,8 +188,8 @@ class TestToolsetIntersection:
         with patch("run_agent.AIAgent", return_value=child):
             built = _build_child_agent(
                 task_index=0,
-                goal="inspect",
-                context=None,
+                description="inspect",
+                prompt=None,
                 toolsets=None,
                 model=None,
                 max_iterations=5,
@@ -216,8 +216,8 @@ class TestToolsetIntersection:
         with patch("run_agent.AIAgent", return_value=child):
             built = _build_child_agent(
                 task_index=0,
-                goal="inspect",
-                context=None,
+                description="inspect",
+                prompt=None,
                 toolsets=None,
                 model=None,
                 max_iterations=5,

@@ -145,7 +145,9 @@ def _install_delegate_task_stubs(monkeypatch, dt, summary_fn):
 
     monkeypatch.setattr(dt, "_build_child_agent", fake_build_child_agent)
 
-    def fake_run_single_child(task_index, goal, child=None, parent_agent=None, **_kw):
+    def fake_run_single_child(
+        task_index, description, child=None, parent_agent=None, **_kw
+    ):
         return {
             "task_index": task_index,
             "status": "completed",
@@ -180,9 +182,9 @@ def test_delegate_task_batch_preserves_contextvar_cwd(tmp_path, monkeypatch):
     tokens = set_session_vars(cwd=str(ctx_cwd))
     try:
         raw = dt.delegate_task(
-            tasks=[{"goal": "a"}, {"goal": "b"}],
+            tasks=[{"description": "a", "prompt": "a"}, {"description": "b", "prompt": "b"}],
             parent_agent=parent,
-        )
+        run_in_background=False)
         payload = json.loads(raw)
         assert [r["summary"] for r in payload["results"]] == [
             str(ctx_cwd),
@@ -225,7 +227,7 @@ def test_delegate_task_background_runner_preserves_contextvar_cwd(tmp_path, monk
 
     tokens = set_session_vars(cwd=str(ctx_cwd))
     try:
-        raw = dt.delegate_task(goal="a", background=True, parent_agent=parent)
+        raw = dt.delegate_task(description="a", prompt="a", run_in_background=True, parent_agent=parent)
         payload = json.loads(raw)
         assert payload["status"] == "dispatched"
         assert captured["entry"]["results"][0]["summary"] == str(ctx_cwd)
@@ -257,11 +259,11 @@ def test_delegate_batch_reuses_one_snapshot_then_new_call_reloads(monkeypatch):
     monkeypatch.setattr(dt, "_build_child_agent", capture_builder)
 
     dt.delegate_task(
-        tasks=[{"goal": "a"}, {"goal": "b"}],
-        scheduling="foreground",
+        tasks=[{"description": "a", "prompt": "a"}, {"description": "b", "prompt": "b"}],
+        run_in_background=False,
         parent_agent=parent,
     )
-    dt.delegate_task(goal="later", scheduling="foreground", parent_agent=parent)
+    dt.delegate_task(description="later", prompt="later", run_in_background=False, parent_agent=parent)
 
     assert load_count == 2
     assert built_snapshots[:2] == [snapshots[0], snapshots[0]]

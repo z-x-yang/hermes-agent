@@ -5674,21 +5674,15 @@ class AIAgent:
         New DELEGATE_TASK_SCHEMA fields only need to be added here to reach all
         invocation paths (concurrent, sequential, inline).
         """
-        from tools.delegate_tool import (
-            _strip_model_hidden_task_fields,
-            delegate_task as _delegate_task,
-        )
+        from tools.delegate_tool import delegate_task as _delegate_task
+
         return _delegate_task(
-            goal=function_args.get("goal"),
-            context=function_args.get("context"),
-            tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
+            description=function_args.get("description"),
+            prompt=function_args.get("prompt"),
+            tasks=function_args.get("tasks"),
             subagent_type=function_args.get("subagent_type"),
-            scheduling=function_args.get("scheduling", "auto"),
-            retain_session=function_args.get("retain_session"),
-            max_iterations=function_args.get("max_iterations"),
-            role=function_args.get("role"),
+            run_in_background=function_args.get("run_in_background"),
             parent_agent=self,
-            _dispatch_origin="model",
         )
 
     def _dispatch_delegate_continue(self, function_args: dict) -> str:
