@@ -1,7 +1,7 @@
 # Worktree 安全归档与 Hermes 空间哨兵设计
 
 日期：2026-07-11
-状态：待 Zongxin 审阅
+状态：已批准并上线（2026-07-11）
 范围：Hermes 本地维护脚本与 no-agent Cron；不改变 Hermes 公共 API
 
 ## 1. 结论
