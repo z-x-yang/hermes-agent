@@ -170,28 +170,41 @@ class TestBuildToolPreview:
         assert result is not None
         assert "find something" in result
 
-    def test_delegate_task_single_goal_preview(self):
-        result = build_tool_preview("delegate_task", {"goal": "Review gateway status"})
-        assert result == "Review gateway status"
-
-    def test_delegate_task_batch_goal_preview(self):
+    def test_delegate_task_single_description_preview(self):
         result = build_tool_preview(
             "delegate_task",
-            {"tasks": [{"goal": "Review PR A"}, {"goal": "Review PR B"}]},
+            {"description": "Review gateway", "prompt": "Review gateway status"},
+        )
+        assert result == "Review gateway"
+
+    def test_delegate_task_batch_description_preview(self):
+        result = build_tool_preview(
+            "delegate_task",
+            {"tasks": [
+                {"description": "Review PR A", "prompt": "Inspect PR A"},
+                {"description": "Review PR B", "prompt": "Inspect PR B"},
+            ]},
         )
         assert result == "2 tasks: Review PR A | Review PR B"
 
-    def test_delegate_task_batch_preview_handles_missing_non_string_goals(self):
+    def test_delegate_task_batch_preview_handles_missing_non_string_descriptions(self):
         result = build_tool_preview(
             "delegate_task",
-            {"tasks": [{"goal": None}, {"goal": 123}, "not-a-task"]},
+            {"tasks": [
+                {"description": None, "prompt": "A"},
+                {"description": 123, "prompt": "B"},
+                "not-a-task",
+            ]},
         )
         assert result == "2 tasks: ? | 123"
 
     def test_delegate_task_batch_preview_respects_max_len(self):
         result = build_tool_preview(
             "delegate_task",
-            {"tasks": [{"goal": "A" * 80}, {"goal": "B" * 80}]},
+            {"tasks": [
+                {"description": "A" * 80, "prompt": "A"},
+                {"description": "B" * 80, "prompt": "B"},
+            ]},
             max_len=30,
         )
         assert result == "2 tasks: AAAAAAAAAAAAAAAAAA..."
@@ -264,10 +277,13 @@ class TestCuteToolMessagePreviewLength:
 
         assert "[error]" not in line
 
-    def test_delegate_task_batch_message_includes_goals(self):
+    def test_delegate_task_batch_message_includes_descriptions(self):
         line = get_cute_tool_message(
             "delegate_task",
-            {"tasks": [{"goal": "Review PR A"}, {"goal": "Review PR B"}]},
+            {"tasks": [
+                {"description": "Review PR A", "prompt": "Inspect PR A"},
+                {"description": "Review PR B", "prompt": "Inspect PR B"},
+            ]},
             1.2,
         )
         assert "2x: Review PR A | Review PR B" in line

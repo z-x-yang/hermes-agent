@@ -65,184 +65,60 @@ class TestDelegateRequirements(unittest.TestCase):
     def test_always_available(self):
         self.assertTrue(check_delegate_requirements())
 
-    def test_schema_valid(self):
-        self.assertEqual(DELEGATE_TASK_SCHEMA["name"], "delegate_task")
+    def test_schema_is_static_claude_like_and_keeps_batch(self):
         props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
-        self.assertIn("goal", props)
-        self.assertIn("tasks", props)
-        self.assertIn("context", props)
-        task_props = props["tasks"]["items"]["properties"]
-
-        # Capability, budget, and timeout policy is operator-controlled. Neither
-        # the top-level call nor a batch item may select/relax these fields.
-        hidden_policy_fields = {
-            "toolsets",
-            "max_iterations",
-            "foreground_wait_timeout_seconds",
-            "child_run_timeout_seconds",
-            "max_foreground_wait_timeout_seconds",
-            "on_foreground_wait_timeout",
-            "model",
-            "provider",
+        self.assertEqual(
+            set(props),
+            {
+                "description",
+                "prompt",
+                "tasks",
+                "subagent_type",
+                "run_in_background",
+            },
+        )
+        self.assertEqual(
+            props["subagent_type"]["enum"],
+            ["Explore", "Plan", "general-purpose"],
+        )
+        item = props["tasks"]["items"]
+        item_props = item["properties"]
+        self.assertEqual(
+            set(item_props), {"description", "prompt", "subagent_type"}
+        )
+        self.assertEqual(item["required"], ["description", "prompt"])
+        for removed in (
+            "goal",
+            "context",
+            "role",
+            "retain_session",
+            "scheduling",
             "background",
-        }
-        for field in hidden_policy_fields:
-            self.assertNotIn(field, props)
-            self.assertNotIn(field, task_props)
+        ):
+            self.assertNotIn(removed, props)
+            self.assertNotIn(removed, item_props)
 
-        # ACP subprocess transport is operator-controlled via config.yaml, not
-        # the model-facing schema.
-        self.assertNotIn("acp_command", props)
-        self.assertNotIn("acp_args", props)
-        self.assertNotIn("acp_command", task_props)
-        self.assertNotIn("acp_args", task_props)
-        self.assertNotIn("maxItems", props["tasks"])  # runtime-configurable limit
+    def test_batch_keeps_one_handle_and_one_consolidated_completion_contract(self):
+        description = DELEGATE_TASK_SCHEMA["description"]
+        self.assertIn("multiple independent tasks", description)
+        self.assertIn("one batch handle", description)
+        self.assertIn("one consolidated completion", description)
 
-        subagent_type_description = props["subagent_type"]["description"]
-        subagent_type_schema = {
-            "type": "string",
-            "enum": ["Explore", "Plan", "general-purpose"],
-            "description": subagent_type_description,
-        }
-        scheduling_schema = {
-            "type": "string",
-            "enum": ["auto", "foreground", "background"],
-            "description": "Whether the parent waits, returns immediately, or uses the type default.",
-        }
-        retain_session_schema = {
-            "type": "boolean",
-            "description": "Retain the child transcript for delegate_continue.",
-        }
-        self.assertEqual(props["subagent_type"]["enum"], ["Explore", "Plan", "general-purpose"])
-        self.assertEqual(props["scheduling"]["enum"], ["auto", "foreground", "background"])
-        self.assertIn("retain_session", props)
-        self.assertEqual(props["subagent_type"], subagent_type_schema)
-        self.assertEqual(props["scheduling"], scheduling_schema)
-        self.assertEqual(props["retain_session"], retain_session_schema)
-        self.assertEqual(task_props["subagent_type"], subagent_type_schema)
-        self.assertEqual(task_props["scheduling"], scheduling_schema)
-        self.assertEqual(task_props["retain_session"], retain_session_schema)
-        for text in (subagent_type_description, task_props["subagent_type"]["description"]):
-            self.assertIn("Explore", text)
-            self.assertIn("Plan", text)
-            self.assertIn("general-purpose", text)
-            self.assertIn("Search and understand", text)
-            self.assertIn("prepare implementation-plan inputs", text)
-            self.assertIn("including edits", text)
-            self.assertIn("Omit to use general-purpose", text)
-
-    def test_schema_description_advertises_runtime_limits(self):
-        """The model must see the user's actual concurrency / spawn-depth caps,
-        not the framework defaults. Without this, models that read 'default 3'
-        will self-cap below the user's real limit.
-        """
-        from tools.delegate_tool import (
-            _build_dynamic_schema_overrides,
-            _get_max_concurrent_children,
-            _get_max_spawn_depth,
-        )
-
-        overrides = _build_dynamic_schema_overrides()
-        max_children = _get_max_concurrent_children()
-        max_depth = _get_max_spawn_depth()
-
-        desc = overrides["description"]
-        tasks_desc = overrides["parameters"]["properties"]["tasks"]["description"]
-        role_desc = overrides["parameters"]["properties"]["role"]["description"]
-
-        # Top-level description names the user's concurrency limit explicitly.
-        self.assertIn(f"up to {max_children}", desc)
-        # Top-level description names the user's spawn-depth limit explicitly.
-        self.assertIn(f"max_spawn_depth={max_depth}", desc)
-        # tasks parameter description repeats the concurrency cap.
-        self.assertIn(f"up to {max_children}", tasks_desc)
-        # role parameter description names the spawn-depth limit.
-        self.assertIn(f"max_spawn_depth={max_depth}", role_desc)
-        # One batch is one model-visible handle and one later consolidated
-        # completion, never independent handles/completions per child.
-        self.assertIn("one batch handle", desc)
-        self.assertIn("one consolidated completion", desc)
-        self.assertIn("not one handle or completion per child", desc)
-        # The misleading "default 3" / "default 2" wording is gone from
-        # every dynamic surface (model-facing).
-        for surface in (desc, tasks_desc, role_desc):
-            self.assertNotIn("default 3", surface)
-            self.assertNotIn("default 2", surface)
-
-    def test_model_facing_description_teaches_profile_routing_and_resume(self):
-        from tools.delegate_tool import _build_dynamic_schema_overrides
-
-        overrides = _build_dynamic_schema_overrides()
-        description = overrides["description"]
-        type_description = overrides["parameters"]["properties"][
-            "subagent_type"
-        ]["description"]
-
-        for text in (description, type_description):
-            self.assertIn("Explore", text)
-            self.assertIn("Plan", text)
-            self.assertIn("general-purpose", text)
-        self.assertIn("focused lookup", type_description)
-        self.assertIn("planning research", type_description)
-        self.assertIn("edits, tests, terminal/process", type_description)
-        self.assertIn("delegate_continue", description)
-        self.assertIn("retained agent_id", description)
-        self.assertIn("instead of spawning a new child", description)
-        self.assertIn("general-purpose is retained by default", description)
-        self.assertIn("Explore and Plan are one-shot by default", description)
-        self.assertIn("complete active-profile governance", description)
-        self.assertIn("exact parent-authorized action plane", description)
-        self.assertIn(
-            "CANNOT call: delegate_task, delegate_continue, clarify",
-            description,
-        )
-        self.assertNotIn(
-            "delegate_task, clarify, memory, send_message, execute_code",
-            description,
-        )
-        self.assertNotIn("while generic,", description)
-        self.assertNotIn("NO memory of your conversation", description)
-
-    def test_schema_overrides_applied_via_get_definitions(self):
-        """Registry.get_definitions() must apply dynamic_schema_overrides so
-        the model API call sees current values, not the static import-time text.
-        """
+    def test_delegate_registry_entry_has_no_dynamic_schema_override(self):
         from tools.registry import registry
-        defs = registry.get_definitions({"delegate_task"})
-        self.assertEqual(len(defs), 1)
-        fn = defs[0]["function"]
-        # Description should mention the user's actual limits, not "default 3".
-        from tools.delegate_tool import (
-            _get_max_concurrent_children,
-            _get_max_spawn_depth,
-        )
-        self.assertIn(f"up to {_get_max_concurrent_children()}", fn["description"])
-        self.assertIn(f"max_spawn_depth={_get_max_spawn_depth()}", fn["description"])
-        effective_props = fn["parameters"]["properties"]
-        self.assertIn("Default to Chinese", fn["description"])
-        self.assertNotIn("default to English", fn["description"])
-        self.assertNotIn("toolsets", fn["description"])
-        effective_task_props = effective_props["tasks"]["items"]["properties"]
-        for field in {
-            "toolsets",
-            "max_iterations",
-            "foreground_wait_timeout_seconds",
-            "child_run_timeout_seconds",
-            "max_foreground_wait_timeout_seconds",
-            "on_foreground_wait_timeout",
-            "model",
-            "provider",
-            "background",
-        }:
-            self.assertNotIn(field, effective_props)
-            self.assertNotIn(field, effective_task_props)
+
+        entry = registry.get_entry("delegate_task")
+        self.assertIsNotNone(entry)
+        self.assertIsNone(getattr(entry, "dynamic_schema_overrides", None))
+        definitions = registry.get_definitions({"delegate_task"})
+        self.assertEqual(definitions[0]["function"], DELEGATE_TASK_SCHEMA)
 
 
 class TestChildSystemPrompt(unittest.TestCase):
     def test_profile_prompt_is_static(self):
         prompt = _build_child_system_prompt(
             profile=get_subagent_profile("Explore"),
-            role="leaf",
+            allow_delegation=False,
             workspace_path="/tmp/repo",
             child_depth=1,
             max_spawn_depth=1,
@@ -264,17 +140,17 @@ class TestChildSystemPrompt(unittest.TestCase):
             MockAgent.return_value = mock_child
 
             delegate_task(
-                goal=goal,
-                context=context,
+                description=goal,
+                prompt=context,
                 subagent_type="Explore",
                 parent_agent=parent,
-            )
+            run_in_background=False)
 
         system_prompt = MockAgent.call_args.kwargs["ephemeral_system_prompt"]
         self.assertNotIn("SECRET_GOAL", system_prompt)
         self.assertNotIn("SECRET_CONTEXT", system_prompt)
         user_message = mock_child.run_conversation.call_args.kwargs["user_message"]
-        self.assertEqual(user_message, _build_child_task_payload(goal, context))
+        self.assertEqual(user_message, _build_child_task_payload(context))
 
 
 class TestStripBlockedTools(unittest.TestCase):
@@ -323,29 +199,35 @@ class TestStripBlockedTools(unittest.TestCase):
 
 class TestDelegateTask(unittest.TestCase):
     def test_no_parent_agent(self):
-        result = json.loads(delegate_task(goal="test"))
+        result = json.loads(delegate_task(description="test", run_in_background=False, prompt="test"))
         self.assertIn("error", result)
         self.assertIn("parent agent", result["error"])
 
     def test_depth_limit(self):
         parent = _make_mock_parent(depth=2)
-        result = json.loads(delegate_task(goal="test", parent_agent=parent))
+        result = json.loads(delegate_task(description="test", prompt="test", parent_agent=parent, run_in_background=False))
         self.assertIn("error", result)
         self.assertIn("depth limit", result["error"].lower())
 
     def test_no_goal_or_tasks(self):
         parent = _make_mock_parent()
-        result = json.loads(delegate_task(parent_agent=parent))
+        result = json.loads(delegate_task(parent_agent=parent, run_in_background=False))
         self.assertIn("error", result)
 
     def test_empty_goal(self):
         parent = _make_mock_parent()
-        result = json.loads(delegate_task(goal="  ", parent_agent=parent))
+        result = json.loads(delegate_task(description="  ", prompt="  ", parent_agent=parent, run_in_background=False))
         self.assertIn("error", result)
 
-    def test_task_missing_goal(self):
+    def test_task_missing_description(self):
         parent = _make_mock_parent()
-        result = json.loads(delegate_task(tasks=[{"context": "no goal here"}], parent_agent=parent))
+        result = json.loads(
+            delegate_task(
+                tasks=[{"prompt": "no description here"}],
+                parent_agent=parent,
+                run_in_background=False,
+            )
+        )
         self.assertIn("error", result)
 
     @patch("tools.delegate_tool._run_single_child")
@@ -355,13 +237,58 @@ class TestDelegateTask(unittest.TestCase):
             "summary": "Done!", "api_calls": 3, "duration_seconds": 5.0
         }
         parent = _make_mock_parent()
-        result = json.loads(delegate_task(goal="Fix tests", context="error log...", parent_agent=parent))
+        result = json.loads(delegate_task(description="Fix tests", prompt="error log...", parent_agent=parent, run_in_background=False))
         self.assertIn("results", result)
         self.assertEqual(len(result["results"]), 1)
         self.assertEqual(result["results"][0]["status"], "completed")
         self.assertEqual(result["results"][0]["summary"], "Done!")
         mock_run.assert_called_once()
-        self.assertEqual(mock_run.call_args.kwargs["context"], "error log...")
+        self.assertEqual(mock_run.call_args.kwargs["prompt"], "error log...")
+
+    def test_omitted_background_flag_dispatches_one_batch_handle(self):
+        parent = _make_mock_parent()
+        captured = {}
+
+        def fake_dispatch(**kwargs):
+            captured.update(kwargs)
+            return {"status": "dispatched", "delegation_id": "batch-1"}
+
+        credentials = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "command": None,
+            "args": [],
+        }
+        with patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            return_value=credentials,
+        ), patch(
+            "tools.delegate_tool._build_child_agent",
+            side_effect=[MagicMock(), MagicMock()],
+        ), patch(
+            "tools.async_delegation.dispatch_async_delegation_batch",
+            side_effect=fake_dispatch,
+        ):
+            result = json.loads(
+                delegate_task(
+                    tasks=[
+                        {"description": "inspect A", "prompt": "inspect A fully"},
+                        {"description": "inspect B", "prompt": "inspect B fully"},
+                    ],
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(result["status"], "dispatched")
+        self.assertEqual(result["delegation_id"], "batch-1")
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(result["descriptions"], ["inspect A", "inspect B"])
+        self.assertEqual(captured["goals"], ["inspect A", "inspect B"])
+        self.assertEqual(captured["initial_delivery_mode"], "background")
+        self.assertTrue(callable(captured["runner"]))
 
     @patch("tools.delegate_tool._run_single_child")
     def test_batch_mode(self, mock_run):
@@ -371,20 +298,20 @@ class TestDelegateTask(unittest.TestCase):
         ]
         parent = _make_mock_parent()
         tasks = [
-            {"goal": "Research topic A", "context": "Context A"},
-            {"goal": "Research topic B", "context": "Context B"},
+            {"description": "Research topic A", "prompt": "Context A"},
+            {"description": "Research topic B", "prompt": "Context B"},
         ]
-        result = json.loads(delegate_task(tasks=tasks, parent_agent=parent))
+        result = json.loads(delegate_task(tasks=tasks, parent_agent=parent, run_in_background=False))
         self.assertIn("results", result)
         self.assertEqual(len(result["results"]), 2)
         self.assertEqual(result["results"][0]["summary"], "Result A")
         self.assertEqual(result["results"][1]["summary"], "Result B")
         self.assertIn("total_duration_seconds", result)
-        contexts_by_goal = {
-            call.kwargs["goal"]: call.kwargs["context"]
+        prompts_by_description = {
+            call.kwargs["description"]: call.kwargs["prompt"]
             for call in mock_run.call_args_list
         }
-        self.assertEqual(contexts_by_goal, {
+        self.assertEqual(prompts_by_description, {
             "Research topic A": "Context A",
             "Research topic B": "Context B",
         })
@@ -410,12 +337,12 @@ class TestDelegateTask(unittest.TestCase):
         parent = _make_mock_parent()
         tasks = json.dumps(
             [
-                {"goal": "Research topic A"},
-                {"goal": "Research topic B"},
+                {"description": "Research topic A", "prompt": "Prompt A"},
+                {"description": "Research topic B", "prompt": "Prompt B"},
             ]
         )
 
-        result = json.loads(delegate_task(tasks=tasks, parent_agent=parent))
+        result = json.loads(delegate_task(tasks=tasks, parent_agent=parent, run_in_background=False))
 
         self.assertIn("results", result)
         self.assertEqual(len(result["results"]), 2)
@@ -427,7 +354,7 @@ class TestDelegateTask(unittest.TestCase):
         parent = _make_mock_parent()
 
         result = json.loads(
-            delegate_task(tasks=["not a task object"], parent_agent=parent)
+            delegate_task(tasks=["not a task object"], parent_agent=parent, run_in_background=False)
         )
 
         self.assertIn("error", result)
@@ -439,7 +366,7 @@ class TestDelegateTask(unittest.TestCase):
         parent = _make_mock_parent()
 
         result = json.loads(
-            delegate_task(tasks='[{"goal": "bad}', parent_agent=parent)
+            delegate_task(tasks='[{"description": "bad"', parent_agent=parent, run_in_background=False)
         )
 
         self.assertIn("error", result)
@@ -454,29 +381,31 @@ class TestDelegateTask(unittest.TestCase):
         }
         parent = _make_mock_parent()
         limit = _get_max_concurrent_children()
-        tasks = [{"goal": f"Task {i}"} for i in range(limit + 2)]
-        result = json.loads(delegate_task(tasks=tasks, parent_agent=parent))
+        tasks = [
+            {"description": f"Task {i}", "prompt": f"Complete task {i}."}
+            for i in range(limit + 2)
+        ]
+        result = json.loads(delegate_task(tasks=tasks, parent_agent=parent, run_in_background=False))
         # Should return an error instead of silently truncating
         self.assertIn("error", result)
         self.assertIn("Too many tasks", result["error"])
         mock_run.assert_not_called()
 
     @patch("tools.delegate_tool._run_single_child")
-    def test_batch_ignores_toplevel_goal(self, mock_run):
-        """When tasks array is provided, top-level goal/context/toolsets are ignored."""
+    def test_batch_rejects_simultaneous_single_task_fields(self, mock_run):
+        """The single-task and batch forms cannot be combined."""
         mock_run.return_value = {
             "task_index": 0, "status": "completed",
             "summary": "Done", "api_calls": 1, "duration_seconds": 1.0
         }
         parent = _make_mock_parent()
         result = json.loads(delegate_task(
-            goal="This should be ignored",
-            tasks=[{"goal": "Actual task"}],
+            description="This should be ignored", prompt="This should be ignored",
+            tasks=[{"description": "Actual task", "prompt": "Actual task"}],
             parent_agent=parent,
-        ))
-        # The mock was called with the tasks array item, not the top-level goal
-        call_args = mock_run.call_args
-        self.assertEqual(call_args.kwargs.get("goal") or call_args[1].get("goal", call_args[0][1] if len(call_args[0]) > 1 else None), "Actual task")
+        run_in_background=False))
+        self.assertIn("do not combine both forms", result["error"])
+        mock_run.assert_not_called()
 
     @patch("tools.delegate_tool._run_single_child")
     def test_failed_child_included_in_results(self, mock_run):
@@ -486,7 +415,7 @@ class TestDelegateTask(unittest.TestCase):
             "api_calls": 0, "duration_seconds": 0.5
         }
         parent = _make_mock_parent()
-        result = json.loads(delegate_task(goal="Break things", parent_agent=parent))
+        result = json.loads(delegate_task(description="Break things", prompt="Break things", parent_agent=parent, run_in_background=False))
         self.assertEqual(result["results"][0]["status"], "error")
         self.assertIn("Something broke", result["results"][0]["error"])
 
@@ -501,7 +430,7 @@ class TestDelegateTask(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            delegate_task(goal="Test depth", parent_agent=parent)
+            delegate_task(description="Test depth", prompt="Test depth", parent_agent=parent, run_in_background=False)
             self.assertEqual(mock_child._delegate_depth, 1)
 
     def test_active_children_tracking(self):
@@ -515,7 +444,7 @@ class TestDelegateTask(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            delegate_task(goal="Test tracking", parent_agent=parent)
+            delegate_task(description="Test tracking", prompt="Test tracking", parent_agent=parent, run_in_background=False)
             self.assertEqual(len(parent._active_children), 0)
 
     def test_child_inherits_runtime_credentials(self):
@@ -534,7 +463,7 @@ class TestDelegateTask(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            delegate_task(goal="Test runtime inheritance", parent_agent=parent)
+            delegate_task(description="Test runtime inheritance", prompt="Test runtime inheritance", parent_agent=parent, run_in_background=False)
 
             _, kwargs = MockAgent.call_args
             self.assertEqual(kwargs["base_url"], parent.base_url)
@@ -553,8 +482,8 @@ class TestDelegateTask(unittest.TestCase):
 
             _build_child_agent(
                 task_index=0,
-                goal="Keep stdout clean",
-                context=None,
+                description="Keep stdout clean",
+                prompt=None,
                 toolsets=None,
                 model=None,
                 max_iterations=10,
@@ -574,8 +503,8 @@ class TestDelegateTask(unittest.TestCase):
 
             _build_child_agent(
                 task_index=0,
-                goal="Avoid raw child spinners",
-                context=None,
+                description="Avoid raw child spinners",
+                prompt=None,
                 toolsets=None,
                 model=None,
                 max_iterations=10,
@@ -608,7 +537,7 @@ class TestToolNamePreservation(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            delegate_task(goal="Test tool preservation", parent_agent=parent)
+            delegate_task(description="Test tool preservation", prompt="Test tool preservation", parent_agent=parent, run_in_background=False)
 
         self.assertEqual(model_tools._last_resolved_tool_names, original_tools)
 
@@ -625,7 +554,7 @@ class TestToolNamePreservation(unittest.TestCase):
             mock_child.run_conversation.side_effect = RuntimeError("boom")
             MockAgent.return_value = mock_child
 
-            result = json.loads(delegate_task(goal="Crash test", parent_agent=parent))
+            result = json.loads(delegate_task(description="Crash test", prompt="Crash test", parent_agent=parent, run_in_background=False))
             self.assertEqual(result["results"][0]["status"], "error")
 
         self.assertEqual(model_tools._last_resolved_tool_names, original_tools)
@@ -644,8 +573,8 @@ class TestToolNamePreservation(unittest.TestCase):
             try:
                 _build_child_agent(
                     task_index=0,
-                    goal="regression check",
-                    context=None,
+                    description="regression check",
+                    prompt=None,
                     toolsets=None,
                     model=None,
                     max_iterations=10,
@@ -675,8 +604,8 @@ class TestToolNamePreservation(unittest.TestCase):
 
             _build_child_agent(
                 task_index=0,
-                goal="search X for crypto twitter",
-                context=None,
+                description="search X for crypto twitter",
+                prompt=None,
                 toolsets=None,
                 model=None,
                 max_iterations=10,
@@ -716,8 +645,8 @@ class TestToolNamePreservation(unittest.TestCase):
 
             _build_child_agent(
                 task_index=0,
-                goal="copilot path",
-                context=None,
+                description="copilot path",
+                prompt=None,
                 toolsets=None,
                 model=None,
                 max_iterations=10,
@@ -736,12 +665,7 @@ class TestToolNamePreservation(unittest.TestCase):
 
     def test_schema_never_exposes_acp_transport_fields(self):
         """delegate_task must never make ACP transport model-facing."""
-        from tools.delegate_tool import _build_dynamic_schema_overrides
-
-        with patch("shutil.which", return_value="/usr/local/bin/copilot"):
-            overrides = _build_dynamic_schema_overrides()
-
-        props = overrides["parameters"]["properties"]
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
         self.assertNotIn("acp_command", props)
         self.assertNotIn("acp_args", props)
 
@@ -770,7 +694,7 @@ class TestToolNamePreservation(unittest.TestCase):
             mock_child.run_conversation.side_effect = capture_and_return
             MockAgent.return_value = mock_child
 
-            delegate_task(goal="capture test", parent_agent=parent)
+            delegate_task(description="capture test", prompt="capture test", parent_agent=parent, run_in_background=False)
 
         self.assertEqual(captured["saved"], expected_tools)
 
@@ -803,7 +727,7 @@ class TestDelegateObservability(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            result = json.loads(delegate_task(goal="Test observability", parent_agent=parent))
+            result = json.loads(delegate_task(description="Test observability", prompt="Test observability", parent_agent=parent, run_in_background=False))
             entry = result["results"][0]
 
             # Core observability fields
@@ -844,7 +768,7 @@ class TestDelegateObservability(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            result = json.loads(delegate_task(goal="Test list content", parent_agent=parent))
+            result = json.loads(delegate_task(description="Test list content", prompt="Test list content", parent_agent=parent, run_in_background=False))
             trace = result["results"][0]["tool_trace"]
             self.assertEqual(trace[0]["tool"], "image_generate")
             self.assertEqual(trace[0]["status"], "ok")
@@ -907,7 +831,7 @@ class TestDelegateObservability(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            result = json.loads(delegate_task(goal="Test error trace", parent_agent=parent))
+            result = json.loads(delegate_task(description="Test error trace", prompt="Test error trace", parent_agent=parent, run_in_background=False))
             trace = result["results"][0]["tool_trace"]
             self.assertEqual(trace[0]["status"], "error")
 
@@ -939,7 +863,7 @@ class TestDelegateObservability(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            result = json.loads(delegate_task(goal="Test parallel", parent_agent=parent))
+            result = json.loads(delegate_task(description="Test parallel", prompt="Test parallel", parent_agent=parent, run_in_background=False))
             trace = result["results"][0]["tool_trace"]
 
             # All three tool calls should have results
@@ -978,7 +902,7 @@ class TestDelegateObservability(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            result = json.loads(delegate_task(goal="Test interrupt", parent_agent=parent))
+            result = json.loads(delegate_task(description="Test interrupt", prompt="Test interrupt", parent_agent=parent, run_in_background=False))
             self.assertEqual(result["results"][0]["exit_reason"], "interrupted")
 
     def test_exit_reason_max_iterations(self):
@@ -999,7 +923,7 @@ class TestDelegateObservability(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            result = json.loads(delegate_task(goal="Test max iter", parent_agent=parent))
+            result = json.loads(delegate_task(description="Test max iter", prompt="Test max iter", parent_agent=parent, run_in_background=False))
             self.assertEqual(result["results"][0]["exit_reason"], "max_iterations")
 
     def test_empty_sentinel_marks_status_failed(self):
@@ -1024,7 +948,7 @@ class TestDelegateObservability(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            result = json.loads(delegate_task(goal="Test empty sentinel", parent_agent=parent))
+            result = json.loads(delegate_task(description="Test empty sentinel", prompt="Test empty sentinel", parent_agent=parent, run_in_background=False))
             self.assertEqual(result["results"][0]["status"], "failed")
 
 
@@ -1060,7 +984,7 @@ class TestSubagentCostRollup(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            result = json.loads(delegate_task(goal="do stuff", parent_agent=parent))
+            result = json.loads(delegate_task(description="do stuff", prompt="do stuff", parent_agent=parent, run_in_background=False))
 
         # Parent footer must reflect parent_cost + child_cost.
         self.assertAlmostEqual(parent.session_estimated_cost_usd, 0.52, places=6)
@@ -1079,7 +1003,6 @@ class TestSubagentCostRollup(unittest.TestCase):
                     "summary": "A",
                     "api_calls": 2,
                     "duration_seconds": 1.0,
-                    "_child_role": "leaf",
                     "_child_cost_usd": 0.15,
                 },
                 {
@@ -1088,7 +1011,6 @@ class TestSubagentCostRollup(unittest.TestCase):
                     "summary": "B",
                     "api_calls": 2,
                     "duration_seconds": 1.0,
-                    "_child_role": "leaf",
                     "_child_cost_usd": 0.27,
                 },
                 {
@@ -1098,15 +1020,14 @@ class TestSubagentCostRollup(unittest.TestCase):
                     "error": "boom",
                     "api_calls": 0,
                     "duration_seconds": 0.1,
-                    "_child_role": "leaf",
                     "_child_cost_usd": 0.03,
                 },
             ]
             result = json.loads(
                 delegate_task(
-                    tasks=[{"goal": "A"}, {"goal": "B"}, {"goal": "C"}],
+                    tasks=[{"description": "A", "prompt": "A"}, {"description": "B", "prompt": "B"}, {"description": "C", "prompt": "C"}],
                     parent_agent=parent,
-                )
+                run_in_background=False)
             )
 
         # 0.15 + 0.27 + 0.03 even though one child failed — the API calls it
@@ -1132,10 +1053,9 @@ class TestSubagentCostRollup(unittest.TestCase):
                 "summary": "done",
                 "api_calls": 1,
                 "duration_seconds": 0.5,
-                "_child_role": "leaf",
                 "_child_cost_usd": 0.0,
             }
-            delegate_task(goal="free local run", parent_agent=parent)
+            delegate_task(description="free local run", prompt="free local run", parent_agent=parent, run_in_background=False)
 
         self.assertEqual(parent.session_estimated_cost_usd, 0.0)
         self.assertEqual(parent.session_cost_source, "none")
@@ -1154,10 +1074,9 @@ class TestSubagentCostRollup(unittest.TestCase):
                 "summary": "done",
                 "api_calls": 1,
                 "duration_seconds": 0.5,
-                "_child_role": "leaf",
                 "_child_cost_usd": 0.30,
             }
-            delegate_task(goal="billed run", parent_agent=parent)
+            delegate_task(description="billed run", prompt="billed run", parent_agent=parent, run_in_background=False)
 
         self.assertAlmostEqual(parent.session_estimated_cost_usd, 0.50, places=6)
         # Real source label preserved.
@@ -1178,7 +1097,7 @@ class TestSubagentCostRollup(unittest.TestCase):
                 "duration_seconds": 0.5,
                 # no _child_role, no _child_cost_usd
             }
-            result = json.loads(delegate_task(goal="legacy", parent_agent=parent))
+            result = json.loads(delegate_task(description="legacy", prompt="legacy", parent_agent=parent, run_in_background=False))
 
         # Parent cost unchanged.
         self.assertEqual(parent.session_estimated_cost_usd, 0.10)
@@ -1360,8 +1279,8 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different endpoint.*API key"):
             _build_child_agent(
                 task_index=0,
-                goal="must not leak parent key",
-                context=None,
+                description="must not leak parent key",
+                prompt=None,
                 toolsets=None,
                 model="child-model",
                 max_iterations=5,
@@ -1544,7 +1463,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            delegate_task(goal="Test provider routing", parent_agent=parent)
+            delegate_task(description="Test provider routing", prompt="Test provider routing", parent_agent=parent, run_in_background=False)
 
             _, kwargs = MockAgent.call_args
             self.assertEqual(kwargs["model"], "google/gemini-3-flash-preview")
@@ -1581,7 +1500,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            delegate_task(goal="Cross-provider test", parent_agent=parent)
+            delegate_task(description="Cross-provider test", prompt="Cross-provider test", parent_agent=parent, run_in_background=False)
 
             _, kwargs = MockAgent.call_args
             # Child should use OpenRouter, NOT Nous
@@ -1624,7 +1543,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            delegate_task(goal="Cross-provider test", parent_agent=parent)
+            delegate_task(description="Cross-provider test", prompt="Cross-provider test", parent_agent=parent, run_in_background=False)
 
             _, kwargs = MockAgent.call_args
             self.assertEqual(kwargs["provider"], "openrouter")
@@ -1658,7 +1577,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            delegate_task(goal="Direct endpoint test", parent_agent=parent)
+            delegate_task(description="Direct endpoint test", prompt="Direct endpoint test", parent_agent=parent, run_in_background=False)
 
             _, kwargs = MockAgent.call_args
             self.assertEqual(kwargs["model"], "qwen2.5-coder")
@@ -1688,7 +1607,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            delegate_task(goal="Test inherit", parent_agent=parent)
+            delegate_task(description="Test inherit", prompt="Test inherit", parent_agent=parent, run_in_background=False)
 
             _, kwargs = MockAgent.call_args
             self.assertEqual(kwargs["model"], parent.model)
@@ -1723,8 +1642,8 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             MockAgent.return_value = mock_child
             _build_child_agent(
                 task_index=0,
-                goal="Use local Ollama",
-                context=None,
+                description="Use local Ollama",
+                prompt=None,
                 toolsets=["terminal"],
                 model=None,
                 max_iterations=10,
@@ -1746,7 +1665,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
         )
         parent = _make_mock_parent(depth=0)
 
-        result = json.loads(delegate_task(goal="Should fail", parent_agent=parent))
+        result = json.loads(delegate_task(description="Should fail", prompt="Should fail", parent_agent=parent, run_in_background=False))
         self.assertIn("error", result)
         self.assertIn("Cannot resolve", result["error"])
         self.assertIn("nonexistent", result["error"])
@@ -1781,8 +1700,11 @@ class TestDelegationProviderIntegration(unittest.TestCase):
                 "summary": "Done", "api_calls": 1, "duration_seconds": 1.0
             }
 
-            tasks = [{"goal": "Task A"}, {"goal": "Task B"}]
-            delegate_task(tasks=tasks, parent_agent=parent)
+            tasks = [
+                {"description": "Task A", "prompt": "Run task A"},
+                {"description": "Task B", "prompt": "Run task B"},
+            ]
+            delegate_task(tasks=tasks, parent_agent=parent, run_in_background=False)
 
             self.assertEqual(mock_build.call_count, 2)
             for call in mock_build.call_args_list:
@@ -1822,7 +1744,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
                 "summary": "Done", "api_calls": 1, "duration_seconds": 1.0
             }
 
-            delegate_task(goal="ACP delegation test", parent_agent=parent)
+            delegate_task(description="ACP delegation test", prompt="ACP delegation test", parent_agent=parent, run_in_background=False)
 
             _, kwargs = mock_build.call_args
             self.assertEqual(kwargs.get("override_provider"), "copilot-acp")
@@ -1857,7 +1779,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            delegate_task(goal="Model only test", parent_agent=parent)
+            delegate_task(description="Model only test", prompt="Model only test", parent_agent=parent, run_in_background=False)
 
             _, kwargs = MockAgent.call_args
             # Model should be overridden
@@ -1993,8 +1915,8 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
             _build_child_agent(
                 task_index=0,
-                goal="Test pool assignment",
-                context=None,
+                description="Test pool assignment",
+                prompt=None,
                 toolsets=["terminal"],
                 model=None,
                 max_iterations=10,
@@ -2021,8 +1943,8 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
             _build_child_agent(
                 task_index=0,
-                goal="Keep explicit endpoint key pinned",
-                context=None,
+                description="Keep explicit endpoint key pinned",
+                prompt=None,
                 toolsets=None,
                 model="child-model",
                 max_iterations=10,
@@ -2048,8 +1970,8 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
             _build_child_agent(
                 task_index=0,
-                goal="Test narrowed toolsets",
-                context=None,
+                description="Test narrowed toolsets",
+                prompt=None,
                 toolsets=["web", "browser"],
                 model=None,
                 max_iterations=10,
@@ -2076,8 +1998,8 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
             _build_child_agent(
                 task_index=0,
-                goal="Test narrowed toolsets",
-                context=None,
+                description="Test narrowed toolsets",
+                prompt=None,
                 toolsets=["web", "browser"],
                 model=None,
                 max_iterations=10,
@@ -2112,7 +2034,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
 
         result = _run_single_child(
             task_index=0,
-            goal="Investigate rate limits",
+            description="Investigate rate limits",
             child=child,
             parent_agent=_make_mock_parent(),
         )
@@ -2133,7 +2055,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
 
         result = _run_single_child(
             task_index=1,
-            goal="Trigger failure",
+            description="Trigger failure",
             child=child,
             parent_agent=_make_mock_parent(),
         )
@@ -2176,7 +2098,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.05):
             _run_single_child(
                 task_index=0,
-                goal="Test heartbeat",
+                description="Test heartbeat",
                 child=child,
                 parent_agent=parent,
             )
@@ -2211,7 +2133,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.05):
             _run_single_child(
                 task_index=0,
-                goal="Test cleanup",
+                description="Test cleanup",
                 child=child,
                 parent_agent=parent,
             )
@@ -2247,7 +2169,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.05):
             result = _run_single_child(
                 task_index=0,
-                goal="Test error cleanup",
+                description="Test error cleanup",
                 child=child,
                 parent_agent=parent,
             )
@@ -2292,7 +2214,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.05):
             _run_single_child(
                 task_index=0,
-                goal="Test desc fallback",
+                description="Test desc fallback",
                 child=child,
                 parent_agent=parent,
             )
@@ -2354,7 +2276,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         ):
             _run_single_child(
                 task_index=0,
-                goal="Test long-running tool",
+                description="Test long-running tool",
                 child=child,
                 parent_agent=parent,
             )
@@ -2380,7 +2302,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
 
         _build_child_agent(
-            task_index=0, goal="test", context=None, toolsets=None,
+            task_index=0, description="test", prompt=None, toolsets=None,
             model=None, max_iterations=50, parent_agent=parent,
             task_count=1,
         )
@@ -2397,7 +2319,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
 
         _build_child_agent(
-            task_index=0, goal="test", context=None, toolsets=None,
+            task_index=0, description="test", prompt=None, toolsets=None,
             model=None, max_iterations=50, parent_agent=parent,
             task_count=1,
         )
@@ -2413,7 +2335,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
 
         _build_child_agent(
-            task_index=0, goal="test", context=None, toolsets=None,
+            task_index=0, description="test", prompt=None, toolsets=None,
             model=None, max_iterations=50, parent_agent=parent,
             task_count=1,
         )
@@ -2430,7 +2352,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         parent.reasoning_config = {"enabled": True, "effort": "high"}
 
         _build_child_agent(
-            task_index=0, goal="test", context=None, toolsets=None,
+            task_index=0, description="test", prompt=None, toolsets=None,
             model=None, max_iterations=50, parent_agent=parent,
             task_count=1,
         )
@@ -2447,7 +2369,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         parent.reasoning_config = {"enabled": True, "effort": "medium"}
 
         _build_child_agent(
-            task_index=0, goal="test", context=None, toolsets=None,
+            task_index=0, description="test", prompt=None, toolsets=None,
             model=None, max_iterations=50, parent_agent=parent,
             task_count=1,
         )
@@ -2462,31 +2384,49 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 class TestDispatchDelegateTask(unittest.TestCase):
     """Tests for the _dispatch_delegate_task helper and full param forwarding."""
 
-    def test_delegate_task_validates_subagent_type_and_scheduling(self):
+    def test_delegate_task_validates_subagent_type_and_background_contract(self):
         parent = _make_mock_parent(depth=0)
 
-        invalid_scheduling = json.loads(
-            delegate_task(goal="test", scheduling="later", parent_agent=parent)
-        )
-        self.assertEqual(invalid_scheduling["error"], "Invalid scheduling: later")
-
         unknown_type = json.loads(
-            delegate_task(goal="test", subagent_type="review-readonly", parent_agent=parent)
+            delegate_task(
+                description="test",
+                prompt="test",
+                subagent_type="review-readonly",
+                parent_agent=parent,
+                run_in_background=False,
+            )
         )
         self.assertIn("Unsupported subagent_type", unknown_type["error"])
 
-        invalid_role = json.loads(
+        nested_parent = _make_mock_parent(depth=1)
+        with patch("tools.delegate_tool._get_max_spawn_depth", return_value=2):
+            nested_background = json.loads(
+                delegate_task(
+                    description="test",
+                    prompt="test",
+                    run_in_background=True,
+                    parent_agent=nested_parent,
+                )
+            )
+        self.assertEqual(
+            nested_background["error"],
+            "Nested delegation cannot run in the background.",
+        )
+
+        unsupported = json.loads(
             delegate_task(
-                goal="test",
-                subagent_type="Explore",
-                role="orchestrator",
+                tasks=[
+                    {
+                        "description": "inspect",
+                        "prompt": "inspect safely",
+                        "role": "orchestrator",
+                    }
+                ],
                 parent_agent=parent,
+                run_in_background=False,
             )
         )
-        self.assertEqual(
-            invalid_role["error"],
-            "subagent_type=Explore cannot use role=orchestrator",
-        )
+        self.assertIn("unsupported fields: role", unsupported["error"])
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     def test_subagent_profile_model_provider_override_reaches_child_builder(self, mock_creds):
@@ -2520,10 +2460,10 @@ class TestDispatchDelegateTask(unittest.TestCase):
             MockAgent.return_value = mock_child
 
             delegate_task(
-                goal="inspect only",
+                description="inspect only", prompt="inspect only",
                 subagent_type="Explore",
                 parent_agent=parent,
-            )
+            run_in_background=False)
 
         _, kwargs = MockAgent.call_args
         self.assertEqual(kwargs["model"], "cheap-model")
@@ -2577,10 +2517,10 @@ class TestDispatchDelegateTask(unittest.TestCase):
             MockAgent.return_value = mock_child
 
             delegate_task(
-                goal="inspect only",
+                description="inspect only", prompt="inspect only",
                 subagent_type="Explore",
                 parent_agent=parent,
-            )
+            run_in_background=False)
 
         _, kwargs = MockAgent.call_args
         self.assertEqual(kwargs["model"], "cheap-model")
@@ -2653,10 +2593,10 @@ class TestDispatchDelegateTask(unittest.TestCase):
             MockAgent.return_value = mock_child
 
             delegate_task(
-                goal="inspect only",
+                description="inspect only", prompt="inspect only",
                 subagent_type="Explore",
                 parent_agent=parent,
-            )
+            run_in_background=False)
 
         self.assertEqual(len(resolver_inputs), 1)
         self.assertEqual(resolver_inputs[0]["provider"], "openrouter")
@@ -2702,19 +2642,18 @@ class TestDispatchDelegateTask(unittest.TestCase):
             result = json.loads(
                 delegate_task(
                     tasks=[
-                        {"goal": "inspect", "subagent_type": "Explore"},
-                        {"goal": "plan", "subagent_type": "Plan"},
+                        {"description": "inspect", "subagent_type": "Explore", "prompt": "inspect"},
+                        {"description": "plan", "subagent_type": "Plan", "prompt": "plan"},
                     ],
                     parent_agent=parent,
-                )
+                run_in_background=False)
             )
 
         self.assertEqual(result["error"], "Cannot resolve Plan credentials")
         self.assertEqual(mock_creds.call_count, 2)
         MockAgent.assert_not_called()
 
-    def test_model_acp_args_not_forwarded(self):
-        """The live model dispatch path strips hidden ACP transport args."""
+    def test_live_dispatch_forwards_only_static_top_level_fields(self):
         import run_agent
 
         captured = {}
@@ -2728,27 +2667,34 @@ class TestDispatchDelegateTask(unittest.TestCase):
             run_agent.AIAgent._dispatch_delegate_task(
                 parent,
                 {
-                    "goal": "test",
+                    "description": "inspect code",
+                    "prompt": "inspect the implementation",
+                    "subagent_type": "Explore",
+                    "run_in_background": False,
                     "acp_command": "claude",
                     "acp_args": ["--acp", "--stdio"],
-                    "tasks": [
-                        {
-                            "goal": "nested",
-                            "acp_command": "codex",
-                            "acp_args": ["--acp"],
-                        },
-                    ],
+                    "role": "orchestrator",
+                    "retain_session": True,
+                    "scheduling": "foreground",
                 },
             )
 
-        self.assertNotIn("acp_command", captured)
-        self.assertNotIn("acp_args", captured)
-        self.assertEqual(captured["goal"], "test")
-        self.assertNotIn("acp_command", captured["tasks"][0])
-        self.assertNotIn("acp_args", captured["tasks"][0])
+        self.assertEqual(captured["description"], "inspect code")
+        self.assertEqual(captured["prompt"], "inspect the implementation")
+        self.assertEqual(captured["subagent_type"], "Explore")
+        self.assertIs(captured["run_in_background"], False)
+        for removed in (
+            "goal",
+            "context",
+            "acp_command",
+            "acp_args",
+            "role",
+            "retain_session",
+            "scheduling",
+        ):
+            self.assertNotIn(removed, captured)
 
-    def test_new_subagent_fields_forwarded(self):
-        """The live dispatch path forwards Task 1 subagent type plumbing."""
+    def test_live_dispatch_forwards_static_batch_items_unchanged(self):
         import run_agent
 
         captured = {}
@@ -2757,32 +2703,22 @@ class TestDispatchDelegateTask(unittest.TestCase):
             captured.update(kwargs)
             return "{}"
 
+        tasks = [
+            {
+                "description": "plan change",
+                "prompt": "prepare the implementation plan",
+                "subagent_type": "Plan",
+            }
+        ]
         parent = _make_mock_parent(depth=0)
         with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
             run_agent.AIAgent._dispatch_delegate_task(
                 parent,
-                {
-                    "goal": "test",
-                    "subagent_type": "Explore",
-                    "scheduling": "foreground",
-                    "retain_session": True,
-                    "tasks": [
-                        {
-                            "goal": "nested",
-                            "subagent_type": "Plan",
-                            "scheduling": "auto",
-                            "retain_session": False,
-                        },
-                    ],
-                },
+                {"tasks": tasks, "run_in_background": True},
             )
 
-        self.assertEqual(captured["subagent_type"], "Explore")
-        self.assertEqual(captured["scheduling"], "foreground")
-        self.assertIs(captured["retain_session"], True)
-        self.assertEqual(captured["tasks"][0]["subagent_type"], "Plan")
-        self.assertEqual(captured["tasks"][0]["scheduling"], "auto")
-        self.assertIs(captured["tasks"][0]["retain_session"], False)
+        self.assertEqual(captured["tasks"], tasks)
+        self.assertIs(captured["run_in_background"], True)
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
@@ -3003,510 +2939,6 @@ class TestMaxSpawnDepth(unittest.TestCase):
         self.assertEqual(_get_max_spawn_depth(), 1)
 
 
-# =========================================================================
-# role param plumbing
-# =========================================================================
-#
-# These tests cover the schema + signature + stash plumbing of the role
-# param.  The full role-honoring behavior (toolset re-add, role-aware
-# prompt) lives in TestOrchestratorRoleBehavior below; these tests only
-# assert on _delegate_role stashing and on the schema shape.
-
-
-class TestOrchestratorRoleSchema(unittest.TestCase):
-    """Tests that the role param reaches the child via dispatch."""
-
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    @patch("tools.delegate_tool._load_config",
-           return_value={"max_spawn_depth": 2})
-    def _run_with_mock_child(self, role_arg, mock_cfg, mock_creds):
-        mock_creds.return_value = {
-            "provider": None, "base_url": None,
-            "api_key": None, "api_mode": None, "model": None,
-        }
-        parent = _make_mock_parent(depth=0)
-        parent.valid_tool_names = {"delegate_task", "read_file"}
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-            mock_child.run_conversation.return_value = {
-                "final_response": "done", "completed": True,
-                "api_calls": 1, "messages": [],
-            }
-            mock_child._delegate_saved_tool_names = []
-            mock_child._credential_pool = None
-            mock_child.session_prompt_tokens = 0
-            mock_child.session_completion_tokens = 0
-            mock_child.model = "test"
-            MockAgent.return_value = mock_child
-            kwargs = {"goal": "test", "parent_agent": parent}
-            if role_arg is not _SENTINEL:
-                kwargs["role"] = role_arg
-            delegate_task(**kwargs)
-            return mock_child
-
-    def test_default_role_is_leaf(self):
-        child = self._run_with_mock_child(_SENTINEL)
-        self.assertEqual(child._delegate_role, "leaf")
-
-    def test_explicit_orchestrator_role_stashed(self):
-        """role='orchestrator' reaches _build_child_agent and is stashed.
-        Full behavior (toolset re-add) lands in commit 3; commit 2 only
-        verifies the plumbing."""
-        child = self._run_with_mock_child("orchestrator")
-        self.assertEqual(child._delegate_role, "orchestrator")
-
-    def test_unknown_role_coerces_to_leaf(self):
-        """role='nonsense' → _normalize_role warns and returns 'leaf'."""
-        import logging
-        with self.assertLogs("tools.delegate_tool", level=logging.WARNING) as cm:
-            child = self._run_with_mock_child("nonsense")
-        self.assertEqual(child._delegate_role, "leaf")
-        self.assertTrue(any("coercing" in m.lower() for m in cm.output))
-
-    def test_schema_has_role_top_level_and_per_task(self):
-        from tools.delegate_tool import DELEGATE_TASK_SCHEMA
-        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
-        self.assertIn("role", props)
-        self.assertEqual(props["role"]["enum"], ["leaf", "orchestrator"])
-        task_props = props["tasks"]["items"]["properties"]
-        self.assertIn("role", task_props)
-        self.assertEqual(task_props["role"]["enum"], ["leaf", "orchestrator"])
-
-    def test_schema_omits_acp_transport_fields(self):
-        from tools.delegate_tool import DELEGATE_TASK_SCHEMA
-        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
-
-        task_props = props["tasks"]["items"]["properties"]
-        self.assertNotIn("acp_command", props)
-        self.assertNotIn("acp_args", props)
-        self.assertNotIn("acp_command", task_props)
-        self.assertNotIn("acp_args", task_props)
-
-
-# Sentinel used to distinguish "role kwarg omitted" from "role=None".
-_SENTINEL = object()
-
-
-# =========================================================================
-# role-honoring behavior
-# =========================================================================
-
-
-def _make_role_mock_child():
-    """Helper: mock child with minimal fields for delegate_task to process."""
-    mock_child = MagicMock()
-    mock_child.run_conversation.return_value = {
-        "final_response": "done", "completed": True,
-        "api_calls": 1, "messages": [],
-    }
-    mock_child._delegate_saved_tool_names = []
-    mock_child._credential_pool = None
-    mock_child.session_prompt_tokens = 0
-    mock_child.session_completion_tokens = 0
-    mock_child.model = "test"
-    return mock_child
-
-
-class TestOrchestratorRoleBehavior(unittest.TestCase):
-    """Tests that role='orchestrator' actually changes toolset + prompt."""
-
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    @patch("tools.delegate_tool._load_config",
-           return_value={"max_spawn_depth": 2})
-    def test_orchestrator_role_keeps_delegation_at_depth_1(
-        self, mock_cfg, mock_creds
-    ):
-        """role='orchestrator' + depth-0 parent with max_spawn_depth=2 →
-        child at depth 1 gets 'delegation' in enabled_toolsets (can
-        further delegate).  Requires max_spawn_depth>=2 since the new
-        default is 1 (flat)."""
-        mock_creds.return_value = {
-            "provider": None, "base_url": None,
-            "api_key": None, "api_mode": None, "model": None,
-        }
-        parent = _make_mock_parent(depth=0)
-        parent.enabled_toolsets = ["terminal", "file"]
-        parent.valid_tool_names = {"delegate_task", "read_file", "terminal"}
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = _make_role_mock_child()
-            MockAgent.return_value = mock_child
-            delegate_task(goal="test", role="orchestrator", parent_agent=parent)
-            kwargs = MockAgent.call_args[1]
-            self.assertIn("delegation", kwargs["enabled_toolsets"])
-            self.assertEqual(mock_child._delegate_role, "orchestrator")
-
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    @patch("tools.delegate_tool._load_config",
-           return_value={"max_spawn_depth": 2})
-    def test_orchestrator_blocked_at_max_spawn_depth(
-        self, mock_cfg, mock_creds
-    ):
-        """Parent at depth 1 with max_spawn_depth=2 spawns child
-        at depth 2 (the floor); role='orchestrator' degrades to leaf."""
-        mock_creds.return_value = {
-            "provider": None, "base_url": None,
-            "api_key": None, "api_mode": None, "model": None,
-        }
-        parent = _make_mock_parent(depth=1)
-        parent.enabled_toolsets = ["terminal", "delegation"]
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = _make_role_mock_child()
-            MockAgent.return_value = mock_child
-            delegate_task(goal="test", role="orchestrator", parent_agent=parent)
-            kwargs = MockAgent.call_args[1]
-            self.assertNotIn("delegation", kwargs["enabled_toolsets"])
-            self.assertEqual(mock_child._delegate_role, "leaf")
-
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    @patch("tools.delegate_tool._load_config", return_value={})
-    def test_orchestrator_blocked_at_default_flat_depth(
-        self, mock_cfg, mock_creds
-    ):
-        """With default max_spawn_depth=1 (flat), role='orchestrator'
-        on a depth-0 parent produces a depth-1 child that is already at
-        the floor — the role degrades to 'leaf' and the delegation
-        toolset is stripped.  This is the new default posture."""
-        mock_creds.return_value = {
-            "provider": None, "base_url": None,
-            "api_key": None, "api_mode": None, "model": None,
-        }
-        parent = _make_mock_parent(depth=0)
-        parent.enabled_toolsets = ["terminal", "file", "delegation"]
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = _make_role_mock_child()
-            MockAgent.return_value = mock_child
-            delegate_task(goal="test", role="orchestrator", parent_agent=parent)
-            kwargs = MockAgent.call_args[1]
-            self.assertNotIn("delegation", kwargs["enabled_toolsets"])
-            self.assertEqual(mock_child._delegate_role, "leaf")
-
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    def test_orchestrator_enabled_false_forces_leaf(self, mock_creds):
-        """Kill switch delegation.orchestrator_enabled=false overrides
-        role='orchestrator'."""
-        mock_creds.return_value = {
-            "provider": None, "base_url": None,
-            "api_key": None, "api_mode": None, "model": None,
-        }
-        parent = _make_mock_parent(depth=0)
-        parent.enabled_toolsets = ["terminal", "delegation"]
-        with patch("tools.delegate_tool._load_config",
-                   return_value={"orchestrator_enabled": False}):
-            with patch("run_agent.AIAgent") as MockAgent:
-                mock_child = _make_role_mock_child()
-                MockAgent.return_value = mock_child
-                delegate_task(goal="test", role="orchestrator",
-                              parent_agent=parent)
-                kwargs = MockAgent.call_args[1]
-                self.assertNotIn("delegation", kwargs["enabled_toolsets"])
-                self.assertEqual(mock_child._delegate_role, "leaf")
-
-    # ── Role-aware system prompt ────────────────────────────────────────
-
-    def test_leaf_prompt_does_not_mention_delegation(self):
-        prompt = _build_child_system_prompt(
-            profile=None, role="leaf", workspace_path="/tmp/repo",
-            max_spawn_depth=2, child_depth=1,
-        )
-        self.assertNotIn("delegate_task", prompt)
-        self.assertNotIn("Orchestrator Role", prompt)
-
-    def test_orchestrator_prompt_mentions_delegation_capability(self):
-        prompt = _build_child_system_prompt(
-            profile=None, role="orchestrator", workspace_path="/tmp/repo",
-            max_spawn_depth=2, child_depth=1,
-        )
-        self.assertIn("delegate_task", prompt)
-        self.assertIn("Orchestrator Role", prompt)
-        # Depth/max-depth note present and literal:
-        self.assertIn("depth 1", prompt)
-        self.assertIn("max_spawn_depth=2", prompt)
-
-    def test_orchestrator_prompt_at_depth_floor_says_children_are_leaves(self):
-        """With max_spawn_depth=2 and child_depth=1, the orchestrator's
-        own children would be at depth 2 (the floor) → must be leaves."""
-        prompt = _build_child_system_prompt(
-            profile=None, role="orchestrator", workspace_path="/tmp/repo",
-            max_spawn_depth=2, child_depth=1,
-        )
-        self.assertIn("MUST be leaves", prompt)
-
-    def test_orchestrator_prompt_below_floor_allows_more_nesting(self):
-        """With max_spawn_depth=3 and child_depth=1, the orchestrator's
-        own children can themselves be orchestrators (depth 2 < 3)."""
-        prompt = _build_child_system_prompt(
-            profile=None, role="orchestrator", workspace_path="/tmp/repo",
-            max_spawn_depth=3, child_depth=1,
-        )
-        self.assertIn("can themselves be orchestrators", prompt)
-
-    # ── Batch mode and intersection ─────────────────────────────────────
-
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    @patch("tools.delegate_tool._load_config",
-           return_value={"max_spawn_depth": 2})
-    def test_batch_mode_per_task_role_override(self, mock_cfg, mock_creds):
-        """Per-task role beats top-level; no top-level role → "leaf".
-
-        tasks=[{role:'orchestrator'},{role:'leaf'},{}] → first gets
-        delegation, second and third don't.  Requires max_spawn_depth>=2
-        (raised explicitly here) since the new default is 1 (flat).
-        """
-        mock_creds.return_value = {
-            "provider": None, "base_url": None,
-            "api_key": None, "api_mode": None, "model": None,
-        }
-        parent = _make_mock_parent(depth=0)
-        parent.enabled_toolsets = ["terminal", "file", "delegation"]
-        parent.valid_tool_names = {"delegate_task", "read_file", "terminal"}
-        built_toolsets = []
-
-        def _factory(*a, **kw):
-            m = _make_role_mock_child()
-            built_toolsets.append(kw.get("enabled_toolsets"))
-            return m
-
-        with patch("run_agent.AIAgent", side_effect=_factory):
-            delegate_task(
-                tasks=[
-                    {"goal": "A", "role": "orchestrator"},
-                    {"goal": "B", "role": "leaf"},
-                    {"goal": "C"},  # no role → falls back to top_role (leaf)
-                ],
-                parent_agent=parent,
-            )
-        self.assertIn("delegation", built_toolsets[0])
-        self.assertNotIn("delegation", built_toolsets[1])
-        self.assertNotIn("delegation", built_toolsets[2])
-
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    @patch("tools.delegate_tool._load_config",
-           return_value={"max_spawn_depth": 2})
-    def test_intersection_does_not_restore_delegation_beyond_parent(
-        self, mock_cfg, mock_creds
-    ):
-        """An orchestrator request cannot restore delegation after the parent
-        exact-name ceiling removes it, even when depth and kill-switch gates pass.
-        """
-        mock_creds.return_value = {
-            "provider": None, "base_url": None,
-            "api_key": None, "api_mode": None, "model": None,
-        }
-        parent = _make_mock_parent(depth=0)
-        parent.enabled_toolsets = ["terminal", "file"]
-        parent.valid_tool_names = {"read_file"}
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = _make_role_mock_child()
-            mock_child.valid_tool_names = {"read_file", "delegate_task"}
-            MockAgent.return_value = mock_child
-            delegate_task(goal="test", role="orchestrator",
-                          parent_agent=parent)
-            self.assertNotIn("delegation", MockAgent.call_args[1]["enabled_toolsets"])
-            self.assertNotIn("delegate_task", mock_child.valid_tool_names)
-            self.assertEqual(mock_child._delegate_role, "leaf")
-
-
-class TestOrchestratorEndToEnd(unittest.TestCase):
-    """End-to-end: parent -> orchestrator -> two-leaf nested orchestration.
-
-    Covers the acceptance gate: parent delegates to an orchestrator
-    child; the orchestrator delegates to two leaf grandchildren; the
-    role/toolset/depth chain all resolve correctly.
-
-    Mock strategy: a single AIAgent patch with a side_effect factory
-    that keys on the child's ephemeral_system_prompt — orchestrator
-    prompts contain the string "Orchestrator Role" (see
-    _build_child_system_prompt), leaves don't.  The orchestrator
-    mock's run_conversation recursively calls delegate_task with
-    tasks=[{goal:...},{goal:...}] to spawn two leaves.  This keeps
-    the test in one patch context and avoids depth-indexed nesting.
-    """
-
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    @patch("tools.delegate_tool._load_config",
-           return_value={"max_spawn_depth": 2})
-    def test_end_to_end_nested_orchestration(self, mock_cfg, mock_creds):
-        mock_creds.return_value = {
-            "provider": None, "base_url": None,
-            "api_key": None, "api_mode": None, "model": None,
-        }
-        parent = _make_mock_parent(depth=0)
-        parent.enabled_toolsets = ["terminal", "file", "delegation"]
-        parent.valid_tool_names = {"delegate_task", "read_file", "terminal"}
-
-        # (enabled_toolsets, _delegate_role) for each agent built
-        built_agents: list = []
-        # Keep the orchestrator mock around so the re-entrant delegate_task
-        # can reach it via closure.
-        orch_mock = {}
-
-        def _factory(*a, **kw):
-            prompt = kw.get("ephemeral_system_prompt", "") or ""
-            is_orchestrator = "Orchestrator Role" in prompt
-            m = _make_role_mock_child()
-            m.valid_tool_names = {"read_file", "terminal"}
-            if "delegation" in (kw.get("enabled_toolsets") or []):
-                m.valid_tool_names.add("delegate_task")
-            built_agents.append({
-                "enabled_toolsets": list(kw.get("enabled_toolsets") or []),
-                "is_orchestrator_prompt": is_orchestrator,
-            })
-
-            if is_orchestrator:
-                # Prepare the orchestrator mock as a parent-capable object
-                # so the nested delegate_task call succeeds.
-                m._delegate_depth = 1
-                m._delegate_role = "orchestrator"
-                m._active_children = []
-                m._active_children_lock = threading.Lock()
-                m._session_db = None
-                m.platform = "cli"
-                m.enabled_toolsets = ["terminal", "file", "delegation"]
-                m.api_key = "***"
-                m.base_url = ""
-                m.provider = None
-                m.api_mode = None
-                m.providers_allowed = None
-                m.providers_ignored = None
-                m.providers_order = None
-                m.provider_sort = None
-                m._print_fn = None
-                m.tool_progress_callback = None
-                m.thinking_callback = None
-                orch_mock["agent"] = m
-
-                def _orchestrator_run(user_message=None, task_id=None, stream_callback=None):
-                    # Re-entrant: orchestrator spawns two leaves
-                    delegate_task(
-                        tasks=[{"goal": "leaf-A"}, {"goal": "leaf-B"}],
-                        parent_agent=m,
-                    )
-                    return {
-                        "final_response": "orchestrated 2 workers",
-                        "completed": True, "api_calls": 1,
-                        "messages": [],
-                    }
-                m.run_conversation.side_effect = _orchestrator_run
-
-            return m
-
-        with patch("run_agent.AIAgent", side_effect=_factory) as MockAgent:
-            delegate_task(
-                goal="top-level orchestration",
-                role="orchestrator",
-                parent_agent=parent,
-            )
-
-        # 1 orchestrator + 2 leaf grandchildren = 3 agents
-        self.assertEqual(MockAgent.call_count, 3)
-        # First built = the orchestrator (parent's direct child)
-        self.assertIn("delegation", built_agents[0]["enabled_toolsets"])
-        self.assertTrue(built_agents[0]["is_orchestrator_prompt"])
-        # Next two = leaves (grandchildren)
-        self.assertNotIn("delegation", built_agents[1]["enabled_toolsets"])
-        self.assertFalse(built_agents[1]["is_orchestrator_prompt"])
-        self.assertNotIn("delegation", built_agents[2]["enabled_toolsets"])
-        self.assertFalse(built_agents[2]["is_orchestrator_prompt"])
-
-
-class TestSubagentApprovalCallback(unittest.TestCase):
-    """Subagent worker threads must have a non-interactive approval callback
-    installed so dangerous-command prompts don't fall back to input() and
-    deadlock the parent's prompt_toolkit TUI.
-
-    Governed by delegation.subagent_auto_approve:
-      false (default) → _subagent_auto_deny
-      true            → _subagent_auto_approve
-    """
-
-    def test_auto_deny_returns_deny(self):
-        from tools.delegate_tool import _subagent_auto_deny
-        self.assertEqual(
-            _subagent_auto_deny("rm -rf /tmp/x", "dangerous"),
-            "deny",
-        )
-
-    def test_auto_approve_returns_once(self):
-        from tools.delegate_tool import _subagent_auto_approve
-        self.assertEqual(
-            _subagent_auto_approve("rm -rf /tmp/x", "dangerous"),
-            "once",
-        )
-
-    @patch("tools.delegate_tool._load_config", return_value={})
-    def test_getter_defaults_to_deny(self, _mock_cfg):
-        from tools.delegate_tool import (
-            _get_subagent_approval_callback,
-            _subagent_auto_deny,
-        )
-        self.assertIs(_get_subagent_approval_callback(), _subagent_auto_deny)
-
-    @patch(
-        "tools.delegate_tool._load_config",
-        return_value={"subagent_auto_approve": False},
-    )
-    def test_getter_explicit_false_is_deny(self, _mock_cfg):
-        from tools.delegate_tool import (
-            _get_subagent_approval_callback,
-            _subagent_auto_deny,
-        )
-        self.assertIs(_get_subagent_approval_callback(), _subagent_auto_deny)
-
-    @patch(
-        "tools.delegate_tool._load_config",
-        return_value={"subagent_auto_approve": True},
-    )
-    def test_getter_true_is_approve(self, _mock_cfg):
-        from tools.delegate_tool import (
-            _get_subagent_approval_callback,
-            _subagent_auto_approve,
-        )
-        self.assertIs(_get_subagent_approval_callback(), _subagent_auto_approve)
-
-    @patch(
-        "tools.delegate_tool._load_config",
-        return_value={"subagent_auto_approve": "yes"},
-    )
-    def test_getter_truthy_string_is_approve(self, _mock_cfg):
-        """is_truthy_value accepts 'yes'/'1'/'true' as truthy."""
-        from tools.delegate_tool import (
-            _get_subagent_approval_callback,
-            _subagent_auto_approve,
-        )
-        self.assertIs(_get_subagent_approval_callback(), _subagent_auto_approve)
-
-    def test_executor_initializer_installs_callback_in_worker(self):
-        """The initializer sets the callback on the worker thread's TLS,
-        not the parent's — verifies the fix actually scopes to workers.
-        """
-        from concurrent.futures import ThreadPoolExecutor
-        from tools.terminal_tool import (
-            set_approval_callback as _set_cb,
-            _get_approval_callback,
-        )
-        from tools.delegate_tool import _subagent_auto_deny
-
-        # Parent thread has no callback.
-        _set_cb(None)
-        self.assertIsNone(_get_approval_callback())
-
-        seen = []
-
-        def worker():
-            seen.append(_get_approval_callback())
-
-        with ThreadPoolExecutor(
-            max_workers=1,
-            initializer=_set_cb,
-            initargs=(_subagent_auto_deny,),
-        ) as executor:
-            executor.submit(worker).result()
-
-        self.assertEqual(seen, [_subagent_auto_deny])
-        # Parent's callback slot is still empty (TLS isolates threads).
-        self.assertIsNone(_get_approval_callback())
-
-
 class TestFallbackModelInheritance(unittest.TestCase):
     """Subagents must inherit the parent's fallback provider chain."""
 
@@ -3520,8 +2952,8 @@ class TestFallbackModelInheritance(unittest.TestCase):
             MockAgent.return_value = MagicMock()
             _build_child_agent(
                 task_index=0,
-                goal="test fallback inheritance",
-                context=None,
+                description="test fallback inheritance",
+                prompt=None,
                 toolsets=None,
                 model=None,
                 max_iterations=10,
@@ -3549,8 +2981,8 @@ class TestFallbackModelInheritance(unittest.TestCase):
             MockAgent.return_value = MagicMock()
             _build_child_agent(
                 task_index=0,
-                goal="inherit the active fallback runtime",
-                context=None,
+                description="inherit the active fallback runtime",
+                prompt=None,
                 toolsets=None,
                 model=None,
                 max_iterations=10,
@@ -3579,8 +3011,8 @@ class TestFallbackModelInheritance(unittest.TestCase):
             MockAgent.return_value = mock_child
             _build_child_agent(
                 task_index=0,
-                goal="keep fallback after a pinned direct primary",
-                context=None,
+                description="keep fallback after a pinned direct primary",
+                prompt=None,
                 toolsets=None,
                 model="primary-model",
                 max_iterations=10,
@@ -3606,8 +3038,8 @@ class TestFallbackModelInheritance(unittest.TestCase):
             MockAgent.return_value = MagicMock()
             _build_child_agent(
                 task_index=0,
-                goal="test no fallback",
-                context=None,
+                description="test no fallback",
+                prompt=None,
                 toolsets=None,
                 model=None,
                 max_iterations=10,

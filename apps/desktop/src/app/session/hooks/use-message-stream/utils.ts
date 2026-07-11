@@ -153,7 +153,9 @@ export function delegateTaskPayloads(
         : 'subagent.progress'
 
   return tasks.map((task, index) => {
-    const goal = firstString(task.goal, args.goal, payload.context) || 'Delegated task'
+    const goal =
+      firstString(task.description, args.description, payload.context) || 'Delegated task'
+
     const summary = firstString(result.summary, payload.summary, payload.message)
 
     return {
@@ -168,7 +170,7 @@ export function delegateTaskPayloads(
       text: eventType === 'subagent.progress' ? progressText || goal : undefined,
       tool_name: eventType === 'subagent.start' ? 'delegate_task' : undefined,
       tool_preview: eventType === 'subagent.start' ? progressText : undefined,
-      toolsets: Array.isArray(task.toolsets) ? task.toolsets : Array.isArray(args.toolsets) ? args.toolsets : [],
+      toolsets: [],
       event_type: eventType,
       output_tail:
         phase === 'complete' && summary

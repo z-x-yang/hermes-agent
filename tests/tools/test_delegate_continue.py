@@ -94,6 +94,20 @@ def _parent(session_id: str = "parent-1", *, enabled_toolsets=None):
     return parent
 
 
+def test_retained_session_has_no_role_field():
+    assert "role" not in RetainedSubagentSession.__dataclass_fields__
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected"),
+    [("Explore", False), ("Plan", False), ("general-purpose", True)],
+)
+def test_retention_is_fixed_by_profile(profile, expected):
+    from tools import delegate_tool as dt
+
+    assert dt._should_retain_session(profile) is expected
+
+
 def _record(**overrides):
     now = time.time()
     from agent.subagent_governance import load_governance_snapshot
@@ -121,7 +135,6 @@ def _record(**overrides):
         "agent_id": "agent-1",
         "parent_session_id": "parent-1",
         "subagent_type": "general-purpose",
-        "role": "leaf",
         "workspace_path": "/tmp",
         "model": "model-a",
         "provider": "openrouter",
@@ -142,7 +155,6 @@ class _CompletedRetainableChild:
     session_id = "child-session"
     model = "model-a"
     provider = "openrouter"
-    _delegate_role = "leaf"
     _subagent_id = "sa-test"
     session_prompt_tokens = 0
     session_completion_tokens = 0
@@ -167,6 +179,31 @@ class _CompletedRetainableChild:
 
     def close(self):
         pass
+
+
+@pytest.mark.parametrize("subagent_type", ["Explore", "Plan"])
+def test_readonly_profiles_are_one_shot(subagent_type):
+    import tools.delegate_tool as dt
+
+    child = _attach_policy(
+        _CompletedRetainableChild(), {"read_file"}, subagent_type
+    )
+    result = dt._run_single_child(
+        task_index=0,
+        description="inspect files",
+        child=child,
+        parent_agent=_parent(),
+        prompt="inspect the requested files",
+        child_timeout_override=30,
+        subagent_type=subagent_type,
+        workspace_path="/tmp/repo",
+    )
+
+    assert result["status"] == "completed"
+    assert "agent_id" not in result
+    assert "retained_until" not in result
+    with pytest.raises(KeyError, match="Unknown retained subagent session"):
+        get_retained_subagent_session("sa-test")
 
 
 def test_retained_session_round_trip_and_ttl():
@@ -375,7 +412,7 @@ def test_successful_oversized_continuation_drops_retention_but_keeps_result(
         "the result is preserved, but agent-1 is no longer resumable."
     )
     retry = json.loads(
-        delegate_continue("agent-1", "retry", "foreground", parent_agent=_parent())
+        delegate_continue("agent-1", "retry", False, parent_agent=_parent())
     )
     assert retry == {
         "error": (
@@ -396,17 +433,20 @@ def test_retained_session_metadata_does_not_persist_api_keys():
     field_names = {field.name for field in dataclasses.fields(RetainedSubagentSession)}
     assert "api_key" not in field_names
     assert "secret" not in field_names
-    assert {"model", "provider", "subagent_type", "role", "workspace_path"}.issubset(field_names)
+    assert {"model", "provider", "subagent_type", "workspace_path"}.issubset(
+        field_names
+    )
+    assert "role" not in field_names
 
 
-def test_delegate_continue_schema_is_narrow_and_registered():
+def test_continue_schema_uses_background_boolean():
     from tools.delegate_continue_tool import DELEGATE_CONTINUE_SCHEMA
     from tools.registry import registry
     from toolsets import TOOLSETS
 
     props = DELEGATE_CONTINUE_SCHEMA["parameters"]["properties"]
-    assert set(props) == {"agent_id", "prompt", "scheduling"}
-    assert props["scheduling"]["enum"] == ["auto", "foreground", "background"]
+    assert set(props) == {"agent_id", "prompt", "run_in_background"}
+    assert props["run_in_background"] == {"type": "boolean"}
     for forbidden in {
         "subagent_type",
         "role",
@@ -473,7 +513,7 @@ def test_delegate_continue_reuses_history_and_updates_retained_record(monkeypatc
         delegate_continue(
             agent_id="agent-1",
             prompt="continue the same investigation",
-            scheduling="foreground",
+            run_in_background=False,
             parent_agent=_parent(),
         )
     )
@@ -511,12 +551,11 @@ def test_continuation_reloads_modified_current_active_governance(monkeypatch, tm
         prompts.append(
             _build_child_system_prompt(
                 profile=kwargs["profile"],
-                role=kwargs["role"],
+                allow_delegation=False,
                 workspace_path=kwargs["workspace_path_override"],
                 child_depth=1,
                 max_spawn_depth=1,
                 governance_snapshot=snapshot,
-                context_policy_capsule=kwargs["context_policy_capsule"],
             )
         )
         return _attach_policy(
@@ -669,7 +708,7 @@ def test_delegate_continue_invalid_workspace_fails_closed_and_invalidates(monkey
     missing = "/definitely/missing/hermes-retained-workspace"
     retain_subagent_session(_record(workspace_path=missing))
     first = json.loads(
-        delegate_continue("agent-1", "continue", "foreground", parent_agent=_parent())
+        delegate_continue("agent-1", "continue", False, parent_agent=_parent())
     )
     assert first["error"] == (
         "Retained subagent workspace is invalid or unavailable: "
@@ -677,7 +716,7 @@ def test_delegate_continue_invalid_workspace_fails_closed_and_invalidates(monkey
     )
 
     second = json.loads(
-        delegate_continue("agent-1", "retry", "foreground", parent_agent=_parent())
+        delegate_continue("agent-1", "retry", False, parent_agent=_parent())
     )
     assert second == first
 
@@ -727,20 +766,20 @@ def test_delegate_continue_rejects_concurrent_same_agent_without_losing_history(
     monkeypatch.setattr("tools.async_delegation.dispatch_async_delegation_batch", fake_dispatch)
 
     first = json.loads(
-        delegate_continue("agent-1", "first follow-up", "background", parent_agent=_parent())
+        delegate_continue("agent-1", "first follow-up", True, parent_agent=_parent())
     )
     assert first["status"] == "dispatched"
     assert run_started.wait(2)
 
     retain_subagent_session(_record(agent_id="agent-2"))
     different = json.loads(
-        delegate_continue("agent-2", "parallel follow-up", "background", parent_agent=_parent())
+        delegate_continue("agent-2", "parallel follow-up", True, parent_agent=_parent())
     )
     assert different["status"] == "dispatched"
     assert different_agent_started.wait(2)
 
     second = json.loads(
-        delegate_continue("agent-1", "racing follow-up", "background", parent_agent=_parent())
+        delegate_continue("agent-1", "racing follow-up", True, parent_agent=_parent())
     )
     assert second == {"error": "Retained subagent continuation already in progress: agent-1"}
 
@@ -750,7 +789,7 @@ def test_delegate_continue_rejects_concurrent_same_agent_without_losing_history(
         assert not worker.is_alive()
 
     third = json.loads(
-        delegate_continue("agent-1", "after first", "background", parent_agent=_parent())
+        delegate_continue("agent-1", "after first", True, parent_agent=_parent())
     )
     assert third["status"] == "dispatched"
     worker_threads[-1].join(timeout=2)
@@ -779,12 +818,12 @@ def test_delegate_continue_releases_claim_after_runner_exception(monkeypatch):
     monkeypatch.setattr("tools.async_delegation.dispatch_async_delegation_batch", fake_dispatch)
 
     first = json.loads(
-        delegate_continue("agent-1", "fails", "background", parent_agent=_parent())
+        delegate_continue("agent-1", "fails", True, parent_agent=_parent())
     )
     assert first["status"] == "dispatched"
 
     second = json.loads(
-        delegate_continue("agent-1", "retry", "background", parent_agent=_parent())
+        delegate_continue("agent-1", "retry", True, parent_agent=_parent())
     )
     assert second["status"] == "dispatched"
     assert dispatch_count == 2
@@ -831,7 +870,7 @@ def test_background_continue_interrupt_all_reaches_child_and_releases_claim(monk
 
     try:
         result = json.loads(
-            delegate_continue("agent-1", "keep going", "background", parent_agent=_parent())
+            delegate_continue("agent-1", "keep going", True, parent_agent=_parent())
         )
         assert result["status"] == "dispatched"
         assert run_started.wait(2)
@@ -899,7 +938,7 @@ def test_background_continue_latches_interrupt_until_child_is_built(monkeypatch)
 
     try:
         result = json.loads(
-            delegate_continue("agent-1", "keep going", "background", parent_agent=_parent())
+            delegate_continue("agent-1", "keep going", True, parent_agent=_parent())
         )
         assert result["status"] == "dispatched"
         assert build_entered.wait(2)
@@ -925,9 +964,9 @@ def test_background_continue_latches_interrupt_until_child_is_built(monkeypatch)
         async_delegation._reset_for_tests()
 
 
-@pytest.mark.parametrize("scheduling", ["background", "foreground"])
+@pytest.mark.parametrize("run_in_background", [True, False])
 def test_top_level_async_continue_is_never_parent_lifecycle_owned(
-    monkeypatch, scheduling
+    monkeypatch, run_in_background
 ):
     import tools.async_delegation as async_delegation
     from tools.delegate_continue_tool import delegate_continue
@@ -978,7 +1017,7 @@ def test_top_level_async_continue_is_never_parent_lifecycle_owned(
         "tools.delegate_continue_tool._build_continuation_child",
         fake_build,
     )
-    if scheduling == "foreground":
+    if not run_in_background:
         monkeypatch.setattr(
             "tools.delegate_tool._resolve_foreground_timeouts",
             lambda *_args, **_kwargs: (60, 60),
@@ -992,7 +1031,7 @@ def test_top_level_async_continue_is_never_parent_lifecycle_owned(
                 delegate_continue(
                     "agent-1",
                     "keep going",
-                    scheduling,
+                    run_in_background,
                     parent_agent=parent,
                 )
             )
@@ -1066,12 +1105,12 @@ def test_sync_continue_fallbacks_remain_parent_attached_while_running(
     )
     if sync_path == "nested":
         parent._delegate_depth = 1
-        scheduling = "auto"
+        run_in_background = None
     elif sync_path == "stateless":
         monkeypatch.setattr(
             "gateway.session_context.async_delivery_supported", lambda: False
         )
-        scheduling = "background"
+        run_in_background = True
     else:
         monkeypatch.setattr(
             "gateway.session_context.async_delivery_supported", lambda: True
@@ -1080,7 +1119,7 @@ def test_sync_continue_fallbacks_remain_parent_attached_while_running(
             "tools.async_delegation.dispatch_async_delegation_batch",
             lambda **_kwargs: {"status": "rejected", "error": "capacity"},
         )
-        scheduling = "background"
+        run_in_background = True
 
     retain_subagent_session(_record())
     caller = threading.Thread(
@@ -1089,7 +1128,7 @@ def test_sync_continue_fallbacks_remain_parent_attached_while_running(
                 delegate_continue(
                     "agent-1",
                     "continue inline",
-                    scheduling,
+                    run_in_background,
                     parent_agent=parent,
                 )
             )
@@ -1135,10 +1174,10 @@ def test_delegate_continue_releases_claim_after_sync_fallbacks(monkeypatch, sync
         )
 
     retain_subagent_session(_record())
-    scheduling = "auto" if sync_path == "nested" else "background"
+    run_in_background = None if sync_path == "nested" else True
     for prompt in ("first", "second"):
         result = json.loads(
-            delegate_continue("agent-1", prompt, scheduling, parent_agent=parent)
+            delegate_continue("agent-1", prompt, run_in_background, parent_agent=parent)
         )
         assert result["status"] == "completed"
 
@@ -1167,10 +1206,10 @@ def test_delegate_continue_capacity_rejection_runs_no_child_and_releases_claim(
     retain_subagent_session(_record())
 
     first = json.loads(
-        delegate_continue("agent-1", "first", "background", parent_agent=_parent())
+        delegate_continue("agent-1", "first", True, parent_agent=_parent())
     )
     second = json.loads(
-        delegate_continue("agent-1", "retry", "background", parent_agent=_parent())
+        delegate_continue("agent-1", "retry", True, parent_agent=_parent())
     )
 
     assert first == second == {
@@ -1209,14 +1248,14 @@ def test_delegate_continue_releases_claim_when_dispatch_raises(monkeypatch):
     retain_subagent_session(_record())
 
     first = json.loads(
-        delegate_continue("agent-1", "first", "background", parent_agent=_parent())
+        delegate_continue("agent-1", "first", True, parent_agent=_parent())
     )
     assert first["error"] == (
         "Failed to dispatch retained subagent continuation: dispatch boom"
     )
 
     second = json.loads(
-        delegate_continue("agent-1", "retry", "background", parent_agent=_parent())
+        delegate_continue("agent-1", "retry", True, parent_agent=_parent())
     )
     assert second == {
         "status": "rejected",
@@ -1295,7 +1334,7 @@ def test_foreground_continue_applies_run_cap_but_background_does_not(monkeypatch
         delegate_continue(
             "foreground-agent",
             "foreground",
-            "foreground",
+            False,
             parent_agent=_parent(),
         )
     )
@@ -1306,7 +1345,7 @@ def test_foreground_continue_applies_run_cap_but_background_does_not(monkeypatch
         delegate_continue(
             "background-agent",
             "background",
-            "background",
+            True,
             parent_agent=_parent(),
         )
     )
@@ -1368,7 +1407,7 @@ def test_delegate_continue_foreground_parent_interrupt_returns_without_late_queu
                     delegate_continue(
                         "agent-1",
                         "interrupt me",
-                        "foreground",
+                        False,
                         parent_agent=parent,
                     )
                 )
@@ -1486,7 +1525,7 @@ def test_foreground_run_cap_poisoned_session_stays_non_resumable_while_worker_li
     try:
         timed_out = json.loads(
             delegate_continue(
-                "agent-1", "foreground cap", "foreground", parent_agent=_parent()
+                "agent-1", "foreground cap", False, parent_agent=_parent()
             )
         )
         assert run_started.is_set()
@@ -1498,7 +1537,7 @@ def test_foreground_run_cap_poisoned_session_stays_non_resumable_while_worker_li
 
         second = json.loads(
             delegate_continue(
-                "agent-1", "must not race stale history", "foreground", parent_agent=_parent()
+                "agent-1", "must not race stale history", False, parent_agent=_parent()
             )
         )
         assert second == {
@@ -1524,7 +1563,7 @@ def test_delegate_continue_requires_owner_parent_session():
         delegate_continue(
             agent_id="agent-1",
             prompt="continue",
-            scheduling="foreground",
+            run_in_background=False,
             parent_agent=_parent("parent-1"),
         )
     )
@@ -1540,7 +1579,7 @@ def test_delegate_continue_rejects_empty_parent_session_ownership():
         delegate_continue(
             agent_id="agent-1",
             prompt="continue",
-            scheduling="foreground",
+            run_in_background=False,
             parent_agent=_parent(""),
         )
     )
@@ -1553,7 +1592,7 @@ def test_delegate_continue_rejects_empty_parent_session_ownership():
         delegate_continue(
             agent_id="agent-1",
             prompt="continue",
-            scheduling="foreground",
+            run_in_background=False,
             parent_agent=_parent("parent-1"),
         )
     )
@@ -1561,7 +1600,7 @@ def test_delegate_continue_rejects_empty_parent_session_ownership():
     assert "non-empty parent session" in empty_record_result["error"]
 
 
-def test_delegate_continue_rejects_invalid_scheduling():
+def test_delegate_continue_rejects_non_boolean_background_value():
     from tools.delegate_continue_tool import delegate_continue
 
     retain_subagent_session(_record())
@@ -1569,11 +1608,11 @@ def test_delegate_continue_rejects_invalid_scheduling():
         delegate_continue(
             agent_id="agent-1",
             prompt="continue",
-            scheduling="later",
+            run_in_background="later",
             parent_agent=_parent(),
         )
     )
-    assert result["error"] == "Invalid scheduling: later"
+    assert result["error"] == "run_in_background must be a boolean when provided."
 
 
 def test_build_continuation_child_warns_after_prior_file_writes(monkeypatch):
@@ -1639,7 +1678,7 @@ def test_build_continuation_child_preserves_explore_capability_ceiling(monkeypat
 
     monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
 
-    record = _record(subagent_type="Explore", role="leaf")
+    record = _record(subagent_type="Explore")
     child = _build_continuation_child(
         record,
         prompt="same investigation",
@@ -1654,7 +1693,7 @@ def test_build_continuation_child_preserves_explore_capability_ceiling(monkeypat
     assert "patch" not in child.valid_tool_names
     assert "terminal" not in child.valid_tool_names
     assert "delegate_continue" not in child.valid_tool_names
-    assert child._delegate_role == "leaf"
+    assert not hasattr(child, "_delegate_role")
     assert child._subagent_profile.name == "Explore"
     assert "/tmp" in child.kwargs["ephemeral_system_prompt"]
 
@@ -1746,22 +1785,22 @@ def test_build_continuation_child_intersects_exact_current_parent_tool_names(mon
         "original_has_delegate_task",
         "parent_has_delegate_task",
         "orchestrator_enabled",
-        "expected_role",
+        "expected_delegation",
     ),
     [
-        (True, True, True, "orchestrator"),
-        (False, True, True, "leaf"),
-        (True, False, True, "leaf"),
-        (True, True, False, "leaf"),
+        (True, True, True, True),
+        (False, True, True, False),
+        (True, False, True, False),
+        (True, True, False, False),
     ],
 )
-def test_orchestrator_continuation_requires_original_and_current_delegate_task(
+def test_continuation_delegation_requires_original_and_current_authority(
     monkeypatch,
     subagent_type,
     original_has_delegate_task,
     parent_has_delegate_task,
     orchestrator_enabled,
-    expected_role,
+    expected_delegation,
 ):
     from tools.delegate_continue_tool import _build_continuation_child
     from toolsets import TOOLSETS
@@ -1805,7 +1844,6 @@ def test_orchestrator_continuation_requires_original_and_current_delegate_task(
     child = _build_continuation_child(
         _record(
             subagent_type=subagent_type,
-            role="orchestrator",
             effective_allowed_tool_names=frozenset(retained_names),
         ),
         prompt="continue orchestration",
@@ -1813,9 +1851,9 @@ def test_orchestrator_continuation_requires_original_and_current_delegate_task(
     )
 
     expected_names = {"read_file"}
-    if original_has_delegate_task and parent_has_delegate_task and orchestrator_enabled:
+    if expected_delegation:
         expected_names.add("delegate_task")
-    assert child._delegate_role == expected_role
+    assert not hasattr(child, "_delegate_role")
     assert child.valid_tool_names == expected_names
     assert child._subagent_tool_policy.allowed_names == frozenset(expected_names)
     assert "delegate_continue" not in child.valid_tool_names
@@ -1894,7 +1932,6 @@ def test_run_single_child_retains_completed_general_purpose_session(monkeypatch)
         session_id = "child-session"
         model = "model-a"
         provider = "openrouter"
-        _delegate_role = "leaf"
         _subagent_id = "sa-test"
         session_prompt_tokens = 0
         session_completion_tokens = 0
@@ -1956,14 +1993,12 @@ def test_run_single_child_retains_completed_general_purpose_session(monkeypatch)
 
     entry = dt._run_single_child(
         task_index=0,
-        goal="implement",
+        description="implement",
         child=child,
         parent_agent=_parent(),
-        context=None,
+        prompt="perform the delegated task",
         child_timeout_override=30,
-        retain_session=True,
         subagent_type="general-purpose",
-        role="leaf",
         workspace_path="/tmp/repo",
     )
 
@@ -1976,7 +2011,6 @@ def test_run_single_child_retains_completed_general_purpose_session(monkeypatch)
     assert record.files_written == ("/tmp/repo/changed.py",)
     assert record.tool_trace_metadata[0][0] == "read_file"
     assert record.subagent_type == "general-purpose"
-    assert record.role == "leaf"
     assert record.workspace_path == "/tmp/repo"
     assert record.effective_allowed_tool_names == frozenset({"read_file"})
     assert record.profile_id == governance.profile_id
@@ -2012,14 +2046,12 @@ def test_run_single_child_surfaces_retention_failure(monkeypatch):
 
     entry = dt._run_single_child(
         task_index=0,
-        goal="implement",
+        description="implement",
         child=child,
         parent_agent=_parent(),
-        context=None,
+        prompt="perform the delegated task",
         child_timeout_override=30,
-        retain_session=True,
         subagent_type="general-purpose",
-        role="leaf",
         workspace_path="/tmp/repo",
     )
 
@@ -2067,14 +2099,12 @@ def test_initial_retained_history_projects_handle_only_tool_results(monkeypatch)
     }
     dt._run_single_child(
         task_index=0,
-        goal="read notion",
+        description="read notion",
         child=child,
         parent_agent=_parent(),
-        context=None,
+        prompt="perform the delegated task",
         child_timeout_override=30,
-        retain_session=True,
         subagent_type="general-purpose",
-        role="leaf",
         workspace_path="/tmp/repo",
     )
 
@@ -2150,14 +2180,12 @@ def test_run_single_child_does_not_retain_without_parent_session_id(monkeypatch)
 
     entry = dt._run_single_child(
         task_index=0,
-        goal="stateless request",
+        description="stateless request",
         child=_CompletedRetainableChild(),
         parent_agent=_parent(""),
-        context=None,
+        prompt="perform the delegated task",
         child_timeout_override=30,
-        retain_session=True,
         subagent_type="general-purpose",
-        role="leaf",
         workspace_path="/tmp/repo",
     )
 
@@ -2168,36 +2196,45 @@ def test_run_single_child_does_not_retain_without_parent_session_id(monkeypatch)
         get_retained_subagent_session("child-session")
 
 
-def test_live_agent_invoke_tool_dispatches_delegate_continue_with_parent_agent():
-    from agent.agent_runtime_helpers import invoke_tool
+def test_live_agent_adapter_dispatches_simplified_delegate_continue(monkeypatch):
+    import run_agent
+    import tools.delegate_continue_tool as dct
 
     captured = {}
 
-    class FakeAgent:
-        session_id = "parent-live"
-        valid_tool_names = {"delegate_continue"}
-        enabled_toolsets = {"delegation"}
-        disabled_toolsets = None
-        _context_engine_tool_names = set()
-        _memory_manager = None
-        _current_turn_id = "turn-1"
-        _current_api_request_id = "req-1"
+    def fake_delegate_continue(
+        agent_id,
+        prompt,
+        run_in_background=None,
+        *,
+        parent_agent=None,
+    ):
+        captured.update({
+            "agent_id": agent_id,
+            "prompt": prompt,
+            "run_in_background": run_in_background,
+            "parent_agent": parent_agent,
+        })
+        return json.dumps({"status": "completed", "agent_id": agent_id})
 
-        def _dispatch_delegate_continue(self, args):
-            captured["self"] = self
-            captured["args"] = dict(args)
-            return json.dumps({"status": "completed", "agent_id": args["agent_id"]})
+    monkeypatch.setattr(dct, "delegate_continue", fake_delegate_continue)
+    agent = object.__new__(run_agent.AIAgent)
 
-    agent = FakeAgent()
     result = json.loads(
-        invoke_tool(
+        run_agent.AIAgent._dispatch_delegate_continue(
             agent,
-            "delegate_continue",
-            {"agent_id": "agent-1", "prompt": "continue", "scheduling": "foreground"},
-            "task-1",
+            {
+                "agent_id": "agent-1",
+                "prompt": "continue",
+                "run_in_background": False,
+            },
         )
     )
 
     assert result == {"status": "completed", "agent_id": "agent-1"}
-    assert captured["self"] is agent
-    assert captured["args"]["prompt"] == "continue"
+    assert captured == {
+        "agent_id": "agent-1",
+        "prompt": "continue",
+        "run_in_background": False,
+        "parent_agent": agent,
+    }

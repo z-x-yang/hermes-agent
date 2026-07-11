@@ -245,7 +245,8 @@ class TestRunSingleChildTimeoutDump:
         parent._current_task_id = None
         return delegate_tool._run_single_child(
             task_index=0,
-            goal="test goal",
+            description="test goal",
+            prompt="test goal",
             child=child,
             parent_agent=parent,
         )
@@ -297,7 +298,8 @@ class TestRunSingleChildTimeoutDump:
         started = time.monotonic()
         result = delegate_tool._run_single_child(
             task_index=0,
-            goal="foreground child",
+            description="foreground child",
+            prompt="foreground child",
             child=child,
             parent_agent=parent,
             child_timeout_override=0.05,

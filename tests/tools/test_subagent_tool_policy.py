@@ -160,8 +160,8 @@ def test_profiled_child_filters_visible_and_runtime_tool_names():
     with patch("run_agent.AIAgent", return_value=child):
         built = _build_child_agent(
             task_index=0,
-            goal="Inspect the repository",
-            context=None,
+            description="Inspect the repository",
+            prompt="",
             toolsets=None,
             model=None,
             max_iterations=10,
@@ -189,8 +189,8 @@ def test_initial_child_intersects_exact_current_parent_tool_names(profile_name):
     with patch("run_agent.AIAgent", return_value=child):
         built = _build_child_agent(
             task_index=0,
-            goal="Stay within the current parent ceiling",
-            context=None,
+            description="Stay within the current parent ceiling",
+            prompt="",
             toolsets=None,
             model=None,
             max_iterations=10,
@@ -216,8 +216,8 @@ def test_initial_child_keeps_exact_empty_parent_tool_names_fail_closed(profile_n
     with patch("run_agent.AIAgent", return_value=child):
         built = _build_child_agent(
             task_index=0,
-            goal="Have no tools",
-            context=None,
+            description="Have no tools",
+            prompt="",
             toolsets=None,
             model=None,
             max_iterations=10,
@@ -231,7 +231,7 @@ def test_initial_child_keeps_exact_empty_parent_tool_names_fail_closed(profile_n
     assert built._subagent_tool_policy.allowed_names == frozenset()
 
 
-def test_general_purpose_orchestrator_gets_only_loaded_delegate_task_role_exception():
+def test_general_purpose_gets_delegate_task_only_when_runtime_gates_allow():
     parent = _parent_agent()
     parent.enabled_toolsets = ["file"]
     parent.valid_tool_names = {"read_file", "delegate_task"}
@@ -248,18 +248,18 @@ def test_general_purpose_orchestrator_gets_only_loaded_delegate_task_role_except
         _set_authority(child, child.valid_tool_names)
         built = _build_child_agent(
             task_index=0,
-            goal="Orchestrate one worker layer",
-            context=None,
+            description="Orchestrate one worker layer",
+            prompt="",
             toolsets=None,
             model=None,
             max_iterations=10,
             task_count=1,
             parent_agent=parent,
-            role="orchestrator",
+
             profile=get_subagent_profile("general-purpose"),
         )
 
-    assert built._delegate_role == "orchestrator"
+    assert "_delegate_role" not in built.__dict__
     assert built.valid_tool_names == {"read_file", "delegate_task"}
     assert built._subagent_tool_policy.allowed_names == frozenset(
         {"read_file", "delegate_task"}
@@ -268,12 +268,12 @@ def test_general_purpose_orchestrator_gets_only_loaded_delegate_task_role_except
 
 
 @pytest.mark.parametrize("bounded_gate", ["kill_switch", "depth"])
-def test_general_purpose_orchestrator_role_exception_requires_live_runtime_gates(
+def test_general_purpose_delegation_requires_live_runtime_gates(
     bounded_gate,
 ):
     parent = _parent_agent()
     parent.enabled_toolsets = ["file"]
-    parent.valid_tool_names = {"read_file"}
+    parent.valid_tool_names = {"read_file", "delegate_task"}
     _set_authority(parent, parent.valid_tool_names)
     child = _child_agent()
     child.valid_tool_names |= {"delegate_task", "delegate_continue"}
@@ -295,18 +295,18 @@ def test_general_purpose_orchestrator_role_exception_requires_live_runtime_gates
     ):
         built = _build_child_agent(
             task_index=0,
-            goal="Bounded orchestrator",
-            context=None,
+            description="Bounded orchestrator",
+            prompt="",
             toolsets=None,
             model=None,
             max_iterations=10,
             task_count=1,
             parent_agent=parent,
-            role="orchestrator",
+
             profile=get_subagent_profile("general-purpose"),
         )
 
-    assert built._delegate_role == "leaf"
+    assert "_delegate_role" not in built.__dict__
     assert built.valid_tool_names == {"read_file"}
     assert built._subagent_tool_policy.allowed_names == frozenset({"read_file"})
 
@@ -318,8 +318,8 @@ def test_initial_child_can_skip_parent_lifecycle_registration():
     with patch("run_agent.AIAgent", return_value=child):
         built = _build_child_agent(
             task_index=0,
-            goal="Async-owned child",
-            context=None,
+            description="Async-owned child",
+            prompt="",
             toolsets=None,
             model=None,
             max_iterations=10,
@@ -346,8 +346,8 @@ def test_omitted_profile_uses_general_purpose_policy_not_fourth_legacy_policy():
     with patch("run_agent.AIAgent", return_value=child):
         _build_child_agent(
             task_index=0,
-            goal="Legacy delegation",
-            context=None,
+            description="Legacy delegation",
+            prompt="",
             toolsets=None,
             model=None,
             max_iterations=10,

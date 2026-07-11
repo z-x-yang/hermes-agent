@@ -1,5 +1,7 @@
 # Hermes Claude-like Subagent 上线前说明
 
+> **SUPERSEDED（2026-07-11）**：本文描述的是已被进一步简化的旧审计候选，包含 dynamic schema、统一 12 字段结果、caller role、显式 retention 与三态 scheduling 等现已删除的设计。当前候选及新鲜证据以 [`2026-07-11-claude-subagent-simplification-traceability.md`](./2026-07-11-claude-subagent-simplification-traceability.md) 为准；本文仅保留为历史审计记录，不得用于 rollout 决策。
+
 ## 结论
 
 当前分支已完成 source、behavioral tests、stress、docs、73+18 traceability 和两轮 Codex 审查后的修复，**停在 merge main / Gateway restart 之前**。Main 尚未合并，Gateway 尚未重启，所以当前 Discord 会话仍运行旧版 subagent runtime。

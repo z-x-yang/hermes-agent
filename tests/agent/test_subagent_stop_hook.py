@@ -2,9 +2,9 @@
 
 Covers wire-up from tools.delegate_tool.delegate_task:
   * fires once per child in both single-task and batch modes
-  * runs on the parent thread (no re-entrancy for hook authors)
-  * carries child_role when the agent exposes _delegate_role
-  * carries child_role=None when _delegate_role is not set (pre-M3)
+  * runs on the invoking thread for nested foreground delegation
+  * carries parent/child session and completion metadata
+  * does not leak internal child-cost accounting fields
 """
 
 from __future__ import annotations
@@ -15,11 +15,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tools.delegate_tool import delegate_task
 from hermes_cli import plugins
+from tools.delegate_tool import delegate_task
 
 
-def _make_parent(depth: int = 0, session_id: str = "parent-1"):
+def _make_parent(depth: int = 1, session_id: str = "parent-1"):
+    """Use nested depth so run_in_background=False executes synchronously."""
     parent = MagicMock()
     parent.base_url = "https://openrouter.ai/api/v1"
     parent.api_key = "***"
@@ -45,8 +46,7 @@ def _make_parent(depth: int = 0, session_id: str = "parent-1"):
 
 @pytest.fixture(autouse=True)
 def _fresh_plugin_manager():
-    """Each test gets a fresh PluginManager so hook callbacks don't
-    leak between tests."""
+    """Each test gets a fresh PluginManager so callbacks do not leak."""
     original = plugins._plugin_manager
     plugins._plugin_manager = plugins.PluginManager()
     yield
@@ -55,18 +55,17 @@ def _fresh_plugin_manager():
 
 @pytest.fixture(autouse=True)
 def _stub_child_builder(monkeypatch):
-    """Replace _build_child_agent with a MagicMock factory so delegate_task
-    never transitively imports run_agent / openai.  Keeps the test runnable
-    in environments without heavyweight runtime deps installed."""
+    """Avoid importing heavyweight runtime dependencies."""
+
     def _fake_build_child(task_index, **kwargs):
         child = MagicMock()
+        child.session_id = f"child-{task_index}"
         child._delegate_saved_tool_names = []
         child._credential_pool = None
         return child
 
-    monkeypatch.setattr(
-        "tools.delegate_tool._build_child_agent", _fake_build_child,
-    )
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", _fake_build_child)
+    monkeypatch.setattr("tools.delegate_tool._get_max_spawn_depth", lambda: 2)
 
 
 def _register_capturing_hook():
@@ -81,7 +80,14 @@ def _register_capturing_hook():
     return captured
 
 
-# ── single-task mode ──────────────────────────────────────────────────────
+def _completed(index: int, summary: str, duration: float = 0.1):
+    return {
+        "task_index": index,
+        "status": "completed",
+        "summary": summary,
+        "api_calls": 1,
+        "duration_seconds": duration,
+    }
 
 
 class TestSingleTask:
@@ -89,34 +95,34 @@ class TestSingleTask:
         captured = _register_capturing_hook()
 
         with patch("tools.delegate_tool._run_single_child") as mock_run:
-            mock_run.return_value = {
-                "task_index": 0,
-                "status": "completed",
-                "summary": "Done!",
-                "api_calls": 3,
-                "duration_seconds": 5.0,
-                "_child_role": "analyst",
-            }
-            delegate_task(goal="do X", parent_agent=_make_parent())
+            mock_run.return_value = _completed(0, "Done!", 5.0)
+            delegate_task(
+                description="do X",
+                prompt="do X",
+                run_in_background=False,
+                parent_agent=_make_parent(),
+            )
 
         assert len(captured) == 1
         payload = captured[0]
-        assert payload["child_role"] == "analyst"
         assert payload["child_status"] == "completed"
         assert payload["child_summary"] == "Done!"
         assert payload["duration_ms"] == 5000
+        assert payload["child_session_id"] == "child-0"
+        assert "child_role" not in payload
 
-    def test_fires_on_parent_thread(self):
+    def test_fires_on_invoking_thread(self):
         captured = _register_capturing_hook()
         main_thread = threading.current_thread()
 
         with patch("tools.delegate_tool._run_single_child") as mock_run:
-            mock_run.return_value = {
-                "task_index": 0, "status": "completed",
-                "summary": "x", "api_calls": 1, "duration_seconds": 0.1,
-                "_child_role": None,
-            }
-            delegate_task(goal="go", parent_agent=_make_parent())
+            mock_run.return_value = _completed(0, "x")
+            delegate_task(
+                description="go",
+                prompt="go",
+                run_in_background=False,
+                parent_agent=_make_parent(),
+            )
 
         assert captured[0]["_thread"] is main_thread
 
@@ -124,20 +130,15 @@ class TestSingleTask:
         captured = _register_capturing_hook()
 
         with patch("tools.delegate_tool._run_single_child") as mock_run:
-            mock_run.return_value = {
-                "task_index": 0, "status": "completed",
-                "summary": "x", "api_calls": 1, "duration_seconds": 0.1,
-                "_child_role": None,
-            }
+            mock_run.return_value = _completed(0, "x")
             delegate_task(
-                goal="go",
+                description="go",
+                prompt="go",
+                run_in_background=False,
                 parent_agent=_make_parent(session_id="sess-xyz"),
             )
 
         assert captured[0]["parent_session_id"] == "sess-xyz"
-
-
-# ── batch mode ────────────────────────────────────────────────────────────
 
 
 class TestBatchMode:
@@ -146,79 +147,57 @@ class TestBatchMode:
 
         with patch("tools.delegate_tool._run_single_child") as mock_run:
             mock_run.side_effect = [
-                {"task_index": 0, "status": "completed",
-                 "summary": "A", "api_calls": 1, "duration_seconds": 1.0,
-                 "_child_role": "role-a"},
-                {"task_index": 1, "status": "completed",
-                 "summary": "B", "api_calls": 2, "duration_seconds": 2.0,
-                 "_child_role": "role-b"},
-                {"task_index": 2, "status": "completed",
-                 "summary": "C", "api_calls": 3, "duration_seconds": 3.0,
-                 "_child_role": "role-c"},
+                _completed(0, "A", 1.0),
+                _completed(1, "B", 2.0),
+                _completed(2, "C", 3.0),
             ]
             delegate_task(
                 tasks=[
-                    {"goal": "A"}, {"goal": "B"}, {"goal": "C"},
+                    {"description": "A", "prompt": "A"},
+                    {"description": "B", "prompt": "B"},
+                    {"description": "C", "prompt": "C"},
                 ],
+                run_in_background=False,
                 parent_agent=_make_parent(),
             )
 
         assert len(captured) == 3
-        roles = sorted(c["child_role"] for c in captured)
-        assert roles == ["role-a", "role-b", "role-c"]
+        assert sorted(c["child_summary"] for c in captured) == ["A", "B", "C"]
+        assert all("child_role" not in c for c in captured)
 
-    def test_all_fires_on_parent_thread(self):
+    def test_all_fire_on_invoking_thread(self):
         captured = _register_capturing_hook()
         main_thread = threading.current_thread()
 
         with patch("tools.delegate_tool._run_single_child") as mock_run:
-            mock_run.side_effect = [
-                {"task_index": 0, "status": "completed",
-                 "summary": "A", "api_calls": 1, "duration_seconds": 1.0,
-                 "_child_role": None},
-                {"task_index": 1, "status": "completed",
-                 "summary": "B", "api_calls": 2, "duration_seconds": 2.0,
-                 "_child_role": None},
-            ]
+            mock_run.side_effect = [_completed(0, "A"), _completed(1, "B")]
             delegate_task(
-                tasks=[{"goal": "A"}, {"goal": "B"}],
+                tasks=[
+                    {"description": "A", "prompt": "A"},
+                    {"description": "B", "prompt": "B"},
+                ],
+                run_in_background=False,
                 parent_agent=_make_parent(),
             )
 
-        for payload in captured:
-            assert payload["_thread"] is main_thread
-
-
-# ── payload shape ─────────────────────────────────────────────────────────
+        assert all(payload["_thread"] is main_thread for payload in captured)
 
 
 class TestPayloadShape:
-    def test_role_absent_becomes_none(self):
-        captured = _register_capturing_hook()
-
-        with patch("tools.delegate_tool._run_single_child") as mock_run:
-            mock_run.return_value = {
-                "task_index": 0, "status": "completed",
-                "summary": "x", "api_calls": 1, "duration_seconds": 0.1,
-                # Deliberately omit _child_role — pre-M3 shape.
-            }
-            delegate_task(goal="do X", parent_agent=_make_parent())
-
-        assert captured[0]["child_role"] is None
-
-    def test_result_does_not_leak_child_role_field(self):
-        """The internal _child_role key must be stripped before the
-        result dict is serialised to JSON."""
+    def test_internal_cost_field_does_not_leak(self):
         _register_capturing_hook()
 
         with patch("tools.delegate_tool._run_single_child") as mock_run:
-            mock_run.return_value = {
-                "task_index": 0, "status": "completed",
-                "summary": "x", "api_calls": 1, "duration_seconds": 0.1,
-                "_child_role": "leaf",
-            }
-            raw = delegate_task(goal="do X", parent_agent=_make_parent())
+            result = _completed(0, "x")
+            result["_child_cost_usd"] = 1.25
+            mock_run.return_value = result
+            raw = delegate_task(
+                description="do X",
+                prompt="do X",
+                run_in_background=False,
+                parent_agent=_make_parent(),
+            )
 
         parsed = json.loads(raw)
         assert "results" in parsed
-        assert "_child_role" not in parsed["results"][0]
+        assert "_child_cost_usd" not in parsed["results"][0]

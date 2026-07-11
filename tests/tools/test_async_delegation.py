@@ -45,7 +45,7 @@ def test_dispatch_returns_immediately_without_blocking():
 
     t0 = time.monotonic()
     res = ad.dispatch_async_delegation(
-        goal="g", context=None, toolsets=None, role="leaf", model="m",
+        goal="g", context=None, toolsets=None,  model="m",
         session_key="", runner=runner, max_async_children=3,
     )
     elapsed = time.monotonic() - t0
@@ -70,7 +70,7 @@ def test_async_executor_workers_are_daemon_threads():
         return {"status": "completed", "summary": "done"}
 
     res = ad.dispatch_async_delegation(
-        goal="daemon check", context=None, toolsets=None, role="leaf", model="m",
+        goal="daemon check", context=None, toolsets=None,  model="m",
         session_key="", runner=runner, max_async_children=1,
     )
     assert res["status"] == "dispatched"
@@ -98,7 +98,7 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
 
     res = ad.dispatch_async_delegation(
         goal="compute X", context="some context", toolsets=["web", "file"],
-        role="leaf", model="test-model", session_key="agent:main:cli:dm:local",
+         model="test-model", session_key="agent:main:cli:dm:local",
         runner=runner, max_async_children=3,
     )
     assert res["status"] == "dispatched"
@@ -119,7 +119,7 @@ def test_rich_reinjection_block_is_self_contained():
     ad.dispatch_async_delegation(
         goal="Compute the meaning of life",
         context="User is a philosopher. Respond tersely.",
-        toolsets=["web"], role="leaf", model="test-model",
+        toolsets=["web"],  model="test-model",
         session_key="", runner=runner, max_async_children=3,
     )
     evt = _drain_one()
@@ -147,13 +147,13 @@ def test_dispatch_rejected_at_capacity():
 
     for i in range(2):
         r = ad.dispatch_async_delegation(
-            goal=f"task{i}", context=None, toolsets=None, role="leaf",
+            goal=f"task{i}", context=None, toolsets=None,
             model="m", session_key="", runner=blocker, max_async_children=2,
         )
         assert r["status"] == "dispatched"
 
     r3 = ad.dispatch_async_delegation(
-        goal="task3", context=None, toolsets=None, role="leaf", model="m",
+        goal="task3", context=None, toolsets=None,  model="m",
         session_key="", runner=blocker, max_async_children=2,
     )
     assert r3["status"] == "rejected"
@@ -166,7 +166,7 @@ def test_crashed_runner_produces_error_completion():
         raise RuntimeError("subagent exploded")
 
     r = ad.dispatch_async_delegation(
-        goal="risky", context=None, toolsets=None, role="leaf", model="m",
+        goal="risky", context=None, toolsets=None,  model="m",
         session_key="", runner=boom, max_async_children=3,
     )
     assert r["status"] == "dispatched"
@@ -193,7 +193,7 @@ def test_interrupt_all_signals_running_children():
         ev.set()
 
     ad.dispatch_async_delegation(
-        goal="long task", context=None, toolsets=None, role="leaf",
+        goal="long task", context=None, toolsets=None,
         model="m", session_key="", runner=blocker,
         interrupt_fn=interrupt_fn, max_async_children=3,
     )
@@ -210,7 +210,7 @@ def test_completed_records_pruned_to_cap():
     # Run more than the retention cap quickly; ensure list doesn't grow forever.
     for i in range(ad._MAX_RETAINED_COMPLETED + 10):
         ad.dispatch_async_delegation(
-            goal=f"t{i}", context=None, toolsets=None, role="leaf", model="m",
+            goal=f"t{i}", context=None, toolsets=None,  model="m",
             session_key="", runner=lambda: {"status": "completed", "summary": "ok"},
             max_async_children=ad._MAX_RETAINED_COMPLETED + 20,
         )
@@ -239,15 +239,14 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     parent._active_children = []
     parent._active_children_lock = None
     fake_child = MagicMock()
-    fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
 
     gate = threading.Event()
 
-    def slow_child(task_index, goal, child=None, parent_agent=None, **kw):
+    def slow_child(task_index, description, child=None, parent_agent=None, **kw):
         gate.wait(timeout=5)  # a sync impl would hang delegate_task here
         return {
-            "task_index": 0, "status": "completed", "summary": f"done: {goal}",
+            "task_index": 0, "status": "completed", "summary": f"done: {description}",
             "api_calls": 1, "duration_seconds": 0.1, "model": "m",
             "exit_reason": "completed",
         }
@@ -262,8 +261,8 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     monkeypatch.setattr(dt, "_run_single_child", slow_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
     out = dt.delegate_task(
-        goal="the real task", context="ctx",
-        background=True, parent_agent=parent,
+        description="the real task", prompt="ctx",
+        run_in_background=True, parent_agent=parent,
     )
 
     import json
@@ -306,15 +305,14 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     parent._active_children_lock = None
 
     fake_child = MagicMock()
-    fake_child._delegate_role = "leaf"
 
     gate = threading.Event()
 
-    def _blocking_child(task_index, goal, child=None, parent_agent=None, **kw):
+    def _blocking_child(task_index, description, child=None, parent_agent=None, **kw):
         gate.wait(timeout=5)
         return {
             "task_index": task_index, "status": "completed",
-            "summary": f"done: {goal}", "api_calls": 1,
+            "summary": f"done: {description}", "api_calls": 1,
             "duration_seconds": 0.1, "model": "m", "exit_reason": "completed",
         }
 
@@ -330,8 +328,8 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     monkeypatch.setattr(dt, "_run_single_child", _blocking_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
     out = dt.delegate_task(
-        tasks=[{"goal": "a"}, {"goal": "b"}, {"goal": "c"}],
-        background=True,
+        tasks=[{"description": "a", "prompt": "a"}, {"description": "b", "prompt": "b"}, {"description": "c", "prompt": "c"}],
+        run_in_background=True,
         parent_agent=parent,
     )
 
@@ -341,7 +339,7 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     assert parsed["count"] == 3
     assert parsed["delegation_id"].startswith("deleg_")
     assert "delegation_ids" not in parsed
-    assert parsed["goals"] == ["a", "b", "c"]
+    assert parsed["descriptions"] == ["a", "b", "c"]
     assert "consolidated results" in parsed["note"]
     assert "single message" in parsed["note"]
     # ONE background unit for the whole fan-out (not three), and the call
@@ -367,44 +365,18 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     assert _drain_one() is None
 
 
-def test_model_dispatch_resolves_auto_by_type_and_shape():
-    """Registry-fallback scheduling matches the live model path."""
-    import tools.delegate_tool as dt
-    from unittest.mock import MagicMock, patch
+def test_registry_and_live_dispatch_forward_static_background_boolean():
+    from unittest.mock import patch
+    import run_agent
     from tools.registry import registry
 
-    top = MagicMock()
-    top._delegate_depth = 0
-    sub = MagicMock()
-    sub._delegate_depth = 1
-
-    assert dt._model_background_value({"goal": "x"}, top) is True
-    assert dt._model_background_value(
-        {"goal": "x", "subagent_type": "Explore"}, top
-    ) is False
-    assert dt._model_background_value(
-        {"goal": "x", "subagent_type": "Plan"}, top
-    ) is False
-    assert dt._model_background_value(
-        {"goal": "x", "subagent_type": "general-purpose"}, top
-    ) is True
-    assert dt._model_background_value(
-        {"tasks": [{"goal": "a", "subagent_type": "Explore"}]}, top
-    ) is False
-    assert dt._model_background_value(
-        {
-            "tasks": [
-                {"goal": "a", "subagent_type": "Explore"},
-                {"goal": "b", "subagent_type": "Explore"},
-            ]
-        },
-        top,
-    ) is True
-    assert dt._model_background_value({"goal": "x"}, sub) is False
+    class _FakeAgent:
+        _delegate_depth = 0
 
     captured = {}
 
     def fake_delegate(**kwargs):
+        captured.clear()
         captured.update(kwargs)
         return "{}"
 
@@ -412,54 +384,29 @@ def test_model_dispatch_resolves_auto_by_type_and_shape():
     assert entry is not None
     with patch("tools.delegate_tool.delegate_task", fake_delegate):
         entry.handler(
-            {"goal": "x", "subagent_type": "Explore", "scheduling": "auto"},
-            parent_agent=top,
+            {
+                "description": "inspect code",
+                "prompt": "inspect the implementation",
+                "subagent_type": "Explore",
+                "run_in_background": False,
+            },
+            parent_agent=_FakeAgent(),
         )
-    assert captured["_dispatch_origin"] == "model"
-    assert captured["scheduling"] == "auto"
-    assert "background" not in captured
-
-
-def test_run_agent_dispatch_forwards_model_origin_for_resolver():
-    """The live model path delegates scheduling instead of forcing a bool."""
-    from unittest.mock import patch
-    import run_agent
-
-    class _FakeAgent:
-        _delegate_depth = 0
-
-    captured = {}
-
-    def _fake_delegate(**kwargs):
-        captured.clear()
-        captured.update(kwargs)
-        return "{}"
-
-    with patch("tools.delegate_tool.delegate_task", _fake_delegate):
-        agent = _FakeAgent()
-        run_agent.AIAgent._dispatch_delegate_task(agent, {"goal": "x"})
-        assert captured["_dispatch_origin"] == "model"
-        assert captured["scheduling"] == "auto"
-        assert "background" not in captured
+        assert captured["run_in_background"] is False
+        assert "scheduling" not in captured
+        assert "_dispatch_origin" not in captured
 
         run_agent.AIAgent._dispatch_delegate_task(
-            agent,
+            _FakeAgent(),
             {
-                "goal": "inspect",
-                "subagent_type": "Explore",
-                "scheduling": "foreground",
+                "description": "inspect code",
+                "prompt": "inspect the implementation",
+                "run_in_background": True,
             },
         )
-        assert captured["subagent_type"] == "Explore"
-        assert captured["scheduling"] == "foreground"
-        assert captured["_dispatch_origin"] == "model"
-        assert "background" not in captured
-
-        sub = _FakeAgent()
-        sub._delegate_depth = 1
-        run_agent.AIAgent._dispatch_delegate_task(sub, {"goal": "x"})
-        assert captured["_dispatch_origin"] == "model"
-        assert "background" not in captured
+        assert captured["run_in_background"] is True
+        assert captured["description"] == "inspect code"
+        assert captured["prompt"] == "inspect the implementation"
 
 
 def test_dispatch_never_forwards_model_toolsets():
@@ -481,9 +428,15 @@ def test_dispatch_never_forwards_model_toolsets():
 
     with patch("tools.delegate_tool.delegate_task", _fake_delegate):
         run_agent.AIAgent._dispatch_delegate_task(
-            _FakeAgent(), {"goal": "x", "toolsets": ["web", "terminal"]}
+            _FakeAgent(), {
+                "description": "inspect scope",
+                "prompt": "Inspect the scoped tool surface.",
+                "toolsets": ["web", "terminal"],
+            }
         )
     assert "toolsets" not in captured
+    assert captured["description"] == "inspect scope"
+    assert captured["prompt"] == "Inspect the scoped tool surface."
 
 
 def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
@@ -499,12 +452,11 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
     parent._active_children = []
     parent._active_children_lock = threading.Lock()
     fake_child = MagicMock()
-    fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
 
     gate = threading.Event()
 
-    def slow_child(task_index, goal, child=None, parent_agent=None, **kw):
+    def slow_child(task_index, description, child=None, parent_agent=None, **kw):
         gate.wait(timeout=5)
         return {"task_index": 0, "status": "completed", "summary": "ok"}
 
@@ -521,7 +473,7 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
     with patch.object(dt, "_build_child_agent", side_effect=build_and_register), \
          patch.object(dt, "_run_single_child", side_effect=slow_child), \
          patch.object(dt, "_resolve_delegation_credentials", return_value=creds):
-        out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
+        out = dt.delegate_task(description="bg task", prompt="bg task", run_in_background=True, parent_agent=parent)
 
     import json
     assert json.loads(out)["status"] == "dispatched"
@@ -547,7 +499,7 @@ def test_concurrent_dispatch_respects_capacity():
         barrier.wait(timeout=5)
         results.append(
             ad.dispatch_async_delegation(
-                goal="race", context=None, toolsets=None, role="leaf",
+                goal="race", context=None, toolsets=None,
                 model="m", session_key="", runner=blocker,
                 max_async_children=1,
             )
@@ -575,7 +527,6 @@ def _make_async_evt(**over):
         "goal": "Investigate flaky test",
         "context": "repo /tmp/p",
         "toolsets": ["terminal"],
-        "role": "leaf",
         "model": "m",
         "status": "completed",
         "summary": "Found the bug in test_foo",

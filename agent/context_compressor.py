@@ -1319,10 +1319,23 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
         return f"[web_extract] {url_desc} ({content_len:,} chars)"
 
     if tool_name == "delegate_task":
-        goal = args.get("goal", "")
-        if len(goal) > 60:
-            goal = goal[:57] + "..."
-        return f"[delegate_task] '{goal}' ({content_len:,} chars result)"
+        descriptions: list[str] = []
+        tasks = args.get("tasks")
+        if isinstance(tasks, list):
+            descriptions = [
+                str(task.get("description") or "").strip()
+                for task in tasks
+                if isinstance(task, dict) and task.get("description")
+            ]
+        if descriptions:
+            label = " | ".join(descriptions[:3])
+            if len(descriptions) > 3:
+                label += f" (+{len(descriptions) - 3} more)"
+        else:
+            label = str(args.get("description") or "").strip()
+        if len(label) > 60:
+            label = label[:57] + "..."
+        return f"[delegate_task] '{label}' ({content_len:,} chars result)"
 
     if tool_name == "execute_code":
         code_preview = (args.get("code") or "")[:60].replace("\n", " ")

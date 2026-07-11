@@ -396,17 +396,21 @@ def redact_tool_args_for_display(tool_name: str, args: dict | None) -> dict | No
     return args
 
 
-def _delegate_task_goal_parts(tasks: Any, *, per_goal_len: int) -> tuple[int, list[str]]:
+def _delegate_task_description_parts(
+    tasks: Any, *, per_description_len: int
+) -> tuple[int, list[str]]:
     if not isinstance(tasks, list):
         return 0, []
-    goals: list[str] = []
+    descriptions: list[str] = []
     for task in tasks:
         if not isinstance(task, dict):
             continue
-        raw_goal = task.get("goal")
-        goal = "?" if raw_goal is None else _oneline(str(raw_goal))
-        goals.append(_truncate_preview(goal or "?", per_goal_len))
-    return len(goals), goals
+        raw_description = task.get("description")
+        description = "?" if raw_description is None else _oneline(str(raw_description))
+        descriptions.append(
+            _truncate_preview(description or "?", per_description_len)
+        )
+    return len(descriptions), descriptions
 
 
 def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
@@ -429,24 +433,26 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         "vision_analyze": "question",
         "skill_view": "name", "skills_list": "category",
         "cronjob": "action",
-        "execute_code": "code", "delegate_task": "goal",
+        "execute_code": "code", "delegate_task": "description",
         "clarify": "question", "skill_manage": "name",
     }
 
-    # delegate_task: show goal (single) or individual task goals (batch)
+    # delegate_task: show description (single) or task descriptions (batch)
     if tool_name == "delegate_task":
         tasks = args.get("tasks")
         if tasks and isinstance(tasks, list):
-            task_count, goals = _delegate_task_goal_parts(tasks, per_goal_len=40)
+            task_count, descriptions = _delegate_task_description_parts(
+                tasks, per_description_len=40
+            )
             preview = (
-                f"{task_count} tasks: " + " | ".join(goals)
-                if goals else f"{len(tasks)} parallel tasks"
+                f"{task_count} tasks: " + " | ".join(descriptions)
+                if descriptions else f"{len(tasks)} parallel tasks"
             )
             return _truncate_preview(preview, max_len)
-        goal = args.get("goal", "")
-        if goal is None:
+        description = args.get("description", "")
+        if description is None:
             return None
-        preview = _oneline(str(goal))
+        preview = _oneline(str(description))
         return _truncate_preview(preview, max_len) if preview else None
 
     if tool_name == "process":
@@ -1409,11 +1415,15 @@ def get_cute_tool_message(
     if tool_name == "delegate_task":
         tasks = args.get("tasks")
         if tasks and isinstance(tasks, list):
-            task_count, goals = _delegate_task_goal_parts(tasks, per_goal_len=30)
-            detail = " | ".join(goals) if goals else "parallel"
+            task_count, descriptions = _delegate_task_description_parts(
+                tasks, per_description_len=30
+            )
+            detail = " | ".join(descriptions) if descriptions else "parallel"
             count_label = task_count or len(tasks)
             return _wrap(f"┊ 🔀 delegate  {count_label}x: {_trunc(detail, 35)}  {dur}")
-        return _wrap(f"┊ 🔀 delegate  {_trunc(args.get('goal', ''), 35)}  {dur}")
+        return _wrap(
+            f"┊ 🔀 delegate  {_trunc(args.get('description', ''), 35)}  {dur}"
+        )
 
     preview = build_tool_preview(tool_name, args) or ""
     return _wrap(f"┊ ⚡ {tool_name[:9]:9} {_trunc(preview, 35)}  {dur}")

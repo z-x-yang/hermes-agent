@@ -105,8 +105,8 @@ class TestToolsetIntersection:
         with patch("run_agent.AIAgent", return_value=child):
             built = _build_child_agent(
                 task_index=0,
-                goal="inspect",
-                context=None,
+                description="inspect",
+                prompt=None,
                 toolsets=None,
                 model=None,
                 max_iterations=5,
@@ -118,90 +118,93 @@ class TestToolsetIntersection:
         assert built._subagent_profile.name == "general-purpose"
         assert built.valid_tool_names == {"read_file"}
 
-    def test_leaf_exact_policy_is_independent_of_composite_toolset_shape(self):
-        parent_names = {
-            "read_file",
-            "memory",
-            "execute_code",
-            "clarify",
-            "delegate_task",
-            "delegate_continue",
-        }
-        expected = {"read_file", "memory", "execute_code"}
-
-        def build(enabled_toolsets):
-            parent = MagicMock()
-            parent._delegate_depth = 0
-            parent.valid_tool_names = set(parent_names)
-            parent.enabled_toolsets = enabled_toolsets
-            parent._active_children = []
-            parent._active_children_lock = None
-            child = MagicMock()
-            child.valid_tool_names = (
-                set(parent_names) if "hermes-cli" in enabled_toolsets else set(expected)
-            )
-            _set_authority(parent, parent_names)
-            _set_authority(child, child.valid_tool_names)
-            with patch("run_agent.AIAgent", return_value=child):
-                return _build_child_agent(
-                    task_index=0,
-                    goal="work",
-                    context=None,
-                    toolsets=None,
-                    model=None,
-                    max_iterations=5,
-                    task_count=1,
-                    parent_agent=parent,
-                    role="leaf",
-                    profile=get_subagent_profile("general-purpose"),
-                )
-
-        composite = build({"hermes-cli"})
-        decomposed = build(
-            {
-                "file",
-                "memory",
-                "cronjob",
-                "code_execution",
-                "messaging",
-                "clarify",
-                "delegation",
-            }
-        )
-        assert composite.valid_tool_names == expected
-        assert decomposed.valid_tool_names == expected
-
-    def test_orchestrator_never_unions_delegate_task_beyond_parent(self, monkeypatch):
+    def test_general_purpose_automatically_gets_delegate_task_only_when_all_gates_allow(
+        self, monkeypatch
+    ):
         import tools.delegate_tool as dt
 
         parent = MagicMock()
         parent._delegate_depth = 0
-        parent.valid_tool_names = {"read_file"}
-        parent.enabled_toolsets = {"file"}
+        parent.valid_tool_names = {"read_file", "delegate_task"}
+        parent.enabled_toolsets = {"file", "delegation"}
         parent._active_children = []
         parent._active_children_lock = None
         child = MagicMock()
         child.valid_tool_names = {"read_file", "delegate_task"}
-
+        _set_authority(parent, parent.valid_tool_names)
+        _set_authority(child, child.valid_tool_names)
         monkeypatch.setattr(dt, "_get_orchestrator_enabled", lambda: True)
         monkeypatch.setattr(dt, "_get_max_spawn_depth", lambda: 2)
+
         with patch("run_agent.AIAgent", return_value=child):
             built = _build_child_agent(
                 task_index=0,
-                goal="inspect",
-                context=None,
+                description="decompose work",
+                prompt="split this task",
                 toolsets=None,
                 model=None,
                 max_iterations=5,
                 task_count=1,
                 parent_agent=parent,
-                role="orchestrator",
                 profile=get_subagent_profile("general-purpose"),
             )
 
-        assert "delegate_task" not in built.valid_tool_names
-        assert built._delegate_role == "leaf"
+        assert "delegate_task" in built.valid_tool_names
+        assert "delegate_continue" not in built.valid_tool_names
+        assert "clarify" not in built.valid_tool_names
+        assert "_delegate_role" not in built.__dict__
 
+    def test_automatic_delegation_fails_closed_when_any_gate_is_missing(
+        self, monkeypatch
+    ):
+        import tools.delegate_tool as dt
+
+        cases = [
+            ("Explore", True, 2, {"read_file", "delegate_task"}),
+            ("Plan", True, 2, {"read_file", "delegate_task"}),
+            ("general-purpose", False, 2, {"read_file", "delegate_task"}),
+            ("general-purpose", True, 1, {"read_file", "delegate_task"}),
+            ("general-purpose", True, 2, {"read_file"}),
+        ]
+        for profile_name, enabled, max_depth, parent_names in cases:
+            parent = MagicMock()
+            parent._delegate_depth = 0
+            parent.valid_tool_names = set(parent_names)
+            parent.enabled_toolsets = {"file", "delegation"}
+            parent._active_children = []
+            parent._active_children_lock = None
+            child = MagicMock()
+            child.valid_tool_names = {
+                "read_file",
+                "delegate_task",
+                "delegate_continue",
+                "clarify",
+            }
+            _set_authority(parent, parent.valid_tool_names)
+            _set_authority(child, child.valid_tool_names)
+            monkeypatch.setattr(
+                dt, "_get_orchestrator_enabled", lambda value=enabled: value
+            )
+            monkeypatch.setattr(
+                dt, "_get_max_spawn_depth", lambda value=max_depth: value
+            )
+            with patch("run_agent.AIAgent", return_value=child):
+                built = _build_child_agent(
+                    task_index=0,
+                    description="inspect work",
+                    prompt="inspect this task",
+                    toolsets=None,
+                    model=None,
+                    max_iterations=5,
+                    task_count=1,
+                    parent_agent=parent,
+                    profile=get_subagent_profile(profile_name),
+                )
+            assert {
+                "delegate_task",
+                "delegate_continue",
+                "clarify",
+            }.isdisjoint(built.valid_tool_names)
     def test_general_purpose_without_parent_exact_names_fails_closed(
         self, monkeypatch
     ):
@@ -216,8 +219,8 @@ class TestToolsetIntersection:
         with patch("run_agent.AIAgent", return_value=child):
             built = _build_child_agent(
                 task_index=0,
-                goal="inspect",
-                context=None,
+                description="inspect",
+                prompt=None,
                 toolsets=None,
                 model=None,
                 max_iterations=5,

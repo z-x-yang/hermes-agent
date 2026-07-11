@@ -1966,7 +1966,9 @@ class TestPluginDispatchTool:
         mock_registry.dispatch.return_value = '{"ok": true}'
 
         with patch("tools.registry.registry", mock_registry):
-            ctx.dispatch_tool("delegate_task", {"goal": "test"})
+            ctx.dispatch_tool(
+                "delegate_task", {"description": "test", "prompt": "test"}
+            )
 
         mock_registry.dispatch.assert_called_once()
         call_kwargs = mock_registry.dispatch.call_args
@@ -1983,7 +1985,9 @@ class TestPluginDispatchTool:
         mock_registry.dispatch.return_value = '{"ok": true}'
 
         with patch("tools.registry.registry", mock_registry):
-            ctx.dispatch_tool("delegate_task", {"goal": "test"})
+            ctx.dispatch_tool(
+                "delegate_task", {"description": "test", "prompt": "test"}
+            )
 
         call_kwargs = mock_registry.dispatch.call_args
         assert "parent_agent" not in call_kwargs[1]
@@ -2002,7 +2006,9 @@ class TestPluginDispatchTool:
         mock_registry.dispatch.return_value = '{"ok": true}'
 
         with patch("tools.registry.registry", mock_registry):
-            ctx.dispatch_tool("delegate_task", {"goal": "test"})
+            ctx.dispatch_tool(
+                "delegate_task", {"description": "test", "prompt": "test"}
+            )
 
         call_kwargs = mock_registry.dispatch.call_args
         assert "parent_agent" not in call_kwargs[1]
@@ -2024,7 +2030,11 @@ class TestPluginDispatchTool:
         mock_registry.dispatch.return_value = '{"ok": true}'
 
         with patch("tools.registry.registry", mock_registry):
-            ctx.dispatch_tool("delegate_task", {"goal": "test"}, parent_agent=explicit_agent)
+            ctx.dispatch_tool(
+                "delegate_task",
+                {"description": "test", "prompt": "test"},
+                parent_agent=explicit_agent,
+            )
 
         call_kwargs = mock_registry.dispatch.call_args
         assert call_kwargs[1]["parent_agent"] is explicit_agent

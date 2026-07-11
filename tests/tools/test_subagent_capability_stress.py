@@ -173,7 +173,6 @@ def test_two_hundred_retained_session_cycles_stay_bounded_and_do_not_leak_fds(
                 agent_id=agent_id,
                 parent_session_id="stress-parent",
                 subagent_type="general-purpose",
-                role="leaf",
                 workspace_path=str(tmp_path),
                 model="fake-model",
                 provider="fake-provider",

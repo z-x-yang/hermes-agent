@@ -631,13 +631,15 @@ terminal(command="tmux new-session -d -s resumed 'hermes --resume 20260225_14305
 
 ### 委派（`delegate_task` / `delegate_continue`）
 
-Hermes 只暴露 `Explore`、`Plan` 和 `general-purpose`；省略类型会解析为 `general-purpose`。`auto` 会等待单个 Explore/Plan，后台运行 general-purpose 和批次，并保留显式 foreground/background 选择。后台池已满时返回 `rejected`，不会偷偷同步执行 child。
+Hermes 只暴露 `Explore`、`Plan` 和 `general-purpose`；省略时解析为 `general-purpose`。单任务使用 `description` + 自包含 `prompt`；顶层省略 `run_in_background` 时后台执行，嵌套省略时前台执行，嵌套 true 会 fail closed。
 
-- **单个：** `delegate_task(goal, context, subagent_type=...)`。
-- **批量：** `delegate_task(tasks=[{goal, ...}, ...])` 并行运行子任务，上限由 `delegation.max_concurrent_children`（默认 3）控制。
-- **续聊：** retained general-purpose 结果会返回 `agent_id`；同一工作应使用 `delegate_continue`，不要新建 child。
-- **角色：** 默认是 `leaf`；只有显式启用的 general-purpose orchestrator 可以继续生成 worker。
-- **不持久：** process/gateway 重启会丢失后台工作和 retained session；需要持久化时使用 cron 或受管后台进程。
+- **单任务：** `delegate_task(description=..., prompt=..., subagent_type=...)`。
+- **Batch：** item 只有 `description`、`prompt` 和可选 `subagent_type`；一个 Batch 只有一个 handle 和一次 consolidated completion。
+- **生命周期：** Explore/Plan 是一次性任务；成功的 general-purpose 在 parent session 与容量可用时自动保留。
+- **续聊：** 同一 retained GP 工作使用 `delegate_continue(agent_id, prompt, run_in_background=...)`。
+- **上下文：** 每个 profile 都收到完整 governance；GP 额外加载项目上下文/workspace snapshot，Explore/Plan 跳过项目上下文。
+- **嵌套：** 由 GP 类型、current parent 精确工具权限、depth 和 kill switch 运行时派生，不由 caller role 决定。
+- **不持久：** process/Gateway restart 会丢失后台工作和 retained session；持久任务用 cron 或 managed process。
 
 配置：`config.yaml` 中的 `delegation.*`。
 

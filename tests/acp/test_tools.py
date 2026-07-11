@@ -285,6 +285,33 @@ class TestBuildToolStart:
         assert result.content[0].new_text == "new advice"
         assert result.raw_input is None
 
+    def test_delegate_task_start_uses_description_and_prompt(self):
+        result = build_tool_start(
+            "tc-delegate-single",
+            "delegate_task",
+            {"description": "Review gateway", "prompt": "Inspect the gateway race paths."},
+        )
+        assert result.content is not None
+        text = result.content[0].content.text
+        assert "Review gateway" in text
+        assert "Inspect the gateway race paths." in text
+        assert "goal" not in text.lower()
+
+    def test_delegate_task_batch_start_uses_simplified_items(self):
+        result = build_tool_start(
+            "tc-delegate-batch",
+            "delegate_task",
+            {"tasks": [
+                {"description": "Review PR A", "prompt": "Inspect PR A"},
+                {"description": "Review PR B", "prompt": "Inspect PR B"},
+            ]},
+        )
+        assert result.content is not None
+        text = result.content[0].content.text
+        assert "Review PR A" in text and "Inspect PR A" in text
+        assert "Review PR B" in text and "Inspect PR B" in text
+        assert "role" not in text.lower()
+
     def test_build_tool_start_generic_fallback(self):
         """Unknown tools should get a generic text representation."""
         args = {"foo": "bar", "baz": 42}

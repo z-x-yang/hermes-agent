@@ -120,10 +120,10 @@ def build_tool_title(tool_name: str, args: Dict[str, Any]) -> str:
         tasks = args.get("tasks")
         if isinstance(tasks, list) and tasks:
             return f"delegate batch ({len(tasks)} tasks)"
-        goal = args.get("goal", "")
-        if goal and len(goal) > 60:
-            goal = goal[:57] + "..."
-        return f"delegate: {goal}" if goal else "delegate task"
+        description = str(args.get("description") or "").strip()
+        if len(description) > 60:
+            description = description[:57] + "..."
+        return f"delegate: {description}" if description else "delegate task"
     if tool_name == "session_search":
         query = str(args.get("query") or "").strip()
         return f"session search: {query}" if query else "recent sessions"
@@ -1183,15 +1183,23 @@ def build_tool_start(
             lines = [f"Delegating {len(tasks)} tasks", ""]
             for i, task in enumerate(tasks[:8], 1):
                 if isinstance(task, dict):
-                    goal = str(task.get("goal") or "").strip()
-                    role = str(task.get("role") or "").strip()
-                    lines.append(f"{i}. " + _truncate_text(goal, limit=160) + (f" ({role})" if role else ""))
+                    description = str(task.get("description") or "").strip()
+                    prompt = str(task.get("prompt") or "").strip()
+                    label = _truncate_text(description, limit=80) or f"Task {i}"
+                    detail = _truncate_text(prompt, limit=160)
+                    lines.append(f"{i}. {label}" + (f": {detail}" if detail else ""))
             if len(tasks) > 8:
                 lines.append(f"... {len(tasks) - 8} more")
             content = [_text("\n".join(lines))]
         else:
-            goal = str(arguments.get("goal") or "").strip()
-            content = [_text("Delegating task" + (f":\n{_truncate_text(goal, limit=800)}" if goal else ""))]
+            description = str(arguments.get("description") or "").strip()
+            prompt = str(arguments.get("prompt") or "").strip()
+            text = "Delegating task"
+            if description:
+                text += f": {description}"
+            if prompt:
+                text += f"\n{_truncate_text(prompt, limit=800)}"
+            content = [_text(text)]
         return acp.start_tool_call(
             tool_call_id, title, kind=kind, content=content, locations=locations,
         )

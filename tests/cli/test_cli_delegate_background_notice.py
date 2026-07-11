@@ -29,7 +29,7 @@ def test_background_dispatch_prints_resume_notice(monkeypatch):
     printed = _capture(monkeypatch)
 
     result = json.dumps({"status": "dispatched", "mode": "background", "count": 1})
-    cli_obj._on_tool_complete("tc1", "delegate_task", {"goal": "x"}, result)
+    cli_obj._on_tool_complete("tc1", "delegate_task", {"description": "x", "prompt": "x"}, result)
 
     joined = "\n".join(printed)
     assert "resume" in joined.lower()
@@ -55,7 +55,7 @@ def test_synchronous_delegate_result_prints_no_notice(monkeypatch):
     printed = _capture(monkeypatch)
 
     result = json.dumps({"results": [{"status": "completed", "summary": "done"}]})
-    cli_obj._on_tool_complete("tc3", "delegate_task", {"goal": "x"}, result)
+    cli_obj._on_tool_complete("tc3", "delegate_task", {"description": "x", "prompt": "x"}, result)
 
     assert not any("resume" in p.lower() for p in printed)
 

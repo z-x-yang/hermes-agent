@@ -32,37 +32,38 @@ def test_builtin_profile_round_trip(name):
     assert profile.model == "inherit"
 
 
-def test_all_profiles_share_the_complete_result_contract():
-    required = (
-        "outcome",
-        "evidence",
-        "actions",
-        "files_changed",
-        "tests_run",
-        "verification",
-        "blockers",
-        "open_questions",
-        "confidence",
-        "limitations",
-        "side_effects",
-        "recommended_next_step",
-    )
-    contracts = []
-    for name in ("Explore", "Plan", "general-purpose"):
-        contract = get_subagent_profile(name).result_contract
-        contracts.append(contract)
-        assert all(field in contract for field in required), (name, contract)
-    assert len(set(contracts)) == 3
-    assert "searches/lookups" in contracts[0]
-    assert "implementation-plan" in contracts[1]
-    assert "executed actions" in contracts[2]
+def test_profiles_use_claude_like_type_specific_final_guidance():
+    explore = get_subagent_profile("Explore").system_instructions
+    plan = get_subagent_profile("Plan").system_instructions
+    gp = get_subagent_profile("general-purpose").system_instructions
+
+    for prompt in (explore, plan, gp):
+        assert "recommended_next_step" not in prompt
+        assert "files_changed" not in prompt
+        assert "side_effects" not in prompt
+    assert "clearly and concisely" in explore
+    assert "absolute file paths" in explore
+    assert "### Critical Files for Implementation" in plan
+    assert "3-5" in plan
+    assert "exact return requirements in the task prompt" in gp
+
+
+def test_profile_metadata_has_no_redundant_capability_booleans_or_context_capsule():
+    profile = get_subagent_profile("general-purpose")
+    for removed in (
+        "result_contract",
+        "context_policy",
+        "can_write_files",
+        "can_external_side_effects",
+        "can_delegate",
+        "default_scheduling",
+    ):
+        assert not hasattr(profile, removed)
 
 
 def test_read_only_profiles_remain_hard_no_external_side_effect():
     for name in ("Explore", "Plan"):
         profile = get_subagent_profile(name)
-        assert profile.can_write_files is False
-        assert profile.can_external_side_effects is False
         assert "terminal" not in profile.allowed_tool_names
         assert "process" not in profile.allowed_tool_names
         assert "web_search" not in profile.allowed_tool_names
@@ -205,10 +206,8 @@ def test_explore_materializes_readonly_aliases_from_raw_parent_authority(monkeyp
     assert policy.allowed_names.isdisjoint(raw_names)
 
 
-def test_general_purpose_truthfully_reports_raw_shell_external_effect_capability():
+def test_general_purpose_truthfully_describes_raw_shell_external_effect_capability():
     profile = get_subagent_profile("general-purpose")
-    assert profile.can_external_side_effects is True
-    assert profile.can_delegate is True
     assert profile.allowed_tool_names is None
     assert "exact parent tool surface" in profile.system_instructions
     assert "Named external-side-effect tools are not available" not in (
@@ -218,19 +217,21 @@ def test_general_purpose_truthfully_reports_raw_shell_external_effect_capability
     assert "normal tool and terminal approvals" in profile.system_instructions
 
 
-def test_delegation_pattern_docs_match_general_purpose_authority():
+def test_delegation_docs_match_simplified_contract():
     root = Path(__file__).resolve().parents[2]
-    pattern_docs = [
-        root / "website/docs/guides/delegation-patterns.md",
-        root
-        / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/guides"
-        / "delegation-patterns.md",
-    ]
-    all_docs = pattern_docs + [
+    docs = [
         root / "website/docs/user-guide/features/delegation.md",
         root
         / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/features"
         / "delegation.md",
+        root / "website/docs/guides/delegation-patterns.md",
+        root
+        / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/guides"
+        / "delegation-patterns.md",
+        root / "website/docs/user-guide/configuration.md",
+        root
+        / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide"
+        / "configuration.md",
         root
         / "website/docs/user-guide/skills/bundled/autonomous-ai-agents"
         / "autonomous-ai-agents-hermes-agent.md",
@@ -238,41 +239,56 @@ def test_delegation_pattern_docs_match_general_purpose_authority():
         / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/skills/bundled/autonomous-ai-agents"
         / "autonomous-ai-agents-hermes-agent.md",
     ]
-    stale_claims = (
-        "excludes named messaging",
-        "排除命名的消息",
-        "Closed repo-local worker policy",
-        "封闭的仓库内工作策略",
-        "Legacy generic children",
-        "后台池已经满了，Hermes 会同步执行",
-        "Synchronous subagent spawn",
-        "同步生成子代理",
+    required_claims = (
+        "description",
+        "prompt",
+        "run_in_background",
+        "Explore",
+        "Plan",
+        "general-purpose",
     )
-    for path in all_docs:
+    stale_claims = (
+        "retain_session",
+        'scheduling="auto"',
+        "scheduling='auto'",
+        'role="orchestrator"',
+        "recommended_next_step",
+    )
+    for path in docs:
         text = path.read_text(encoding="utf-8")
+        assert all(claim in text for claim in required_claims), path
         assert not any(claim in text for claim in stale_claims), path
+
+    feature_docs = docs[:2]
+    semantic_claims = (
+        "one batch handle",
+        "one consolidated completion",
+        "one-shot",
+        "automatically retained",
+        "project context",
+        "complete governance",
+        "runtime-derived",
+    )
+    zh_semantic_claims = (
+        "一个 batch handle",
+        "一次合并完成通知",
+        "一次性",
+        "自动保留",
+        "项目上下文",
+        "完整 governance",
+        "运行时派生",
+    )
+    en_text = feature_docs[0].read_text(encoding="utf-8")
+    zh_text = feature_docs[1].read_text(encoding="utf-8")
+    assert all(claim in en_text for claim in semantic_claims)
+    assert all(claim in zh_text for claim in zh_semantic_claims)
+
+    pattern_docs = docs[2:4]
     for path in pattern_docs:
         text = path.read_text(encoding="utf-8")
         assert "exact current-parent tool authority" in text or (
             "current parent 精确工具权限" in text
         )
-    result_fields = (
-        "outcome",
-        "evidence",
-        "actions",
-        "files_changed",
-        "tests_run",
-        "verification",
-        "blockers",
-        "open_questions",
-        "confidence",
-        "limitations",
-        "side_effects",
-        "recommended_next_step",
-    )
-    for path in all_docs[2:4]:
-        text = path.read_text(encoding="utf-8")
-        assert all(field in text for field in result_fields), path
 
 
 def test_unknown_profile_fails_closed():

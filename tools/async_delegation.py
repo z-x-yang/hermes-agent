@@ -136,7 +136,6 @@ def dispatch_async_delegation(
     goal: str,
     context: Optional[str],
     toolsets: Optional[List[str]],
-    role: str,
     model: Optional[str],
     session_key: str,
     runner: Callable[[], Dict[str, Any]],
@@ -147,7 +146,7 @@ def dispatch_async_delegation(
 
     Parameters
     ----------
-    goal, context, toolsets, role, model
+    goal, context, toolsets, model
         The dispatch-time task spec, captured verbatim for the rich
         completion block.
     session_key
@@ -179,7 +178,6 @@ def dispatch_async_delegation(
         "goal": goal,
         "context": context,
         "toolsets": list(toolsets) if toolsets else None,
-        "role": role,
         "model": model,
         "session_key": session_key,
         "status": "running",
@@ -295,7 +293,6 @@ def _push_completion_event(
         "goal": record.get("goal", ""),
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),
-        "role": record.get("role"),
         "model": result.get("model") or record.get("model"),
         "status": status,
         "summary": summary,
@@ -323,7 +320,6 @@ def dispatch_async_delegation_batch(
     goals: List[str],
     context: Optional[str],
     toolsets: Optional[List[str]],
-    role: str,
     model: Optional[str],
     session_key: str,
     runner: Callable[[], Dict[str, Any]],
@@ -361,7 +357,6 @@ def dispatch_async_delegation_batch(
         "goals": list(goals),
         "context": context,
         "toolsets": list(toolsets) if toolsets else None,
-        "role": role,
         "model": model,
         "session_key": session_key,
         "status": "running",
@@ -484,7 +479,6 @@ def _build_batch_completion_event(
         "goals": event_record.get("goals"),
         "context": event_record.get("context"),
         "toolsets": event_record.get("toolsets"),
-        "role": event_record.get("role"),
         "model": event_record.get("model"),
         "status": status,
         "is_batch": True,
