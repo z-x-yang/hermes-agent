@@ -4695,15 +4695,9 @@ class SessionDB:
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
-                snippet_token = non_op_tokens[0]
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
-                           replace(
-                               substr({projection_sql},
-                                      max(1, instr({projection_sql}, ?) - 40),
-                                      120),
-                               ?, '>>>' || ? || '<<<'
-                           ) AS snippet,
+                           {projection_sql} AS _search_projection,
                            m.content, m.timestamp, m.tool_name,
                            s.source, s.model, s.started_at AS session_started
                     FROM messages m
@@ -4713,11 +4707,35 @@ class SessionDB:
                     LIMIT ? OFFSET ?
                 """
                 like_params.extend([limit, offset])
-                # instr()/replace() use the first search token for the snippet.
-                like_params = [snippet_token, snippet_token, snippet_token] + like_params
                 with self._lock:
                     like_cursor = self._conn.execute(like_sql, like_params)
                     matches = [dict(row) for row in like_cursor.fetchall()]
+
+                # SQLite LIKE folds ordinary ASCII case but otherwise treats the
+                # escaped token text literally. Mirror those semantics when
+                # locating the first query token that actually matched each
+                # row's full searchable projection.
+                ascii_lower = str.maketrans(
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"
+                )
+                for match in matches:
+                    projection = match.pop("_search_projection")
+                    folded_projection = projection.translate(ascii_lower)
+                    for token in non_op_tokens:
+                        index = folded_projection.find(token.translate(ascii_lower))
+                        if index >= 0:
+                            start = max(0, index - 40)
+                            end = max(start + 120, index + len(token))
+                            snippet = projection[start:end]
+                            relative_index = index - start
+                            match["snippet"] = (
+                                snippet[:relative_index]
+                                + ">>>"
+                                + snippet[relative_index:relative_index + len(token)]
+                                + "<<<"
+                                + snippet[relative_index + len(token):]
+                            )
+                            break
         else:
             with self._lock:
                 try:

@@ -1538,6 +1538,48 @@ class TestCJKSearchFallback:
         assert rows[0]["content"] == "visible body"
         assert "调用关" in rows[0]["snippet"].replace(">>>", "").replace("<<<", "")
 
+    def test_cjk_like_snippet_marks_first_token_matching_each_projection(self, db):
+        db.create_session(session_id="later-token", source="cli")
+        metadata_id = db.append_message(
+            "later-token", role="tool", content="body", tool_name="桂林"
+        )
+        content_id = db.append_message(
+            "later-token", role="tool", content="content 桂林"
+        )
+        tool_calls_id = db.append_message(
+            "later-token", role="tool", content="calls body"
+        )
+        db._conn.execute(
+            "UPDATE messages SET tool_calls=? WHERE id=?",
+            ('{"destination":"桂林"}', tool_calls_id),
+        )
+        db._conn.commit()
+
+        rows = db.search_messages("广西 OR 桂林", role_filter=["tool"])
+        by_id = {row["id"]: row for row in rows}
+
+        assert set(by_id) == {metadata_id, content_id, tool_calls_id}
+        assert all(">>>桂林<<<" in row["snippet"] for row in rows)
+        assert by_id[metadata_id]["content"] == "body"
+        assert by_id[content_id]["content"] == "content 桂林"
+        assert by_id[tool_calls_id]["content"] == "calls body"
+
+    def test_cjk_like_snippet_preserves_ascii_case_and_literal_wildcards(self, db):
+        db.create_session(session_id="literal-snippet", source="cli")
+        content = r"body 工具Alpha%_完成\路径"
+        message_id = db.append_message(
+            "literal-snippet", role="tool", content=content
+        )
+
+        rows = db.search_messages(
+            r"广西 OR 工具ALPHA%_完成\路径", role_filter=["tool"]
+        )
+
+        assert [row["id"] for row in rows] == [message_id]
+        assert rows[0]["snippet"] == r"body >>>工具Alpha%_完成\路径<<<  "
+        assert rows[0]["content"] == content
+        assert "_search_projection" not in rows[0]
+
     def test_tool_cjk_uses_like_and_preserves_filters(self, db):
         db.create_session(session_id="included", source="cli")
         db.create_session(session_id="compacted", source="cli")
