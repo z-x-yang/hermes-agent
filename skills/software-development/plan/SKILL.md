@@ -315,13 +315,13 @@ git commit -m "type: description"
 
 After saving the plan, offer the execution approach:
 
-**"Plan complete and saved. Ready to execute using subagent-driven-development — I'll dispatch a fresh subagent per task with two-stage review (spec compliance then code quality). Shall I proceed?"**
+**"Plan complete and saved. Ready to execute using subagent-driven-development — I'll dispatch a fresh implementer per task, verify each task myself, and run one final independent review when the risk gate requires it. Shall I proceed?"**
 
 When executing, use the `subagent-driven-development` skill:
-- Fresh `delegate_task` per task with full context
-- Spec compliance review after each task
-- Code quality review after spec passes
-- Proceed only when both reviews approve
+- Fresh `delegate_task` implementer per independently contractible task
+- Controller-owned diff/test verification after each task
+- Implementers perform self-review only and do not launch independent reviewers
+- One final whole-change independent review when required by risk
 
 ## Remember
 

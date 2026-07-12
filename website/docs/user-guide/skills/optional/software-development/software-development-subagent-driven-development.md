@@ -1,14 +1,14 @@
 ---
-title: "Subagent Driven Development — Execute plans via delegate_task subagents (2-stage review)"
+title: "Subagent Driven Development"
 sidebar_label: "Subagent Driven Development"
-description: "Execute plans via delegate_task subagents (2-stage review)"
+description: "Use when the user explicitly requests subagent-driven implementation, or an approved software plan has multiple independently contractible context-heavy task..."
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Subagent Driven Development
 
-Execute plans via delegate_task subagents (2-stage review).
+Use when the user explicitly requests subagent-driven implementation, or an approved software plan has multiple independently contractible context-heavy tasks that cannot safely fit one controller session.
 
 ## Skill metadata
 
@@ -16,11 +16,11 @@ Execute plans via delegate_task subagents (2-stage review).
 |---|---|
 | Source | Optional — install with `hermes skills install official/software-development/subagent-driven-development` |
 | Path | `optional-skills/software-development/subagent-driven-development` |
-| Version | `1.1.0` |
+| Version | `2.0.0` |
 | Author | Hermes Agent (adapted from obra/superpowers) |
 | License | MIT |
 | Platforms | linux, macos, windows |
-| Tags | `delegation`, `subagent`, `implementation`, `workflow`, `parallel` |
+| Tags | `delegation`, `subagent`, `implementation`, `workflow`, `review-governance` |
 | Related skills | [`plan`](/docs/user-guide/skills/bundled/software-development/software-development-plan), [`requesting-code-review`](/docs/user-guide/skills/bundled/software-development/software-development-requesting-code-review), [`test-driven-development`](/docs/user-guide/skills/bundled/software-development/software-development-test-driven-development) |
 
 ## Reference: full SKILL.md
@@ -33,342 +33,157 @@ The following is the complete skill definition that Hermes loads when this skill
 
 ## Overview
 
-Execute implementation plans by dispatching fresh subagents per task with systematic two-stage review.
+Execute an approved implementation plan with a fresh implementer subagent per independently contractible task. The parent/controller verifies every task's diff and test evidence; one fresh independent reviewer evaluates the integrated change at the end when the risk gate requires it.
 
-**Core principle:** Fresh subagent per task + two-stage review (spec then quality) = high quality, fast iteration.
+**Core principle:** Fresh implementers + controller-owned task checks + one final independent review = quality without reviewer thrash.
 
 ## When to Use
 
-Use this skill when:
-- You have an implementation plan (from the `plan` skill or user requirements)
-- Tasks are mostly independent
-- Quality and spec compliance are important
-- You want automated review between tasks
+Use this workflow only when:
 
-**vs. manual execution:**
-- Fresh context per task (no confusion from accumulated state)
-- Automated review process catches issues early
-- Consistent quality checks across all tasks
-- Subagents can ask questions before starting work
+- the user explicitly requests subagent-driven implementation; or
+- an approved software plan has multiple independent, context-heavy tasks that would materially degrade one controller context, and fresh isolation has a concrete correctness or recovery benefit.
 
-## The Process
+Do not use it merely because a plan exists, several files will change, or subagents are available. Small and medium changes should remain in the main implementation session.
 
-### 1. Read and Parse Plan
+## Review Ownership
 
-Read the plan file. Extract ALL tasks with their full text and context upfront. Create a todo list:
+The parent/controller owns all independent review for the change. Every implementer brief must state this explicitly.
 
-```python
-# Read the plan
-read_file("docs/plans/feature-plan.md")
+- Implementers perform tests and self-review only.
+- Implementers must not invoke Codex, Claude Code, reviewer subagents, or other independent reviewers on their own work.
+- If an implementer sees a risk that may need early independent judgment, it reports the concrete risk to the controller instead of launching a review.
+- Per-task independent reviewers are exceptional: use one only when the user/plan explicitly requires it or a concrete high-risk blocker needs isolated judgment.
+- The ordinary path has one final independent review after all task diffs have landed and the controller has verified them.
 
-# Create todo list with all tasks
-todo([
-    {"id": "task-1", "content": "Create User model with email field", "status": "pending"},
-    {"id": "task-2", "content": "Add password hashing utility", "status": "pending"},
-    {"id": "task-3", "content": "Create login endpoint", "status": "pending"},
-])
-```
+This is prompt/system-contract governance, matching ordinary subagent runtimes: identity and responsibility are explicit, while tool exposure and depth continue to enforce the nesting boundary. Do not add a second review-budget state machine merely to restate this workflow.
 
-**Key:** Read the plan ONCE. Extract everything. Don't make subagents read the plan file — provide the full task text directly in context.
+## Process
 
-### 2. Per-Task Workflow
+### 1. Parse the approved plan once
 
-For EACH task in the plan:
+Extract every task, dependency, global constraint, and completion oracle. Create todos before the first dispatch. Give each implementer a self-contained task brief rather than the whole plan or parent conversation.
 
-#### Step 1: Dispatch Implementer Subagent
+### 2. Dispatch one implementer at a time
 
-Use `delegate_task` with complete context:
+Use the current public API and the `general-purpose` profile:
 
 ```python
 delegate_task(
-    description="Implement User model",
+    description="Implement Task N",
     subagent_type="general-purpose",
     run_in_background=False,
     prompt="""
-    TASK FROM PLAN:
-    - Create: src/models/user.py
-    - Add User class with email (str) and password_hash (str) fields
-    - Use bcrypt for password hashing
-    - Include __repr__ for debugging
+    Implement Task N from the approved plan.
 
-    FOLLOW TDD:
-    1. Write failing test in tests/models/test_user.py
-    2. Run: pytest tests/models/test_user.py -v (verify FAIL)
-    3. Write minimal implementation
-    4. Run: pytest tests/models/test_user.py -v (verify PASS)
-    5. Run: pytest tests/ -q (verify no regressions)
-    6. Commit: git add -A && git commit -m "feat: add User model with password hashing"
+    REQUIREMENTS:
+    [SELF-CONTAINED TASK BRIEF]
 
-    PROJECT CONTEXT:
-    - Python 3.11, Flask app in src/app.py
-    - Existing models in src/models/
-    - Tests use pytest, run from project root
-    - bcrypt already in requirements.txt
+    INDEPENDENT REVIEW OWNERSHIP:
+    The parent/controller owns all independent review for this change. Do not
+    invoke Codex, Claude Code, reviewer subagents, or any other independent
+    reviewer on your own implementation. Perform tests and self-review only.
+    If independent judgment seems necessary, report the concrete risk to the
+    controller instead of launching a reviewer.
+
+    EXECUTION:
+    1. Follow TDD when deterministic behavior changes.
+    2. Implement only this task.
+    3. Run the focused test and required regression checks.
+    4. Self-review the full task diff.
+    5. Make a scoped commit and report status, tests, files, and concerns.
+
+    If required context is missing, return NEEDS_CONTEXT rather than guessing.
     """,
 )
 ```
 
-#### Step 2: Dispatch Spec Compliance Reviewer
+Do not dispatch overlapping implementers against the same files/worktree. A child may decompose genuine independent implementation subtasks only when the runtime exposes delegation and the brief permits it; it must not pass through its entire assignment or spawn reviewers.
 
-After the implementer completes, verify against the original spec:
+### 3. Controller verifies each task
 
-```python
-delegate_task(
-    description="Review spec compliance",
-    subagent_type="Explore",
-    run_in_background=False,
-    prompt="""
-    ORIGINAL TASK SPEC:
-    - Create src/models/user.py with User class
-    - Fields: email (str), password_hash (str)
-    - Use bcrypt for password hashing
-    - Include __repr__
+After the implementer returns, the controller personally:
 
-    CHECK:
-    - [ ] All requirements from spec implemented?
-    - [ ] File paths match spec?
-    - [ ] Function signatures match spec?
-    - [ ] Behavior matches expected?
-    - [ ] Nothing extra added (no scope creep)?
+1. checks the exact commit and changed-file scope;
+2. reads the diff and any concerns;
+3. runs the task's focused tests and high-signal regression checks;
+4. verifies the production call path, not only helper tests;
+5. sends one bounded fix brief for confirmed blockers;
+6. marks the task complete only after deterministic evidence passes.
 
-    OUTPUT: PASS or list of specific spec gaps to fix.
-    """,
-)
-```
+This is controller verification, not an independent reviewer call. Do not run separate spec and quality reviewer subagents after every task.
 
-**If spec issues found:** Fix gaps, then re-run spec review. Continue only when spec-compliant.
+### 4. Run one final independent review when required
 
-#### Step 3: Dispatch Code Quality Reviewer
-
-After spec compliance passes:
+After all tasks are complete and controller-verified, use `requesting-code-review` for one fresh-context whole-change review. Supply the approved contract, scoped integrated diff, and fresh test/build evidence.
 
 ```python
 delegate_task(
-    description="Review code quality",
-    subagent_type="Explore",
-    run_in_background=False,
-    prompt="""
-    FILES TO REVIEW:
-    - src/models/user.py
-    - tests/models/test_user.py
-
-    CHECK:
-    - [ ] Follows project conventions and style?
-    - [ ] Proper error handling?
-    - [ ] Clear variable/function names?
-    - [ ] Adequate test coverage?
-    - [ ] No obvious bugs or missed edge cases?
-    - [ ] No security issues?
-
-    OUTPUT FORMAT:
-    - Critical Issues: [must fix before proceeding]
-    - Important Issues: [should fix]
-    - Minor Issues: [optional]
-    - Verdict: APPROVED or REQUEST_CHANGES
-    """,
-)
-```
-
-**If quality issues found:** Fix issues, re-review. Continue only when approved.
-
-#### Step 4: Mark Complete
-
-```python
-todo([{"id": "task-1", "content": "Create User model with email field", "status": "completed"}], merge=True)
-```
-
-### 3. Final Review
-
-After ALL tasks are complete, dispatch a final integration reviewer:
-
-```python
-delegate_task(
-    description="Review integration",
+    description="Review integrated change",
     subagent_type="general-purpose",
     run_in_background=False,
     prompt="""
-    All tasks from the plan are complete. Review the full implementation:
-    - Do all components work together?
-    - Any inconsistencies between tasks?
-    - All tests passing?
-    - Ready for merge?
+    You are the assigned independent reviewer for the integrated software change.
+    This checkout is read-only: do not edit, commit, or launch another reviewer.
+
+    APPROVED CONTRACT:
+    [INSERT APPROVED CONTRACT]
+
+    ACCEPTANCE CRITERIA / INVARIANTS:
+    [INSERT CRITERIA]
+
+    SCOPED INTEGRATED DIFF OR REVIEW PACKAGE:
+    [INSERT EXACT RANGE OR PACKAGE PATH]
+
+    FRESH TEST / BUILD / RUNTIME EVIDENCE:
+    [INSERT COMMANDS AND RESULTS]
+
+    Review those supplied inputs and return only evidence-backed candidate
+    blockers for controller adjudication.
     """,
 )
 ```
 
-### 4. Verify and Commit
+For high-stakes/shared-core/auth/concurrency work, prefer Codex as the final reviewer. Reviewer findings are leads; the controller reproduces and classifies them before repair. A repair does not automatically authorize another review pass.
 
-```bash
-# Run full test suite
-pytest tests/ -q
+### 5. Close the branch
 
-# Review all changes
-git diff --stat
+Run the final deterministic suite, lint/type/build checks that match the changed surfaces, `git diff --check`, and clean-status verification. Stage and commit only task files, then follow the branch-closeout workflow.
 
-# Final commit if needed
-git add -A && git commit -m "feat: complete [feature name] implementation"
-```
+## Implementer Status
 
-## Task Granularity
+- **DONE:** verify the claimed diff/tests and continue.
+- **DONE_WITH_CONCERNS:** inspect concerns before acceptance.
+- **NEEDS_CONTEXT:** provide the missing context and re-dispatch.
+- **BLOCKED:** resolve a deterministic seam, split the task, or ask the user only when the choice changes their goal/resources/done contract.
 
-**Each task = 2-5 minutes of focused work.**
+An interrupted worker that leaves coherent changes is an interrupted transaction. Audit and rescue the unresolved seam; do not restart the whole task over the dirty worktree.
 
-**Too big:**
-- "Implement user authentication system"
+## Red Flags
 
-**Right size:**
-- "Create User model with email and password fields"
-- "Add password hashing function"
-- "Create login endpoint"
-- "Add JWT token generation"
-- "Create registration endpoint"
+Never:
 
-## Red Flags — Never Do These
+- dispatch an implementer without explicit controller review ownership;
+- run reviewer subagents after every task by default;
+- let implementer self-review replace controller verification;
+- let controller verification replace the required final independent review for high-risk changes;
+- let an implementer invoke Codex/Claude/reviewer agents on its own work;
+- dispatch multiple implementers against overlapping files;
+- accept worker self-report without diff/test readback;
+- start an unbounded reviewer-fixer-reviewer loop;
+- continue with open Critical/Important blockers.
 
-- Start implementation without a plan
-- Skip reviews (spec compliance OR code quality)
-- Proceed with unfixed critical/important issues
-- Dispatch multiple implementation subagents for tasks that touch the same files
-- Make subagent read the plan file (provide full text in context instead)
-- Skip scene-setting context (subagent needs to understand where the task fits)
-- Ignore subagent questions (answer before letting them proceed)
-- Accept "close enough" on spec compliance
-- Skip review loops (reviewer found issues → implementer fixes → review again)
-- Let implementer self-review replace actual review (both are needed)
-- **Start code quality review before spec compliance is PASS** (wrong order)
-- Move to next task while either review has open issues
+## Integration
 
-## Handling Issues
+- `plan` defines the approved software contract.
+- `test-driven-development` governs deterministic RED→GREEN behavior changes.
+- `requesting-code-review` owns the one final independent review.
+- `verification-before-completion` owns fresh completion evidence.
+- `using-git-worktrees` owns isolation and safe integration.
 
-### If Subagent Asks Questions
+## Further Reading
 
-- Answer clearly and completely
-- Provide additional context if needed
-- Don't rush them into implementation
+Load these only when their trigger applies:
 
-### If Reviewer Finds Issues
-
-- Implementer subagent (or a new one) fixes them
-- Reviewer reviews again
-- Repeat until approved
-- Don't skip the re-review
-
-### If Subagent Fails a Task
-
-- Dispatch a new fix subagent with specific instructions about what went wrong
-- Don't try to fix manually in the controller session (context pollution)
-
-## Efficiency Notes
-
-**Why fresh subagent per task:**
-- Prevents context pollution from accumulated state
-- Each subagent gets clean, focused context
-- No confusion from prior tasks' code or reasoning
-
-**Why two-stage review:**
-- Spec review catches under/over-building early
-- Quality review ensures the implementation is well-built
-- Catches issues before they compound across tasks
-
-**Cost trade-off:**
-- More subagent invocations (implementer + 2 reviewers per task)
-- But catches issues early (cheaper than debugging compounded problems later)
-
-## Integration with Other Skills
-
-### With plan
-
-This skill EXECUTES plans created by the `plan` skill:
-1. User requirements → plan → implementation plan
-2. Implementation plan → subagent-driven-development → working code
-
-### With test-driven-development
-
-Implementer subagents should follow TDD:
-1. Write failing test first
-2. Implement minimal code
-3. Verify test passes
-4. Commit
-
-Include TDD instructions in every implementer context.
-
-### With requesting-code-review
-
-The two-stage review process IS the code review. For final integration review, use the requesting-code-review skill's review dimensions.
-
-### With systematic-debugging
-
-If a subagent encounters bugs during implementation:
-1. Follow systematic-debugging process
-2. Find root cause before fixing
-3. Write regression test
-4. Resume implementation
-
-## Example Workflow
-
-```
-[Read plan: docs/plans/auth-feature.md]
-[Create todo list with 5 tasks]
-
---- Task 1: Create User model ---
-[Dispatch implementer subagent]
-  Implementer: "Should email be unique?"
-  You: "Yes, email must be unique"
-  Implementer: Implemented, 3/3 tests passing, committed.
-
-[Dispatch spec reviewer]
-  Spec reviewer: ✅ PASS — all requirements met
-
-[Dispatch quality reviewer]
-  Quality reviewer: ✅ APPROVED — clean code, good tests
-
-[Mark Task 1 complete]
-
---- Task 2: Password hashing ---
-[Dispatch implementer subagent]
-  Implementer: No questions, implemented, 5/5 tests passing.
-
-[Dispatch spec reviewer]
-  Spec reviewer: ❌ Missing: password strength validation (spec says "min 8 chars")
-
-[Implementer fixes]
-  Implementer: Added validation, 7/7 tests passing.
-
-[Dispatch spec reviewer again]
-  Spec reviewer: ✅ PASS
-
-[Dispatch quality reviewer]
-  Quality reviewer: Important: Magic number 8, extract to constant
-  Implementer: Extracted MIN_PASSWORD_LENGTH constant
-  Quality reviewer: ✅ APPROVED
-
-[Mark Task 2 complete]
-
-... (continue for all tasks)
-
-[After all tasks: dispatch final integration reviewer]
-[Run full test suite: all passing]
-[Done!]
-```
-
-## Remember
-
-```
-Fresh subagent per task
-Two-stage review every time
-Spec compliance FIRST
-Code quality SECOND
-Never skip reviews
-Catch issues early
-```
-
-**Quality is not an accident. It's the result of systematic process.**
-
-## Further reading (load when relevant)
-
-When the orchestration involves significant context usage, long review loops, or complex validation checkpoints, load these references for the specific discipline:
-
-- **`references/context-budget-discipline.md`** — Four-tier context degradation model (PEAK / GOOD / DEGRADING / POOR), read-depth rules that scale with context window size, and early warning signs of silent degradation. Load when a run will clearly consume significant context (multi-phase plans, many subagents, large artifacts).
-- **`references/gates-taxonomy.md`** — The four canonical gate types (Pre-flight, Revision, Escalation, Abort) with behavior, recovery, and examples. Load when designing or reviewing any workflow that has validation checkpoints — use the vocabulary explicitly so each gate has defined entry, failure behavior, and resumption rules.
-
-Both references adapted from gsd-build/get-shit-done (MIT © 2025 Lex Christopherson).
+- `references/context-budget-discipline.md` — context degradation and recovery for long multi-task runs.
+- `references/gates-taxonomy.md` — pre-flight, revision, escalation, and abort gate semantics.

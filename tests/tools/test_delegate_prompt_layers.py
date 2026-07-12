@@ -48,6 +48,17 @@ def test_core_contract_preserves_evelyn_quality_without_full_soul():
     assert "external side effects" in SUBAGENT_CORE_CONTRACT
 
 
+def test_core_contract_keeps_independent_review_owned_by_parent():
+    contract = " ".join(SUBAGENT_CORE_CONTRACT.split())
+    assert "Independent-review ownership remains with your parent/controller" in contract
+    assert (
+        "do not invoke Codex, Claude Code, or reviewer agents on your own work"
+        in contract
+    )
+    assert "perform only self-review" in contract
+    assert "perform that review yourself and do not spawn another reviewer" in contract
+
+
 def test_generic_delegation_keeps_a_static_fallback_contract():
     system_prompt = _build_child_system_prompt(
         profile=None,
@@ -58,6 +69,31 @@ def test_generic_delegation_keeps_a_static_fallback_contract():
     )
     assert "Complete the scoped task" in system_prompt
     assert SUBAGENT_CORE_CONTRACT in system_prompt
+
+
+def test_child_review_ownership_explicitly_outranks_inherited_governance(tmp_path):
+    (tmp_path / "SOUL.md").write_text(
+        "For every high-risk task, launch Codex before reporting.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "memories").mkdir()
+    (tmp_path / "memories/MEMORY.md").write_text("", encoding="utf-8")
+    (tmp_path / "memories/USER.md").write_text("", encoding="utf-8")
+    snapshot = load_governance_snapshot(
+        profile_home=tmp_path,
+        profile_id="review-precedence",
+    )
+
+    system_prompt = _system_prompt("general-purpose", str(tmp_path), snapshot)
+    normalized = " ".join(system_prompt.split())
+
+    assert "For every high-risk task, launch Codex before reporting." in normalized
+    assert "Runtime capability policy and tool safety contracts are immutable" in normalized
+    assert "Independent-review ownership remains with your parent/controller" in normalized
+    assert "perform only self-review and report any review need to the parent" in normalized
+    assert system_prompt.index(snapshot.soul.text) < system_prompt.index(
+        "Independent-review ownership"
+    )
 
 
 def test_complete_governance_is_byte_preserved_in_trusted_prompt_only(tmp_path):

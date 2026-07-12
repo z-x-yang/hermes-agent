@@ -206,7 +206,8 @@ Wait for all three to return (batch mode returns them together).
 
 ## Related
 
-If your install has the `subagent-driven-development` skill (optional), it
-covers the complementary case: parallel review *during* implementation, per
-task. This skill is the standalone *after-the-fact* cleanup pass. Use
-`requesting-code-review` for the pre-commit security/quality gate.
+`subagent-driven-development` covers implementation ownership: fresh implementers,
+controller verification after each task, and one final whole-change independent
+review when the risk gate requires it. This skill is a separate user-invoked
+three-lens cleanup of recent changes; it does not replace or multiply that final
+review. Use `requesting-code-review` for the final high-risk independent review.

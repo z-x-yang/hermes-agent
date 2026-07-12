@@ -214,7 +214,7 @@ hermes skills uninstall <skill-name>
 |-------|-------------|
 | [**code-wiki**](/docs/user-guide/skills/optional/software-development/software-development-code-wiki) | Generate wiki docs + Mermaid diagrams for any codebase. |
 | [**rest-graphql-debug**](/docs/user-guide/skills/optional/software-development/software-development-rest-graphql-debug) | Debug REST/GraphQL APIs: status codes, auth, schemas, repro. |
-| [**subagent-driven-development**](/docs/user-guide/skills/optional/software-development/software-development-subagent-driven-development) | Execute plans via delegate_task subagents (2-stage review). |
+| [**subagent-driven-development**](/docs/user-guide/skills/optional/software-development/software-development-subagent-driven-development) | Use when the user explicitly requests subagent-driven implementation, or an approved software plan has multiple independently contractible context-heavy tasks that cannot safely fit one controller session. |
 
 ## web-development
 
