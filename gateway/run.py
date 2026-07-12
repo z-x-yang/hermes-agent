@@ -2056,19 +2056,27 @@ _AGENT_PENDING_SENTINEL = object()
 _PROCESS_COMPLETION_EVENT_ID_KEY = "hermes_process_completion_id"
 
 
-def _consumed_process_completion_id(event: Any) -> Optional[str]:
-    """Return a trusted queued completion id only after its result was consumed."""
+def _process_completion_notification_policy(
+    event: Any,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return Registry policy for a trusted internal completion event."""
     if not bool(getattr(event, "internal", False)):
-        return None
+        return None, None
     metadata = getattr(event, "metadata", None)
     if not isinstance(metadata, dict):
-        return None
+        return None, None
     completion_id = str(metadata.get(_PROCESS_COMPLETION_EVENT_ID_KEY, "") or "")
     if not completion_id:
-        return None
+        return None, None
     from tools.process_registry import process_registry as _pr_completion
 
-    return completion_id if _pr_completion.is_completion_consumed(completion_id) else None
+    return completion_id, _pr_completion.completion_notification_decision(completion_id)
+
+
+def _suppressed_process_completion_id(event: Any) -> Optional[str]:
+    """Compatibility helper for trusted completions already suppressed by policy."""
+    completion_id, decision = _process_completion_notification_policy(event)
+    return completion_id if decision == "suppress" else None
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -4718,16 +4726,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             queued_events.setdefault(session_key, []).insert(0, next_queued)
         return pending_event
 
-    def _dequeue_next_unconsumed_event(self, adapter: Any, session_key: str):
-        """Drain queued events while discarding already-consumed completions."""
+    async def _dequeue_next_unconsumed_event(self, adapter: Any, session_key: str):
+        """Drain queued events, parking unresolved and dropping suppressed completions."""
         pending_event = _dequeue_pending_event(adapter, session_key)
         pending_event = self._promote_queued_event(session_key, adapter, pending_event)
         while pending_event is not None:
-            completion_id = _consumed_process_completion_id(pending_event)
-            if not completion_id:
+            completion_id, decision = _process_completion_notification_policy(pending_event)
+            if not completion_id or decision == "notify":
                 return pending_event
+            if decision == "defer":
+                # Keep the event in this local drain slot until kill_process has
+                # resolved the signal. Returning/requeueing it would either
+                # dispatch too early or strand it with no future wake-up.
+                await asyncio.sleep(0.05)
+                continue
             logger.info(
-                "Dropping consumed queued process completion for %s",
+                "Dropping registry-suppressed queued process completion for %s",
                 completion_id,
             )
             # Promotion may have staged the next overflow event in the adapter's
@@ -9129,10 +9143,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # become stale follow-up turns.  Watch-match events carry no completion
         # id and intentionally remain unaffected.
         if is_internal:
-            _completion_id = _consumed_process_completion_id(event)
-            if _completion_id:
+            _completion_id, _completion_decision = _process_completion_notification_policy(event)
+            while _completion_decision == "defer":
+                await asyncio.sleep(0.05)
+                _completion_id, _completion_decision = _process_completion_notification_policy(event)
+            if _completion_id and _completion_decision == "suppress":
                 logger.info(
-                    "Dropping consumed queued process completion for %s",
+                    "Dropping registry-suppressed queued process completion for %s",
                     _completion_id,
                 )
                 return None
@@ -15705,14 +15722,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             last_output_len = current_output_len
 
             if session.exited:
-                # --- Agent-triggered completion: inject synthetic message ---
-                # Skip if the agent already consumed the terminal result via
-                # wait/log or an exited poll().  That second check matters for
-                # gateway turns: a process may finish, the agent may poll it and
-                # include the result in its final answer, and this watcher may
-                # only reach the same completion after the turn ends.
+                # Registry is the single owner of completion-notification
+                # eligibility across Gateway/CLI/TUI. During an unresolved
+                # process.kill race, keep the watcher parked; after a confirmed
+                # expected kill or agent-consumed completion, end silently.
                 from tools.process_registry import format_process_notification, process_registry as _pr_check
-                if agent_notify and not _pr_check.is_completion_consumed(session_id):
+                completion_decision = _pr_check.completion_notification_decision(session_id)
+                if completion_decision == "defer":
+                    continue
+                if completion_decision == "suppress":
+                    logger.debug(
+                        "Process watcher suppressed completion by registry policy: %s",
+                        session_id,
+                    )
+                    break
+
+                # --- Agent-triggered completion: inject synthetic message ---
+                if agent_notify:
                     from tools.ansi_strip import strip_ansi
                     _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
                     # Truncate at line boundaries so notifications never start
@@ -15805,6 +15831,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             break
                     if adapter and chat_id:
                         try:
+                            # Rendering/routing can overlap a terminal poll,
+                            # wait, or log call. Re-check at the final delivery
+                            # boundary so a newly consumed result cannot fall
+                            # through the text-only compatibility path.
+                            final_decision = _pr_check.completion_notification_decision(session_id)
+                            if final_decision == "defer":
+                                continue
+                            if final_decision == "suppress":
+                                break
                             send_meta = {"thread_id": thread_id} if thread_id else None
                             await adapter.send(
                                 chat_id,
@@ -19786,7 +19821,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Queued follow-up turns recurse directly into _run_agent rather
                 # than re-entering _handle_message, so consumed process
                 # completions must be filtered at this real drain boundary.
-                pending_event = self._dequeue_next_unconsumed_event(
+                pending_event = await self._dequeue_next_unconsumed_event(
                     adapter,
                     session_key,
                 )

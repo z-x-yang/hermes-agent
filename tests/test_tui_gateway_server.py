@@ -7682,13 +7682,15 @@ def test_notification_poller_delivers_completion(monkeypatch):
             process_registry.completion_queue.get_nowait()
 
 
-def test_notification_poller_skips_consumed(monkeypatch):
-    """Already-consumed completions are not dispatched by the poller."""
+@pytest.mark.parametrize("suppression_kind", ["consumed", "expected_kill"])
+def test_notification_poller_skips_registry_suppressed(monkeypatch, suppression_kind):
+    """Registry-suppressed completions are not dispatched by the poller."""
     import queue as _queue_mod
 
     from tools.process_registry import process_registry
 
     turns = []
+    emitted = []
 
     class _Agent:
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
@@ -7704,7 +7706,7 @@ def test_notification_poller_skips_consumed(monkeypatch):
     sess = _session(agent=_Agent())
     server._sessions["sid_skip"] = sess
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
-    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
 
@@ -7715,10 +7717,24 @@ def test_notification_poller_skips_consumed(monkeypatch):
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
     monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
 
-    process_registry._completion_consumed.add("proc_already_done")
+    process_id = "proc_registry_suppressed"
+    if suppression_kind == "consumed":
+        process_registry._completion_consumed.add(process_id)
+    else:
+        from tools.process_registry import ProcessSession
+
+        process_registry._finished[process_id] = ProcessSession(
+            id=process_id,
+            command="sleep 60",
+            exited=True,
+            exit_code=-15,
+            completion_reason="killed",
+            termination_source="process.kill",
+            notify_on_complete=True,
+        )
     isolated_queue.put({
         "type": "completion",
-        "session_id": "proc_already_done",
+        "session_id": process_id,
         "command": "echo x",
         "exit_code": 0,
         "output": "x",
@@ -7730,9 +7746,11 @@ def test_notification_poller_skips_consumed(monkeypatch):
     try:
         server._notification_poller_loop(stop, "sid_skip", sess)
         assert len(turns) == 0
+        assert emitted == []
     finally:
         server._sessions.pop("sid_skip", None)
-        process_registry._completion_consumed.discard("proc_already_done")
+        process_registry._completion_consumed.discard(process_id)
+        process_registry._finished.pop(process_id, None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
 

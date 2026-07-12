@@ -8,6 +8,7 @@ after the agent finishes its current task — not silently dropped.
 import asyncio
 from unittest.mock import MagicMock
 
+import pytest
 
 from gateway.run import _dequeue_pending_event
 from gateway.platforms.base import (
@@ -298,10 +299,103 @@ class TestQueueConsumptionAfterCompletion:
         # gets the next-in-line item.
         assert adapter._pending_messages[session_key].text == "Q2"
 
+    def test_completion_policy_gate_drops_expected_kill_event(self):
+        from gateway.run import (
+            _PROCESS_COMPLETION_EVENT_ID_KEY,
+            _suppressed_process_completion_id,
+        )
+        from tools.process_registry import ProcessSession, process_registry
+
+        process_id = "proc_expected_kill_queued"
+        session = ProcessSession(
+            id=process_id,
+            command="sleep 60",
+            exited=True,
+            exit_code=-15,
+            completion_reason="killed",
+            termination_source="process.kill",
+            notify_on_complete=True,
+        )
+        process_registry._finished[process_id] = session
+        event = MessageEvent(
+            text="[process killed]",
+            message_type=MessageType.TEXT,
+            source=MagicMock(),
+            internal=True,
+            metadata={_PROCESS_COMPLETION_EVENT_ID_KEY: process_id},
+        )
+        try:
+            assert _suppressed_process_completion_id(event) == process_id
+        finally:
+            process_registry._finished.pop(process_id, None)
+
+    @pytest.mark.asyncio
+    async def test_dequeue_does_not_dispatch_deferred_completion(self, monkeypatch):
+        """A queued completion stays parked until kill outcome suppresses it."""
+        import tools.process_registry as pr_module
+        from gateway.run import GatewayRunner, _PROCESS_COMPLETION_EVENT_ID_KEY
+
+        class _DeferredRegistry:
+            def __init__(self):
+                self.decisions = ["defer", "suppress"]
+
+            def completion_notification_decision(self, _session_id):
+                return self.decisions.pop(0)
+
+        registry = _DeferredRegistry()
+        monkeypatch.setattr(pr_module, "process_registry", registry)
+        runner = GatewayRunner.__new__(GatewayRunner)
+        adapter = _StubAdapter()
+        session_key = "telegram:user:deferred-completion"
+        completion = MessageEvent(
+            text="[process completion pending kill outcome]",
+            message_type=MessageType.TEXT,
+            source=MagicMock(),
+            internal=True,
+            metadata={_PROCESS_COMPLETION_EVENT_ID_KEY: "proc_deferred_queued"},
+        )
+        adapter._pending_messages[session_key] = completion
+        runner._queued_events = {}
+
+        assert await runner._dequeue_next_unconsumed_event(adapter, session_key) is None
+        assert registry.decisions == []
+        assert session_key not in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_dequeue_delivers_deferred_completion_when_policy_resolves_notify(self, monkeypatch):
+        """A failed kill must release the parked real completion instead of losing it."""
+        import tools.process_registry as pr_module
+        from gateway.run import GatewayRunner, _PROCESS_COMPLETION_EVENT_ID_KEY
+
+        class _DeferredThenNotifyRegistry:
+            def __init__(self):
+                self.decisions = ["defer", "notify"]
+
+            def completion_notification_decision(self, _session_id):
+                return self.decisions.pop(0)
+
+        registry = _DeferredThenNotifyRegistry()
+        monkeypatch.setattr(pr_module, "process_registry", registry)
+        runner = GatewayRunner.__new__(GatewayRunner)
+        adapter = _StubAdapter()
+        session_key = "telegram:user:failed-kill-completion"
+        completion = MessageEvent(
+            text="[real process completion]",
+            message_type=MessageType.TEXT,
+            source=MagicMock(),
+            internal=True,
+            metadata={_PROCESS_COMPLETION_EVENT_ID_KEY: "proc_failed_kill_queued"},
+        )
+        adapter._pending_messages[session_key] = completion
+        runner._queued_events = {}
+
+        assert await runner._dequeue_next_unconsumed_event(adapter, session_key) is completion
+        assert registry.decisions == []
+
     def test_completion_consumption_gate_requires_trusted_internal_event(self):
         from gateway.run import (
             _PROCESS_COMPLETION_EVENT_ID_KEY,
-            _consumed_process_completion_id,
+            _suppressed_process_completion_id,
         )
         from tools.process_registry import process_registry
 
@@ -321,12 +415,13 @@ class TestQueueConsumptionAfterCompletion:
                 source=MagicMock(),
                 internal=True,
             )
-            assert _consumed_process_completion_id(user_event) is None
-            assert _consumed_process_completion_id(watch_event) is None
+            assert _suppressed_process_completion_id(user_event) is None
+            assert _suppressed_process_completion_id(watch_event) is None
         finally:
             process_registry._completion_consumed.discard(process_id)
 
-    def test_dequeue_skips_consumed_completion_without_stranding_user_text(self):
+    @pytest.mark.asyncio
+    async def test_dequeue_skips_consumed_completion_without_stranding_user_text(self):
         from gateway.run import (
             GatewayRunner,
             _PROCESS_COMPLETION_EVENT_ID_KEY,
@@ -357,7 +452,7 @@ class TestQueueConsumptionAfterCompletion:
             adapter._pending_messages[session_key] = completion
             runner._queued_events = {session_key: [user_event]}
             assert (
-                runner._dequeue_next_unconsumed_event(adapter, session_key)
+                await runner._dequeue_next_unconsumed_event(adapter, session_key)
                 is user_event
             )
 
@@ -366,10 +461,10 @@ class TestQueueConsumptionAfterCompletion:
             adapter._pending_messages[session_key] = user_event
             runner._queued_events = {session_key: [completion]}
             assert (
-                runner._dequeue_next_unconsumed_event(adapter, session_key)
+                await runner._dequeue_next_unconsumed_event(adapter, session_key)
                 is user_event
             )
-            assert runner._dequeue_next_unconsumed_event(adapter, session_key) is None
+            assert await runner._dequeue_next_unconsumed_event(adapter, session_key) is None
         finally:
             process_registry._completion_consumed.discard(process_id)
 

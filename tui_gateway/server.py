@@ -8459,8 +8459,14 @@ def _notification_poller_loop(
             continue
 
         _evt_sid = evt.get("session_id", "")
-        if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
-            continue
+        if evt.get("type") == "completion":
+            _decision = process_registry.completion_notification_decision(_evt_sid)
+            if _decision == "suppress":
+                continue
+            if _decision == "defer":
+                process_registry.completion_queue.put(evt)
+                time.sleep(0.1)
+                continue
 
         text = format_process_notification(evt)
         if not text:
@@ -8507,8 +8513,13 @@ def _notification_poller_loop(
             deferred.append(evt)
             continue
         _evt_sid = evt.get("session_id", "")
-        if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
-            continue
+        if evt.get("type") == "completion":
+            _decision = process_registry.completion_notification_decision(_evt_sid)
+            if _decision == "suppress":
+                continue
+            if _decision == "defer":
+                deferred.append(evt)
+                continue
         text = format_process_notification(evt)
         if not text:
             continue

@@ -39,6 +39,9 @@ class _FakeRegistry:
     def is_completion_consumed(self, session_id):
         return session_id in self._completion_consumed
 
+    def completion_notification_decision(self, session_id):
+        return "suppress" if self.is_completion_consumed(session_id) else "notify"
+
 
 def _build_runner(monkeypatch, tmp_path) -> GatewayRunner:
     """Create a GatewayRunner with notifications set to 'all'."""
@@ -95,6 +98,7 @@ async def test_notify_on_complete_sets_internal_flag(monkeypatch, tmp_path):
     await runner._run_process_watcher(_watcher_dict_with_notify())
 
     assert adapter.handle_message.await_count == 1
+    assert getattr(adapter.send, "await_count") == 0
     event = adapter.handle_message.await_args.args[0]
     assert isinstance(event, MessageEvent)
     assert event.internal is True, "Synthetic completion event must be marked internal"
@@ -136,6 +140,137 @@ async def test_poll_suppresses_duplicate_notify_on_complete_watcher(monkeypatch,
     await runner._run_process_watcher(watcher)
 
     assert getattr(adapter.handle_message, "await_count") == 0
+    assert getattr(adapter.send, "await_count") == 0
+
+
+@pytest.mark.parametrize("termination_source", ["process.kill", "kill_all"])
+@pytest.mark.asyncio
+async def test_expected_process_kill_does_not_inject_gateway_completion(
+    monkeypatch, tmp_path, termination_source
+):
+    """An agent-requested kill remains inspectable but must not wake a new turn."""
+    import tools.process_registry as pr_module
+
+    registry = ProcessRegistry()
+    session = ProcessSession(
+        id="proc_expected_kill",
+        command="sleep 60",
+        output_buffer="",
+        exited=True,
+        exit_code=-15,
+        completion_reason="killed",
+        termination_source=termination_source,
+        notify_on_complete=True,
+    )
+    registry._finished[session.id] = session
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    runner = _build_runner(monkeypatch, tmp_path)
+    adapter = runner.adapters[Platform.DISCORD]
+    watcher = _watcher_dict_with_notify()
+    watcher["session_id"] = session.id
+
+    await runner._run_process_watcher(watcher)
+
+    assert registry.get(session.id) is session
+    assert session.completion_reason == "killed"
+    assert session.termination_source == termination_source
+    assert getattr(adapter.handle_message, "await_count") == 0
+    assert getattr(adapter.send, "await_count") == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_watcher_defers_until_kill_outcome_is_known(monkeypatch, tmp_path):
+    """Reader-observed exit during kill intent must wait for the signal result."""
+    import tools.process_registry as pr_module
+
+    session = SimpleNamespace(
+        output_buffer="",
+        exited=True,
+        exit_code=-15,
+        command="sleep 60",
+        completion_reason="exited",
+        termination_source="",
+    )
+
+    class _RaceRegistry:
+        def __init__(self):
+            self.decisions = ["defer", "suppress"]
+            self.seen = []
+
+        def get(self, _session_id):
+            return session
+
+        def completion_notification_decision(self, session_id):
+            decision = self.decisions.pop(0)
+            self.seen.append((session_id, decision))
+            return decision
+
+    registry = _RaceRegistry()
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    runner = _build_runner(monkeypatch, tmp_path)
+    adapter = runner.adapters[Platform.DISCORD]
+
+    await runner._run_process_watcher(_watcher_dict_with_notify())
+
+    assert registry.seen == [
+        ("proc_test_internal", "defer"),
+        ("proc_test_internal", "suppress"),
+    ]
+    assert getattr(adapter.handle_message, "await_count") == 0
+    assert getattr(adapter.send, "await_count") == 0
+
+
+@pytest.mark.asyncio
+async def test_text_watcher_rechecks_policy_immediately_before_send(monkeypatch, tmp_path):
+    """A terminal state consumed during rendering must not leak via text fallback."""
+    import tools.process_registry as pr_module
+
+    session = SimpleNamespace(
+        output_buffer="done\n",
+        exited=True,
+        exit_code=0,
+        command="echo done",
+        completion_reason="exited",
+        termination_source="",
+    )
+
+    class _ConsumeRaceRegistry:
+        def __init__(self):
+            self.decisions = ["notify", "suppress"]
+
+        def get(self, _session_id):
+            return session
+
+        def completion_notification_decision(self, _session_id):
+            return self.decisions.pop(0)
+
+    registry = _ConsumeRaceRegistry()
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    runner = _build_runner(monkeypatch, tmp_path)
+    adapter = runner.adapters[Platform.DISCORD]
+    watcher = _watcher_dict_with_notify()
+    watcher["notify_on_complete"] = False
+
+    await runner._run_process_watcher(watcher)
+
+    assert registry.decisions == []
+    assert getattr(adapter.handle_message, "await_count") == 0
+    assert getattr(adapter.send, "await_count") == 0
 
 
 @pytest.mark.asyncio

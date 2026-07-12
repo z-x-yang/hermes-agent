@@ -35,6 +35,9 @@ class _FakeRegistry:
     def is_completion_consumed(self, session_id):
         return False
 
+    def completion_notification_decision(self, session_id):
+        return "notify"
+
 
 def _build_runner(monkeypatch, tmp_path, mode: str) -> GatewayRunner:
     """Create a GatewayRunner with a fake config for the given mode."""

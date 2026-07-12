@@ -1308,6 +1308,66 @@ class TestKillProcess:
         assert result["status"] == "killed"
         assert registry.drain_notifications() == []
 
+    def test_completion_notification_decision_is_single_policy_owner(self, registry):
+        natural = _make_session(sid="proc_natural", exited=True, exit_code=0)
+        registry._finished[natural.id] = natural
+        assert registry.completion_notification_decision(natural.id) == "notify"
+
+        natural._kill_intent_pending = True
+        assert registry.completion_notification_decision(natural.id) == "defer"
+
+        natural._kill_intent_pending = False
+        natural.completion_reason = "killed"
+        natural.termination_source = "process.kill"
+        assert registry.completion_notification_decision(natural.id) == "suppress"
+
+        natural.termination_source = "kill_all"
+        assert registry.completion_notification_decision(natural.id) == "suppress"
+
+        natural.completion_reason = "exited"
+        natural.termination_source = ""
+        registry._completion_consumed.add(natural.id)
+        assert registry.completion_notification_decision(natural.id) == "suppress"
+
+    def test_drain_defers_pending_kill_then_suppresses_confirmed_cleanup(self, registry):
+        session = _make_session(sid="proc_deferred_drain", exited=True, exit_code=-15)
+        session.notify_on_complete = True
+        session._kill_intent_pending = True
+        registry._finished[session.id] = session
+        registry.completion_queue.put(
+            {
+                "type": "completion",
+                "session_id": session.id,
+                "command": session.command,
+                "exit_code": session.exit_code,
+                "output": "",
+            }
+        )
+
+        assert registry.drain_notifications() == []
+        assert registry.completion_queue.qsize() == 1
+
+        session._kill_intent_pending = False
+        session.completion_reason = "killed"
+        session.termination_source = "process.kill"
+        assert registry.drain_notifications() == []
+        assert registry.completion_queue.empty()
+
+    def test_pruning_preserves_consumed_completion_suppression(self, registry):
+        """A queued completion cannot resurrect after its finished session is pruned."""
+        session = _make_session(sid="proc_consumed_then_pruned", exited=True, exit_code=0)
+        session.notify_on_complete = True
+        session.started_at = 0
+        registry._finished[session.id] = session
+        registry._completion_consumed.add(session.id)
+        assert registry.completion_notification_decision(session.id) == "suppress"
+
+        with registry._lock:
+            registry._prune_if_needed()
+
+        assert registry.get(session.id) is None
+        assert registry.completion_notification_decision(session.id) == "suppress"
+
     def test_expected_process_kill_suppresses_reader_race_notification(self, registry, monkeypatch):
         """The reader may observe SIGTERM before kill_process returns from the terminator."""
         s = _make_session(sid="proc_expected_kill_race", command="codex review --uncommitted")

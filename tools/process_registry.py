@@ -46,11 +46,14 @@ _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from hermes_cli.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
+
+CompletionNotificationDecision = Literal["notify", "defer", "suppress"]
+_EXPECTED_KILL_NOTIFICATION_SOURCES = frozenset({"process.kill", "kill_all"})
 
 
 # Checkpoint file for crash recovery (gateway only)
@@ -195,6 +198,14 @@ class ProcessRegistry:
         # lets older or partially migrated queued completion paths dedupe a poll
         # observation without changing watch_match/watch_disabled events.
         self._poll_observed: set = set()
+
+        # Process-lifetime suppression tombstones outlive finished-session
+        # pruning. Gateway/TUI events can remain queued after the 30-minute / 64
+        # session retention boundary; forgetting a consumed ID would turn an
+        # already-suppressed completion back into ``notify``. These IDs are
+        # intentionally reset only with the registry process, when all in-memory
+        # notification queues are reset too.
+        self._completion_suppression_tombstones: set = set()
 
         # Global watch-match circuit breaker — across all sessions.
         # Prevents sibling processes from collectively flooding the user even
@@ -1310,7 +1321,52 @@ finally:
 
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed by the agent."""
-        return session_id in self._completion_consumed
+        with self._lock:
+            return (
+                session_id in self._completion_consumed
+                or session_id in self._completion_suppression_tombstones
+            )
+
+    def _mark_completion_consumed(self, session_id: str, *, polled: bool = False) -> None:
+        """Atomically record the durable in-process completion suppression ack."""
+        with self._lock:
+            self._completion_consumed.add(session_id)
+            self._completion_suppression_tombstones.add(session_id)
+            if polled:
+                self._poll_observed.add(session_id)
+
+    def completion_notification_decision(
+        self, session_id: str
+    ) -> CompletionNotificationDecision:
+        """Return the single cross-surface policy for automatic completion delivery.
+
+        ``defer`` closes the reader-vs-kill race while the signal outcome is
+        unresolved. ``suppress`` covers terminal state already observed by the
+        agent and successful agent/user-requested cleanup. Unknown/pruned
+        sessions default to ``notify`` so a real completion is never silently
+        lost merely because retention expired before a queued event drained.
+        """
+        with self._lock:
+            if (
+                session_id in self._completion_suppression_tombstones
+                or session_id in self._completion_consumed
+                or session_id in self._poll_observed
+            ):
+                return "suppress"
+            session = self._running.get(session_id) or self._finished.get(session_id)
+
+        if session is None:
+            return "notify"
+
+        with session._lock:
+            if session._kill_intent_pending:
+                return "defer"
+            if (
+                session.completion_reason == "killed"
+                and session.termination_source in _EXPECTED_KILL_NOTIFICATION_SOURCES
+            ):
+                return "suppress"
+        return "notify"
 
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop parked on this session should still be parked.
@@ -1348,36 +1404,35 @@ finally:
                 return False
         return True
 
-    def _drain_should_skip(self, session_id: str) -> bool:
-        """Whether the CLI drain should skip a completion event for this session.
-
-        Skips when the agent has consumed the terminal state/output (wait/log
-        or exited poll → ``_completion_consumed``) or when an older queue path
-        only recorded the poll observation (``_poll_observed``).  In both cases
-        the CLI agent already has the result this turn, so injecting a
-        [SYSTEM: ...] completion would be a duplicate (#8228).
-        """
-        return session_id in self._completion_consumed or session_id in self._poll_observed
-
     def drain_notifications(self) -> "list[tuple[dict, str]]":
-        """Pop all pending notification events and return formatted pairs.
+        """Pop eligible notification events and return formatted pairs.
 
-        Returns a list of (raw_event, formatted_text) tuples.
-        Skips completion events the agent already consumed via wait/log or
-        observed inline via poll() (see ``_drain_should_skip``).
+        Completion delivery is governed only by
+        :meth:`completion_notification_decision`. Deferred kill-race events are
+        returned to the queue after this drain pass; suppressed completions are
+        discarded. Non-completion watch/delegation events are unaffected.
         """
         results = []
+        deferred = []
         while not self.completion_queue.empty():
             try:
                 evt = self.completion_queue.get_nowait()
             except Exception:
                 break
-            _evt_sid = evt.get("session_id", "")
-            if evt.get("type") == "completion" and self._drain_should_skip(_evt_sid):
-                continue
+            if evt.get("type") == "completion":
+                decision = self.completion_notification_decision(
+                    evt.get("session_id", "")
+                )
+                if decision == "suppress":
+                    continue
+                if decision == "defer":
+                    deferred.append(evt)
+                    continue
             text = format_process_notification(evt)
             if text:
                 results.append((evt, text))
+        for evt in deferred:
+            self.completion_queue.put(evt)
         return results
 
     def get(self, session_id: str) -> Optional[ProcessSession]:
@@ -1496,8 +1551,7 @@ finally:
             # / TUI notify_on_complete watchers do not inject the same result
             # again after the final response.  Running polls remain read-only
             # and do not suppress future completion notifications.
-            self._completion_consumed.add(session_id)
-            self._poll_observed.add(session_id)
+            self._mark_completion_consumed(session_id, polled=True)
         if session.detached:
             result["detached"] = True
             result["note"] = "Process recovered after restart -- output restored from durable log when available"
@@ -1533,7 +1587,7 @@ finally:
             "showing": f"{len(selected)} lines",
         }
         if session.exited:
-            self._completion_consumed.add(session_id)
+            self._mark_completion_consumed(session_id)
         return result
 
     def wait(self, session_id: str, timeout: int = None) -> dict:
@@ -1583,7 +1637,7 @@ finally:
             # child has already exited (issue #17327).
             self._reconcile_local_exit(session)
             if session.exited:
-                self._completion_consumed.add(session_id)
+                self._mark_completion_consumed(session_id)
                 result = {
                     "status": "exited",
                     "command": session.command,
@@ -1993,6 +2047,8 @@ finally:
             if (now - s.started_at) > FINISHED_TTL_SECONDS
         ]
         for sid in expired:
+            if sid in self._completion_consumed or sid in self._poll_observed:
+                self._completion_suppression_tombstones.add(sid)
             del self._finished[sid]
             self._completion_consumed.discard(sid)
             self._poll_observed.discard(sid)
@@ -2001,14 +2057,15 @@ finally:
         total = len(self._running) + len(self._finished)
         if total >= MAX_PROCESSES and self._finished:
             oldest_id = min(self._finished, key=lambda sid: self._finished[sid].started_at)
+            if oldest_id in self._completion_consumed or oldest_id in self._poll_observed:
+                self._completion_suppression_tombstones.add(oldest_id)
             del self._finished[oldest_id]
             self._completion_consumed.discard(oldest_id)
             self._poll_observed.discard(oldest_id)
 
-        # Drop any _completion_consumed / _poll_observed entries whose sessions
-        # are no longer tracked at all — belt-and-suspenders against
-        # module-lifetime growth on registry lookup paths that don't reach the
-        # dict prunes.
+        # Compact the live-session compatibility sets. The process-lifetime
+        # tombstone ledger above remains authoritative for queued events that
+        # outlive session retention.
         tracked = self._running.keys() | self._finished.keys()
         stale = self._completion_consumed - tracked
         if stale:
