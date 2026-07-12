@@ -2050,6 +2050,26 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
 
+# MessageEvent.metadata key carried only by notify-on-complete synthetic events.
+# It lets a completion queued behind an active turn re-check whether the agent
+# consumed that process terminal state before the queued event is dispatched.
+_PROCESS_COMPLETION_EVENT_ID_KEY = "hermes_process_completion_id"
+
+
+def _consumed_process_completion_id(event: Any) -> Optional[str]:
+    """Return a trusted queued completion id only after its result was consumed."""
+    if not bool(getattr(event, "internal", False)):
+        return None
+    metadata = getattr(event, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    completion_id = str(metadata.get(_PROCESS_COMPLETION_EVENT_ID_KEY, "") or "")
+    if not completion_id:
+        return None
+    from tools.process_registry import process_registry as _pr_completion
+
+    return completion_id if _pr_completion.is_completion_consumed(completion_id) else None
+
 
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
@@ -4698,6 +4718,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             queued_events.setdefault(session_key, []).insert(0, next_queued)
         return pending_event
 
+    def _dequeue_next_unconsumed_event(self, adapter: Any, session_key: str):
+        """Drain queued events while discarding already-consumed completions."""
+        pending_event = _dequeue_pending_event(adapter, session_key)
+        pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+        while pending_event is not None:
+            completion_id = _consumed_process_completion_id(pending_event)
+            if not completion_id:
+                return pending_event
+            logger.info(
+                "Dropping consumed queued process completion for %s",
+                completion_id,
+            )
+            # Promotion may have staged the next overflow event in the adapter's
+            # pending slot. Pull again so later user input is never stranded.
+            pending_event = _dequeue_pending_event(adapter, session_key)
+            pending_event = self._promote_queued_event(
+                session_key,
+                adapter,
+                pending_event,
+            )
+        return None
+
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
         """Total pending /queue items for a session — slot + overflow."""
         queued_events = getattr(self, "_queued_events", None) or {}
@@ -5587,19 +5629,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not adapter:
             return False  # let default path handle it
 
-        # --- Internal synthetic events must never interrupt/steer ---
+        # --- Internal synthetic events must never interrupt/steer or merge ---
         # Async-delegation completions (delegate_task(run_in_background=true)) and
         # background-process completions (terminal notify_on_complete) re-enter
-        # the originating session as internal MessageEvents. When the session
-        # is busy, treating them like a user TEXT message means interrupt-mode
-        # (the default busy_text_mode) aborts the active turn AND sends a "⚡
-        # Interrupting current task" ack — exactly the opposite of the design
-        # invariant that a completion surfaces as a NEW turn only when idle and
-        # never splices into a running turn. Fall through to the base adapter,
-        # which queues internal events silently (no interrupt, no ack) so they
-        # cascade after the current turn finishes.
+        # the originating session as internal MessageEvents. Keep them in the
+        # runner's FIFO overflow rather than the adapter's mergeable pending slot:
+        # a completion and nearby user TEXT must remain separate turns in either
+        # arrival order. The drain path promotes overflow even when the pending
+        # slot is empty.
         if getattr(event, "internal", False):
-            return False
+            if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+                logger.warning(
+                    "Dropping internal busy-session event for %s — pending queue at cap (%d).",
+                    session_key,
+                    self._BUSY_QUEUE_MAX_PENDING,
+                )
+                return True
+            queued_events = getattr(self, "_queued_events", None)
+            if queued_events is None:
+                queued_events = {}
+                self._queued_events = queued_events
+            queued_events.setdefault(session_key, []).append(event)
+            logger.debug(
+                "Queued isolated internal event for busy session %s",
+                session_key,
+            )
+            return True
 
         running_agent = self._running_agents.get(session_key)
 
@@ -9066,6 +9121,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
+
+        # A completion watcher can enqueue this synthetic event while the origin
+        # session is busy, then the active agent can observe the exited process
+        # through poll/wait/log before the queued event is dispatched.  Re-check
+        # consumption on every dispatch so that already-queued completions do not
+        # become stale follow-up turns.  Watch-match events carry no completion
+        # id and intentionally remain unaffected.
+        if is_internal:
+            _completion_id = _consumed_process_completion_id(event)
+            if _completion_id:
+                logger.info(
+                    "Dropping consumed queued process completion for %s",
+                    _completion_id,
+                )
+                return None
 
         # scale-to-zero (Phase 0, 0.B/F13): stamp the gateway-scoped last-inbound
         # clock for real (user-originated) inbound only. Internal/system events
@@ -15697,6 +15767,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 source=source,
                                 internal=True,
                                 message_id=message_id,
+                                metadata={_PROCESS_COMPLETION_EVENT_ID_KEY: session_id},
                             )
                             logger.info(
                                 "Process %s finished — injecting agent notification for session %s chat=%s thread=%s",
@@ -19712,14 +19783,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pending_event = None
             pending = None
             if result and adapter and session_key:
-                pending_event = _dequeue_pending_event(adapter, session_key)
-                # /queue overflow: after consuming the adapter's "next-up"
-                # slot, promote the next queued event into it so the
-                # recursive run's drain will see it.  This keeps the slot
-                # occupied for the full FIFO chain, which (a) preserves
-                # order, and (b) causes any mid-chain /queue to correctly
-                # route to overflow rather than jumping the queue.
-                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                # Queued follow-up turns recurse directly into _run_agent rather
+                # than re-entering _handle_message, so consumed process
+                # completions must be filtered at this real drain boundary.
+                pending_event = self._dequeue_next_unconsumed_event(
+                    adapter,
+                    session_key,
+                )
                 if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                     interrupt_message = result.get("interrupt_message")
                     if _is_control_interrupt_message(interrupt_message):

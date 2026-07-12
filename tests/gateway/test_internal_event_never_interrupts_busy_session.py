@@ -10,12 +10,10 @@ default ``busy_input_mode='interrupt'`` path — calling
 completions (terminal ``notify_on_complete``), which also re-enter as internal
 events.
 
-The fix: ``_handle_active_session_busy_message`` returns ``False`` early for any
-event with ``internal=True``, so the base adapter queues it silently (no
-interrupt, no ack) and it cascades as a new turn after the current one finishes.
-This preserves strict message-role alternation and the design invariant that a
-completion surfaces as a NEW turn only when idle, never spliced into a running
-turn.
+The fix: ``_handle_active_session_busy_message`` handles internal events by
+putting them in the runner's isolated FIFO overflow, never the adapter's
+mergeable pending slot.  They cascade as distinct new turns after the current
+one finishes without interrupting or absorbing nearby user text.
 """
 
 from __future__ import annotations
@@ -44,6 +42,7 @@ from gateway.platforms.base import (  # noqa: E402
     MessageType,
     SessionSource,
     build_session_key,
+    merge_pending_message_event,
 )
 from gateway.run import GatewayRunner  # noqa: E402
 
@@ -118,13 +117,52 @@ async def test_internal_event_does_not_interrupt_busy_session() -> None:
 
     handled = await runner._handle_active_session_busy_message(event, sk)
 
-    # Returns False so the base adapter silently queues the internal event
-    # as a cascading next turn — it must NOT be handled-with-interrupt here.
-    assert handled is False
+    # The runner handles and isolates the completion in FIFO overflow so the
+    # base adapter cannot merge it with a nearby user TEXT event.
+    assert handled is True
+    assert adapter._pending_messages == {}
+    assert runner._queued_events[sk] == [event]
     # The active turn must survive.
     parent.interrupt.assert_not_called()
     # No "⚡ Interrupting current task" (or any) ack for a synthetic event.
     adapter._send_with_retry.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completion_first", [True, False])
+async def test_internal_completion_never_merges_with_user_pending_text(
+    completion_first: bool,
+) -> None:
+    runner = _make_runner()
+    runner._busy_input_mode = "interrupt"
+    adapter = _make_adapter()
+    completion = _make_internal_event("[process completion]")
+    user_event = _make_internal_event("real user follow-up")
+    object.__setattr__(user_event, "internal", False)
+    sk = build_session_key(completion.source)
+    runner._running_agents[sk] = _make_running_parent()
+    runner.adapters[completion.source.platform] = adapter
+
+    if completion_first:
+        assert await runner._handle_active_session_busy_message(completion, sk) is True
+        merge_pending_message_event(
+            adapter._pending_messages,
+            sk,
+            user_event,
+            merge_text=True,
+        )
+    else:
+        merge_pending_message_event(
+            adapter._pending_messages,
+            sk,
+            user_event,
+            merge_text=True,
+        )
+        assert await runner._handle_active_session_busy_message(completion, sk) is True
+
+    assert adapter._pending_messages[sk] is user_event
+    assert adapter._pending_messages[sk].text == "real user follow-up"
+    assert runner._queued_events[sk] == [completion]
 
 
 @pytest.mark.asyncio

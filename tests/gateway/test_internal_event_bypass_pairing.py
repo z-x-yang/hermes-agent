@@ -98,6 +98,7 @@ async def test_notify_on_complete_sets_internal_flag(monkeypatch, tmp_path):
     event = adapter.handle_message.await_args.args[0]
     assert isinstance(event, MessageEvent)
     assert event.internal is True, "Synthetic completion event must be marked internal"
+    assert event.metadata["hermes_process_completion_id"] == "proc_test_internal"
 
 
 @pytest.mark.asyncio
@@ -135,6 +136,45 @@ async def test_poll_suppresses_duplicate_notify_on_complete_watcher(monkeypatch,
     await runner._run_process_watcher(watcher)
 
     assert getattr(adapter.handle_message, "await_count") == 0
+
+
+@pytest.mark.asyncio
+async def test_queued_completion_is_dropped_when_consumed_before_dispatch(monkeypatch, tmp_path):
+    """A watcher-queued completion must not become a stale follow-up turn.
+
+    Reproduces the live race: the watcher creates the synthetic event while the
+    origin session is busy, then process.poll observes the exited handle before
+    the queued event is dispatched after that turn.
+    """
+    import tools.process_registry as pr_module
+
+    session = SimpleNamespace(
+        output_buffer="done\n",
+        exited=True,
+        exit_code=0,
+        command="echo test",
+    )
+    registry = _FakeRegistry([session])
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    runner = _build_runner(monkeypatch, tmp_path)
+    adapter = runner.adapters[Platform.DISCORD]
+
+    watcher = _watcher_dict_with_notify()
+    await runner._run_process_watcher(watcher)
+    queued_event = getattr(adapter.handle_message, "await_args").args[0]
+
+    registry._completion_consumed.add(watcher["session_id"])
+    runner._handle_message_with_agent = AsyncMock(return_value="stale")
+
+    result = await runner._handle_message(queued_event)
+
+    assert result is None
+    runner._handle_message_with_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio

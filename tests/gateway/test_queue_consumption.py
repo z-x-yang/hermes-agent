@@ -298,6 +298,81 @@ class TestQueueConsumptionAfterCompletion:
         # gets the next-in-line item.
         assert adapter._pending_messages[session_key].text == "Q2"
 
+    def test_completion_consumption_gate_requires_trusted_internal_event(self):
+        from gateway.run import (
+            _PROCESS_COMPLETION_EVENT_ID_KEY,
+            _consumed_process_completion_id,
+        )
+        from tools.process_registry import process_registry
+
+        process_id = "proc_user_metadata_must_not_authorize"
+        process_registry._completion_consumed.add(process_id)
+        try:
+            user_event = MessageEvent(
+                text="real user input",
+                message_type=MessageType.TEXT,
+                source=MagicMock(),
+                internal=False,
+                metadata={_PROCESS_COMPLETION_EVENT_ID_KEY: process_id},
+            )
+            watch_event = MessageEvent(
+                text="[watch matched]",
+                message_type=MessageType.TEXT,
+                source=MagicMock(),
+                internal=True,
+            )
+            assert _consumed_process_completion_id(user_event) is None
+            assert _consumed_process_completion_id(watch_event) is None
+        finally:
+            process_registry._completion_consumed.discard(process_id)
+
+    def test_dequeue_skips_consumed_completion_without_stranding_user_text(self):
+        from gateway.run import (
+            GatewayRunner,
+            _PROCESS_COMPLETION_EVENT_ID_KEY,
+        )
+        from tools.process_registry import process_registry
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        adapter = _StubAdapter()
+        session_key = "telegram:user:completion-race"
+        process_id = "proc_consumed_queued"
+        completion = MessageEvent(
+            text="[process completed]",
+            message_type=MessageType.TEXT,
+            source=MagicMock(),
+            internal=True,
+            metadata={_PROCESS_COMPLETION_EVENT_ID_KEY: process_id},
+        )
+        user_event = MessageEvent(
+            text="real user follow-up",
+            message_type=MessageType.TEXT,
+            source=MagicMock(),
+        )
+        process_registry._completion_consumed.add(process_id)
+
+        try:
+            # Completion in the adapter slot, user text in overflow: dropping the
+            # completion must immediately pull and return the user event.
+            adapter._pending_messages[session_key] = completion
+            runner._queued_events = {session_key: [user_event]}
+            assert (
+                runner._dequeue_next_unconsumed_event(adapter, session_key)
+                is user_event
+            )
+
+            # User text in the slot, completion in overflow: user runs first and
+            # the next drain silently consumes the now-staged completion.
+            adapter._pending_messages[session_key] = user_event
+            runner._queued_events = {session_key: [completion]}
+            assert (
+                runner._dequeue_next_unconsumed_event(adapter, session_key)
+                is user_event
+            )
+            assert runner._dequeue_next_unconsumed_event(adapter, session_key) is None
+        finally:
+            process_registry._completion_consumed.discard(process_id)
+
     def test_queue_depth_counts_slot_plus_overflow(self):
         from gateway.run import GatewayRunner
 
