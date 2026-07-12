@@ -7,6 +7,7 @@ import sqlite3
 from dataclasses import asdict, replace
 from pathlib import Path
 
+import state_db_fts_migration as migration
 from state_db_fts import create_fts_v1, rebuild_fts
 from state_db_maintenance import (
     JournalPhase,
@@ -37,7 +38,8 @@ def _make_v1_fixture(path: Path) -> None:
             model TEXT,
             started_at REAL NOT NULL,
             ended_at REAL,
-            archived INTEGER NOT NULL DEFAULT 0
+            archived INTEGER NOT NULL DEFAULT 0,
+            parent_session_id TEXT
         );
         CREATE TABLE messages (
             id INTEGER PRIMARY KEY,
@@ -67,10 +69,10 @@ def _make_v1_fixture(path: Path) -> None:
         """
     )
     conn.executemany(
-        "INSERT INTO sessions(id, source, model, started_at, ended_at, archived) VALUES(?,?,?,?,?,?)",
+        "INSERT INTO sessions(id, source, model, started_at, ended_at, archived, parent_session_id) VALUES(?,?,?,?,?,?,?)",
         [
-            ("active-session", "cli", "model-a", 100.0, None, 0),
-            ("held-archive", "cron", "model-b", 50.0, 60.0, 1),
+            ("active-session", "cli", "model-a", 100.0, None, 0, None),
+            ("held-archive", "cron", "model-b", 50.0, 60.0, 1, "active-session"),
         ],
     )
     conn.executemany(
@@ -452,6 +454,7 @@ def test_paired_search_accepts_complete_parity_and_emits_aggregate_only_report(t
     assert report.field_digest_equal
     assert report.row_counts_equal
     assert report.all_match_sets_equal
+    assert report.all_lineage_dedupe_equal
     assert report.minimum_top10_overlap >= 0.9
     assert report.all_snippets_valid
     assert report.all_ordering_differences_allowed
@@ -463,6 +466,12 @@ def test_paired_search_accepts_complete_parity_and_emits_aggregate_only_report(t
         "english", "default_cjk", "tool_cjk"
     }
     assert all(case.match_sets_equal for case in report.cases)
+    lineage_case = next(case for case in report.cases if case.case_id == "c09")
+    assert lineage_case.source_match_count == 2
+    assert lineage_case.candidate_match_count == 2
+    assert lineage_case.source_lineage_dedup_count == 1
+    assert lineage_case.candidate_lineage_dedup_count == 1
+    assert lineage_case.lineage_dedupe_equal
     assert all(case.snippets_valid for case in report.cases)
     serialized = json.dumps(asdict(report), sort_keys=True)
     representation = repr(report)
@@ -477,6 +486,63 @@ def test_paired_search_accepts_complete_parity_and_emits_aggregate_only_report(t
         "candidate-operation",
         "hermes://",
         '"name":"工具调用中文"',
+        ">>>",
+        "<<<",
+    ):
+        assert secret not in serialized
+        assert secret not in representation
+
+
+def test_paired_search_rejects_different_lineage_survivor_identity_without_leaking(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source" / "state.db"
+    source.parent.mkdir()
+    _candidate_fixture(source)
+    journal, permit = _candidate_access(source)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(mode=0o700)
+    build_v2_candidate(source, work_dir, journal, permit)
+    candidate = work_dir / "candidate-build" / "candidate.db"
+    corpus = _paired_corpus()
+    canonical = migration._lineage_survivor_identities
+    calls = 0
+
+    def changed_candidate_survivor(db, raw_results):
+        nonlocal calls
+        calls += 1
+        survivors = canonical(db, raw_results)
+        if calls <= len(corpus):
+            return survivors
+        return tuple(
+            (root, session_id, message_id + 1000)
+            for root, session_id, message_id in survivors
+        )
+
+    monkeypatch.setattr(
+        migration, "_lineage_survivor_identities", changed_candidate_survivor
+    )
+
+    report = verify_v2_candidate(source, candidate, corpus)
+
+    assert report.all_match_sets_equal
+    assert report.minimum_top10_overlap >= 0.9
+    assert report.all_ordering_differences_allowed
+    assert not report.all_lineage_dedupe_equal
+    assert not report.verification_passed
+    assert not report.candidate_accepted
+    assert any(
+        case.source_lineage_dedup_count == case.candidate_lineage_dedup_count
+        and not case.lineage_dedupe_equal
+        for case in report.cases
+    )
+    serialized = json.dumps(asdict(report), sort_keys=True)
+    representation = repr(report)
+    for secret in (
+        "English alpha",
+        "active-session",
+        "held-archive",
+        "candidate-operation",
         ">>>",
         "<<<",
     ):

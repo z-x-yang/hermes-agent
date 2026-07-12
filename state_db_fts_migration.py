@@ -128,7 +128,10 @@ class SearchCaseReport:
     category: str
     source_match_count: int
     candidate_match_count: int
+    source_lineage_dedup_count: int
+    candidate_lineage_dedup_count: int
     match_sets_equal: bool
+    lineage_dedupe_equal: bool
     top10_overlap: float
     snippets_valid: bool
     ordering_difference_allowed: bool
@@ -156,6 +159,7 @@ class VerificationReport:
     field_digest_equal: bool
     row_counts_equal: bool
     all_match_sets_equal: bool
+    all_lineage_dedupe_equal: bool
     minimum_top10_overlap: float
     all_snippets_valid: bool
     all_ordering_differences_allowed: bool
@@ -459,7 +463,32 @@ def build_v2_candidate(
     )
 
 
-def _search_copy(path: Path, cases: Sequence[SearchCase]) -> list[tuple[list[dict], float]]:
+@dataclass(frozen=True)
+class _SearchCopyResult:
+    matches: list[dict]
+    latency_ms: float
+    lineage_survivors: tuple[tuple[str, str, int], ...]
+
+
+def _lineage_survivor_identities(
+    db: Any, raw_results: list[dict]
+) -> tuple[tuple[str, str, int], ...]:
+    """Apply canonical recall ordering and first-hit-per-lineage selection."""
+    from tools.session_search_tool import _order_for_recall, _resolve_to_parent
+
+    seen: set[str] = set()
+    survivors: list[tuple[str, str, int]] = []
+    for match in _order_for_recall(raw_results):
+        session_id = str(match["session_id"])
+        lineage_root = _resolve_to_parent(db, session_id)
+        if lineage_root in seen:
+            continue
+        seen.add(lineage_root)
+        survivors.append((lineage_root, session_id, int(match["id"])))
+    return tuple(survivors)
+
+
+def _search_copy(path: Path, cases: Sequence[SearchCase]) -> list[_SearchCopyResult]:
     from hermes_state import SessionDB
 
     conn = _open_read_only(path)
@@ -472,7 +501,7 @@ def _search_copy(path: Path, cases: Sequence[SearchCase]) -> list[tuple[list[dic
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts_trigram'"
     ).fetchone() is not None
     total = int(conn.execute("SELECT count(*) FROM messages").fetchone()[0])
-    results: list[tuple[list[dict], float]] = []
+    results: list[_SearchCopyResult] = []
     try:
         for case in cases:
             started = time.perf_counter_ns()
@@ -485,7 +514,13 @@ def _search_copy(path: Path, cases: Sequence[SearchCase]) -> list[tuple[list[dic
                 include_inactive=case.include_inactive,
             )
             elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
-            results.append((matches, elapsed_ms))
+            results.append(
+                _SearchCopyResult(
+                    matches=matches,
+                    latency_ms=elapsed_ms,
+                    lineage_survivors=_lineage_survivor_identities(db, matches),
+                )
+            )
     finally:
         conn.close()
     return results
@@ -625,9 +660,11 @@ def verify_v2_candidate(
         and initial_candidate_sha256 == final_candidate_sha256
     )
     case_reports: list[SearchCaseReport] = []
-    for case, (source_matches, source_ms), (candidate_matches, candidate_ms) in zip(
+    for case, source_result, candidate_result in zip(
         cases, source_results, candidate_results
     ):
+        source_matches = source_result.matches
+        candidate_matches = candidate_result.matches
         source_ids = [int(match["id"]) for match in source_matches]
         candidate_ids = [int(match["id"]) for match in candidate_matches]
         snippets = [
@@ -642,14 +679,20 @@ def verify_v2_candidate(
                 category=case.category,
                 source_match_count=len(source_ids),
                 candidate_match_count=len(candidate_ids),
+                source_lineage_dedup_count=len(source_result.lineage_survivors),
+                candidate_lineage_dedup_count=len(candidate_result.lineage_survivors),
                 match_sets_equal=set(source_ids) == set(candidate_ids),
+                lineage_dedupe_equal=(
+                    source_result.lineage_survivors
+                    == candidate_result.lineage_survivors
+                ),
                 top10_overlap=_top10_overlap(source_ids, candidate_ids),
                 snippets_valid=snippets_valid,
                 ordering_difference_allowed=(
                     source_ids == candidate_ids or _bm25_ordering_applies(case)
                 ),
-                source_latency_ms=round(source_ms, 6),
-                candidate_latency_ms=round(candidate_ms, 6),
+                source_latency_ms=round(source_result.latency_ms, 6),
+                candidate_latency_ms=round(candidate_result.latency_ms, 6),
             )
         )
 
@@ -677,6 +720,7 @@ def verify_v2_candidate(
             )
         )
     match_sets_equal = all(item.match_sets_equal for item in case_reports)
+    lineage_dedupe_equal = all(item.lineage_dedupe_equal for item in case_reports)
     minimum_overlap = min(item.top10_overlap for item in case_reports)
     snippets_valid = all(item.snippets_valid for item in case_reports)
     ordering_valid = all(item.ordering_difference_allowed for item in case_reports)
@@ -687,6 +731,7 @@ def verify_v2_candidate(
         and fields_equal
         and row_counts_equal
         and match_sets_equal
+        and lineage_dedupe_equal
         and minimum_overlap >= 0.9
         and snippets_valid
         and ordering_valid
@@ -702,6 +747,7 @@ def verify_v2_candidate(
         field_digest_equal=fields_equal,
         row_counts_equal=row_counts_equal,
         all_match_sets_equal=match_sets_equal,
+        all_lineage_dedupe_equal=lineage_dedupe_equal,
         minimum_top10_overlap=minimum_overlap,
         all_snippets_valid=snippets_valid,
         all_ordering_differences_allowed=ordering_valid,
