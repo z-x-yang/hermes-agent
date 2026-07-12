@@ -855,6 +855,33 @@ def test_controlled_provider_exercises_all_required_semantics_without_mutating_o
     assert not (work_dir / "controlled-paired-verification").exists()
 
 
+def test_controlled_verifier_uses_fresh_namespace_when_legacy_term_exists(tmp_path):
+    source = tmp_path / "source" / "state.db"
+    source.parent.mkdir()
+    _candidate_fixture(source)
+    conn = sqlite3.connect(source)
+    try:
+        conn.execute(
+            "UPDATE messages SET content=coalesce(content,'') || ? WHERE id=(SELECT min(id) FROM messages)",
+            (" cpx9d7b4e2a61f38",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    journal, permit = _candidate_access(source)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(mode=0o700)
+    build_v2_candidate(source, work_dir, journal, permit)
+    candidate = work_dir / "candidate-build" / "candidate.db"
+
+    result = verify_v2_candidate_with_controlled_corpus(source, candidate, work_dir)
+
+    assert result.paired_corpus_version == CONTROLLED_PAIRED_CORPUS_VERSION
+    assert result.verification.verification_passed
+    assert result.verification.candidate_accepted
+    assert not (work_dir / "controlled-paired-verification").exists()
+
+
 def test_controlled_verifier_cleans_owned_copies_after_injected_failure(
     tmp_path, monkeypatch
 ):

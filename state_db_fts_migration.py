@@ -60,21 +60,46 @@ _PAYLOAD_FIELDS = (
     "codex_message_items",
 )
 
-CONTROLLED_PAIRED_CORPUS_VERSION = "hermes-state-fts-controlled-v1"
+CONTROLLED_PAIRED_CORPUS_VERSION = "hermes-state-fts-controlled-v2"
 _CONTROLLED_DIR_NAME = "controlled-paired-verification"
-_CONTROLLED_TERMS = {
-    "english": "cpx9d7b4e2a61f38",
-    "unicode": "cafécpx7a91d5e3b62",
-    "user_cjk": "受控检索甲辰玖",
-    "assistant_cjk": "受控检索乙巳捌",
-    "tool_calls_cjk": "受控检索丙午柒",
-    "tool_mixed_like": "cpx5e81a2d9f工具",
-    "tool_cjk_like": "验具",
-    "short_cjk": "短验",
-    "source": "cpx4c7e19a6b35d",
-    "visibility": "cpx8a2f6d1e94b7",
-    "lineage": "cpx3b9e71d5a26f",
-}
+_CONTROLLED_TERM_KEYS = (
+    "english",
+    "unicode",
+    "user_cjk",
+    "assistant_cjk",
+    "tool_calls_cjk",
+    "tool_mixed_like",
+    "tool_cjk_like",
+    "short_cjk",
+    "source",
+    "visibility",
+    "lineage",
+)
+
+
+def _random_cjk(length: int) -> str:
+    return "".join(chr(0x4E00 + secrets.randbelow(0x9FFF - 0x4E00 + 1)) for _ in range(length))
+
+
+def _new_controlled_terms() -> dict[str, str]:
+    """Generate a payload-independent namespace that cannot become stale corpus data."""
+    nonce = secrets.token_hex(16)
+    terms = {
+        "english": f"cpx{nonce}a",
+        "unicode": f"café{nonce}b",
+        "user_cjk": _random_cjk(8),
+        "assistant_cjk": _random_cjk(8),
+        "tool_calls_cjk": _random_cjk(8),
+        "tool_mixed_like": f"cpx{nonce}c{_random_cjk(2)}",
+        "tool_cjk_like": _random_cjk(2),
+        "short_cjk": _random_cjk(2),
+        "source": f"cpx{nonce}d",
+        "visibility": f"cpx{nonce}e",
+        "lineage": f"cpx{nonce}f",
+    }
+    if set(terms) != set(_CONTROLLED_TERM_KEYS) or len(set(terms.values())) != len(terms):
+        raise RuntimeError("controlled verification namespace generation failed")
+    return terms
 
 
 @dataclass(frozen=True)
@@ -231,9 +256,13 @@ class MigrationResult:
     paired_corpus_version: str = CONTROLLED_PAIRED_CORPUS_VERSION
 
 
-def controlled_paired_corpus() -> tuple[SearchCase, ...]:
-    """Return the versioned private corpus used only on controlled disposable rows."""
-    terms = _CONTROLLED_TERMS
+def controlled_paired_corpus(
+    terms: Mapping[str, str] | None = None,
+) -> tuple[SearchCase, ...]:
+    """Return one fresh, versioned corpus used only on controlled disposable rows."""
+    terms = dict(terms) if terms is not None else _new_controlled_terms()
+    if set(terms) != set(_CONTROLLED_TERM_KEYS):
+        raise ValueError("controlled verification terms do not match the corpus contract")
     return (
         SearchCase("english", "english", terms["english"]),
         SearchCase("english-unicode", "english", terms["unicode"]),
@@ -1004,6 +1033,7 @@ def _insert_controlled_rows(
     source_copy: Path,
     candidate_copy: Path,
     session_ids: tuple[str, str, str],
+    terms: Mapping[str, str],
 ) -> None:
     connections = [sqlite3.connect(source_copy), sqlite3.connect(candidate_copy)]
     try:
@@ -1032,7 +1062,7 @@ def _insert_controlled_rows(
                     (term,),
                 ).fetchone()
                 is not None
-                for term in _CONTROLLED_TERMS.values()
+                for term in terms.values()
             ):
                 raise RuntimeError("controlled verification term collides with existing data")
             if any(
@@ -1054,7 +1084,6 @@ def _insert_controlled_rows(
             (child_id, "hermes-controlled-include", "controlled", 2.0, None, 0, parent_id),
             (excluded_id, "hermes-controlled-exclude", "controlled", 3.0, None, 0, None),
         )
-        terms = _CONTROLLED_TERMS
         message_rows = (
             (base_id, parent_id, "user", terms["english"], None, None, None, 10.0, 1, 0),
             (base_id + 1, parent_id, "assistant", terms["unicode"], None, None, None, 11.0, 1, 0),
@@ -1097,9 +1126,12 @@ def _insert_controlled_rows(
             conn.close()
 
 
-def _controlled_semantics_passed(report: VerificationReport) -> bool:
+def _controlled_semantics_passed(
+    report: VerificationReport,
+    corpus: Sequence[SearchCase],
+) -> bool:
     cases = {case.case_id: case for case in report.cases}
-    expected_ids = {case.case_id for case in controlled_paired_corpus()}
+    expected_ids = {case.case_id for case in corpus}
     if set(cases) != expected_ids:
         return False
     if any(
@@ -1165,6 +1197,7 @@ def verify_v2_candidate_with_controlled_corpus(
     try:
         _backup_to_private_copy(source_path, disposable_source)
         _backup_to_private_copy(candidate_path, disposable_candidate)
+        terms = _new_controlled_terms()
         session_ids = tuple(
             f"hermes-controlled-{secrets.token_hex(24)}" for _ in range(3)
         )
@@ -1172,10 +1205,11 @@ def verify_v2_candidate_with_controlled_corpus(
             disposable_source,
             disposable_candidate,
             (session_ids[0], session_ids[1], session_ids[2]),
+            terms,
         )
-        corpus = controlled_paired_corpus()
+        corpus = controlled_paired_corpus(terms)
         report = verify_v2_candidate(disposable_source, disposable_candidate, corpus)
-        if not _controlled_semantics_passed(report):
+        if not _controlled_semantics_passed(report, corpus):
             report = replace(
                 report,
                 verification_passed=False,
