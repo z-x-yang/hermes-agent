@@ -2,16 +2,28 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from state_db_fts import create_fts_v1, rebuild_fts
-from state_db_maintenance import MaintenanceJournal, write_maintenance_journal
+from state_db_maintenance import (
+    JournalPhase,
+    MaintenanceBlockedError,
+    MaintenanceJournal,
+    issue_maintenance_permit,
+    state_db_file_inventory,
+    write_maintenance_journal,
+)
 from state_db_fts_migration import (
+    SearchCase,
+    build_v2_candidate,
     estimate_payload_retention,
+    field_digest,
     plan_fts_migration,
     status_fts_migration,
+    verify_v2_candidate,
 )
 
 
@@ -22,6 +34,7 @@ def _make_v1_fixture(path: Path) -> None:
         CREATE TABLE sessions (
             id TEXT PRIMARY KEY,
             source TEXT NOT NULL,
+            model TEXT,
             started_at REAL NOT NULL,
             ended_at REAL,
             archived INTEGER NOT NULL DEFAULT 0
@@ -44,13 +57,20 @@ def _make_v1_fixture(path: Path) -> None:
             compacted INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE durable_records (
+            record_key TEXT PRIMARY KEY,
+            payload BLOB,
+            ordinal INTEGER NOT NULL
+        );
+        INSERT INTO durable_records(record_key,payload,ordinal)
+        VALUES('record-a',x'0001ff',1);
         """
     )
     conn.executemany(
-        "INSERT INTO sessions(id, source, started_at, ended_at, archived) VALUES(?,?,?,?,?)",
+        "INSERT INTO sessions(id, source, model, started_at, ended_at, archived) VALUES(?,?,?,?,?,?)",
         [
-            ("active-session", "cli", 100.0, None, 0),
-            ("held-archive", "cli", 50.0, 60.0, 1),
+            ("active-session", "cli", "model-a", 100.0, None, 0),
+            ("held-archive", "cron", "model-b", 50.0, 60.0, 1),
         ],
     )
     conn.executemany(
@@ -231,3 +251,260 @@ def test_invalid_schema_marker_is_reported_without_raw_value(tmp_path):
     assert status["schema_marker"] == "invalid"
     assert "private-session-id" not in repr(plan)
     assert "private-session-id" not in json.dumps(status, sort_keys=True)
+
+
+def _candidate_fixture(path: Path) -> None:
+    _make_v1_fixture(path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.executemany(
+            """INSERT INTO messages(
+                   id, session_id, role, content, tool_call_id, tool_calls, tool_name,
+                   timestamp, active, compacted
+               ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            [
+                (7, "active-session", "user", "English alpha café", None, None, None, 105.0, 1, 0),
+                (8, "active-session", "assistant", "默认中文检索", None, None, None, 106.0, 1, 0),
+                (9, "active-session", "assistant", "", None, '[{"name":"工具调用中文"}]', None, 107.0, 1, 0),
+                (10, "active-session", "tool", "显式工具中文", "call-3", None, "terminal", 108.0, 1, 0),
+                (11, "active-session", "user", "短词中文", None, None, None, 109.0, 0, 1),
+                (12, "held-archive", "assistant", "lineage duplicate English alpha", None, None, None, 61.0, 0, 0),
+            ],
+        )
+        rebuild_fts(conn, "v1_inline")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _candidate_access(path: Path):
+    journal = replace(
+        MaintenanceJournal.new("candidate-operation", path),
+        phase=JournalPhase.BACKUP_READY,
+    )
+    write_maintenance_journal(path, journal)
+    permit = issue_maintenance_permit(
+        path,
+        journal.operation_id,
+        frozenset({JournalPhase.BACKUP_READY}),
+    )
+    return journal, permit
+
+
+def test_candidate_copy_preserves_source_and_builds_verified_compact_v2(tmp_path):
+    source = tmp_path / "source" / "state.db"
+    source.parent.mkdir()
+    _candidate_fixture(source)
+    journal, permit = _candidate_access(source)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(mode=0o700)
+    before_db = _db_digest(source)
+    before_files = state_db_file_inventory(source)
+    before_names = sorted(item.name for item in source.parent.iterdir())
+
+    report = build_v2_candidate(source, work_dir, journal, permit)
+
+    assert report.source_message_count == report.candidate_message_count == 12
+    assert report.source_session_count == report.candidate_session_count == 2
+    assert report.field_digest_equal
+    assert report.unicode_integrity == "passed_rank1"
+    assert report.trigram_integrity == "passed_rank1"
+    assert report.trigger_rollback_probe == "passed"
+    assert report.quick_check == "ok"
+    assert report.no_inline_content_shadows
+    assert not report.candidate_wal_exists
+    assert not report.candidate_shm_exists
+    assert len(report.candidate_sha256) == 64
+    assert report.paired_verification_required
+    assert not report.eligible_for_live_swap
+    assert _db_digest(source) == before_db
+    assert state_db_file_inventory(source) == before_files
+    assert sorted(item.name for item in source.parent.iterdir()) == before_names
+
+    build_dir = work_dir / "candidate-build"
+    candidate = build_dir / "candidate.db"
+    assert report.candidate_sha256 == _sha256(candidate)
+    assert (os.stat(build_dir).st_mode & 0o777) == 0o700
+    assert (os.stat(candidate).st_mode & 0o777) == 0o600
+    assert not Path(f"{candidate}-wal").exists()
+    assert not Path(f"{candidate}-shm").exists()
+    source_conn = sqlite3.connect(f"{source.resolve().as_uri()}?mode=ro", uri=True)
+    candidate_conn = sqlite3.connect(f"{candidate.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        assert field_digest(source_conn) == field_digest(candidate_conn)
+        assert candidate_conn.execute(
+            "SELECT value FROM state_meta WHERE key='fts_schema_version'"
+        ).fetchone() == ("2",)
+        assert candidate_conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE name IN "
+            "('messages_fts_content','messages_fts_trigram_content')"
+        ).fetchone() == (0,)
+        assert candidate_conn.execute(
+            "SELECT record_key,payload,ordinal FROM durable_records"
+        ).fetchone() == ("record-a", b"\x00\x01\xff", 1)
+    finally:
+        source_conn.close()
+        candidate_conn.close()
+
+
+def test_candidate_copy_requires_bound_permit_and_rejects_unsafe_paths(tmp_path):
+    source = tmp_path / "source" / "state.db"
+    source.parent.mkdir()
+    _candidate_fixture(source)
+    journal, permit = _candidate_access(source)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(mode=0o700)
+    before_db = _db_digest(source)
+    before_files = state_db_file_inventory(source)
+
+    try:
+        build_v2_candidate(source, work_dir, journal, None)
+    except MaintenanceBlockedError:
+        pass
+    else:
+        raise AssertionError("ordinary caller bypassed the maintenance permit")
+
+    other = tmp_path / "other.db"
+    _candidate_fixture(other)
+    other_journal, other_permit = _candidate_access(other)
+    try:
+        build_v2_candidate(source, work_dir, other_journal, other_permit)
+    except MaintenanceBlockedError:
+        pass
+    else:
+        raise AssertionError("permit for another journal/database was accepted")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    symlink_dir = tmp_path / "symlink-work"
+    symlink_dir.symlink_to(outside, target_is_directory=True)
+    try:
+        build_v2_candidate(source, symlink_dir, journal, permit)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("symlink work_dir was accepted")
+
+    collision = work_dir / "candidate-build"
+    collision.mkdir()
+    sentinel = collision / "unknown"
+    sentinel.write_text("keep", encoding="utf-8")
+    try:
+        build_v2_candidate(source, work_dir, journal, permit)
+    except FileExistsError:
+        pass
+    else:
+        raise AssertionError("pre-existing candidate path was overwritten")
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert _db_digest(source) == before_db
+    assert state_db_file_inventory(source) == before_files
+
+
+def _paired_corpus():
+    return (
+        SearchCase("c01", "english", "English alpha", role_filter=("user", "assistant")),
+        SearchCase("c02", "english", "café", role_filter=("user", "assistant")),
+        SearchCase("c03", "default_cjk", "默认中文", role_filter=("user", "assistant")),
+        SearchCase("c04", "default_cjk", "工具调用中文", role_filter=("user", "assistant")),
+        SearchCase("c05", "tool_cjk", "显式工具中文", role_filter=("tool",)),
+        SearchCase("c06", "default_cjk", "短词", role_filter=("user", "assistant")),
+        SearchCase(
+            "c07",
+            "english",
+            "English alpha",
+            role_filter=("user", "assistant"),
+            source_filter=("cli",),
+        ),
+        SearchCase(
+            "c08",
+            "english",
+            "English alpha",
+            role_filter=("user", "assistant"),
+            exclude_sources=("cron",),
+        ),
+        SearchCase(
+            "c09",
+            "english",
+            "English alpha",
+            role_filter=("user", "assistant"),
+            include_inactive=True,
+        ),
+    )
+
+
+def test_paired_search_accepts_complete_parity_and_emits_aggregate_only_report(tmp_path):
+    source = tmp_path / "source" / "state.db"
+    source.parent.mkdir()
+    _candidate_fixture(source)
+    journal, permit = _candidate_access(source)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(mode=0o700)
+    build_v2_candidate(source, work_dir, journal, permit)
+    candidate = work_dir / "candidate-build" / "candidate.db"
+
+    report = verify_v2_candidate(source, candidate, _paired_corpus())
+
+    assert report.verification_passed
+    assert report.candidate_accepted
+    assert report.files_stable
+    assert report.source_copy_sha256 == _sha256(source)
+    assert report.candidate_sha256 == _sha256(candidate)
+    assert report.field_digest_equal
+    assert report.row_counts_equal
+    assert report.all_match_sets_equal
+    assert report.minimum_top10_overlap >= 0.9
+    assert report.all_snippets_valid
+    assert report.all_ordering_differences_allowed
+    assert not report.eligible_for_live_swap
+    assert {case.case_id for case in report.cases} == {
+        "c01", "c02", "c03", "c04", "c05", "c06", "c07", "c08", "c09"
+    }
+    assert {item.category for item in report.latency} == {
+        "english", "default_cjk", "tool_cjk"
+    }
+    assert all(case.match_sets_equal for case in report.cases)
+    assert all(case.snippets_valid for case in report.cases)
+    serialized = json.dumps(asdict(report), sort_keys=True)
+    representation = repr(report)
+    for secret in (
+        "English alpha",
+        "默认中文",
+        "工具调用中文",
+        "显式工具中文",
+        "短词",
+        "active-session",
+        "held-archive",
+        "candidate-operation",
+        "hermes://",
+        '"name":"工具调用中文"',
+        ">>>",
+        "<<<",
+    ):
+        assert secret not in serialized
+        assert secret not in representation
+
+
+def test_paired_search_rejects_marker_two_candidate_with_changed_base_fields(tmp_path):
+    source = tmp_path / "source" / "state.db"
+    source.parent.mkdir()
+    _candidate_fixture(source)
+    journal, permit = _candidate_access(source)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(mode=0o700)
+    build_v2_candidate(source, work_dir, journal, permit)
+    candidate = work_dir / "candidate-build" / "candidate.db"
+    conn = sqlite3.connect(candidate)
+    try:
+        conn.execute("UPDATE messages SET content=? WHERE id=7", ("private mutated payload",))
+        conn.commit()
+    finally:
+        conn.close()
+
+    report = verify_v2_candidate(source, candidate, _paired_corpus())
+
+    assert not report.verification_passed
+    assert not report.candidate_accepted
+    assert not report.field_digest_equal
+    assert not report.eligible_for_live_swap
+    assert "private mutated payload" not in repr(report)
+    assert "private mutated payload" not in json.dumps(asdict(report), sort_keys=True)
