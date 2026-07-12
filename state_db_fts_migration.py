@@ -451,10 +451,87 @@ def _verify_candidate_file(path: Path, expected_digest: str) -> tuple[int, int, 
         quick = str(conn.execute("PRAGMA quick_check").fetchone()[0])
         if quick != "ok":
             raise RuntimeError("candidate quick_check failed")
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        mode_row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        if mode_row is None or str(mode_row[0]).lower() != "wal":
+            raise RuntimeError("candidate could not persist WAL journal mode")
         return message_count, session_count, quick, not bool(shadows)
     finally:
         conn.close()
+
+
+def _checkpoint_candidate_file(path: Path) -> None:
+    """Checkpoint only after the verifier's SQLite handle is fully closed."""
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        checkpoint = (
+            tuple(int(value) for value in row)
+            if row is not None and len(row) == 3
+            else None
+        )
+        if checkpoint != (0, 0, 0):
+            raise RuntimeError("candidate checkpoint did not return exact (0,0,0)")
+    finally:
+        conn.close()
+
+
+_WAL_INDEX_READ_MARK_START = 100
+_WAL_INDEX_READ_MARK_END = 120
+
+
+def _read_optional_file(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _same_candidate_build_source_inventory(
+    before: Mapping[str, object],
+    after: Mapping[str, object],
+    before_shm: bytes | None,
+    after_shm: bytes | None,
+) -> bool:
+    """Compare source stability around known read-only SQLite handles.
+
+    SQLite may update the five ``aReadMark`` reader slots (bytes 100:120 in
+    the WAL-index header) and SHM mtime even for a ``mode=ro`` connection.
+    Main is exact; WAL identity, size, and bytes are exact; SHM may differ only
+    in those reader slots while preserving presence, device, inode, and size.
+    This tolerance is intentionally local to known read-only verification
+    handles; rename/swap/rollback classifiers keep exact fingerprints.
+    """
+
+    def same_keys(name: str, keys: tuple[str, ...]) -> bool:
+        left = before.get(name)
+        right = after.get(name)
+        if left is None or right is None:
+            return left is None and right is None
+        if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+            return False
+        return all(left.get(key) == right.get(key) for key in keys)
+
+    if not (
+        same_keys("db", ("size", "mtime_ns", "device", "inode", "sha256"))
+        and same_keys("wal", ("size", "device", "inode", "sha256"))
+        and same_keys("shm", ("size", "device", "inode"))
+    ):
+        return False
+    before_fp = before.get("shm")
+    after_fp = after.get("shm")
+    if before_fp is None and after_fp is None:
+        return True
+    if not isinstance(before_fp, Mapping) or not isinstance(after_fp, Mapping):
+        return False
+    if before_fp.get("sha256") == after_fp.get("sha256"):
+        return True
+    if before_shm is None or after_shm is None or len(before_shm) != len(after_shm):
+        return False
+    return all(
+        _WAL_INDEX_READ_MARK_START <= offset < _WAL_INDEX_READ_MARK_END
+        for offset, (left, right) in enumerate(zip(before_shm, after_shm))
+        if left != right
+    )
 
 
 def build_v2_candidate(
@@ -472,6 +549,8 @@ def build_v2_candidate(
         raise ValueError("source must be a regular database file")
     _validate_build_access(source_path, journal, permit)
     before_inventory = state_db_file_inventory(source_path)
+    source_shm = Path(f"{source_path}-shm")
+    before_shm = _read_optional_file(source_shm)
     source_conn = _open_read_only(source_path)
     try:
         before_truth = _source_truth_digest(source_conn)
@@ -502,6 +581,7 @@ def build_v2_candidate(
     candidate_messages, candidate_sessions, quick, no_shadows = _verify_candidate_file(
         candidate_path, source_fields
     )
+    _checkpoint_candidate_file(candidate_path)
     with candidate_path.open("rb") as stream:
         os.fsync(stream.fileno())
 
@@ -510,7 +590,11 @@ def build_v2_candidate(
         after_truth = _source_truth_digest(after_conn)
     finally:
         after_conn.close()
-    if before_truth != after_truth or before_inventory != state_db_file_inventory(source_path):
+    after_inventory = state_db_file_inventory(source_path)
+    after_shm = _read_optional_file(source_shm)
+    if before_truth != after_truth or not _same_candidate_build_source_inventory(
+        before_inventory, after_inventory, before_shm, after_shm
+    ):
         raise RuntimeError("source database or sidecars changed during candidate build")
     if (source_messages, source_sessions) != (candidate_messages, candidate_sessions):
         raise RuntimeError("candidate row counts differ from source copy")
@@ -723,6 +807,7 @@ def verify_v2_candidate(
         raise RuntimeError("candidate row counts changed during verification")
     source_results = _search_copy(source_path, cases)
     candidate_results = _search_copy(candidate_path, cases)
+    _checkpoint_candidate_file(candidate_path)
     candidate_wal = Path(f"{candidate_path}-wal").exists()
     candidate_shm = Path(f"{candidate_path}-shm").exists()
     final_source_sha256 = _sha256_file(source_path)
@@ -843,6 +928,7 @@ class _OriginalInvariant:
     sha256: str
     truth_digest: str
     inventory: dict[str, Any]
+    shm_bytes: bytes | None
 
 
 def _snapshot_original(path: Path) -> _OriginalInvariant:
@@ -855,11 +941,22 @@ def _snapshot_original(path: Path) -> _OriginalInvariant:
         sha256=_sha256_file(path),
         truth_digest=truth,
         inventory=state_db_file_inventory(path),
+        shm_bytes=_read_optional_file(Path(f"{path}-shm")),
     )
 
 
 def _assert_original_unchanged(path: Path, expected: _OriginalInvariant) -> None:
-    if _snapshot_original(path) != expected:
+    actual = _snapshot_original(path)
+    if (
+        actual.sha256 != expected.sha256
+        or actual.truth_digest != expected.truth_digest
+        or not _same_candidate_build_source_inventory(
+            expected.inventory,
+            actual.inventory,
+            expected.shm_bytes,
+            actual.shm_bytes,
+        )
+    ):
         raise RuntimeError("original verification database changed")
 
 
@@ -1585,6 +1682,10 @@ def resume_fts_migration(db_path: Path) -> MigrationResult:
                 or not controlled.verification.candidate_accepted
             ):
                 raise RuntimeError("controlled paired candidate verification failed")
+            # Controlled verification opens the accepted WAL-mode candidate
+            # read-only. Close those handles, then restore the required exact
+            # empty-checkpoint/no-sidecar candidate bundle before recording it.
+            _checkpoint_candidate_file(candidate)
             candidate_inventory = _candidate_inventory_fingerprints(candidate)
             if candidate_inventory["candidate_db"] is None:
                 raise RuntimeError("verified candidate main file is missing")
@@ -1599,6 +1700,7 @@ def resume_fts_migration(db_path: Path) -> MigrationResult:
                 journal,
                 JournalPhase.CANDIDATE_READY,
                 fingerprints={
+                    **_source_inventory_fingerprints(path),
                     "candidate": candidate_inventory["candidate_db"],
                     **candidate_inventory,
                     "work": fingerprint_path(work_db),
@@ -1747,26 +1849,11 @@ def rollback_fts_migration(
             if journal.phase in {JournalPhase.CANARY_PASSED, JournalPhase.COMPLETE}
             else journal.phase
         )
-        activation_fingerprints: dict[str, dict[str, int | str] | None] = {
-            "rollback_activation": _status_fingerprint("planned")
-        }
-        if journal.phase in {
-            JournalPhase.CANDIDATE_LIVE,
-            JournalPhase.CANARY_PASSED,
-            JournalPhase.COMPLETE,
-        }:
-            _validate_live_source(path, journal)
-            activation_fingerprints.update(
-                {
-                    f"rollback_{name}": fingerprint_path(item)
-                    for name, item in _bundle_paths(path).items()
-                }
-            )
         journal = _transition(
             path,
             journal,
             next_phase,
-            fingerprints=activation_fingerprints,
+            fingerprints={"rollback_activation": _status_fingerprint("planned")},
         )
     elif not _same_fingerprint(
         dict(activation) if isinstance(activation, Mapping) else None,
@@ -1777,6 +1864,26 @@ def rollback_fts_migration(
     # Proof two always runs after the durable nonterminal activation. A crash or
     # failed proof leaves this marker in place, so every retry repeats this proof.
     _require_no_live_users_for_paths(_rollback_liveness_paths(path))
+
+    if journal.phase is JournalPhase.CANDIDATE_LIVE and "rollback_db" not in journal.fingerprints:
+        # Normal read-only use of a WAL-mode v2 database may materialize empty
+        # WAL/SHM sidecars.  Only after the durable write block and second clear
+        # liveness proof may we checkpoint them away.  The exact main fingerprint
+        # must still match the accepted candidate, and the checkpoint must be
+        # exactly empty before the rollback inventory is durably captured.
+        permit = _permit(path, journal)
+        assert_state_db_maintenance_access(path, write_capable=True, permit=permit)
+        _checkpoint_candidate_file(path)
+        _validate_live_source(path, journal)
+        journal = _transition(
+            path,
+            journal,
+            journal.phase,
+            fingerprints={
+                f"rollback_{name}": fingerprint_path(item)
+                for name, item in _bundle_paths(path).items()
+            },
+        )
 
     if journal.phase is JournalPhase.SWAPPING:
         journal = _move_recorded_bundle_to_original(path, journal)

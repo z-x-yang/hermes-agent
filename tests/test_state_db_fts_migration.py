@@ -459,6 +459,68 @@ def test_candidate_copy_preserves_source_and_builds_verified_compact_v2(tmp_path
         candidate_conn.close()
 
 
+def test_candidate_build_rejects_source_main_inode_change(tmp_path, monkeypatch):
+    source = tmp_path / "source" / "state.db"
+    source.parent.mkdir()
+    _candidate_fixture(source)
+    journal, permit = _candidate_access(source)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(mode=0o700)
+    canonical_verify = migration._verify_candidate_file
+    original_inode = source.stat().st_ino
+
+    def replace_source_after_candidate_verify(candidate_path, expected_digest):
+        result = canonical_verify(candidate_path, expected_digest)
+        replacement = source.with_name("replacement.db")
+        replacement.write_bytes(source.read_bytes())
+        os.chmod(replacement, 0o600)
+        os.replace(replacement, source)
+        assert source.stat().st_ino != original_inode
+        return result
+
+    monkeypatch.setattr(migration, "_verify_candidate_file", replace_source_after_candidate_verify)
+
+    with pytest.raises(
+        RuntimeError, match="source database or sidecars changed during candidate build"
+    ):
+        build_v2_candidate(source, work_dir, journal, permit)
+
+
+def test_candidate_build_rejects_non_reader_slot_shm_change(tmp_path, monkeypatch):
+    source = tmp_path / "source" / "state.db"
+    source.parent.mkdir()
+    _checkpointed_wal_v1_fixture(source)
+    # A read-only open materializes persistent WAL/SHM sidecars for this
+    # checkpointed WAL database, matching the production candidate-build seam.
+    _db_digest(source)
+    source_shm = Path(f"{source}-shm")
+    assert source_shm.exists() and source_shm.stat().st_size > 200
+    journal, permit = _candidate_access(source)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(mode=0o700)
+    canonical_truth = migration._source_truth_digest
+    truth_calls = 0
+
+    def corrupt_shm_during_final_truth_read(conn):
+        nonlocal truth_calls
+        truth = canonical_truth(conn)
+        truth_calls += 1
+        if truth_calls == 2:
+            with source_shm.open("r+b") as stream:
+                stream.seek(200)
+                original = stream.read(1)
+                stream.seek(200)
+                stream.write(bytes([original[0] ^ 0xFF]))
+        return truth
+
+    monkeypatch.setattr(migration, "_source_truth_digest", corrupt_shm_during_final_truth_read)
+
+    with pytest.raises(
+        RuntimeError, match="source database or sidecars changed during candidate build"
+    ):
+        build_v2_candidate(source, work_dir, journal, permit)
+
+
 def test_candidate_copy_requires_bound_permit_and_rejects_unsafe_paths(tmp_path):
     source = tmp_path / "source" / "state.db"
     source.parent.mkdir()
@@ -705,6 +767,8 @@ def test_controlled_provider_exercises_all_required_semantics_without_mutating_o
     candidate_before = _db_digest(candidate)
     source_inventory = state_db_file_inventory(source)
     candidate_inventory = state_db_file_inventory(candidate)
+    candidate_shm = Path(f"{candidate}-shm")
+    candidate_shm_before = candidate_shm.read_bytes() if candidate_shm.exists() else None
 
     corpus = controlled_paired_corpus()
     result = verify_v2_candidate_with_controlled_corpus(source, candidate, work_dir)
@@ -739,7 +803,12 @@ def test_controlled_provider_exercises_all_required_semantics_without_mutating_o
     assert _db_digest(source) == source_before
     assert _db_digest(candidate) == candidate_before
     assert state_db_file_inventory(source) == source_inventory
-    assert state_db_file_inventory(candidate) == candidate_inventory
+    assert migration._same_candidate_build_source_inventory(
+        candidate_inventory,
+        state_db_file_inventory(candidate),
+        candidate_shm_before,
+        candidate_shm.read_bytes() if candidate_shm.exists() else None,
+    )
     assert not (work_dir / "controlled-paired-verification").exists()
 
 
@@ -842,6 +911,55 @@ def _allow_apply(monkeypatch):
     )
 
 
+def _allow_real_wal_apply(monkeypatch):
+    monkeypatch.setattr(migration, "_run_lsof", lambda paths: _lsof_result(1, ""))
+    monkeypatch.setattr(
+        migration.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=20 * 1024**3, used=0, free=20 * 1024**3),
+    )
+
+
+def _checkpointed_wal_v1_fixture(path: Path) -> None:
+    _candidate_fixture(path)
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        conn.commit()
+        assert conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone() == (0, 0, 0)
+    finally:
+        conn.close()
+
+
+def test_real_wal_apply_complete_and_rollback_restores_verified_v1(tmp_path, monkeypatch):
+    path = tmp_path / "state.db"
+    _checkpointed_wal_v1_fixture(path)
+    _allow_real_wal_apply(monkeypatch)
+    before = _db_digest(path)
+    before_truth = before["schema"], before["meta"], before["data"]
+
+    applied = apply_fts_migration(path)
+
+    assert applied.phase == "complete"
+    assert applied.completed
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        assert migration.detect_fts_schema(conn) == "v2_external"
+        assert conn.execute(
+            "SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?",
+            ('"English alpha"',),
+        ).fetchone() is not None
+    finally:
+        conn.close()
+
+    rolled_back = rollback_fts_migration(path)
+
+    assert rolled_back.phase == "rolled_back"
+    restored = _db_digest(path)
+    assert (restored["schema"], restored["meta"], restored["data"]) == before_truth
+    assert restored["main_sha256"] == before["main_sha256"]
+
+
 def test_apply_runs_exact_phase_sequence_and_installs_verified_candidate(
     tmp_path, monkeypatch
 ):
@@ -876,6 +994,8 @@ def test_apply_runs_exact_phase_sequence_and_installs_verified_candidate(
         "canary_passed",
         "complete",
     ]
+    assert not Path(f"{path}-wal").exists()
+    assert not Path(f"{path}-shm").exists()
     conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     try:
         assert migration.detect_fts_schema(conn) == "v2_external"
@@ -884,8 +1004,6 @@ def test_apply_runs_exact_phase_sequence_and_installs_verified_candidate(
         ).fetchone() == ("2",)
     finally:
         conn.close()
-    assert not Path(f"{path}-wal").exists()
-    assert not Path(f"{path}-shm").exists()
     assert (tmp_path / "state.db.pre-v2.original").exists()
     assert (tmp_path / "state.db.pre-v2.backup").exists()
     serialized = json.dumps(asdict(result), sort_keys=True)
