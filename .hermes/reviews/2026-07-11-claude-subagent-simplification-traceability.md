@@ -1,5 +1,7 @@
 # Claude-like Subagent Simplification — Traceability
 
+> **HISTORICAL REVIEW SNAPSHOT.** The candidate was later merged and deployed; the original branch/rollout status below is preserved only as point-in-time evidence. Use the live registered schema and current delegation docs for operational instructions.
+
 Date: 2026-07-11
 Branch: `feat/claude-subagent-simplification`
 Scope boundary: candidate only; **not merged to local main and Gateway not restarted**.

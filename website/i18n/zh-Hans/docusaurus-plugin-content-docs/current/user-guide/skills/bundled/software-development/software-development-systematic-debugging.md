@@ -350,9 +350,11 @@ pytest tests/ -q
 
 ```python
 delegate_task(
-    goal="调查为何 [特定测试/行为] 失败",
-    context="""
-    遵循 systematic-debugging skill：
+    description="追踪失败行为",
+    subagent_type="general-purpose",
+    run_in_background=False,
+    prompt="""
+    调查为何 [特定测试/行为] 失败，并遵循 systematic-debugging：
     1. 仔细阅读错误信息
     2. 复现问题
     3. 追踪数据流以找到根因
@@ -362,7 +364,6 @@ delegate_task(
     文件：[故障代码路径]
     测试命令：[确切命令]
     """,
-    toolsets=['terminal', 'file']
 )
 ```
 

@@ -186,7 +186,8 @@ _DEFAULT_PAYLOADS = {
     },
     "subagent_stop": {
         "parent_session_id": "parent-sess",
-        "child_role": None,
+        "parent_turn_id": "turn-1",
+        "child_session_id": "child-sess",
         "child_summary": "Synthetic summary for hooks test",
         "child_status": "completed",
         "duration_ms": 1234,

@@ -318,13 +318,15 @@ terminal("pytest tests/ -q")
 
 ### With delegate_task
 
-When dispatching subagents for implementation, enforce TDD in the goal:
+When dispatching an implementation subagent, put the TDD contract in its self-contained `prompt`:
 
 ```python
 delegate_task(
-    goal="Implement [feature] using strict TDD",
-    context="""
-    Follow test-driven-development skill:
+    description="Implement feature with TDD",
+    subagent_type="general-purpose",
+    run_in_background=False,
+    prompt="""
+    Implement [feature] using strict test-driven development:
     1. Write failing test FIRST
     2. Run test to verify it fails
     3. Write minimal code to pass
@@ -335,7 +337,6 @@ delegate_task(
     Project test command: pytest tests/ -q
     Project structure: [describe relevant files]
     """,
-    toolsets=['terminal', 'file']
 )
 ```
 

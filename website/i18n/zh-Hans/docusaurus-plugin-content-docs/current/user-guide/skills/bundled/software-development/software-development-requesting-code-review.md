@@ -142,8 +142,11 @@ which go && go vet ./... 2>&1 | tail -10
 
 ```python
 delegate_task(
-    goal="""You are an independent code reviewer. You have no context about how
-these changes were made. Review the git diff and return ONLY valid JSON.
+    description="独立代码审查",
+    subagent_type="Explore",
+    run_in_background=False,
+    prompt="""You are an independent code reviewer. You have no context about how
+these changes were made. Review the supplied git diff and return ONLY valid JSON.
 
 FAIL-CLOSED RULES:
 - security_concerns non-empty -> passed must be false
@@ -179,8 +182,6 @@ Return ONLY this JSON:
   "suggestions": [],
   "summary": "one sentence verdict"
 }""",
-    context="Independent code review. Return only JSON verdict.",
-    toolsets=["terminal"]
 )
 ```
 
@@ -210,7 +211,10 @@ Suggestions (non-blocking): [list]
 
 ```python
 delegate_task(
-    goal="""You are a code fix agent. Fix ONLY the specific issues listed below.
+    description="修复审查发现",
+    subagent_type="general-purpose",
+    run_in_background=False,
+    prompt="""You are a code fix agent. Fix ONLY the specific issues listed below.
 Do NOT refactor, rename, or change anything else. Do NOT add features.
 
 Issues to fix:
@@ -224,8 +228,6 @@ Current diff for context:
 ---
 
 Fix each issue precisely. Describe what you changed and why.""",
-    context="Fix only the reported issues. Do not change anything else.",
-    toolsets=["terminal", "file"]
 )
 ```
 

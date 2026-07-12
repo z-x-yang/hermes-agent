@@ -1,5 +1,7 @@
 # Hermes Claude-style Subagents Implementation Plan
 
+> **SUPERSEDED HISTORICAL PLAN — DO NOT EXECUTE.** It records an earlier contract that exposed controls since removed. Current calls use `description`, self-contained `prompt`, optional `subagent_type`, and optional `run_in_background`; continuation uses only `agent_id`, `prompt`, and optional `run_in_background`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 在不破坏现有 delegation 调用的前提下，为 Hermes 增加 Claude Code 对齐的 `Explore` / `Plan` / `general-purpose` agent type、system/task prompt 分层、硬工具权限、foreground/background 调度，以及可继续的 retained child session。

@@ -95,10 +95,9 @@ emitted by each built-in hook site.
 
 ``subagent_stop`` (emitted from ``tools/delegate_tool.py``)::
 
-    parent_turn_id  – parent agent's current turn id
+    parent_turn_id   – parent agent's current turn id
     child_session_id – child (subagent) session id
-    child_role      – role string of the child agent
-    child_summary   – summary of the child's work
+    child_summary    – summary of the child's work
     child_status    – exit status string (e.g. "success", "error")
     duration_ms     – wall-clock time of the child run in milliseconds
 """

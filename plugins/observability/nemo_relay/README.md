@@ -260,8 +260,8 @@ parent received nested subagent result.
 Sanitized ATOF excerpt:
 
 ```jsonl
-{"kind":"scope","category":"tool","name":"delegate_task","scope_category":"start","metadata":{"session_id":"docs-parent-session","tool_call_id":"call_delegate"},"data":{"goal":"Run the command `printf docs_nested_leaf_function` using the terminal tool.","toolsets":["terminal"]}}
-{"kind":"mark","name":"hermes.subagent.start","metadata":{"parent_session_id":"docs-parent-session","session_id":"docs-child-session","subagent_id":"sa-0-docs","child_role":"leaf"}}
+{"kind":"scope","category":"tool","name":"delegate_task","scope_category":"start","metadata":{"session_id":"docs-parent-session","tool_call_id":"call_delegate"},"data":{"description":"Run nested command","prompt":"Run the command `printf docs_nested_leaf_function` using the terminal tool.","subagent_type":"general-purpose","run_in_background":false}}
+{"kind":"mark","name":"hermes.subagent.start","metadata":{"parent_session_id":"docs-parent-session","child_session_id":"docs-child-session","child_subagent_id":"sa_docs"},"data":{"child_goal":"Run nested command"}}
 {"kind":"scope","category":"tool","name":"terminal","scope_category":"end","metadata":{"session_id":"docs-child-session","tool_call_id":"call_terminal","status":"ok"},"data":"{\"output\":\"docs_nested_leaf_function\",\"exit_code\":0,\"error\":null}"}
 {"kind":"scope","category":"tool","name":"delegate_task","scope_category":"end","metadata":{"session_id":"docs-parent-session","tool_call_id":"call_delegate","status":"ok"}}
 ```

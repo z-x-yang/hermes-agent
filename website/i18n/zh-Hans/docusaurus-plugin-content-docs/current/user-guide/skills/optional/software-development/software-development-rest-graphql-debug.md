@@ -485,8 +485,11 @@ web_extract(urls=["https://docs.example.com/api/v1/users"])
 
 ```python
 delegate_task(
-    goal="Test all CRUD endpoints for /api/v1/users",
-    context="""
+    description="运行 CRUD API 检查",
+    subagent_type="general-purpose",
+    run_in_background=False,
+    prompt="""
+Test all CRUD endpoints for /api/v1/users.
 Follow the rest-graphql-debug skill (optional-skills/software-development/rest-graphql-debug).
 Base URL: https://api.example.com
 Auth: Bearer token from API_TOKEN env var.
@@ -498,7 +501,6 @@ For each verb (POST, GET, PATCH, DELETE):
 
 Output: pass/fail per endpoint + correlation IDs for failures.
 """,
-    toolsets=["terminal", "file"],
 )
 ```
 

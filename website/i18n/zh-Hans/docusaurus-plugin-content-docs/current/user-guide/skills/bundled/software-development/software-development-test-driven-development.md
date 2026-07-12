@@ -321,9 +321,11 @@ terminal("pytest tests/ -q")
 
 ```python
 delegate_task(
-    goal="Implement [feature] using strict TDD",
-    context="""
-    Follow test-driven-development skill:
+    description="使用 TDD 实现功能",
+    subagent_type="general-purpose",
+    run_in_background=False,
+    prompt="""
+    Implement [feature] using strict test-driven development:
     1. Write failing test FIRST
     2. Run test to verify it fails
     3. Write minimal code to pass
@@ -334,7 +336,6 @@ delegate_task(
     Project test command: pytest tests/ -q
     Project structure: [describe relevant files]
     """,
-    toolsets=['terminal', 'file']
 )
 ```
 

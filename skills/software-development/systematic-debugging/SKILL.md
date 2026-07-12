@@ -372,13 +372,15 @@ Use these Hermes tools during Phase 1:
 
 ### With delegate_task
 
-For complex multi-component debugging, dispatch investigation subagents:
+For complex multi-component debugging, dispatch a self-contained investigation to a general-purpose child (it may need terminal access to reproduce the failure):
 
 ```python
 delegate_task(
-    goal="Investigate why [specific test/behavior] fails",
-    context="""
-    Follow systematic-debugging skill:
+    description="Trace failing behavior",
+    subagent_type="general-purpose",
+    run_in_background=False,
+    prompt="""
+    Investigate why [specific test/behavior] fails. Follow systematic-debugging:
     1. Read the error message carefully
     2. Reproduce the issue
     3. Trace the data flow to find root cause
@@ -388,7 +390,6 @@ delegate_task(
     File: [path to failing code]
     Test command: [exact command]
     """,
-    toolsets=['terminal', 'file']
 )
 ```
 

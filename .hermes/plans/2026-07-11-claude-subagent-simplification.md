@@ -1,5 +1,7 @@
 # Claude-like Subagent 简化 Implementation Plan
 
+> **COMPLETED HISTORICAL PLAN — DO NOT RE-EXECUTE.** Its removal examples are migration history, not callable syntax. Current truth is the effective registered schema and the delegation user guide.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 将 Hermes subagent 的 model-facing API、prompt 与 lifecycle 收敛到 Claude Code 的简单形态，同时保留 Zongxin 明确要求的 Batch API、完整 Evelyn governance、Notion/Mail 数据源、provider fallback、独立 timeout 和既有 runtime safety hardening。

@@ -1,5 +1,7 @@
 # Hermes Claude-style Subagents 设计
 
+> **SUPERSEDED HISTORICAL DESIGN — DO NOT IMPLEMENT OR USE AS API DOCUMENTATION.** The later simplification contract removed caller-visible `goal`, `context`, `toolsets`, `role`, `scheduling`, `retain_session`, and `background`. Current truth is the effective registered schema and `website/docs/user-guide/features/delegation.md`.
+
 ## 结论
 
 本次按 Zongxin 批准的范围实现 Claude Code 对齐的 Hermes subagent 改造：先内置 **`Explore` / `Plan` / `general-purpose`** 三类真实 Claude Code agent type，不额外发明 `review-readonly`、`research-sweeper`、`verifier` 等可见 profile；同时完成 P0 的 prompt/schema/权限硬化，以及 P1 的 foreground/background 调度和 resumable/steerable subagent 设计。

@@ -812,15 +812,17 @@ def my_callback(session_id: str, platform: str, **kwargs):
 **回调签名：**
 
 ```python
-def my_callback(parent_session_id: str, child_role: str | None,
-                child_summary: str | None, child_status: str,
+def my_callback(parent_session_id: str, parent_turn_id: str,
+                child_session_id: str | None, child_summary: str | None,
+                child_status: str,
                 duration_ms: int, **kwargs):
 ```
 
 | 参数 | 类型 | 描述 |
 |-----|------|------|
 | `parent_session_id` | `str` | 委托父 agent 的会话 ID |
-| `child_role` | `str \| None` | 子 agent 上设置的编排角色标签（若功能未启用则为 `None`） |
+| `parent_turn_id` | `str` | 发起委派的父轮次 ID |
+| `child_session_id` | `str \| None` | 为子 agent 分配的会话 ID |
 | `child_summary` | `str \| None` | 子 agent 返回给父 agent 的最终响应 |
 | `child_status` | `str` | `"completed"`、`"failed"`、`"interrupted"` 或 `"error"` |
 | `duration_ms` | `int` | 运行子 agent 的挂钟时间，单位毫秒 |
@@ -837,10 +839,10 @@ def my_callback(parent_session_id: str, child_role: str | None,
 import logging
 logger = logging.getLogger(__name__)
 
-def log_subagent(parent_session_id, child_role, child_status, duration_ms, **kwargs):
+def log_subagent(parent_session_id, child_session_id, child_status, duration_ms, **kwargs):
     logger.info(
-        "SUBAGENT parent=%s role=%s status=%s duration_ms=%d",
-        parent_session_id, child_role, child_status, duration_ms,
+        "SUBAGENT parent=%s child_session=%s status=%s duration_ms=%d",
+        parent_session_id, child_session_id, child_status, duration_ms,
     )
 
 def register(ctx):
@@ -848,7 +850,7 @@ def register(ctx):
 ```
 
 :::info
-在大量委托场景下（如编排器角色 × 5 个叶节点 × 嵌套深度），`subagent_stop` 每轮会触发多次。保持回调快速执行；将耗时操作推送到后台队列。
+在大量委托场景下（如大型 Batch 或运行时授权的嵌套），`subagent_stop` 每轮会触发多次。保持回调快速执行；将耗时操作推送到后台队列。
 :::
 
 ---
@@ -1195,7 +1197,7 @@ hooks_auto_accept: false         # See "Consent model" below
 }
 ```
 
-对于非工具事件（`pre_llm_call`、`subagent_stop`、会话生命周期），`tool_name` 和 `tool_input` 为 `null`。`extra` 字典携带所有事件特定的 kwargs（`user_message`、`conversation_history`、`child_role`、`duration_ms` 等）。不可序列化的值会被字符串化而非省略。
+对于非工具事件（`pre_llm_call`、`subagent_stop`、会话生命周期），`tool_name` 和 `tool_input` 为 `null`。`extra` 字典携带所有事件特定的 kwargs（`user_message`、`conversation_history`、`child_session_id`、`duration_ms` 等）。不可序列化的值会被字符串化而非省略。
 
 **stdout——可选响应：**
 

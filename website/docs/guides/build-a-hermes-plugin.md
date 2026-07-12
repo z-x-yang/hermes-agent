@@ -807,8 +807,10 @@ def register(ctx):
         result = ctx.dispatch_tool(
             "delegate_task",
             {
-                "goal": raw_args,
-                "toolsets": ["terminal", "file", "web"],
+                "description": "Run delegated command",
+                "prompt": raw_args,
+                "subagent_type": "general-purpose",
+                "run_in_background": False,
             },
         )
         return result

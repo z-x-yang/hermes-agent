@@ -81,8 +81,10 @@ Use `delegate_task` with complete context:
 
 ```python
 delegate_task(
-    goal="Implement Task 1: Create User model with email and password_hash fields",
-    context="""
+    description="Implement User model",
+    subagent_type="general-purpose",
+    run_in_background=False,
+    prompt="""
     TASK FROM PLAN:
     - Create: src/models/user.py
     - Add User class with email (str) and password_hash (str) fields
@@ -103,7 +105,6 @@ delegate_task(
     - Tests use pytest, run from project root
     - bcrypt already in requirements.txt
     """,
-    toolsets=['terminal', 'file']
 )
 ```
 
@@ -113,8 +114,10 @@ After the implementer completes, verify against the original spec:
 
 ```python
 delegate_task(
-    goal="Review if implementation matches the spec from the plan",
-    context="""
+    description="Review spec compliance",
+    subagent_type="Explore",
+    run_in_background=False,
+    prompt="""
     ORIGINAL TASK SPEC:
     - Create src/models/user.py with User class
     - Fields: email (str), password_hash (str)
@@ -130,7 +133,6 @@ delegate_task(
 
     OUTPUT: PASS or list of specific spec gaps to fix.
     """,
-    toolsets=['file']
 )
 ```
 
@@ -142,8 +144,10 @@ After spec compliance passes:
 
 ```python
 delegate_task(
-    goal="Review code quality for Task 1 implementation",
-    context="""
+    description="Review code quality",
+    subagent_type="Explore",
+    run_in_background=False,
+    prompt="""
     FILES TO REVIEW:
     - src/models/user.py
     - tests/models/test_user.py
@@ -162,7 +166,6 @@ delegate_task(
     - Minor Issues: [optional]
     - Verdict: APPROVED or REQUEST_CHANGES
     """,
-    toolsets=['file']
 )
 ```
 
@@ -180,15 +183,16 @@ After ALL tasks are complete, dispatch a final integration reviewer:
 
 ```python
 delegate_task(
-    goal="Review the entire implementation for consistency and integration issues",
-    context="""
+    description="Review integration",
+    subagent_type="general-purpose",
+    run_in_background=False,
+    prompt="""
     All tasks from the plan are complete. Review the full implementation:
     - Do all components work together?
     - Any inconsistencies between tasks?
     - All tests passing?
     - Ready for merge?
     """,
-    toolsets=['terminal', 'file']
 )
 ```
 

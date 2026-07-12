@@ -131,8 +131,11 @@ the implementer. Fail-closed: unparseable response = fail.
 
 ```python
 delegate_task(
-    goal="""You are an independent code reviewer. You have no context about how
-these changes were made. Review the git diff and return ONLY valid JSON.
+    description="Independent code review",
+    subagent_type="Explore",
+    run_in_background=False,
+    prompt="""You are an independent code reviewer. You have no context about how
+these changes were made. Review the supplied git diff and return ONLY valid JSON.
 
 FAIL-CLOSED RULES:
 - security_concerns non-empty -> passed must be false
@@ -168,8 +171,6 @@ Return ONLY this JSON:
   "suggestions": [],
   "summary": "one sentence verdict"
 }""",
-    context="Independent code review. Return only JSON verdict.",
-    toolsets=["terminal"]
 )
 ```
 
@@ -200,7 +201,10 @@ It fixes ONLY the reported issues:
 
 ```python
 delegate_task(
-    goal="""You are a code fix agent. Fix ONLY the specific issues listed below.
+    description="Fix review findings",
+    subagent_type="general-purpose",
+    run_in_background=False,
+    prompt="""You are a code fix agent. Fix ONLY the specific issues listed below.
 Do NOT refactor, rename, or change anything else. Do NOT add features.
 
 Issues to fix:
@@ -214,8 +218,6 @@ Current diff for context:
 ---
 
 Fix each issue precisely. Describe what you changed and why.""",
-    context="Fix only the reported issues. Do not change anything else.",
-    toolsets=["terminal", "file"]
 )
 ```
 

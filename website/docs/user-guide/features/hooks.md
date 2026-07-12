@@ -891,7 +891,6 @@ def my_callback(parent_session_id: str | None,
                 parent_subagent_id: str | None,
                 child_session_id: str | None,
                 child_subagent_id: str,
-                child_role: str,
                 child_goal: str,
                 **kwargs):
 ```
@@ -903,8 +902,7 @@ def my_callback(parent_session_id: str | None,
 | `parent_subagent_id` | `str \| None` | Parent subagent ID when this child was spawned by another subagent; `None` for top-level parent agents. |
 | `child_session_id` | `str \| None` | Session ID allocated for the child agent. |
 | `child_subagent_id` | `str` | Stable subagent ID used by delegation observability and controls. |
-| `child_role` | `str` | Effective child role after delegation policy is applied, for example `"leaf"` or `"orchestrator"`. |
-| `child_goal` | `str` | Delegated goal/prompt that the child agent will execute. |
+| `child_goal` | `str` | Short progress label from the call's `description`; the full task remains in `prompt`. |
 
 **Fires:** In `tools/delegate_tool.py`, inside `_build_child_agent()`, after the child `AIAgent` has been constructed and annotated with subagent identity metadata, and before `_run_single_child()` runs the child.
 
@@ -924,17 +922,15 @@ def log_subagent_start(
     parent_turn_id,
     child_session_id,
     child_subagent_id,
-    child_role,
     child_goal,
     **kwargs,
 ):
     logger.info(
-        "SUBAGENT_START parent=%s turn=%s child_session=%s child=%s role=%s goal=%r",
+        "SUBAGENT_START parent=%s turn=%s child_session=%s child=%s description=%r",
         parent_session_id,
         parent_turn_id,
         child_session_id,
         child_subagent_id,
-        child_role,
         child_goal[:200],
     )
 
@@ -955,15 +951,17 @@ Fires **once per child agent** after `delegate_task` finishes. Whether you deleg
 **Callback signature:**
 
 ```python
-def my_callback(parent_session_id: str, child_role: str | None,
-                child_summary: str | None, child_status: str,
+def my_callback(parent_session_id: str, parent_turn_id: str,
+                child_session_id: str | None, child_summary: str | None,
+                child_status: str,
                 duration_ms: int, **kwargs):
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `parent_session_id` | `str` | Session ID of the delegating parent agent |
-| `child_role` | `str \| None` | Orchestrator role tag set on the child (`None` if the feature isn't enabled) |
+| `parent_turn_id` | `str` | Turn ID of the parent turn that requested delegation |
+| `child_session_id` | `str \| None` | Session ID allocated for the child agent |
 | `child_summary` | `str \| None` | The final response the child returned to the parent |
 | `child_status` | `str` | `"completed"`, `"failed"`, `"interrupted"`, or `"error"` |
 | `duration_ms` | `int` | Wall-clock time spent running the child, in milliseconds |
@@ -974,16 +972,16 @@ def my_callback(parent_session_id: str, child_role: str | None,
 
 **Use cases:** Logging orchestration activity, accumulating child durations for billing, writing post-delegation audit records.
 
-**Example — log orchestrator activity:**
+**Example — log subagent activity:**
 
 ```python
 import logging
 logger = logging.getLogger(__name__)
 
-def log_subagent(parent_session_id, child_role, child_status, duration_ms, **kwargs):
+def log_subagent(parent_session_id, child_session_id, child_status, duration_ms, **kwargs):
     logger.info(
-        "SUBAGENT parent=%s role=%s status=%s duration_ms=%d",
-        parent_session_id, child_role, child_status, duration_ms,
+        "SUBAGENT parent=%s child_session=%s status=%s duration_ms=%d",
+        parent_session_id, child_session_id, child_status, duration_ms,
     )
 
 def register(ctx):
@@ -991,7 +989,7 @@ def register(ctx):
 ```
 
 :::info
-With heavy delegation (e.g. orchestrator roles × 5 leaves × nested depth), `subagent_stop` fires many times per turn. Keep your callback fast; push expensive work to a background queue.
+With heavy delegation (large batches or runtime-authorized nesting), `subagent_stop` fires many times per turn. Keep your callback fast; push expensive work to a background queue.
 :::
 
 ---
@@ -1338,7 +1336,7 @@ Each time the event fires, Hermes spawns a subprocess for every matching hook (m
 }
 ```
 
-`tool_name` and `tool_input` are `null` for non-tool events (`pre_llm_call`, `subagent_stop`, session lifecycle). The `extra` dict carries all event-specific kwargs (`user_message`, `conversation_history`, `child_role`, `duration_ms`, …). Unserialisable values are stringified rather than omitted.
+`tool_name` and `tool_input` are `null` for non-tool events (`pre_llm_call`, `subagent_stop`, session lifecycle). The `extra` dict carries all event-specific kwargs (`user_message`, `conversation_history`, `child_session_id`, `duration_ms`, …). Unserialisable values are stringified rather than omitted.
 
 **stdout — optional response:**
 

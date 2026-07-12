@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -367,6 +368,40 @@ def test_bundled_hermes_skill_uses_current_delegation_contract():
         "`orchestrator`",
     ):
         assert stale not in delegation
+
+
+def test_operational_delegation_code_examples_use_current_public_fields():
+    """Bundled skills/docs must not teach removed model-facing call fields."""
+    root = Path(__file__).resolve().parents[2]
+    markdown_roots = (
+        root / "skills",
+        root / "optional-skills",
+        root / "website/docs",
+        root / "website/i18n",
+        root / "plugins",
+    )
+    fenced_block = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+    stale_field = re.compile(
+        r"(?:\b(?:goal|context|toolsets|role|retain_session|scheduling)\s*="
+        r"|[\"'](?:goal|context|toolsets|role|retain_session|scheduling|background)[\"']\s*:"
+        r"|delegate_(?:task|continue)\s*\(\s*background\s*=)"
+    )
+    stale_examples = []
+
+    for markdown_root in markdown_roots:
+        for path in markdown_root.rglob("*.md"):
+            text = path.read_text(encoding="utf-8")
+            for block in fenced_block.findall(text):
+                if "delegate_task" not in block and "delegate_continue" not in block:
+                    continue
+                match = stale_field.search(block)
+                if match:
+                    line = text[: text.find(block) + match.start()].count("\n") + 1
+                    stale_examples.append(
+                        f"{path.relative_to(root)}:{line}: {match.group(0)}"
+                    )
+
+    assert not stale_examples, "\n".join(stale_examples)
 
 
 def test_unknown_profile_fails_closed():
