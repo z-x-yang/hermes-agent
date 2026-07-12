@@ -55,6 +55,12 @@ class _NoFtsExistingTableConnection(sqlite3.Connection):
 class _NoTrigramCursor(sqlite3.Cursor):
     """Simulate a SQLite build with FTS5 but without the trigram tokenizer."""
 
+    def execute(self, sql, parameters=()):
+        probe = sql.strip()
+        if "tokenize='trigram'" in probe or probe == "SELECT * FROM messages_fts_trigram LIMIT 0":
+            raise sqlite3.OperationalError("no such tokenizer: trigram")
+        return super().execute(sql, parameters)
+
     def executescript(self, sql_script):
         if "tokenize='trigram'" in sql_script:
             raise sqlite3.OperationalError("no such tokenizer: trigram")
@@ -628,7 +634,11 @@ class TestSessionLifecycle:
             assert migrated_db._fts_enabled is True
             assert migrated_db._trigram_available is False
             assert migrated_db._fts_table_exists("messages_fts") is True
-            assert migrated_db._fts_table_exists("messages_fts_trigram") is False
+            # A verified marker-2 database is never downgraded or dropped merely
+            # because this runtime cannot use trigram. The physical owner remains
+            # v2 while search records trigram as unavailable for fallback routing.
+            assert migrated_db._fts_table_exists("messages_fts_trigram") is True
+            assert migrated_db.get_meta("fts_schema_version") == "2"
 
             # Existing messages must be searchable via base FTS.
             results = migrated_db.search_messages("legacy message")
@@ -1507,6 +1517,223 @@ class TestCJKSearchFallback:
     back to LIKE substring matching whenever FTS5 returns no results and
     the query contains CJK characters.
     """
+
+    def test_metadata_only_cjk_all_roles_uses_full_projection(self, db):
+        db.create_session(session_id="tool-session", source="cli")
+        message_id = db.append_message(
+            "tool-session",
+            role="tool",
+            content="visible body",
+            tool_name="runner",
+        )
+        db._conn.execute(
+            "UPDATE messages SET tool_calls=? WHERE id=?",
+            ('{"query":"工具调用关键词"}', message_id),
+        )
+        db._conn.commit()
+
+        rows = db.search_messages("调用关", role_filter=None)
+
+        assert [row["id"] for row in rows] == [message_id]
+        assert rows[0]["content"] == "visible body"
+        assert "调用关" in rows[0]["snippet"].replace(">>>", "").replace("<<<", "")
+
+    def test_cjk_like_snippet_marks_first_token_matching_each_projection(self, db):
+        db.create_session(session_id="later-token", source="cli")
+        metadata_id = db.append_message(
+            "later-token", role="tool", content="body", tool_name="桂林"
+        )
+        content_id = db.append_message(
+            "later-token", role="tool", content="content 桂林"
+        )
+        tool_calls_id = db.append_message(
+            "later-token", role="tool", content="calls body"
+        )
+        db._conn.execute(
+            "UPDATE messages SET tool_calls=? WHERE id=?",
+            ('{"destination":"桂林"}', tool_calls_id),
+        )
+        db._conn.commit()
+
+        rows = db.search_messages("广西 OR 桂林", role_filter=["tool"])
+        by_id = {row["id"]: row for row in rows}
+
+        assert set(by_id) == {metadata_id, content_id, tool_calls_id}
+        assert all(">>>桂林<<<" in row["snippet"] for row in rows)
+        assert by_id[metadata_id]["content"] == "body"
+        assert by_id[content_id]["content"] == "content 桂林"
+        assert by_id[tool_calls_id]["content"] == "calls body"
+
+    def test_cjk_like_snippet_preserves_ascii_case_and_literal_wildcards(self, db):
+        db.create_session(session_id="literal-snippet", source="cli")
+        content = r"body 工具Alpha%_完成\路径"
+        message_id = db.append_message(
+            "literal-snippet", role="tool", content=content
+        )
+
+        rows = db.search_messages(
+            r"广西 OR 工具ALPHA%_完成\路径", role_filter=["tool"]
+        )
+
+        assert [row["id"] for row in rows] == [message_id]
+        assert rows[0]["snippet"] == r"body >>>工具Alpha%_完成\路径<<<  "
+        assert rows[0]["content"] == content
+        assert "_search_projection" not in rows[0]
+
+    def test_tool_cjk_uses_like_and_preserves_filters(self, db):
+        db.create_session(session_id="included", source="cli")
+        db.create_session(session_id="compacted", source="cli")
+        db.create_session(session_id="rewound", source="cli")
+        db.create_session(session_id="excluded", source="telegram")
+
+        included_id = db.append_message(
+            "included", role="tool", content="active body", tool_name="工具关键词"
+        )
+        compacted_id = db.append_message(
+            "compacted", role="tool", content="compacted body",
+        )
+        rewound_id = db.append_message(
+            "rewound", role="tool", content="rewound body", tool_name="工具关键词"
+        )
+        db.append_message(
+            "excluded", role="tool", content="excluded body", tool_name="工具关键词"
+        )
+        db._conn.execute(
+            "UPDATE messages SET active=0, compacted=1, tool_calls=? WHERE id=?",
+            ('{"query":"工具关键词"}', compacted_id),
+        )
+        db._conn.execute(
+            "UPDATE messages SET active=0, compacted=0 WHERE id=?", (rewound_id,)
+        )
+        db._conn.commit()
+
+        rows = db.search_messages(
+            "工具关",
+            role_filter=["tool"],
+            exclude_sources=["telegram"],
+            include_inactive=False,
+        )
+
+        assert {row["id"] for row in rows} == {included_id, compacted_id}
+        assert all("工具关" in row["snippet"] for row in rows)
+        assert {row["content"] for row in rows} == {"active body", "compacted body"}
+
+        inactive_rows = db.search_messages(
+            "工具关",
+            role_filter=["tool"],
+            exclude_sources=["telegram"],
+            include_inactive=True,
+        )
+        assert {row["id"] for row in inactive_rows} == {
+            included_id, compacted_id, rewound_id,
+        }
+
+    def test_cjk_trigram_requires_explicit_user_assistant_role_subset(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="assistant", content="选择路由关键词")
+
+        def executed_sql(role_filter):
+            statements = []
+            db._conn.set_trace_callback(statements.append)
+            try:
+                db.search_messages("路由关", role_filter=role_filter)
+            finally:
+                db._conn.set_trace_callback(None)
+            return "\n".join(statements)
+
+        for roles in (["assistant"], ["user", "assistant"]):
+            assert "FROM messages_fts_trigram" in executed_sql(roles)
+
+        for roles in (
+            None,
+            [],
+            ["tool"],
+            ["system"],
+            ["session_meta"],
+            ["user", "tool"],
+            ["user", "assistant", "tool", "system", "session_meta"],
+        ):
+            sql = executed_sql(roles)
+            assert "FROM messages_fts_trigram" not in sql
+            assert "coalesce(m.tool_calls,'')" in sql
+
+    def test_cjk_like_treats_percent_underscore_and_escape_as_literals(self, db):
+        db.create_session(session_id="literal", source="cli")
+        db.create_session(session_id="wildcard-neighbor", source="cli")
+        literal_id = db.append_message(
+            "literal", role="tool", content=r"工具100%_完成\路径"
+        )
+        db.append_message(
+            "wildcard-neighbor", role="tool", content="工具100XX完成路径"
+        )
+
+        percent_rows = db.search_messages("工具100%_完成", role_filter=["tool"])
+        escape_rows = db.search_messages(r"完成\路径", role_filter=["tool"])
+
+        assert [row["id"] for row in percent_rows] == [literal_id]
+        assert [row["id"] for row in escape_rows] == [literal_id]
+
+    def test_v1_v2_search_message_id_parity(self, tmp_path):
+        from state_db_fts import create_fts_v1, rebuild_fts
+
+        v1_path = tmp_path / "v1.db"
+        v2_path = tmp_path / "v2.db"
+        seed = SessionDB(v1_path)
+        seed.close()
+        conn = sqlite3.connect(v1_path)
+        for trigger in (
+            "messages_fts_insert", "messages_fts_delete", "messages_fts_update",
+            "messages_fts_trigram_insert", "messages_fts_trigram_delete",
+            "messages_fts_trigram_update",
+        ):
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        conn.execute("DROP TABLE messages_fts_trigram")
+        conn.execute("DROP TABLE messages_fts")
+        conn.execute("DROP VIEW messages_fts_trigram_content_v2")
+        conn.execute("DROP VIEW messages_fts_unicode_content_v2")
+        conn.execute("DELETE FROM state_meta WHERE key='fts_schema_version'")
+        create_fts_v1(conn)
+        rebuild_fts(conn, "v1_inline")
+        conn.commit()
+        conn.close()
+
+        v1 = SessionDB(v1_path)
+        v2 = SessionDB(v2_path)
+        try:
+            for candidate in (v1, v2):
+                candidate.create_session(session_id="s1", source="cli")
+                candidate.append_message(
+                    "s1", role="user", content="representative englishneedle"
+                )
+                assistant_id = candidate.append_message(
+                    "s1", role="assistant", content="assistant body"
+                )
+                tool_id = candidate.append_message(
+                    "s1", role="tool", content="tool body"
+                )
+                candidate._conn.execute(
+                    "UPDATE messages SET tool_calls=? WHERE id=?",
+                    ('{"query":"助手调用关键词"}', assistant_id),
+                )
+                candidate._conn.execute(
+                    "UPDATE messages SET tool_calls=? WHERE id=?",
+                    ('{"query":"工具调用关键词"}', tool_id),
+                )
+                candidate._conn.commit()
+
+            cases = (
+                ("englishneedle", ["user", "assistant"]),
+                ("调用关", ["user", "assistant"]),
+                ("工具调", ["tool"]),
+                ("调用", None),
+            )
+            for query, roles in cases:
+                v1_ids = {row["id"] for row in v1.search_messages(query, role_filter=roles)}
+                v2_ids = {row["id"] for row in v2.search_messages(query, role_filter=roles)}
+                assert v2_ids == v1_ids, (query, roles, v1_ids, v2_ids)
+        finally:
+            v1.close()
+            v2.close()
 
     def test_cjk_detection_covers_all_ranges(self):
         from hermes_state import SessionDB
@@ -4181,13 +4408,11 @@ class TestFTS5ToolCallIndexing:
 
 
 class TestFTS5ToolCallMigration:
-    """v11 migration: pre-existing state.db with old external-content FTS tables
-    must be re-indexed so tool_name / tool_calls become searchable after upgrade."""
+    """Unmarked external-content schemas are ambiguous and fail closed."""
 
-    def test_v10_to_v11_upgrade_backfills_tool_fields(self, tmp_path):
-        """Simulate an existing user: build a v10-shaped DB by hand, insert a
-        row with tool_calls, then open via SessionDB (which runs migrations).
-        After upgrade, the tool_calls token must be searchable."""
+    def test_unmarked_legacy_external_schema_is_not_migrated_on_startup(self, tmp_path):
+        """An external schema without marker 2 must remain byte/schema-stable and
+        require explicit migration tooling rather than startup ownership guessing."""
         import sqlite3
 
         db_path = tmp_path / "legacy.db"
@@ -4261,22 +4486,21 @@ class TestFTS5ToolCallMigration:
         assert legacy_hits == [], "sanity: legacy FTS must NOT contain tool_name"
         conn.close()
 
-        # Now open via SessionDB — migration runs.
-        session_db = SessionDB(db_path=db_path)
+        # Startup must refuse this contradictory external/no-marker ownership
+        # state before any schema-version or FTS write.
+        with pytest.raises(RuntimeError, match="inconsistent FTS schema"):
+            SessionDB(db_path=db_path)
+
+        conn = sqlite3.connect(str(db_path))
         try:
-            assert len(session_db.search_messages("LEGACYTOOL")) == 1, \
-                "v11 migration must backfill tool_name into FTS"
-            assert len(session_db.search_messages("LEGACYARG")) == 1, \
-                "v11 migration must backfill tool_calls JSON into FTS"
-            # schema_version bumped
-            from hermes_state import SCHEMA_VERSION
-            row = session_db._conn.execute(
+            assert conn.execute(
                 "SELECT version FROM schema_version LIMIT 1"
-            ).fetchone()
-            version = row["version"] if hasattr(row, "keys") else row[0]
-            assert version == SCHEMA_VERSION
+            ).fetchone()[0] == 10
+            assert conn.execute(
+                "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'LEGACYTOOL'"
+            ).fetchall() == []
         finally:
-            session_db.close()
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -4924,3 +5148,19 @@ def test_archive_and_compact_returning_ids_reports_fresh_active_rows(db):
         "current user",
     ]
     assert len(db.get_messages("s-rowids", include_inactive=True)) == 4
+
+
+def test_sessiondb_read_only_connection_enables_query_only(tmp_path):
+    path = tmp_path / "state.db"
+    writable = SessionDB(db_path=path)
+    writable.close()
+
+    read_only = SessionDB(db_path=path, read_only=True)
+    try:
+        conn = read_only._conn
+        assert conn is not None
+        assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("INSERT INTO state_meta(key,value) VALUES('x','y')")
+    finally:
+        read_only.close()

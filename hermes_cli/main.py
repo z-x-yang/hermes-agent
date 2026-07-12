@@ -13441,6 +13441,52 @@ def main():
         help="Skip the timestamped backup copy (not recommended)",
     )
 
+    sessions_subparsers.add_parser(
+        "fts-plan", help="Read-only FTS v2 migration plan and space check"
+    )
+    sessions_subparsers.add_parser(
+        "fts-status", help="Read-only FTS schema and maintenance-journal status"
+    )
+    sessions_fts_migrate = sessions_subparsers.add_parser(
+        "fts-migrate", help="Apply the explicitly confirmed FTS v2 migration"
+    )
+    sessions_fts_migrate.add_argument(
+        "--apply",
+        action="store_true",
+        help="Required acknowledgement that this command changes state.db",
+    )
+    sessions_fts_migrate.add_argument(
+        "--yes", action="store_true", help="Skip interactive confirmation"
+    )
+    sessions_fts_resume = sessions_subparsers.add_parser(
+        "fts-resume", help="Resume the journaled FTS migration"
+    )
+    sessions_fts_resume.add_argument(
+        "--yes", action="store_true", help="Skip interactive confirmation"
+    )
+    sessions_fts_abort = sessions_subparsers.add_parser(
+        "fts-abort", help="Abort a safe pre-swap FTS migration phase"
+    )
+    sessions_fts_abort.add_argument(
+        "--yes", action="store_true", help="Skip interactive confirmation"
+    )
+    sessions_fts_rollback = sessions_subparsers.add_parser(
+        "fts-rollback", help="Rollback a journaled FTS migration"
+    )
+    sessions_fts_rollback.add_argument(
+        "backup", nargs="?", help="Optional backup path; must match the journal"
+    )
+    sessions_fts_rollback.add_argument(
+        "--yes", action="store_true", help="Skip interactive confirmation"
+    )
+    sessions_retention_estimate = sessions_subparsers.add_parser(
+        "retention-estimate",
+        help="Read-only aggregate retention sensitivity estimate",
+    )
+    sessions_retention_estimate.add_argument(
+        "--json", action="store_true", help="Emit stable aggregate-only JSON"
+    )
+
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
     sessions_rename = sessions_subparsers.add_parser(
@@ -13472,6 +13518,135 @@ def main():
 
         action = args.sessions_action
 
+        maintenance_actions = {
+            "fts-plan",
+            "fts-status",
+            "fts-migrate",
+            "fts-resume",
+            "fts-abort",
+            "fts-rollback",
+            "retention-estimate",
+        }
+        if action in maintenance_actions:
+            from dataclasses import asdict
+            from pathlib import Path
+
+            from hermes_state import DEFAULT_DB_PATH
+            from state_db_fts_migration import (
+                abort_fts_migration,
+                apply_fts_migration,
+                estimate_payload_retention,
+                plan_fts_migration,
+                resume_fts_migration,
+                rollback_fts_migration,
+                status_fts_migration,
+            )
+
+            db_path = DEFAULT_DB_PATH
+
+            def fail(exc: Exception) -> None:
+                print(f"✗ {exc}")
+                print("Recovery: hermes sessions fts-status")
+                print(
+                    "Then use: hermes sessions fts-resume --yes "
+                    "or hermes sessions fts-rollback --yes"
+                )
+                sys.exit(1)
+
+            def confirmed(label: str) -> bool:
+                if getattr(args, "yes", False):
+                    return True
+                ok = _confirm_prompt(
+                    f"{label} This requires stopped state.db writers and may take "
+                    "30–40 minutes. Continue? [y/N] "
+                )
+                if not ok:
+                    print("Cancelled.")
+                return ok
+
+            try:
+                if action == "fts-plan":
+                    report = plan_fts_migration(db_path)
+                    print("State DB FTS migration plan (read-only)")
+                    print(f"  schema: {report.schema_kind}")
+                    print(f"  marker: {report.schema_marker or 'none'}")
+                    print(
+                        f"  rows: {report.message_count} messages, "
+                        f"{report.session_count} sessions"
+                    )
+                    print(
+                        f"  space: {report.free_bytes} free / "
+                        f"{report.required_free_bytes} required bytes"
+                    )
+                    print(f"  maintenance: {report.maintenance_status}")
+                    print(f"  paired corpus: {report.paired_corpus_version}")
+                    print(f"  can apply: {'yes' if report.can_apply else 'no'}")
+                    for reason in report.reasons:
+                        print(f"  reason: {reason}")
+                    return
+
+                if action == "fts-status":
+                    report = status_fts_migration(db_path)
+                    print("State DB FTS status (read-only)")
+                    print(f"  schema: {report.get('schema_kind')}")
+                    print(f"  marker: {report.get('schema_marker') or 'none'}")
+                    print(f"  maintenance: {report.get('maintenance_status')}")
+                    if report.get("journal_phase"):
+                        print(f"  journal phase: {report['journal_phase']}")
+                    if report.get("journal_error"):
+                        print(f"  journal error: {report['journal_error']}")
+                    counts = report.get("counts", {})
+                    print(
+                        f"  rows: {counts.get('messages', 0)} messages, "
+                        f"{counts.get('sessions', 0)} sessions"
+                    )
+                    print(f"  read-only: {'yes' if report.get('read_only') else 'no'}")
+                    return
+
+                if action == "retention-estimate":
+                    report = estimate_payload_retention(db_path)
+                    if getattr(args, "json", False):
+                        print(_json.dumps(asdict(report), sort_keys=True))
+                    else:
+                        print("State DB retention estimate (read-only)")
+                        print(f"  clock status: {report.clock_status}")
+                        print(f"  age basis: {report.rows_by_age_basis}")
+                        print(f"  valid handle targets: {report.valid_handle_targets}")
+                        print(f"  handle exemptions: {report.handle_exemptions}")
+                        print(f"  malformed handles: {report.malformed_handles}")
+                        print(f"  missing/wrong targets: {report.missing_or_wrong_targets}")
+                        print(f"  archived session holds: {report.archived_session_holds}")
+                        print("  session deletion candidates: 0")
+                    return
+
+                if action == "fts-migrate":
+                    if not getattr(args, "apply", False):
+                        print("✗ fts-migrate requires explicit --apply")
+                        sys.exit(2)
+                    if not confirmed("Apply the FTS v2 migration?"):
+                        return
+                    result = apply_fts_migration(db_path)
+                elif action == "fts-resume":
+                    if not confirmed("Resume the journaled FTS migration?"):
+                        return
+                    result = resume_fts_migration(db_path)
+                elif action == "fts-abort":
+                    if not confirmed("Abort this pre-swap FTS migration?"):
+                        return
+                    result = abort_fts_migration(db_path)
+                else:
+                    if not confirmed("Rollback the journaled FTS migration?"):
+                        return
+                    backup = Path(args.backup) if getattr(args, "backup", None) else None
+                    result = rollback_fts_migration(db_path, backup=backup)
+                print(f"FTS maintenance phase: {result.phase}")
+                print(f"Completed: {'yes' if result.completed else 'no'}")
+                return
+            except SystemExit:
+                raise
+            except Exception as exc:
+                fail(exc)
+
         # 'repair' must run BEFORE opening SessionDB(): a malformed schema is
         # exactly the case where SessionDB() can't open, so it operates on the
         # raw file path instead.
@@ -13481,12 +13656,17 @@ def main():
                 _db_opens_cleanly,
                 repair_state_db_schema,
             )
+            from state_db_maintenance import MaintenanceBlockedError
 
             db_path = DEFAULT_DB_PATH
             if not db_path.exists():
                 print(f"No session database at {db_path} (nothing to repair).")
                 return
-            reason = _db_opens_cleanly(db_path)
+            try:
+                reason = _db_opens_cleanly(db_path)
+            except MaintenanceBlockedError as exc:
+                print(f"✗ {exc}")
+                sys.exit(1)
             if reason is None:
                 print(f"✓ {db_path} opens cleanly — no repair needed.")
                 return
@@ -13494,9 +13674,13 @@ def main():
             if getattr(args, "check_only", False):
                 return
             print("Repairing (a backup copy is made first)…")
-            report = repair_state_db_schema(
-                db_path, backup=not getattr(args, "no_backup", False)
-            )
+            try:
+                report = repair_state_db_schema(
+                    db_path, backup=not getattr(args, "no_backup", False)
+                )
+            except MaintenanceBlockedError as exc:
+                print(f"✗ {exc}")
+                sys.exit(1)
             if report.get("repaired"):
                 if report.get("backup_path"):
                     print(f"  backup: {report['backup_path']}")
