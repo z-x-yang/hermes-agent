@@ -1466,7 +1466,88 @@ def test_terminal_rollback_requires_durable_two_proof_liveness_activation(
     assert not quarantine.exists()
     with pytest.raises(MaintenanceBlockedError, match="write blocked"):
         assert_state_db_maintenance_access(path, write_capable=True, permit=None)
-
     monkeypatch.setattr(migration, "_run_lsof", lambda paths: _lsof_result(1, ""))
     assert rollback_fts_migration(path).phase == "rolled_back"
     assert _db_digest(path) == before
+
+
+def test_terminal_rollback_proofs_cover_every_extant_split_bundle_path_atomically(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.db"
+    _candidate_fixture(path)
+    _allow_apply(monkeypatch)
+    apply_fts_migration(path)
+    original = migration._original_paths(path)
+    quarantine = migration._quarantine_paths(path)
+    original["wal"].write_bytes(b"split-original-wal")
+    quarantine["shm"].write_bytes(b"split-quarantine-shm")
+    expected_paths = (
+        path,
+        original["db"],
+        original["wal"],
+        quarantine["shm"],
+    )
+    journal_path = migration.maintenance_journal_path(path)
+    file_snapshot = _snapshot_paths(expected_paths)
+    journal_before = journal_path.read_bytes()
+    calls = []
+
+    def holder_on_nonfirst_root(paths):
+        calls.append(tuple(paths))
+        assert tuple(paths) == expected_paths
+        return _lsof_result(1, "") if len(calls) == 1 else _lsof_result(0, "p5150\nf1\n")
+
+    monkeypatch.setattr(migration, "_run_lsof", holder_on_nonfirst_root)
+    with pytest.raises(RuntimeError, match="writers are still live"):
+        rollback_fts_migration(path)
+
+    assert calls == [expected_paths, expected_paths]
+    _assert_path_snapshot(file_snapshot)
+    activated = migration.load_maintenance_journal(path)
+    assert activated is not None
+    assert activated.phase is JournalPhase.CANDIDATE_LIVE
+    assert activated.fingerprints["rollback_activation"]["sha256"] == "planned"
+    assert journal_path.read_bytes() != journal_before
+
+
+def test_activated_rollback_retry_recomputes_complete_split_bundle_path_set(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.db"
+    _candidate_fixture(path)
+    _allow_apply(monkeypatch)
+    apply_fts_migration(path)
+    outcomes = [_lsof_result(1, ""), _lsof_result(0, "p5250\nf1\n")]
+    monkeypatch.setattr(migration, "_run_lsof", lambda paths: outcomes.pop(0))
+    with pytest.raises(RuntimeError, match="writers are still live"):
+        rollback_fts_migration(path)
+
+    original = migration._original_paths(path)
+    quarantine = migration._quarantine_paths(path)
+    live = migration._bundle_paths(path)
+    live["wal"].write_bytes(b"retry-live-wal")
+    original["shm"].write_bytes(b"retry-original-shm")
+    quarantine["db"].write_bytes(b"retry-quarantine-main")
+    expected_paths = (
+        live["db"],
+        live["wal"],
+        original["db"],
+        original["shm"],
+        quarantine["db"],
+    )
+    journal_path = migration.maintenance_journal_path(path)
+    snapshot = _snapshot_paths((*expected_paths, journal_path))
+    calls = []
+
+    def retry_holder_on_nonfirst_root(paths):
+        calls.append(tuple(paths))
+        assert tuple(paths) == expected_paths
+        return _lsof_result(0, "p5350\nf1\n")
+
+    monkeypatch.setattr(migration, "_run_lsof", retry_holder_on_nonfirst_root)
+    with pytest.raises(RuntimeError, match="writers are still live"):
+        rollback_fts_migration(path)
+
+    assert calls == [expected_paths]
+    _assert_path_snapshot(snapshot)

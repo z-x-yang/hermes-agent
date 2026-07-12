@@ -1104,14 +1104,16 @@ def _run_lsof(paths: tuple[Path, ...]):
     )
 
 
-def find_live_state_db_users(db_path: Path) -> LivenessReport:
-    """Return aggregate liveness, failing closed on unavailable or ambiguous lsof."""
-    path = Path(db_path).expanduser().resolve(strict=False)
-    paths = tuple(
-        candidate
-        for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm"))
-        if candidate.exists()
-    )
+def _find_live_state_db_users_for_paths(paths: Sequence[Path]) -> LivenessReport:
+    """Prove aggregate liveness for one deduplicated extant recovery path set."""
+    extant_paths: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in paths:
+        normalized = Path(candidate).expanduser().resolve(strict=False)
+        if normalized.exists() and normalized not in seen:
+            seen.add(normalized)
+            extant_paths.append(normalized)
+    paths = tuple(extant_paths)
     if not paths:
         raise RuntimeError("lsof cannot prove liveness for a missing database bundle")
     try:
@@ -1143,8 +1145,19 @@ def find_live_state_db_users(db_path: Path) -> LivenessReport:
     return LivenessReport(status="live", holder_count=len(holders))
 
 
+def find_live_state_db_users(db_path: Path) -> LivenessReport:
+    """Return aggregate liveness for the normal live database bundle."""
+    path = Path(db_path).expanduser().resolve(strict=False)
+    return _find_live_state_db_users_for_paths(tuple(_bundle_paths(path).values()))
+
+
 def _require_no_live_users(db_path: Path) -> None:
     if find_live_state_db_users(db_path).status != "clear":
+        raise RuntimeError("state DB writers are still live")
+
+
+def _require_no_live_users_for_paths(paths: Sequence[Path]) -> None:
+    if _find_live_state_db_users_for_paths(paths).status != "clear":
         raise RuntimeError("state DB writers are still live")
 
 
@@ -1690,13 +1703,16 @@ def _restore_original_bundle(path: Path, journal: MaintenanceJournal) -> None:
         _fsync_directory(path.parent)
 
 
-def _rollback_liveness_root(path: Path) -> Path:
-    for root in (path, _quarantine_paths(path)["db"], _original_paths(path)["db"]):
-        if any(_bundle_paths(root).values()) and any(
-            item.exists() for item in _bundle_paths(root).values()
-        ):
-            return root
-    return path
+def _rollback_liveness_paths(path: Path) -> tuple[Path, ...]:
+    return tuple(
+        item
+        for bundle in (
+            _bundle_paths(path),
+            _original_paths(path),
+            _quarantine_paths(path),
+        )
+        for item in bundle.values()
+    )
 
 
 def rollback_fts_migration(
@@ -1725,7 +1741,7 @@ def rollback_fts_migration(
     activation = journal.fingerprints.get("rollback_activation")
     if activation is None:
         # Proof one occurs while a terminal journal may still allow ordinary writers.
-        _require_no_live_users(_rollback_liveness_root(path))
+        _require_no_live_users_for_paths(_rollback_liveness_paths(path))
         next_phase = (
             JournalPhase.CANDIDATE_LIVE
             if journal.phase in {JournalPhase.CANARY_PASSED, JournalPhase.COMPLETE}
@@ -1760,7 +1776,7 @@ def rollback_fts_migration(
 
     # Proof two always runs after the durable nonterminal activation. A crash or
     # failed proof leaves this marker in place, so every retry repeats this proof.
-    _require_no_live_users(_rollback_liveness_root(path))
+    _require_no_live_users_for_paths(_rollback_liveness_paths(path))
 
     if journal.phase is JournalPhase.SWAPPING:
         journal = _move_recorded_bundle_to_original(path, journal)
