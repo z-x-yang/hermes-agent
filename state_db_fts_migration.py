@@ -1230,12 +1230,67 @@ def _require_fingerprint(path: Path, expected: object, label: str) -> None:
         raise RuntimeError(f"unknown {label} fingerprint; no files changed")
 
 
+def _exact_two_location_state(
+    source: Path,
+    destination: Path,
+    expected: object,
+    label: str,
+) -> str:
+    """Classify an idempotent rename only when the other location is absent."""
+    source_fp = fingerprint_path(source)
+    destination_fp = fingerprint_path(destination)
+    if expected is None:
+        if source_fp is None and destination_fp is None:
+            return "absent"
+    elif _same_fingerprint(source_fp, expected) and destination_fp is None:
+        return "source"
+    elif _same_fingerprint(destination_fp, expected) and source_fp is None:
+        return "destination"
+    raise RuntimeError(f"unknown {label} state; no files changed")
+
+
+def _status_fingerprint(status: str) -> dict[str, int | str]:
+    """Store a schema-compatible explicit durable status marker."""
+    return {
+        "size": 0,
+        "mtime_ns": 0,
+        "device": 0,
+        "inode": 0,
+        "sha256": status,
+    }
+
+
 def _bundle_paths(db_path: Path) -> dict[str, Path]:
     return {
         "db": db_path,
         "wal": Path(f"{db_path}-wal"),
         "shm": Path(f"{db_path}-shm"),
     }
+
+
+def _candidate_bundle_paths(candidate: Path) -> dict[str, Path]:
+    return {
+        "db": candidate,
+        "wal": Path(f"{candidate}-wal"),
+        "shm": Path(f"{candidate}-shm"),
+    }
+
+
+def _candidate_inventory_fingerprints(
+    candidate: Path,
+) -> dict[str, dict[str, int | str] | None]:
+    return {
+        f"candidate_{name}": fingerprint_path(item)
+        for name, item in _candidate_bundle_paths(candidate).items()
+    }
+
+
+def _validate_candidate_bundle(candidate: Path, journal: MaintenanceJournal) -> None:
+    for name, item in _candidate_bundle_paths(candidate).items():
+        key = f"candidate_{name}"
+        if key not in journal.fingerprints:
+            raise RuntimeError(f"candidate {name} inventory missing from journal")
+        _require_fingerprint(item, journal.fingerprints[key], f"candidate {name}")
 
 
 def _original_paths(db_path: Path) -> dict[str, Path]:
@@ -1307,17 +1362,10 @@ def _move_recorded_bundle_to_original(
     actions: list[tuple[Path, Path]] = []
     for name in ("db", "wal", "shm"):
         expected = journal.fingerprints.get(name)
-        source_fp = fingerprint_path(live[name])
-        destination_fp = fingerprint_path(original[name])
-        if expected is None:
-            if source_fp is not None or destination_fp is not None:
-                raise RuntimeError(f"unknown source {name} inventory; no files changed")
-            continue
-        source_matches = _same_fingerprint(source_fp, expected)
-        destination_matches = _same_fingerprint(destination_fp, expected)
-        if source_matches == destination_matches:
-            raise RuntimeError(f"unknown source {name} rename state; no files changed")
-        if source_matches:
+        state = _exact_two_location_state(
+            live[name], original[name], expected, f"source {name} rename"
+        )
+        if state == "source":
             actions.append((live[name], original[name]))
     for source, destination in actions:
         os.replace(source, destination)
@@ -1334,18 +1382,24 @@ def _install_recorded_candidate(
     if journal.candidate_path is None:
         raise RuntimeError("candidate path missing from journal")
     candidate = Path(journal.candidate_path)
-    expected = journal.fingerprints.get("candidate")
+    expected = journal.fingerprints.get("candidate_db")
+    for name in ("wal", "shm"):
+        key = f"candidate_{name}"
+        if key not in journal.fingerprints:
+            raise RuntimeError(f"candidate {name} inventory missing from journal")
+        _require_fingerprint(
+            _candidate_bundle_paths(candidate)[name],
+            journal.fingerprints[key],
+            f"candidate {name}",
+        )
     live = _bundle_paths(db_path)
     for name in ("wal", "shm"):
         if live[name].exists():
             raise RuntimeError("stale sidecar remains at live basename")
-    candidate_fp = fingerprint_path(candidate)
-    live_fp = fingerprint_path(db_path)
-    at_candidate = _same_fingerprint(candidate_fp, expected)
-    at_live = _same_fingerprint(live_fp, expected)
-    if at_candidate == at_live:
-        raise RuntimeError("unknown candidate rename state; no files changed")
-    if at_candidate:
+    state = _exact_two_location_state(
+        candidate, db_path, expected, "candidate rename"
+    )
+    if state == "source":
         os.replace(candidate, db_path)
         _fsync_directory(db_path.parent)
     return _transition(
@@ -1479,11 +1533,13 @@ def resume_fts_migration(db_path: Path) -> MigrationResult:
                     },
                 )
                 expected_backup = journal.fingerprints.get("backup")
-            pending_matches = _same_fingerprint(fingerprint_path(pending_backup), expected_backup)
-            final_matches = _same_fingerprint(fingerprint_path(backup), expected_backup)
-            if pending_matches == final_matches:
-                raise RuntimeError("unknown rollback backup install state")
-            if pending_matches:
+            backup_state = _exact_two_location_state(
+                pending_backup,
+                backup,
+                expected_backup,
+                "rollback backup install",
+            )
+            if backup_state == "source":
                 os.replace(pending_backup, backup)
                 _fsync_directory(backup.parent)
             journal = _transition(
@@ -1516,13 +1572,22 @@ def resume_fts_migration(db_path: Path) -> MigrationResult:
                 or not controlled.verification.candidate_accepted
             ):
                 raise RuntimeError("controlled paired candidate verification failed")
+            candidate_inventory = _candidate_inventory_fingerprints(candidate)
+            if candidate_inventory["candidate_db"] is None:
+                raise RuntimeError("verified candidate main file is missing")
+            if (
+                candidate_inventory["candidate_wal"] is not None
+                or candidate_inventory["candidate_shm"] is not None
+            ):
+                raise RuntimeError("verified candidate has an unexpected sidecar")
             work_db = Path(journal.work_path) / "candidate-build" / "work.db"
             journal = _transition(
                 path,
                 journal,
                 JournalPhase.CANDIDATE_READY,
                 fingerprints={
-                    "candidate": fingerprint_path(candidate),
+                    "candidate": candidate_inventory["candidate_db"],
+                    **candidate_inventory,
                     "work": fingerprint_path(work_db),
                 },
             )
@@ -1530,9 +1595,7 @@ def resume_fts_migration(db_path: Path) -> MigrationResult:
             _validate_live_source(path, journal)
             if journal.candidate_path is None:
                 raise RuntimeError("candidate path missing from journal")
-            _require_fingerprint(
-                Path(journal.candidate_path), journal.fingerprints.get("candidate"), "candidate"
-            )
+            _validate_candidate_bundle(Path(journal.candidate_path), journal)
             journal = _transition(path, journal, JournalPhase.SWAPPING)
         elif phase is JournalPhase.SWAPPING:
             journal = _move_recorded_bundle_to_original(path, journal)
@@ -1611,22 +1674,29 @@ def _restore_original_bundle(path: Path, journal: MaintenanceJournal) -> None:
     original = _original_paths(path)
     actions: list[tuple[Path, Path]] = []
     for name in ("db", "wal", "shm"):
-        expected = journal.fingerprints.get(f"original_{name}") or journal.fingerprints.get(name)
-        source_fp = fingerprint_path(original[name])
-        live_fp = fingerprint_path(live[name])
-        if expected is None:
-            if source_fp is not None or live_fp is not None:
-                raise RuntimeError(f"unknown original {name} inventory")
-            continue
-        at_original = _same_fingerprint(source_fp, expected)
-        at_live = _same_fingerprint(live_fp, expected)
-        if at_original == at_live:
-            raise RuntimeError(f"unknown original {name} restore state")
-        if at_original:
+        original_key = f"original_{name}"
+        expected = (
+            journal.fingerprints[original_key]
+            if original_key in journal.fingerprints
+            else journal.fingerprints.get(name)
+        )
+        state = _exact_two_location_state(
+            original[name], live[name], expected, f"original {name} restore"
+        )
+        if state == "source":
             actions.append((original[name], live[name]))
     for source, destination in actions:
         os.replace(source, destination)
         _fsync_directory(path.parent)
+
+
+def _rollback_liveness_root(path: Path) -> Path:
+    for root in (path, _quarantine_paths(path)["db"], _original_paths(path)["db"]):
+        if any(_bundle_paths(root).values()) and any(
+            item.exists() for item in _bundle_paths(root).values()
+        ):
+            return root
+    return path
 
 
 def rollback_fts_migration(
@@ -1651,56 +1721,66 @@ def rollback_fts_migration(
         if journal.backup_path is None or Path(backup).resolve(strict=False) != Path(journal.backup_path).resolve(strict=False):
             raise RuntimeError("rollback backup does not match journal")
         _require_fingerprint(Path(backup), journal.fingerprints.get("backup"), "rollback backup")
-    if "rollback_liveness" not in journal.fingerprints:
-        _require_no_live_users(path)
-        current_bundle = {
-            name: fingerprint_path(item) for name, item in _bundle_paths(path).items()
-        }
+
+    activation = journal.fingerprints.get("rollback_activation")
+    if activation is None:
+        # Proof one occurs while a terminal journal may still allow ordinary writers.
+        _require_no_live_users(_rollback_liveness_root(path))
         next_phase = (
             JournalPhase.CANDIDATE_LIVE
             if journal.phase in {JournalPhase.CANARY_PASSED, JournalPhase.COMPLETE}
             else journal.phase
         )
+        activation_fingerprints: dict[str, dict[str, int | str] | None] = {
+            "rollback_activation": _status_fingerprint("planned")
+        }
+        if journal.phase in {
+            JournalPhase.CANDIDATE_LIVE,
+            JournalPhase.CANARY_PASSED,
+            JournalPhase.COMPLETE,
+        }:
+            _validate_live_source(path, journal)
+            activation_fingerprints.update(
+                {
+                    f"rollback_{name}": fingerprint_path(item)
+                    for name, item in _bundle_paths(path).items()
+                }
+            )
         journal = _transition(
             path,
             journal,
             next_phase,
-            fingerprints={
-                "rollback_liveness": {"size": 0, "mtime_ns": 0, "device": 0, "inode": 0, "sha256": "proved"},
-                **{f"rollback_{name}": value for name, value in current_bundle.items()},
-            },
+            fingerprints=activation_fingerprints,
         )
+    elif not _same_fingerprint(
+        dict(activation) if isinstance(activation, Mapping) else None,
+        _status_fingerprint("planned"),
+    ):
+        raise RuntimeError("unknown rollback activation marker")
+
+    # Proof two always runs after the durable nonterminal activation. A crash or
+    # failed proof leaves this marker in place, so every retry repeats this proof.
+    _require_no_live_users(_rollback_liveness_root(path))
+
     if journal.phase is JournalPhase.SWAPPING:
-        # Normalize any partially moved source bundle, then restore it.
         journal = _move_recorded_bundle_to_original(path, journal)
     if journal.phase is JournalPhase.OLD_MOVED:
         _restore_original_bundle(path, journal)
     else:
         live = _bundle_paths(path)
         quarantine = _quarantine_paths(path)
-        current = {name: fingerprint_path(item) for name, item in live.items()}
-        if current["db"] is not None and "rollback_db" not in journal.fingerprints:
-            # Persist exact rollback intent before the first rename.
-            journal = _transition(
-                path,
-                journal,
-                JournalPhase.CANDIDATE_LIVE,
-                fingerprints={f"rollback_{name}": value for name, value in current.items()},
-            )
         actions: list[tuple[Path, Path]] = []
         for name in ("db", "wal", "shm"):
-            expected = journal.fingerprints.get(f"rollback_{name}")
-            live_fp = fingerprint_path(live[name])
-            quarantine_fp = fingerprint_path(quarantine[name])
-            if expected is None:
-                if live_fp is not None or quarantine_fp is not None:
-                    raise RuntimeError(f"unknown candidate {name} rollback inventory")
-                continue
-            at_live = _same_fingerprint(live_fp, expected)
-            at_quarantine = _same_fingerprint(quarantine_fp, expected)
-            if at_live == at_quarantine:
-                raise RuntimeError(f"unknown candidate {name} quarantine state")
-            if at_live:
+            key = f"rollback_{name}"
+            if key not in journal.fingerprints:
+                raise RuntimeError(f"candidate {name} rollback inventory missing")
+            state = _exact_two_location_state(
+                live[name],
+                quarantine[name],
+                journal.fingerprints[key],
+                f"candidate {name} quarantine",
+            )
+            if state == "source":
                 actions.append((live[name], quarantine[name]))
         for source, destination in actions:
             os.replace(source, destination)
