@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import state_db_fts_migration as migration
 import pytest
+from hermes_state import SessionDB
 from state_db_fts import create_fts_v1, rebuild_fts
 from state_db_maintenance import (
     JournalPhase,
@@ -952,12 +953,133 @@ def test_real_wal_apply_complete_and_rollback_restores_verified_v1(tmp_path, mon
     finally:
         conn.close()
 
+    post_complete_token = "postcompleteordinarywrite"
+    session_db = SessionDB(db_path=path)
+    try:
+        new_message_id = session_db.append_message(
+            "active-session", "assistant", post_complete_token
+        )
+        matches = session_db.search_messages(post_complete_token)
+        assert any(row["id"] == new_message_id for row in matches)
+    finally:
+        session_db.close()
+
     rolled_back = rollback_fts_migration(path)
 
     assert rolled_back.phase == "rolled_back"
     restored = _db_digest(path)
     assert (restored["schema"], restored["meta"], restored["data"]) == before_truth
     assert restored["main_sha256"] == before["main_sha256"]
+    quarantine = tmp_path / "state.db.v2.quarantine"
+    quarantined = sqlite3.connect(
+        f"{quarantine.resolve().as_uri()}?mode=ro", uri=True
+    )
+    try:
+        assert quarantined.execute(
+            "SELECT count(*) FROM messages WHERE id=? AND content=?",
+            (new_message_id, post_complete_token),
+        ).fetchone() == (1,)
+    finally:
+        quarantined.close()
+    journal = migration.load_maintenance_journal(path)
+    assert journal is not None
+    assert journal.fingerprints["rollback_v1_canary"]["sha256"] == "passed"
+
+
+def test_complete_rollback_rejects_replaced_v2_inode_without_moving_files(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.db"
+    _checkpointed_wal_v1_fixture(path)
+    _allow_real_wal_apply(monkeypatch)
+    assert apply_fts_migration(path).phase == "complete"
+    replacement = tmp_path / "replacement.db"
+    replacement.write_bytes(path.read_bytes())
+    os.replace(replacement, path)
+    current = migration.fingerprint_path(path)
+    current_bytes = path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="unknown live candidate lineage"):
+        rollback_fts_migration(path)
+
+    assert migration.fingerprint_path(path) == current
+    assert path.read_bytes() == current_bytes
+    assert not (tmp_path / "state.db.v2.quarantine").exists()
+    assert (tmp_path / "state.db.pre-v2.original").exists()
+
+
+def test_complete_rollback_rejects_same_inode_unknown_schema_without_quarantine(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.db"
+    _checkpointed_wal_v1_fixture(path)
+    _allow_real_wal_apply(monkeypatch)
+    assert apply_fts_migration(path).phase == "complete"
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "UPDATE state_meta SET value='1' WHERE key='fts_schema_version'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    bundle = migration._bundle_paths(path)
+    before = {
+        name: item.read_bytes() if item.exists() else None
+        for name, item in bundle.items()
+    }
+
+    with pytest.raises(RuntimeError, match="not verified v2_external"):
+        rollback_fts_migration(path)
+
+    assert {
+        name: item.read_bytes() if item.exists() else None
+        for name, item in bundle.items()
+    } == before
+    assert not (tmp_path / "state.db.v2.quarantine").exists()
+    assert (tmp_path / "state.db.pre-v2.original").exists()
+
+
+def test_complete_rollback_checkpoint_failure_does_not_quarantine(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.db"
+    _checkpointed_wal_v1_fixture(path)
+    _allow_real_wal_apply(monkeypatch)
+    assert apply_fts_migration(path).phase == "complete"
+    current = migration.fingerprint_path(path)
+    monkeypatch.setattr(migration, "_checkpoint_source", lambda *args: (1, 2, 3))
+
+    with pytest.raises(RuntimeError, match="rollback checkpoint did not return exact"):
+        rollback_fts_migration(path)
+
+    assert migration.fingerprint_path(path) == current
+    assert not (tmp_path / "state.db.v2.quarantine").exists()
+    assert (tmp_path / "state.db.pre-v2.original").exists()
+
+
+def test_rollback_v1_canary_failure_never_claims_rolled_back(tmp_path, monkeypatch):
+    path = tmp_path / "state.db"
+    _candidate_fixture(path)
+    _allow_apply(monkeypatch)
+    assert apply_fts_migration(path).phase == "complete"
+
+    def fail_canary(*args):
+        raise RuntimeError("injected restored v1 canary failure")
+
+    monkeypatch.setattr(migration, "_run_v1_rollback_canary", fail_canary)
+    with pytest.raises(RuntimeError, match="injected restored v1 canary failure"):
+        rollback_fts_migration(path)
+
+    journal = migration.load_maintenance_journal(path)
+    assert journal is not None
+    assert journal.phase is not JournalPhase.ROLLED_BACK
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        assert migration.detect_fts_schema(conn) == "v1_inline"
+    finally:
+        conn.close()
+    assert (tmp_path / "state.db.v2.quarantine").exists()
 
 
 def test_apply_runs_exact_phase_sequence_and_installs_verified_candidate(

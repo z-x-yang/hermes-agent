@@ -1429,6 +1429,82 @@ def _validate_live_source(db_path: Path, journal: MaintenanceJournal) -> None:
         _require_fingerprint(path, journal.fingerprints.get(name), f"source {name}")
 
 
+_REQUIRED_SESSION_COLUMNS = frozenset(
+    {"id", "source", "model", "started_at", "ended_at", "archived", "parent_session_id"}
+)
+_REQUIRED_MESSAGE_COLUMNS = frozenset(
+    {
+        "id", "session_id", "role", "content", "tool_call_id", "tool_calls",
+        "tool_name", "timestamp", "active", "compacted",
+    }
+)
+
+
+def _require_expected_base_schema(conn: sqlite3.Connection) -> None:
+    if not _REQUIRED_SESSION_COLUMNS.issubset(_columns(conn, "sessions")):
+        raise RuntimeError("live database has an unexpected sessions schema")
+    if not _REQUIRED_MESSAGE_COLUMNS.issubset(_columns(conn, "messages")):
+        raise RuntimeError("live database has an unexpected messages schema")
+
+
+def _require_live_main_lineage(db_path: Path, journal: MaintenanceJournal) -> None:
+    """Allow content drift only while retaining the accepted live main inode."""
+    expected = journal.fingerprints.get("db")
+    actual = fingerprint_path(db_path)
+    if not isinstance(expected, Mapping) or actual is None or any(
+        actual.get(key) != expected.get(key) for key in ("device", "inode")
+    ):
+        raise RuntimeError("unknown live candidate lineage; no files changed")
+
+
+def _verify_v2_rollback_database(
+    db_path: Path, permit: MaintenancePermit
+) -> None:
+    assert_state_db_maintenance_access(db_path, write_capable=True, permit=permit)
+    conn = sqlite3.connect(db_path)
+    try:
+        marker = conn.execute(
+            "SELECT value FROM state_meta WHERE key='fts_schema_version'"
+        ).fetchone()
+        if marker != ("2",) or detect_fts_schema(conn) != "v2_external":
+            raise RuntimeError("live rollback candidate is not verified v2_external")
+        _require_expected_base_schema(conn)
+        if conn.execute("PRAGMA quick_check").fetchone() != ("ok",):
+            raise RuntimeError("live rollback candidate quick_check failed")
+        integrity_check_fts_v2(conn)
+    finally:
+        conn.close()
+
+
+def _verify_active_v2_for_rollback(
+    db_path: Path, journal: MaintenanceJournal
+) -> MaintenanceJournal:
+    """Recapture an ordinary-use v2 bundle only after rollback is write-blocked."""
+    _require_live_main_lineage(db_path, journal)
+    permit = _permit(db_path, journal)
+    # Reject wrong ownership/base schema/corruption before a checkpoint can
+    # modify the current bundle, then repeat against checkpointed truth.
+    _verify_v2_rollback_database(db_path, permit)
+    checkpoint = _checkpoint_source(db_path, journal, permit)
+    if checkpoint != (0, 0, 0):
+        raise RuntimeError("rollback checkpoint did not return exact (0,0,0)")
+
+    # The checkpoint handle is closed by _checkpoint_source before this fresh
+    # verification handle is opened. Any sidecars materialized by verification
+    # are deliberately included in the exact inventory captured below.
+    _verify_v2_rollback_database(db_path, permit)
+
+    return _transition(
+        db_path,
+        journal,
+        journal.phase,
+        fingerprints={
+            f"rollback_{name}": fingerprint_path(item)
+            for name, item in _bundle_paths(db_path).items()
+        },
+    )
+
+
 def _create_sqlite_backup(
     source: Path,
     destination: Path,
@@ -1805,6 +1881,57 @@ def _restore_original_bundle(path: Path, journal: MaintenanceJournal) -> None:
         _fsync_directory(path.parent)
 
 
+def _run_v1_rollback_canary(path: Path, journal: MaintenanceJournal) -> None:
+    """Prove restored v1 write/read/search while leaving no durable canary row."""
+    permit = _permit(path, journal)
+    assert_state_db_maintenance_access(path, write_capable=True, permit=permit)
+    conn = sqlite3.connect(path)
+    token = f"hermesrollbackcanary{secrets.token_hex(12)}"
+    try:
+        if detect_fts_schema(conn) != "v1_inline":
+            raise RuntimeError("restored database is not v1_inline")
+        _require_expected_base_schema(conn)
+        row = conn.execute("SELECT id FROM messages ORDER BY id LIMIT 1").fetchone()
+        if row is None:
+            raise RuntimeError("rollback canary requires a message row")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE messages SET content=coalesce(content,'') || ? WHERE id=?",
+                (f" {token}", row[0]),
+            )
+            read = conn.execute(
+                "SELECT content FROM messages WHERE id=?", (row[0],)
+            ).fetchone()
+            if read is None or token not in str(read[0]):
+                raise RuntimeError("restored v1 canary read failed")
+            found = conn.execute(
+                "SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?",
+                (f'"{token}"',),
+            ).fetchone()
+            if found is None:
+                raise RuntimeError("restored v1 canary search failed")
+        finally:
+            conn.rollback()
+    finally:
+        conn.close()
+
+    checkpoint = _checkpoint_source(path, journal, _permit(path, journal))
+    if checkpoint != (0, 0, 0):
+        raise RuntimeError("restored v1 checkpoint did not return exact (0,0,0)")
+    verify = sqlite3.connect(path)
+    try:
+        if detect_fts_schema(verify) != "v1_inline":
+            raise RuntimeError("restored database lost v1_inline ownership")
+        _require_expected_base_schema(verify)
+        if verify.execute("PRAGMA quick_check").fetchone() != ("ok",):
+            raise RuntimeError("restored v1 quick_check failed")
+        # Both v1 indexes are FTS5 owners and support the rank-1 integrity command.
+        integrity_check_fts_v2(verify)
+    finally:
+        verify.close()
+
+
 def _rollback_liveness_paths(path: Path) -> tuple[Path, ...]:
     return tuple(
         item
@@ -1866,24 +1993,11 @@ def rollback_fts_migration(
     _require_no_live_users_for_paths(_rollback_liveness_paths(path))
 
     if journal.phase is JournalPhase.CANDIDATE_LIVE and "rollback_db" not in journal.fingerprints:
-        # Normal read-only use of a WAL-mode v2 database may materialize empty
-        # WAL/SHM sidecars.  Only after the durable write block and second clear
-        # liveness proof may we checkpoint them away.  The exact main fingerprint
-        # must still match the accepted candidate, and the checkpoint must be
-        # exactly empty before the rollback inventory is durably captured.
-        permit = _permit(path, journal)
-        assert_state_db_maintenance_access(path, write_capable=True, permit=permit)
-        _checkpoint_candidate_file(path)
-        _validate_live_source(path, journal)
-        journal = _transition(
-            path,
-            journal,
-            journal.phase,
-            fingerprints={
-                f"rollback_{name}": fingerprint_path(item)
-                for name, item in _bundle_paths(path).items()
-            },
-        )
+        # Ordinary post-complete use may legitimately change size, mtime, hash,
+        # and WAL contents. After both liveness proofs, accept only the same live
+        # main device+inode lineage, then checkpoint and fully verify v2 before
+        # freezing a fresh exact quarantine inventory.
+        journal = _verify_active_v2_for_rollback(path, journal)
 
     if journal.phase is JournalPhase.SWAPPING:
         journal = _move_recorded_bundle_to_original(path, journal)
@@ -1911,11 +2025,15 @@ def rollback_fts_migration(
         _restore_original_bundle(path, journal)
     _fsync_file(path)
     _fsync_directory(path.parent)
+    _run_v1_rollback_canary(path, journal)
     journal = _transition(
         path,
         journal,
         JournalPhase.ROLLED_BACK,
-        fingerprints=_source_inventory_fingerprints(path),
+        fingerprints={
+            **_source_inventory_fingerprints(path),
+            "rollback_v1_canary": _status_fingerprint("passed"),
+        },
     )
     return MigrationResult(phase=journal.phase.value, completed=False)
 
