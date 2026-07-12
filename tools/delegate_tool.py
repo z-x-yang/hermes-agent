@@ -1299,13 +1299,33 @@ def _build_child_agent(
     if parent_enabled is not None:
         parent_toolsets = set(parent_enabled)
     elif parent_agent and hasattr(parent_agent, "valid_tool_names"):
-        # enabled_toolsets is None (all tools) — derive from loaded tool names
+        # enabled_toolsets=None means "all enabled tools". Tool Search may have
+        # compacted the model-visible names, so derive toolsets from the frozen
+        # pre-Tool-Search surface when available; otherwise deferred tools such
+        # as web_search disappear before the child's exact authority policy is
+        # even built.
         import model_tools
 
+        resolved_parent_defs = getattr(
+            parent_agent, "_resolved_tool_definitions", None
+        )
+        if isinstance(resolved_parent_defs, (list, tuple)):
+            parent_tool_names = set()
+            for definition in resolved_parent_defs:
+                if not isinstance(definition, dict):
+                    continue
+                function_schema = definition.get("function")
+                if not isinstance(function_schema, dict):
+                    continue
+                name = function_schema.get("name")
+                if isinstance(name, str) and name:
+                    parent_tool_names.add(name)
+        else:
+            parent_tool_names = set(parent_agent.valid_tool_names or ())
         parent_toolsets = {
             ts
-            for name in parent_agent.valid_tool_names
-            if (ts := model_tools.get_toolset_for_tool(name)) is not None
+            for name in parent_tool_names
+            if name and (ts := model_tools.get_toolset_for_tool(name)) is not None
         }
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)

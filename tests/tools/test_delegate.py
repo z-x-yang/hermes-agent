@@ -505,6 +505,62 @@ class TestDelegateTask(unittest.TestCase):
 
         self.assertIs(mock_child._print_fn, sink)
 
+    def test_child_toolsets_derive_from_pre_tool_search_parent_surface(self):
+        """Deferred parent tools must still contribute their toolset to the child."""
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = None
+        parent.valid_tool_names = {"delegate_task", "tool_search", "tool_call"}
+        parent._resolved_tool_definitions = (
+            {"type": "function", "function": {"name": "web_search"}},
+            {"type": "function", "function": {"name": "web_extract"}},
+            {"type": "function", "function": {"name": "delegate_task"}},
+        )
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                description="Keep deferred web authority",
+                prompt="Inspect web docs without changes",
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                profile=get_subagent_profile("Explore"),
+            )
+
+        child_toolsets = MockAgent.call_args.kwargs["enabled_toolsets"]
+        self.assertIn("web", child_toolsets)
+
+    def test_child_toolset_derivation_skips_malformed_resolved_definitions(self):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = None
+        parent.valid_tool_names = {"delegate_task"}
+        parent._resolved_tool_definitions = (
+            {"type": "function", "function": "not-a-schema"},
+            {"type": "function", "function": {"name": "web_search"}},
+        )
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                description="Ignore malformed frozen entries",
+                prompt="Inspect web docs without changes",
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                profile=get_subagent_profile("Explore"),
+            )
+
+        self.assertIn("web", MockAgent.call_args.kwargs["enabled_toolsets"])
+
     def test_child_uses_thinking_callback_when_progress_callback_available(self):
         parent = _make_mock_parent(depth=0)
         parent.tool_progress_callback = MagicMock()
