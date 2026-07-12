@@ -179,6 +179,42 @@ class FakeCodexAgentForSummaryRuntime:
         )
 
 
+class ScopedCodexAgentForSummaryRuntime(FakeCodexAgentForSummaryRuntime):
+    """Use the real Responses transport so cache-key lineage is observable."""
+
+    model = "gpt-5.6-sol"
+    tools = []
+    session_id = "20260712_010101_parent"
+
+    def _build_api_kwargs(self, messages):
+        from agent.transports import get_transport
+
+        transport = get_transport("codex_responses")
+        assert transport is not None
+        return transport.build_kwargs(
+            model=self.model,
+            messages=messages,
+            tools=self.tools,
+            reasoning_config={"enabled": False},
+            session_id=self.session_id,
+        )
+
+
+def test_append_cached_summary_uses_parent_session_cache_key():
+    agent = ScopedCodexAgentForSummaryRuntime()
+    main_kwargs = agent._build_api_kwargs([
+        {"role": "system", "content": agent._cached_system_prompt},
+        {"role": "user", "content": "normal main turn"},
+    ])
+
+    summary_kwargs = make_summary_runtime(agent).build_kwargs(
+        [{"role": "user", "content": "append summary instruction"}],
+        12345,
+    )
+
+    assert summary_kwargs["prompt_cache_key"] == main_kwargs["prompt_cache_key"]
+
+
 def test_make_summary_runtime_forwards_ephemeral_output_tokens_to_codex_build_kwargs():
     agent = FakeCodexAgentForSummaryRuntime()
     runtime = make_summary_runtime(agent)

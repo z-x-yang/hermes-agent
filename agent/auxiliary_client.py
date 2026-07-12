@@ -933,11 +933,11 @@ class _CodexCompletionsAdapter:
             if converted:
                 resp_kwargs["tools"] = converted
 
-        # Stable prompt-cache routing for the Codex/Responses aux path, mirroring
-        # the main transport (agent/transports/codex.py::build_kwargs, which sets
-        # prompt_cache_key = _content_cache_key(instructions, tools)). Without
-        # this, MoA acting-aggregator and other auxiliary Responses calls stay
-        # cache-cold while the main Responses transport is warm (issue #53735).
+        # Stable prompt-cache routing for the Codex/Responses aux path using the
+        # main transport's static-prefix hash helper. Auxiliary calls do not
+        # carry a conversation session scope. Without this, MoA acting-aggregator
+        # and other auxiliary Responses calls stay cache-cold while the main
+        # Responses transport is warm (issue #53735).
         # The key is content-addressed from the static prefix (instructions +
         # tool schemas) so it stays warm across turns/fires. Guard the top-level
         # field the same way the main transport does: xAI Responses takes the

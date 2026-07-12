@@ -7,26 +7,43 @@ streaming, or the _run_codex_stream() call path.
 
 import hashlib
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
 
 
-def _content_cache_key(instructions: str, tools: Optional[List[Dict[str, Any]]]) -> Optional[str]:
-    """Content-address the prompt cache key from the static request prefix.
+_CRON_RUN_SESSION_RE = re.compile(r"^(cron_.+)_\d{8}_\d{6}$")
 
-    Returns ``pck_<sha256[:24]>`` of (instructions + sorted tool schemas), or
-    None when there is nothing static to key on. The cache key is a routing
-    hint only — never a correctness boundary — so two requests sharing a system
-    prompt and tool set intentionally resolve to the same warm prefix bucket.
+
+def _stable_cache_scope(session_id: Optional[str]) -> Optional[str]:
+    """Partition cache routing by conversation while reusing recurring cron fires."""
+    value = str(session_id or "").strip()
+    if not value:
+        return None
+    cron_match = _CRON_RUN_SESSION_RE.fullmatch(value)
+    return cron_match.group(1) if cron_match else value
+
+
+def _content_cache_key(
+    instructions: str,
+    tools: Optional[List[Dict[str, Any]]],
+    *,
+    cache_scope: Optional[str] = None,
+) -> Optional[str]:
+    """Content-address the prompt cache key from static prefix and cache scope.
+
+    Returns ``pck_<sha256[:24]>`` of (instructions + sorted tool schemas +
+    optional stable cache scope), or None when there is nothing static to key on.
+    The cache key is a routing
+    hint only — never a correctness boundary. Interactive conversations use a
+    distinct stable scope so divergent histories do not compete in one bucket.
 
     The fix this exists for: recurring cron jobs build session_id as
-    ``cron_<id>_<timestamp>``, so using session_id as the cache key made every
-    fire cache-cold. The static prefix (identity + tools) is identical across
-    fires, so hashing it gives a stable key that stays warm within the
-    provider's cache TTL. Sorting tools by name keeps the hash insertion-order
-    independent.
+    ``cron_<id>_<timestamp>``. Their scope is normalized to ``cron_<id>`` so
+    repeated fires still reuse the same static prefix. Sorting tools by name
+    keeps the hash insertion-order independent.
     """
     if not instructions and not tools:
         return None
@@ -42,6 +59,8 @@ def _content_cache_key(instructions: str, tools: Optional[List[Dict[str, Any]]])
     # \x00 separator so instructions ending in the tool JSON can't collide with
     # a request whose instructions contain that JSON and whose tools are empty.
     content = f"{instructions or ''}\x00{tools_part}"
+    if cache_scope:
+        content = f"{content}\x00scope\x00{cache_scope}"
     digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:24]
     return f"pck_{digest}"
 
@@ -250,13 +269,15 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs["parallel_tool_calls"] = True
 
         session_id = params.get("session_id")
-        # prompt_cache_key is content-addressed from the static prefix
-        # (instructions + tools), NOT session_id — recurring cron jobs carry a
-        # per-fire timestamp in session_id (cron_<id>_<ts>) that made every run
-        # cache-cold. session_id is left untouched for transcript isolation and
-        # the cache-scope routing headers below. Falls back to session_id when
-        # there is no static content to hash.
-        cache_key = _content_cache_key(instructions, response_tools) or session_id
+        # Interactive sessions receive distinct cache buckets so divergent
+        # histories cannot evict each other. Recurring cron fire timestamps are
+        # normalized away so one job retains a stable bucket across runs.
+        cache_scope = _stable_cache_scope(session_id)
+        cache_key = _content_cache_key(
+            instructions,
+            response_tools,
+            cache_scope=cache_scope,
+        ) or cache_scope
         # xAI Responses takes prompt_cache_key in extra_body (set further
         # down); GitHub Models opts out of cache-key routing entirely.
         if not is_github_responses and not is_xai_responses and cache_key:

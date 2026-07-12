@@ -5,6 +5,7 @@ import pytest
 from types import SimpleNamespace
 
 from agent.transports import get_transport
+from agent.transports.codex import _content_cache_key
 from agent.transports.types import NormalizedResponse
 
 
@@ -93,11 +94,12 @@ class TestCodexBuildKwargs:
         )
         assert "reasoning" not in kw or kw.get("include") == []
 
+    def test_unscoped_content_cache_key_keeps_legacy_digest(self):
+        """Auxiliary callers without session scope keep their warmed key lineage."""
+        assert _content_cache_key("SYS", None) == "pck_976cb99eefb5d3aa9e064bbd"
+
     def test_cache_key_is_content_addressed_not_session_id(self, transport):
-        """prompt_cache_key is content-addressed from the static prefix
-        (instructions + tools), not the session_id. This keeps recurring cron
-        jobs — whose session_id carries a per-fire timestamp — on a stable warm
-        cache key. The key is a 'pck_' hash and must NOT equal session_id."""
+        """The scoped cache key is hashed and never exposes the raw session id."""
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(
             model="gpt-5.4", messages=messages, tools=[],
@@ -107,10 +109,8 @@ class TestCodexBuildKwargs:
         assert pck.startswith("pck_")
         assert pck != "cron_job42_20260624_143000"
 
-    def test_cache_key_stable_across_session_ids(self, transport):
-        """Same static prefix + different session_id (e.g. two cron fires of the
-        same job) must yield the same prompt_cache_key — the whole point of the
-        fix: repeated fires reuse the warm prefix instead of going cold."""
+    def test_cache_key_stable_across_cron_fires(self, transport):
+        """Two timestamped fires of one cron job share one warm cache scope."""
         messages = [{"role": "user", "content": "Hi"}]
         kw1 = transport.build_kwargs(
             model="gpt-5.4", messages=messages, tools=[],
@@ -121,6 +121,44 @@ class TestCodexBuildKwargs:
             session_id="cron_job42_20260624_143500",
         )
         assert kw1["prompt_cache_key"] == kw2["prompt_cache_key"]
+
+    def test_cache_key_partitions_interactive_sessions(self, transport):
+        """Divergent interactive histories must not compete in one cache bucket."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw1 = transport.build_kwargs(
+            model="gpt-5.6-sol", messages=messages, tools=[],
+            session_id="20260712_010101_aaaaaaaa",
+        )
+        kw2 = transport.build_kwargs(
+            model="gpt-5.6-sol", messages=messages, tools=[],
+            session_id="20260712_010102_bbbbbbbb",
+        )
+        assert kw1["prompt_cache_key"] != kw2["prompt_cache_key"]
+
+    def test_cache_key_is_stable_within_interactive_session(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kwargs = {
+            "model": "gpt-5.6-sol",
+            "messages": messages,
+            "tools": [],
+            "session_id": "20260712_010101_aaaaaaaa",
+        }
+        assert (
+            transport.build_kwargs(**kwargs)["prompt_cache_key"]
+            == transport.build_kwargs(**kwargs)["prompt_cache_key"]
+        )
+
+    def test_cache_key_partitions_distinct_cron_jobs(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kw1 = transport.build_kwargs(
+            model="gpt-5.6-sol", messages=messages, tools=[],
+            session_id="cron_daily_digest_20260712_010101",
+        )
+        kw2 = transport.build_kwargs(
+            model="gpt-5.6-sol", messages=messages, tools=[],
+            session_id="cron_weekly_digest_20260712_010101",
+        )
+        assert kw1["prompt_cache_key"] != kw2["prompt_cache_key"]
 
     def test_github_responses_no_cache_key(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
