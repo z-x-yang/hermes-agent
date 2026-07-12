@@ -455,7 +455,7 @@ async def test_task_clarify_undo_restores_authored_body_not_bare_link():
     assert "合作者回了论文修改意见" in kwargs["embed"].description
     assert "**可选下一步**" in kwargs["embed"].description
     labels = [_item(child).label for child in kwargs["view"].children]
-    assert labels == ["1.", "2.", "3.", "Other", "🧵", "⏰", "⏸", "🗑", "✓"]
+    assert labels == ["1.", "2.", "3.", "Other", "已接手", "🧵", "⏰", "⏸", "🗑", "✓"]
 
 
 @pytest.mark.asyncio
@@ -490,7 +490,7 @@ async def test_task_clarify_done_then_undo_restores_original_choices():
     assert "已选择：完成" not in desc
     assert "状态：已完成" not in desc
     labels = [_item(child).label for child in kwargs["view"].children]
-    assert labels == ["1.", "2.", "3.", "Other", "🧵", "⏰", "⏸", "🗑", "✓"]
+    assert labels == ["1.", "2.", "3.", "Other", "已接手", "🧵", "⏰", "⏸", "🗑", "✓"]
 
 
 @pytest.mark.asyncio
@@ -966,7 +966,7 @@ async def test_task_clarify_snooze_picker_preserves_authored_card_body():
     assert "合作者回了论文修改意见" in kwargs["embed"].description
     assert "**可选下一步**" in kwargs["embed"].description
     labels = [_item(child).label for child in kwargs["view"].children if hasattr(child, "item")]
-    assert labels == ["1.", "2.", "3.", "Other", "🧵", "⏰", "⏸", "🗑", "✓"]
+    assert labels == ["1.", "2.", "3.", "Other", "已接手", "🧵", "⏰", "⏸", "🗑", "✓"]
     assert any(getattr(child, "custom_id", "").startswith("ntask:snooze-select:")
                for child in kwargs["view"].children)
 
@@ -1056,8 +1056,8 @@ async def test_open_thread_returns_existing_binding_without_creating():
     inter.response.edit_message.assert_awaited_once()
     kwargs = inter.response.edit_message.call_args.kwargs
     labels = [_item(child).label for child in kwargs["view"].children]
-    assert labels == ["1.", "2.", "3.", "Other", "🧵", "⏰", "⏸", "🗑", "✓"]
-    assert _item(kwargs["view"].children[4]).url == "https://discord.com/channels/147/777"
+    assert labels == ["1.", "2.", "3.", "Other", "已接手", "🧵", "⏰", "⏸", "🗑", "✓"]
+    assert _item(kwargs["view"].children[5]).url == "https://discord.com/channels/147/777"
 
 
 @pytest.mark.asyncio
@@ -1076,6 +1076,29 @@ async def test_open_thread_existing_binding_non_clarify_card_keeps_fallback_noti
     inter.response.edit_message.assert_not_awaited()
     inter.response.send_message.assert_awaited_once()
     assert "<#777>" in inter.response.send_message.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_card_collapses_without_changing_notion_task():
+    notion = SimpleNamespace(get_page=AsyncMock())
+    ctrl = _ctrl(notion)
+    inter = _task_clarify_interaction(content=f"Task https://notion.so/{PID}")
+    inter.message.components = [SimpleNamespace(children=[
+        SimpleNamespace(label="🧵", url=THREAD_URL),
+    ])]
+
+    await ctrl.handle_action("ack", PID, inter)
+
+    notion.get_page.assert_not_awaited()
+    inter.response.send_message.assert_not_awaited()
+    inter.response.edit_message.assert_awaited_once()
+    kwargs = inter.response.edit_message.call_args.kwargs
+    assert "已选择：已接手" in kwargs["embed"].description
+    assert "状态：已接手，任务保持原状态" in kwargs["embed"].description
+    assert "正文已收起，Notion Task 状态未改变。" in kwargs["embed"].description
+    labels = [_item(child).label for child in kwargs["view"].children]
+    assert labels == ["🧵", "⏰", "⏸", "🗑", "✓"]
+    assert _button_from_view(kwargs["view"], "🧵").url == THREAD_URL
 
 
 @pytest.mark.asyncio

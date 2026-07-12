@@ -137,7 +137,7 @@ class TaskActionButton(discord.ui.DynamicItem[discord.ui.Button], template=CUSTO
                  num: int | None = None):
         self.action = action
         self.page_id = page_id
-        if action == "done":
+        if action in ("done", "ack"):
             style = discord.ButtonStyle.green
         elif action in ("choice1", "resume", "open_thread"):
             style = discord.ButtonStyle.primary

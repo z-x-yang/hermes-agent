@@ -38,6 +38,9 @@ def test_build_button_styles_and_labels():
     assert b.build_button("choice1", PID).item.label == "1."
     assert b.build_button("choice2", PID).item.custom_id == f"ntask:v1:choice2:{PID}"
     assert b.build_button("other", PID).item.label == "Other"
+    ack = b.build_button("ack", PID)
+    assert ack.item.label == "已接手"
+    assert ack.item.custom_id == f"ntask:v1:ack:{PID}"
 
 
 def test_build_button_numbered_label():
@@ -58,6 +61,19 @@ async def test_callback_routes_to_active_controller(monkeypatch):
     interaction = SimpleNamespace()
     await btn.callback(interaction)
     ctrl.handle_action.assert_awaited_once_with("done", PID, interaction)
+
+
+@pytest.mark.asyncio
+async def test_ack_callback_routes_after_dynamic_rebuild(monkeypatch):
+    ctrl = SimpleNamespace(handle_action=AsyncMock())
+    monkeypatch.setattr(b, "get_active_controller", lambda: ctrl)
+    match = re.fullmatch(b.CUSTOM_ID_RE, f"ntask:v1:ack:{PID}")
+    btn = await b.TaskActionButton.from_custom_id(SimpleNamespace(), None, match)
+    interaction = SimpleNamespace()
+
+    await btn.callback(interaction)  # type: ignore[arg-type]
+
+    ctrl.handle_action.assert_awaited_once_with("ack", PID, interaction)
 
 
 @pytest.mark.asyncio

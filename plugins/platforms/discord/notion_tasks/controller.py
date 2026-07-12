@@ -85,6 +85,7 @@ _TASK_CLARIFY_SHORT_LABELS = {
     "choice2": "2.",
     "choice3": "3.",
     "other": "Other",
+    "ack": "已接手",
     "open_thread": "🧵",
     "undo": "↩",
     "snooze": "⏰",
@@ -164,6 +165,20 @@ def _thread_url_from_page(page: dict, interaction) -> str:
         thread_id=str(binding.get("thread_id") or ""),
         thread_url=str(binding.get("thread_url") or ""),
     )
+
+
+def _thread_url_from_interaction(interaction) -> str:
+    msg = getattr(interaction, "message", None)
+    for row in getattr(msg, "components", []) or []:
+        items = getattr(row, "children", None) or getattr(row, "components", None) or []
+        for child in items:
+            item = getattr(child, "item", child)
+            if str(getattr(item, "label", "") or "") != _TASK_CLARIFY_SHORT_LABELS["open_thread"]:
+                continue
+            url = str(getattr(item, "url", "") or "").strip()
+            if url:
+                return url
+    return ""
 
 
 def _current_channel_id(interaction) -> str:
@@ -783,6 +798,8 @@ class NotionTaskController:
                 show_other = "Other" in _embed_description(embed) if embed is not None else False
             if show_other:
                 view.add_item(self._short_button("other", page_id, row=0))
+            if choice_count:
+                view.add_item(self._short_button("ack", page_id, row=0))
         if thread_url:
             thread_btn = discord.ui.Button(
                 label=_TASK_CLARIFY_SHORT_LABELS["open_thread"],
@@ -1064,6 +1081,35 @@ class NotionTaskController:
             await interaction.response.send_message("你没有权限操作这个任务。", ephemeral=True)
             return
 
+        if action == "ack":
+            await _defer_message_update(interaction)
+            embed = _task_clarify_embed_from_interaction(interaction)
+            if embed is None:
+                await _send_interaction_notice(interaction, "这张消息不是可接手的任务卡。", ephemeral=True)
+                return
+            raw_title = _embed_title(embed).strip()
+            title = raw_title.split("·", 1)[1].strip() if "·" in raw_title else raw_title
+            title = title or "任务"
+            thread_url = _thread_url_from_interaction(interaction)
+            self._persist_followthrough_state(
+                page_id,
+                interaction=interaction,
+                choice_kind="ack",
+                choice_text="已接手",
+                thread_id="",
+                thread_url=thread_url,
+                state="acknowledged",
+            )
+            await self._edit_task_clarify_card(
+                page_id,
+                title=title,
+                interaction=interaction,
+                thread_url=thread_url,
+                selected_choice_text="已接手",
+                followthrough_state="acknowledged",
+                task_state={"state": "open", "due_label": None},
+            )
+            return
         if action == "snooze":
             await self.handle_snooze_menu(page_id, interaction)
             return

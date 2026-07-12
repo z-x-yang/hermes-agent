@@ -313,14 +313,15 @@ class TestTaskClarifyCard:
     def test_components_keep_primary_buttons_numeric_and_secondary_separate(self):
         rows = c.task_clarify_components(self.card())
         labels = [b["label"] for row in rows for b in row["components"]]
-        assert labels[:4] == ["1.", "2.", "3.", "Other"]
-        assert labels[4:] == ["🧵", "⏰", "⏸", "🗑", "✓"]
+        assert labels[:5] == ["1.", "2.", "3.", "Other", "已接手"]
+        assert labels[5:] == ["🧵", "⏰", "⏸", "🗑", "✓"]
         custom_ids = [b["custom_id"] for row in rows for b in row["components"]]
         assert custom_ids[0] == f"ntask:v1:choice1:{self.PID}"
         assert custom_ids[1] == f"ntask:v1:choice2:{self.PID}"
         assert custom_ids[2] == f"ntask:v1:choice3:{self.PID}"
         assert custom_ids[3] == f"ntask:v1:other:{self.PID}"
-        assert custom_ids[4] == f"ntask:v1:open_thread:{self.PID}"
+        assert custom_ids[4] == f"ntask:v1:ack:{self.PID}"
+        assert custom_ids[5] == f"ntask:v1:open_thread:{self.PID}"
 
     def test_components_render_existing_thread_as_same_subthread_link_button(self):
         card = self.card()

@@ -11,7 +11,7 @@ carry only a number, and per-task state renders inside the card.
 """
 from __future__ import annotations
 
-_ACTIONS = "done|undo|snooze|hold|drop|resume|open_thread|rename_thread|choice1|choice2|choice3|other"
+_ACTIONS = "done|undo|snooze|hold|drop|resume|open_thread|rename_thread|choice1|choice2|choice3|other|ack"
 CUSTOM_ID_RE = rf"ntask:(?:v1:)?(?P<action>{_ACTIONS}):(?P<page_id>[0-9a-f]{{32}})"
 
 # Legacy full-text labels. Only used when no number is available — i.e. the
@@ -26,6 +26,7 @@ _ACTION_MARK = {
     "choice2": "2.",
     "choice3": "3.",
     "other": "Other",
+    "ack": "已接手",
     "done": "✓",
     "undo": "↩",
     "snooze": "⏰",
@@ -40,6 +41,7 @@ _LEGACY_LABEL = {
     "choice2": "2.",
     "choice3": "3.",
     "other": "Other",
+    "ack": "已接手",
     "done": LABEL_DONE,
     "undo": LABEL_UNDO,
     "snooze": LABEL_SNOOZE,
@@ -66,6 +68,7 @@ _STYLE_BY_ACTION = {
     "choice2": 2,
     "choice3": 2,
     "other": 2,
+    "ack": 3,
     "done": 3,
     "undo": 2,
     "snooze": 2,
@@ -247,6 +250,8 @@ def _followthrough_status_text(state: str) -> str:
         return "已暂挂 / 延后提醒"
     if state == "selected":
         return "已记录选择"
+    if state == "acknowledged":
+        return "已接手，任务保持原状态"
     return "已选择"
 
 
@@ -269,6 +274,12 @@ def _compact_followthrough_lines(card: dict) -> list[str] | None:
         lines.append(f"状态：{_followthrough_status_text(state)}")
         lines.append("正文已收起，需要恢复可点 ↩。")
         return lines
+    if state == "acknowledged" and selected_text:
+        return [
+            f"已选择：{selected_text}",
+            f"状态：{_followthrough_status_text(state)}",
+            "正文已收起，Notion Task 状态未改变。",
+        ]
     if state in {"selected", "continued", "following_through"} and selected_text:
         return [
             f"已选择：{selected_text}",
@@ -296,7 +307,7 @@ def _task_clarify_state_kind(card: dict) -> str:
         return "done"
     if state in {"dropped", "snoozed", "setting_snooze", "setting_hold"}:
         return "muted"
-    if _selected_choice_text(card) or state in {"selected", "continued", "following_through"}:
+    if _selected_choice_text(card) or state in {"selected", "continued", "following_through", "acknowledged"}:
         return "selected"
     return "pending"
 
@@ -380,6 +391,7 @@ def task_clarify_components(card: dict) -> list[dict]:
                 primary.append(_raw_button(action, page_id, f"{idx}."))
         if (card.get("otherChoice") or {}).get("enabled", True):
             primary.append(_raw_button("other", page_id, "Other"))
+        primary.append(_raw_button("ack", page_id, "已接手"))
     rows = []
     if primary:
         rows.append({"type": 1, "components": primary[:_MAX_PER_ROW]})
