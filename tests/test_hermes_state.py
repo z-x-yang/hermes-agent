@@ -5164,3 +5164,27 @@ def test_sessiondb_read_only_connection_enables_query_only(tmp_path):
             conn.execute("INSERT INTO state_meta(key,value) VALUES('x','y')")
     finally:
         read_only.close()
+
+
+def test_sessiondb_read_only_searches_existing_v2_indexes(tmp_path):
+    path = tmp_path / "state.db"
+    writable = SessionDB(db_path=path)
+    writable.create_session(session_id="read-only-search", source="cli")
+    writable.append_message(
+        "read-only-search",
+        role="user",
+        content="visiblev2historyprobe 只读检索验收",
+    )
+    assert writable._fts_effective_schema == "v2_external"
+    writable.close()
+
+    read_only = SessionDB(db_path=path, read_only=True)
+    try:
+        english_hits = read_only.search_messages("visiblev2historyprobe")
+        cjk_hits = read_only.search_messages(
+            "只读检索验收", role_filter=["user", "assistant"]
+        )
+        assert [row["session_id"] for row in english_hits] == ["read-only-search"]
+        assert [row["session_id"] for row in cjk_hits] == ["read-only-search"]
+    finally:
+        read_only.close()

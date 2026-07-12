@@ -986,6 +986,16 @@ class SessionDB:
                 )
                 self._conn.execute("PRAGMA query_only=ON")
                 self._conn.row_factory = sqlite3.Row
+                self._fts_effective_schema = detect_fts_schema(self._conn)
+                self._fts_enabled = self._fts_effective_schema in {
+                    "v1_inline",
+                    "v2_external",
+                }
+                if self._fts_enabled:
+                    self._trigram_available = self._conn.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='messages_fts_trigram'"
+                    ).fetchone() is not None
                 return
 
             assert_state_db_maintenance_access(
