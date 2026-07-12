@@ -424,13 +424,25 @@ def test_governed_middleware_denial_then_fallback_success_keeps_call_charge(
 
     agent = _runtime_agent()
     refunds = _spy_iteration_refunds(monkeypatch, agent)
+    fallback_activations = 0
+
+    def _activate_once():
+        nonlocal fallback_activations
+        if fallback_activations:
+            return False
+        fallback_activations += 1
+        return _activate_test_route(agent, "fallback")
+
     monkeypatch.setattr(
         agent,
         "_try_activate_fallback",
-        MagicMock(side_effect=lambda: _activate_test_route(agent, "fallback")),
+        MagicMock(side_effect=_activate_once),
     )
 
+    middleware_providers = []
+
     def _middleware(api_kwargs, **kwargs):
+        middleware_providers.append(agent.provider)
         if agent.provider != "fallback":
             raise RuntimeError("private-body-canary")
         return real_apply(api_kwargs, **kwargs)
@@ -452,10 +464,167 @@ def test_governed_middleware_denial_then_fallback_success_keeps_call_charge(
 
     result = agent.run_conversation("task-payload-canary")
 
-    assert result["completed"] is True
+    assert result["completed"] is True, (result, middleware_providers)
     assert result["api_calls"] == 1
     assert backend.call_count == 1
     assert refunds == []
+
+
+def test_execution_middleware_rewrite_is_rechecked_before_observer_and_backend(
+    monkeypatch,
+):
+    from agent.provider_attempt import (
+        execute_provider_attempt,
+        prepare_provider_attempt,
+    )
+
+    agent = _runtime_agent()
+    original = {
+        "model": getattr(agent, "model", ""),
+        "messages": [{"role": "user", "content": "safe"}],
+        "max_tokens": 20,
+    }
+    prepared = prepare_provider_attempt(
+        agent,
+        original,
+        task_id="task",
+        turn_id="turn",
+        api_request_id="request",
+        api_call_count=1,
+    )
+    rewritten = dict(prepared.payload)
+    rewritten["messages"] = [
+        {"role": "user", "content": "execution-middleware-canary"}
+    ]
+    backend = MagicMock(return_value=_stop_response("must-not-run"))
+    observer = MagicMock()
+    fit_payloads = []
+
+    def _fit(_agent, payload):
+        fit_payloads.append(payload)
+        if payload is rewritten:
+            raise GovernancePreflightError("governance_transport_unverifiable")
+
+    monkeypatch.setattr(
+        "agent.subagent_governance.assert_governance_request_fits",
+        _fit,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_llm_execution_middleware",
+        lambda _request, next_call, **_kwargs: next_call(rewritten),
+    )
+
+    with pytest.raises(GovernancePreflightError):
+        execute_provider_attempt(
+            agent,
+            prepared,
+            backend,
+            task_id="task",
+            turn_id="turn",
+            api_request_id="request",
+            api_call_count=1,
+            pre_api_observer=observer,
+        )
+
+    assert fit_payloads == [rewritten]
+    observer.assert_not_called()
+    backend.assert_not_called()
+
+
+def test_max_iteration_summary_strips_tools_added_by_request_middleware(monkeypatch):
+    agent = _runtime_agent()
+    backend = MagicMock(return_value=_stop_response("tool-less-summary"))
+
+    def _inject_tools(api_kwargs, **_kwargs):
+        payload = dict(api_kwargs)
+        payload["tools"] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "must be stripped",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        payload["tool_choice"] = "auto"
+        payload["parallel_tool_calls"] = True
+        return SimpleNamespace(
+            payload=payload,
+            original_payload=dict(api_kwargs),
+            trace=[],
+        )
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_llm_request_middleware",
+        _inject_tools,
+    )
+    monkeypatch.setattr(
+        "agent.subagent_governance.assert_governance_request_fits",
+        lambda _agent, _payload: None,
+    )
+    monkeypatch.setattr(agent, "_interruptible_api_call", backend)
+
+    result = agent._handle_max_iterations(
+        [{"role": "user", "content": "summarize without tools"}],
+        60,
+    )
+
+    assert result == "tool-less-summary"
+    sent = backend.call_args.args[0]
+    assert "tools" not in sent
+    assert "tool_choice" not in sent
+    assert "parallel_tool_calls" not in sent
+
+
+def test_max_iteration_summary_rechecks_governance_on_fallback_before_any_sink(
+    monkeypatch,
+):
+    agent = _runtime_agent()
+    primary_direct_backend = agent.client.chat.completions.create
+    primary_direct_backend.return_value = _stop_response("primary-leak")
+    fallback_backend = MagicMock(return_value=_stop_response("fallback-summary"))
+    hook_providers = []
+    request_dump = MagicMock()
+
+    monkeypatch.setattr(
+        agent,
+        "_try_activate_fallback",
+        MagicMock(side_effect=lambda: _activate_test_route(agent, "fallback")),
+    )
+
+    def _preflight(_agent, _kwargs):
+        if agent.provider != "fallback":
+            raise GovernancePreflightError("governance_transport_unverifiable")
+
+    monkeypatch.setattr(
+        "agent.subagent_governance.assert_governance_request_fits",
+        _preflight,
+    )
+    monkeypatch.setattr(agent, "_interruptible_api_call", fallback_backend)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.has_hook",
+        lambda name: name == "pre_api_request",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda name, **_kwargs: hook_providers.append(agent.provider) or [],
+    )
+    monkeypatch.setenv("HERMES_DUMP_REQUESTS", "1")
+    monkeypatch.setattr(agent, "_dump_api_request_debug", request_dump)
+
+    result = agent._handle_max_iterations(
+        [{"role": "user", "content": "summarize governed work"}],
+        60,
+    )
+
+    assert result == "fallback-summary"
+    primary_direct_backend.assert_not_called()
+    assert fallback_backend.call_count == 1
+    assert agent.session_api_calls == 1
+    assert getattr(agent, "_last_max_iteration_summary_api_calls", 0) == 1
+    assert hook_providers == ["fallback"]
+    assert request_dump.call_count == 1
 
 
 def _activate_test_route(agent, provider: str):

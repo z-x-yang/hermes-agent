@@ -747,3 +747,40 @@ def test_tool_call_bridge_blocks_denied_underlying_external_tool_after_unwrap(
         tool_name=external_tool_name,
         call_id="bridge-denied",
     )
+
+
+def test_apply_policy_materializes_allowed_tools_before_tool_search_compaction():
+    read_tool = _tool("read_file")
+    deferred_read_tool = _tool("skill_view_readonly")
+    forbidden_tool = _tool("write_file")
+    child = SimpleNamespace(
+        tools=[read_tool, _tool("tool_search"), _tool("tool_call")],
+        valid_tool_names={"read_file", "tool_search", "tool_call"},
+        _resolved_tool_definitions=[
+            read_tool,
+            deferred_read_tool,
+            forbidden_tool,
+        ],
+        enabled_toolsets=None,
+        disabled_toolsets=None,
+    )
+    allowed_identities = {
+        identity
+        for name in ("read_file", "skill_view_readonly")
+        if isinstance((identity := registry.resolved_policy_identity(name)), str)
+    }
+    policy = ToolNamePolicy(
+        allowed_names=frozenset({"read_file", "skill_view_readonly"}),
+        allowed_effects=None,
+        authority_snapshot=build_authority_snapshot(
+            allowed_identities, registry_generation=registry._generation
+        ),
+        profile_name="Explore",
+    )
+    apply_tool_policy_to_agent(child, policy)
+
+    assert child.valid_tool_names == {"read_file", "skill_view_readonly"}
+    assert {tool["function"]["name"] for tool in child.tools} == {
+        "read_file",
+        "skill_view_readonly",
+    }

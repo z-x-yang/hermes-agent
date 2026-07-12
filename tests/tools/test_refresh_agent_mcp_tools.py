@@ -150,6 +150,61 @@ def test_refresh_detects_equal_size_swap(monkeypatch):
     assert "old_mcp_tool" not in agent.valid_tool_names
 
 
+def test_governed_refresh_preserves_authorized_deferred_tools(monkeypatch):
+    original = "task6_refresh_visible"
+    deferred = "task6_refresh_deferred"
+    _register_read_tool(original)
+    _register_read_tool(deferred)
+    try:
+        original_identity = registry.resolved_policy_identity(original)
+        deferred_identity = registry.resolved_policy_identity(deferred)
+        assert isinstance(original_identity, str)
+        assert isinstance(deferred_identity, str)
+        identities = {original_identity, deferred_identity}
+        agent = _agent([original])
+        agent._resolved_tool_definitions = (
+            _tool(original),
+            _tool(deferred),
+        )
+        apply_tool_policy_to_agent(
+            agent,
+            ToolNamePolicy(
+                allowed_names=frozenset({original, deferred}),
+                allowed_effects=frozenset(
+                    {ToolEffect.READ_LOCAL, ToolEffect.READ_REMOTE}
+                ),
+                authority_snapshot=build_authority_snapshot(
+                    identities, registry_generation=registry._generation
+                ),
+                profile_name="Explore",
+            ),
+        )
+        assert agent.valid_tool_names == {original, deferred}
+
+        import model_tools
+
+        calls = []
+
+        def fake_get_tool_definitions(**kwargs):
+            calls.append(dict(kwargs))
+            if kwargs.get("skip_tool_search_assembly"):
+                return [_tool(original), _tool(deferred)]
+            return [_tool(original)]
+
+        monkeypatch.setattr(
+            model_tools, "get_tool_definitions", fake_get_tool_definitions
+        )
+
+        added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+        assert added == set()
+        assert agent.valid_tool_names == {original, deferred}
+        assert calls[0]["skip_tool_search_assembly"] is True
+    finally:
+        registry.deregister(original)
+        registry.deregister(deferred)
+
+
 def test_refresh_passes_agent_toolset_filters(monkeypatch):
     """The rebuild re-derives with the agent's OWN enabled/disabled toolsets."""
     agent = _agent(["a"], enabled=["coding", "granola"], disabled=["messaging"])
@@ -331,6 +386,30 @@ def test_resolve_discovery_timeout_falls_back_on_bad_value(monkeypatch):
 
     monkeypatch.setattr(cfg, "load_config", lambda: {"mcp_discovery_timeout": "oops"})
     assert mcp_startup._resolve_discovery_timeout(None) == default
+
+
+def test_refresh_retries_when_registry_changes_during_rebuild(monkeypatch):
+    agent = _agent(["read_file"])
+    calls = []
+
+    import model_tools
+
+    def _changing_definitions(**_kwargs):
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            with registry._lock:
+                registry._generation += 1
+            return [_tool("read_file"), _tool("stale_tool")]
+        return [_tool("read_file"), _tool("stable_tool")]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _changing_definitions)
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert calls == [1, 2]
+    assert added == {"stable_tool"}
+    assert agent.valid_tool_names == {"read_file", "stable_tool"}
+    assert agent._tool_snapshot_generation == registry._generation
 
 
 def test_stale_generation_refresh_does_not_clobber_newer(monkeypatch):

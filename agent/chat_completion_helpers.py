@@ -35,7 +35,13 @@ from agent.message_sanitization import (
     _repair_tool_call_arguments,
 )
 from tools.terminal_tool import is_persistent_env
-from utils import base_url_host_matches, base_url_hostname, env_float, env_int
+from utils import (
+    base_url_host_matches,
+    base_url_hostname,
+    env_float,
+    env_int,
+    env_var_enabled,
+)
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
@@ -1643,6 +1649,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
+    agent._last_max_iteration_summary_api_calls = 0
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
 
     summary_request = (
@@ -1699,6 +1706,127 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         # turns so Anthropic-family providers don't 400 the summary call.
         api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
 
+        _summary_task_id = str(
+            getattr(agent, "current_task_id", "")
+            or getattr(agent, "task_id", "")
+            or "max-iterations-summary"
+        )
+        _summary_turn_id = str(
+            getattr(agent, "_current_turn_id", "") or f"summary-{uuid.uuid4().hex}"
+        )
+
+        def _summary_pre_api_observer(final_api_kwargs, middleware_trace):
+            try:
+                from hermes_cli.plugins import has_hook, invoke_hook
+
+                if has_hook("pre_api_request"):
+                    request_messages = final_api_kwargs.get("messages")
+                    if not isinstance(request_messages, list):
+                        request_messages = final_api_kwargs.get("input")
+                    invoke_hook(
+                        "pre_api_request",
+                        task_id=_summary_task_id,
+                        turn_id=_summary_turn_id,
+                        api_request_id=_summary_api_request_id,
+                        session_id=agent.session_id or "",
+                        user_message=summary_request,
+                        conversation_history=list(messages),
+                        platform=agent.platform or "",
+                        model=agent.model,
+                        provider=agent.provider,
+                        base_url=agent.base_url,
+                        api_mode=agent.api_mode,
+                        api_call_count=api_call_count,
+                        request_messages=list(request_messages)
+                        if isinstance(request_messages, list)
+                        else [],
+                        message_count=len(api_messages),
+                        tool_count=0,
+                        middleware_trace=list(middleware_trace),
+                        request=agent._api_request_payload_for_hook(final_api_kwargs),
+                    )
+            except Exception:
+                pass
+            if env_var_enabled("HERMES_DUMP_REQUESTS"):
+                agent._dump_api_request_debug(
+                    final_api_kwargs,
+                    reason="iteration_limit_summary",
+                )
+
+        def _strip_summary_tools(final_api_kwargs):
+            tool_less = dict(final_api_kwargs)
+            for key in ("tools", "tool_choice", "parallel_tool_calls"):
+                tool_less.pop(key, None)
+            return tool_less
+
+        def _run_summary_provider_attempt(summary_api_kwargs):
+            from agent.provider_attempt import (
+                execute_provider_attempt,
+                prepare_provider_attempt,
+            )
+
+            nonlocal _summary_api_request_id
+            _summary_api_request_id = f"summary-{uuid.uuid4().hex}"
+            if agent.api_mode == "codex_responses":
+                summary_api_kwargs = agent._get_transport().preflight_kwargs(
+                    summary_api_kwargs,
+                    allow_stream=False,
+                )
+            prepared = prepare_provider_attempt(
+                agent,
+                summary_api_kwargs,
+                task_id=_summary_task_id,
+                turn_id=_summary_turn_id,
+                api_request_id=_summary_api_request_id,
+                api_call_count=api_call_count,
+            )
+            def _summary_backend_call(final_api_kwargs):
+                agent._last_max_iteration_summary_api_calls += 1
+                agent.session_api_calls += 1
+                return agent._interruptible_api_call(final_api_kwargs)
+
+            response = execute_provider_attempt(
+                agent,
+                prepared,
+                _summary_backend_call,
+                task_id=_summary_task_id,
+                turn_id=_summary_turn_id,
+                api_request_id=_summary_api_request_id,
+                api_call_count=api_call_count,
+                pre_api_observer=_summary_pre_api_observer,
+                final_payload_transform=_strip_summary_tools,
+            )
+            usage = getattr(response, "usage", None)
+            if usage:
+                from agent.usage_pricing import normalize_usage
+
+                canonical_usage = normalize_usage(
+                    usage,
+                    provider=agent.provider,
+                    api_mode=agent.api_mode,
+                )
+                usage_dict = {
+                    "prompt_tokens": canonical_usage.prompt_tokens,
+                    "completion_tokens": canonical_usage.output_tokens,
+                    "total_tokens": canonical_usage.total_tokens,
+                    "input_tokens": canonical_usage.input_tokens,
+                    "output_tokens": canonical_usage.output_tokens,
+                    "cache_read_tokens": canonical_usage.cache_read_tokens,
+                    "cache_write_tokens": canonical_usage.cache_write_tokens,
+                    "reasoning_tokens": canonical_usage.reasoning_tokens,
+                }
+                agent.context_compressor.update_from_response(usage_dict)
+                agent.session_prompt_tokens += canonical_usage.prompt_tokens
+                agent.session_completion_tokens += canonical_usage.output_tokens
+                agent.session_total_tokens += canonical_usage.total_tokens
+                agent.session_input_tokens += canonical_usage.input_tokens
+                agent.session_output_tokens += canonical_usage.output_tokens
+                agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
+                agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
+                agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+            return response
+
+        _summary_api_request_id = ""
         summary_extra_body = {}
         try:
             from agent.auxiliary_client import _fixed_temperature_for_model, OMIT_TEMPERATURE as _OMIT_TEMP
@@ -1740,7 +1868,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         if agent.api_mode == "codex_responses":
             codex_kwargs = agent._build_api_kwargs(api_messages)
             codex_kwargs.pop("tools", None)
-            summary_response = agent._run_codex_stream(codex_kwargs)
+            summary_response = _run_summary_provider_attempt(codex_kwargs)
             _ct_sum = agent._get_transport()
             _cnr_sum = _ct_sum.normalize_response(summary_response)
             final_response = (_cnr_sum.content or "").strip()
@@ -1803,11 +1931,11 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                                max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
                                is_oauth=agent._is_anthropic_oauth,
                                preserve_dots=agent._anthropic_preserve_dots())
-                summary_response = agent._anthropic_messages_create(_ant_kw)
+                summary_response = _run_summary_provider_attempt(_ant_kw)
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
             else:
-                summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
+                summary_response = _run_summary_provider_attempt(summary_kwargs)
                 _summary_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_summary_result.content or "").strip()
 
@@ -1823,7 +1951,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             if agent.api_mode == "codex_responses":
                 codex_kwargs = agent._build_api_kwargs(api_messages)
                 codex_kwargs.pop("tools", None)
-                retry_response = agent._run_codex_stream(codex_kwargs)
+                retry_response = _run_summary_provider_attempt(codex_kwargs)
                 _ct_retry = agent._get_transport()
                 _cnr_retry = _ct_retry.normalize_response(retry_response)
                 final_response = (_cnr_retry.content or "").strip()
@@ -1833,7 +1961,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                                 is_oauth=agent._is_anthropic_oauth,
                                 max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
                                 preserve_dots=agent._anthropic_preserve_dots())
-                retry_response = agent._anthropic_messages_create(_ant_kw2)
+                retry_response = _run_summary_provider_attempt(_ant_kw2)
                 _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_retry_result.content or "").strip()
             else:
@@ -1850,7 +1978,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 
-                summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry").chat.completions.create(**summary_kwargs)
+                summary_response = _run_summary_provider_attempt(summary_kwargs)
                 _retry_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_retry_result.content or "").strip()
 
@@ -1865,8 +1993,21 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
     except Exception as e:
-        logger.warning(f"Failed to get summary response: {e}")
-        final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
+        from agent.subagent_governance import GovernancePreflightError
+
+        if isinstance(e, GovernancePreflightError):
+            if agent._try_activate_fallback():
+                if (
+                    messages
+                    and messages[-1].get("role") == "user"
+                    and messages[-1].get("content") == summary_request
+                ):
+                    messages.pop()
+                return handle_max_iterations(agent, messages, api_call_count)
+            final_response = e.code
+        else:
+            logger.warning(f"Failed to get summary response: {e}")
+            final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
 
     return final_response
 

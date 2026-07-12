@@ -1178,35 +1178,20 @@ def run_conversation(
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
                     api_kwargs = agent._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
-                try:
-                    from hermes_cli.middleware import apply_llm_request_middleware
+                from agent.provider_attempt import prepare_provider_attempt
 
-                    _llm_request_mw = apply_llm_request_middleware(
-                        api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                    )
-                    api_kwargs = _llm_request_mw.payload
-                    _original_api_kwargs = _llm_request_mw.original_payload
-                    _llm_middleware_trace = _llm_request_mw.trace
-                except Exception:
-                    governance = getattr(agent, "_governance_diagnostics", None)
-                    if isinstance(governance, dict) and governance.get("fingerprint"):
-                        from agent.subagent_governance import GovernancePreflightError
-
-                        raise GovernancePreflightError(
-                            "governance_transport_unverifiable"
-                        ) from None
-                    _original_api_kwargs = dict(api_kwargs)
-                    _llm_middleware_trace = []
+                _prepared_provider_attempt = prepare_provider_attempt(
+                    agent,
+                    api_kwargs,
+                    task_id=effective_task_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    api_call_count=api_call_count,
+                )
+                api_kwargs = _prepared_provider_attempt.payload
+                _llm_middleware_trace = list(
+                    _prepared_provider_attempt.middleware_trace
+                )
 
                 _record_pending_compression_request_estimate(
                     agent,
@@ -1214,7 +1199,7 @@ def run_conversation(
                     active_system_prompt=active_system_prompt or "",
                 )
 
-                def _emit_pre_api_observers(final_api_kwargs):
+                def _emit_pre_api_observers(final_api_kwargs, middleware_trace):
                     """Run body-bearing observers only after governed fit approval."""
                     try:
                         from hermes_cli.plugins import (
@@ -1253,7 +1238,7 @@ def run_conversation(
                                 request_char_count=total_chars,
                                 max_tokens=agent.max_tokens,
                                 started_at=api_start_time,
-                                middleware_trace=list(_llm_middleware_trace),
+                                middleware_trace=list(middleware_trace),
                                 request=_request_payload,
                             )
                     except Exception:
@@ -1320,12 +1305,6 @@ def run_conversation(
 
                 def _perform_api_call(next_api_kwargs):
                     nonlocal provider_backend_invoked_this_iteration
-                    from agent.subagent_governance import (
-                        assert_governance_request_fits,
-                    )
-
-                    assert_governance_request_fits(agent, next_api_kwargs)
-                    _emit_pre_api_observers(next_api_kwargs)
                     provider_backend_invoked_this_iteration = True
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
@@ -1333,23 +1312,17 @@ def run_conversation(
                         )
                     return agent._interruptible_api_call(next_api_kwargs)
 
-                from hermes_cli.middleware import run_llm_execution_middleware
+                from agent.provider_attempt import execute_provider_attempt
 
-                response = run_llm_execution_middleware(
-                    api_kwargs,
+                response = execute_provider_attempt(
+                    agent,
+                    _prepared_provider_attempt,
                     _perform_api_call,
-                    original_request=_original_api_kwargs,
                     task_id=effective_task_id,
                     turn_id=turn_id,
                     api_request_id=api_request_id,
-                    session_id=agent.session_id or "",
-                    platform=agent.platform or "",
-                    model=agent.model,
-                    provider=agent.provider,
-                    base_url=agent.base_url,
-                    api_mode=agent.api_mode,
                     api_call_count=api_call_count,
-                    middleware_trace=list(_llm_middleware_trace),
+                    pre_api_observer=_emit_pre_api_observers,
                 )
                 
                 api_duration = time.time() - api_start_time

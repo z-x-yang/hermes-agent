@@ -704,20 +704,15 @@ here; full developer notes live in `AGENTS.md`, user-facing docs under
 
 ### Delegation (`delegate_task`)
 
-Spawn a subagent with an isolated context + terminal session.
+Spawn a subagent with an isolated context and its canonical profile ceiling.
 
-- **Single:** `delegate_task(goal, context)`.
-- **Batch:** `delegate_task(tasks=[{goal, ...}, ...])` runs children in
-  parallel, capped by `delegation.max_concurrent_children` (default 3).
-- **Background:** `delegate_task(background=true)` returns a handle
-  immediately and keeps the parent loop going; the child's result
-  re-enters the conversation as a new turn when it finishes.
-- **Roles:** `leaf` (default; cannot re-delegate) vs `orchestrator`
-  (can spawn its own workers, bounded by `delegation.max_spawn_depth`).
-- **Not durable.** A backgrounded child is still process-local — if the
-  parent process exits, the child is lost. For work that must outlive
-  the process, use `cronjob` or
-  `terminal(background=True, notify_on_complete=True)`.
+- **Single:** `delegate_task(description=..., prompt=..., subagent_type=..., run_in_background=...)`.
+- **Batch:** `delegate_task(tasks=[{description, prompt, subagent_type?}, ...], run_in_background=...)` runs children in parallel, capped by `delegation.max_concurrent_children` (default 3), and returns one consolidated completion.
+- **Profiles:** `Explore` and `Plan` are read-only one-shot agents; `general-purpose` handles multi-step execution and is automatically retained only after explicit successful completion.
+- **Scheduling:** top-level omission defaults to background; a nested omission runs foreground. `run_in_background=true` forces background where the runtime permits it. Background results re-enter the parent conversation on completion.
+- **Continuation:** resume a retained successful general-purpose child with `delegate_continue(agent_id=..., prompt=..., run_in_background=...)` in the same live parent session.
+- **Nesting:** authority is runtime-derived from depth, profile policy, configuration, and the exact current-parent tool ceiling. Callers cannot select delegation privilege roles.
+- **Not durable.** Background children and retained continuations are process-local. If work must outlive the process, use `cronjob` or `terminal(background=True, notify_on_complete=True)`.
 
 Config: `delegation.*` in `config.yaml`.
 

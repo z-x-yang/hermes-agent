@@ -1660,7 +1660,7 @@ delegation:
 
 `run_in_background` 是唯一 caller scheduling control：顶层省略时后台，顶层 `False` 前台等待；嵌套省略或 `False` 前台，嵌套 `True` 在 child 执行前拒绝；一个 Batch 共用一个顶层选择。
 
-`foreground_wait_timeout_seconds` 控制 parent 等待时间。超时后同一个 future 转到后台，并只投递一次 completion。`child_run_timeout_seconds` 只限制从前台启动的工作；`agents.<type>` 覆盖 global fallback，`max_foreground_wait_timeout_seconds` 是全局 wait ceiling。纯后台不套用 profile foreground run cap；显式 `child_timeout_seconds` 仍是独立 hard cap。
+`foreground_wait_timeout_seconds` 控制 parent 等待时间。超时后同一个 future 转到后台，并只投递一次 completion。`child_run_timeout_seconds` 限制每个 child run，无论从前台还是后台启动；`agents.<type>` 覆盖 global fallback，`max_foreground_wait_timeout_seconds` 是全局 wait ceiling。显式 `child_timeout_seconds` 仍是独立 hard cap。
 
 ### Profile 上下文与生命周期
 

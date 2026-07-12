@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -22,7 +24,10 @@ from tools.tool_effects import ResultRetention, ToolEffect, build_authority_snap
 
 
 def setup_function():
+    from tools.delegation_capacity import _reset_for_tests
+
     clear_retained_subagent_sessions()
+    _reset_for_tests()
 
 
 def _set_authority(agent, names) -> None:
@@ -149,6 +154,27 @@ def _record(**overrides):
     }
     data.update(overrides)
     return RetainedSubagentSession(**data)
+
+
+def _transport_identity(
+    *,
+    provider: str,
+    base_url: str,
+    api_mode: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "api_mode": api_mode,
+            "args": [],
+            "base_url": base_url.rstrip("/"),
+            "command": "",
+            "provider": provider,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
 class _CompletedRetainableChild:
@@ -368,6 +394,58 @@ def test_retained_transcript_budget_is_config_authoritative_and_not_model_facing
     )
 
 
+@pytest.mark.parametrize("completed_value", [False, 1, "true"])
+def test_non_boolean_or_false_continuation_does_not_commit_history(
+    monkeypatch,
+    completed_value,
+):
+    from tools.delegate_continue_tool import _run_continuation_entry
+
+    original_history = [{"role": "user", "content": "first"}]
+    retain_subagent_session(_record(conversation_history=original_history))
+
+    class FailedContinuationChild:
+        model = "model-a"
+        provider = "openrouter"
+
+        def run_conversation(self, **_kwargs):
+            return {
+                "final_response": "governance_transport_unverifiable",
+                "completed": completed_value,
+                "error": "governance_transport_unverifiable",
+                "api_calls": 0,
+                "messages": [
+                    *original_history,
+                    {"role": "user", "content": "continue"},
+                    {
+                        "role": "assistant",
+                        "content": "governance_transport_unverifiable",
+                    },
+                ],
+            }
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "tools.delegate_continue_tool._build_continuation_child",
+        lambda *_args, **_kwargs: FailedContinuationChild(),
+    )
+
+    entry = _run_continuation_entry(
+        get_retained_subagent_session("agent-1"),
+        "continue",
+        _parent(),
+    )
+
+    assert entry["status"] == "failed"
+    assert entry["summary"] == "governance_transport_unverifiable"
+    assert (
+        get_retained_subagent_session("agent-1").conversation_history
+        == original_history
+    )
+
+
 def test_successful_oversized_continuation_drops_retention_but_keeps_result(
     monkeypatch,
 ):
@@ -380,6 +458,7 @@ def test_successful_oversized_continuation_drops_retention_but_keeps_result(
         def run_conversation(self, **kwargs):
             return {
                 "final_response": "successful result survives",
+                "completed": True,
                 "messages": kwargs["conversation_history"]
                 + [{"role": "assistant", "content": "z" * 1024}],
                 "api_calls": 1,
@@ -675,6 +754,7 @@ def test_continuation_runtime_pins_retained_workspace_and_clears_task_override(
             )
             return {
                 "final_response": "continued in retained workspace",
+                "completed": True,
                 "messages": kwargs["conversation_history"]
                 + [{"role": "assistant", "content": "continued"}],
                 "api_calls": 1,
@@ -744,6 +824,7 @@ def test_delegate_continue_rejects_concurrent_same_agent_without_losing_history(
             assert allow_finish.wait(2)
             return {
                 "final_response": "continued",
+                "completed": True,
                 "messages": kwargs["conversation_history"]
                 + [{"role": "assistant", "content": "continued"}],
                 "api_calls": 1,
@@ -796,6 +877,106 @@ def test_delegate_continue_rejects_concurrent_same_agent_without_losing_history(
     assert not worker_threads[-1].is_alive()
     assert len(seen_histories) == 3
     assert seen_histories[2][-1] == {"role": "assistant", "content": "continued"}
+
+
+def test_delegate_continue_runner_capacity_counts_inline_nested_continuation(monkeypatch):
+    from tools import async_delegation as async_delegation
+    from tools import delegation_capacity
+    from tools.delegate_continue_tool import delegate_continue
+
+    async_delegation._reset_for_tests()
+    delegation_capacity._reset_for_tests()
+    release = threading.Event()
+    first_started = threading.Event()
+    second_started = threading.Event()
+
+    def run_entry(record, prompt, parent_agent, **_kwargs):
+        if record.agent_id == "agent-1":
+            first_started.set()
+            assert release.wait(3)
+        else:
+            second_started.set()
+        return {
+            "status": "completed",
+            "agent_id": record.agent_id,
+            "summary": prompt,
+        }
+
+    monkeypatch.setattr(
+        "tools.delegate_continue_tool._run_continuation_entry",
+        run_entry,
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._load_config",
+        lambda: {
+            "max_concurrent_children": 1,
+            "foreground_wait_timeout_seconds": 60,
+            "child_run_timeout_seconds": 60,
+        },
+    )
+    retain_subagent_session(_record(agent_id="agent-1"))
+    retain_subagent_session(_record(agent_id="agent-2"))
+    nested_parent = _parent()
+    nested_parent._delegate_depth = 1
+    first_result = []
+    thread = threading.Thread(
+        target=lambda: first_result.append(
+            json.loads(
+                delegate_continue(
+                    "agent-1",
+                    "inline",
+                    False,
+                    parent_agent=nested_parent,
+                )
+            )
+        )
+    )
+    thread.start()
+    assert first_started.wait(1)
+
+    second = json.loads(
+        delegate_continue("agent-2", "background", True, parent_agent=_parent())
+    )
+    try:
+        assert second["status"] == "rejected"
+        assert "runner capacity" in second["error"].lower()
+        assert not second_started.is_set()
+    finally:
+        release.set()
+        thread.join(timeout=3)
+        with async_delegation._records_lock:
+            futures = [
+                record.get("future")
+                for record in async_delegation._records.values()
+                if record.get("future") is not None
+            ]
+        for future in futures:
+            future.result(timeout=3)
+        async_delegation._reset_for_tests()
+        delegation_capacity._reset_for_tests()
+
+    assert first_result[0]["status"] == "completed"
+
+
+def test_delegate_continue_rejects_invalid_background_run_timeout_before_dispatch(monkeypatch):
+    from tools.delegate_continue_tool import delegate_continue
+
+    retain_subagent_session(_record())
+    monkeypatch.setattr(
+        "tools.delegate_tool._load_config",
+        lambda: {"child_run_timeout_seconds": 0},
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.dispatch_async_delegation_batch",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not dispatch")),
+    )
+
+    result = json.loads(
+        delegate_continue("agent-1", "continue", True, parent_agent=_parent())
+    )
+
+    assert "child_run_timeout_seconds" in result["error"]
+    assert "positive integer" in result["error"]
 
 
 def test_delegate_continue_releases_claim_after_runner_exception(monkeypatch):
@@ -988,6 +1169,7 @@ def test_top_level_async_continue_is_never_parent_lifecycle_owned(
             assert allow_finish.wait(2)
             return {
                 "final_response": "continued",
+                "completed": True,
                 "messages": kwargs["conversation_history"]
                 + [{"role": "assistant", "content": "continued"}],
                 "api_calls": 1,
@@ -1083,6 +1265,7 @@ def test_sync_continue_fallbacks_remain_parent_attached_while_running(
             assert allow_finish.wait(2)
             return {
                 "final_response": "continued inline",
+                "completed": True,
                 "messages": kwargs["conversation_history"]
                 + [{"role": "assistant", "content": "continued inline"}],
                 "api_calls": 1,
@@ -1288,7 +1471,7 @@ def test_claimed_retained_session_survives_midflight_ttl_then_expires(monkeypatc
         get_retained_subagent_session("agent-1")
 
 
-def test_foreground_continue_applies_run_cap_but_background_does_not(monkeypatch):
+def test_continue_applies_run_cap_to_foreground_and_background(monkeypatch):
     from tools.delegate_continue_tool import delegate_continue
 
     seen_run_caps = []
@@ -1350,7 +1533,7 @@ def test_foreground_continue_applies_run_cap_but_background_does_not(monkeypatch
         )
     )
     assert background["status"] == "dispatched"
-    assert seen_run_caps == [0.25, None]
+    assert seen_run_caps == [0.25, 0.25]
 
 
 def test_delegate_continue_foreground_parent_interrupt_returns_without_late_queue(
@@ -1832,6 +2015,11 @@ def test_continuation_delegation_requires_original_and_current_authority(
     retained_names = {"read_file", "delegate_continue"}
     if original_has_delegate_task:
         retained_names.add("delegate_task")
+    retained_identities = frozenset(
+        identity
+        for name in retained_names
+        if isinstance((identity := registry.resolved_policy_identity(name)), str)
+    )
     parent_toolsets = ["file"]
     parent_names = {"read_file"}
     if parent_has_delegate_task:
@@ -1845,6 +2033,7 @@ def test_continuation_delegation_requires_original_and_current_authority(
         _record(
             subagent_type=subagent_type,
             effective_allowed_tool_names=frozenset(retained_names),
+            original_policy_identities=retained_identities,
         ),
         prompt="continue orchestration",
         parent_agent=parent,
@@ -1925,6 +2114,87 @@ def test_build_continuation_child_isolates_retained_provider_transport(monkeypat
     assert captured["override_acp_args"] == []
 
 
+def test_build_continuation_child_inherits_exact_matching_parent_transport(monkeypatch):
+    from tools.delegate_continue_tool import _build_continuation_child
+
+    captured = {}
+    monkeypatch.setattr("tools.delegate_tool._load_config", lambda: {})
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must inherit parent")),
+    )
+
+    def fake_build_child_agent(**kwargs):
+        captured.update(kwargs)
+        return _attach_policy(
+            SimpleNamespace(valid_tool_names={"read_file"}),
+            {"read_file"},
+            kwargs["profile"].name,
+        )
+
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", fake_build_child_agent)
+    record = _record(
+        provider="openrouter",
+        transport_identity=_transport_identity(
+            provider="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+        ),
+    )
+
+    _build_continuation_child(record, prompt="continue", parent_agent=_parent())
+
+    assert captured["override_provider"] is None
+    assert captured["override_base_url"] is None
+    assert captured["override_api_key"] is None
+
+
+def test_build_continuation_child_reuses_only_matching_trusted_custom_endpoint(monkeypatch):
+    from tools.delegate_continue_tool import _build_continuation_child
+
+    endpoint = "https://retained-custom.example/v1"
+    endpoint_key = "current-endpoint-secret"
+    captured = {}
+    monkeypatch.setattr(
+        "tools.delegate_tool._load_config",
+        lambda: {
+            "model": "custom-model",
+            "base_url": endpoint,
+            "api_key": endpoint_key,
+            "api_mode": "chat_completions",
+        },
+    )
+
+    def fake_build_child_agent(**kwargs):
+        captured.update(kwargs)
+        return _attach_policy(
+            SimpleNamespace(valid_tool_names={"read_file"}),
+            {"read_file"},
+            kwargs["profile"].name,
+        )
+
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", fake_build_child_agent)
+
+    record = _record(provider="custom", model="custom-model")
+    object.__setattr__(
+        record,
+        "transport_identity",
+        _transport_identity(
+            provider="custom",
+            base_url=endpoint,
+            api_mode="chat_completions",
+        ),
+    )
+
+    _build_continuation_child(record, prompt="continue", parent_agent=_parent())
+
+    assert captured["override_provider"] == "custom"
+    assert captured["override_base_url"] == endpoint
+    assert captured["override_api_key"] == endpoint_key
+    assert captured["override_api_mode"] == "chat_completions"
+    assert endpoint_key not in repr(record)
+
+
 def test_run_single_child_retains_completed_general_purpose_session(monkeypatch):
     import tools.delegate_tool as dt
 
@@ -1932,6 +2202,9 @@ def test_run_single_child_retains_completed_general_purpose_session(monkeypatch)
         session_id = "child-session"
         model = "model-a"
         provider = "openrouter"
+        base_url = "https://openrouter.ai/api/v1"
+        api_mode = "chat_completions"
+        api_key = "child-secret-key"
         _subagent_id = "sa-test"
         session_prompt_tokens = 0
         session_completion_tokens = 0
@@ -2019,7 +2292,86 @@ def test_run_single_child_retains_completed_general_purpose_session(monkeypatch)
         child._subagent_tool_policy.authority_snapshot.policy_identities
     )
     assert record.original_governance_fingerprint == governance.fingerprint
+    assert record.provider == "openrouter"
+    assert record.transport_identity == _transport_identity(
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        api_mode="chat_completions",
+    )
+    assert "child-secret-key" not in repr(record)
     assert record.conversation_history[-1] == {"role": "assistant", "content": "done"}
+
+
+@pytest.mark.parametrize("completed_value", [False, 1, "true"])
+def test_run_single_child_rejects_non_boolean_or_false_completion(
+    monkeypatch,
+    completed_value,
+):
+    import tools.delegate_tool as dt
+
+    class FailedChild:
+        session_id = "failed-child-session"
+        model = "model-a"
+        provider = "openrouter"
+        _subagent_id = "failed-sa-test"
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_estimated_cost_usd = 0.0
+        session_reasoning_tokens = 0
+        tool_progress_callback = None
+        valid_tool_names = {"read_file"}
+        _governance_diagnostics = None
+
+        def run_conversation(self, **kwargs):
+            return {
+                "final_response": "governance_transport_unverifiable",
+                "completed": completed_value,
+                "api_calls": 0,
+                "messages": [
+                    {"role": "user", "content": kwargs["user_message"]},
+                    {
+                        "role": "assistant",
+                        "content": "governance_transport_unverifiable",
+                    },
+                ],
+            }
+
+        def get_activity_summary(self):
+            return {"api_call_count": 0, "current_tool": None, "max_iterations": 1}
+
+        def close(self):
+            pass
+
+    retain = MagicMock()
+    monkeypatch.setattr(
+        "tools.subagent_sessions.retain_subagent_session", retain
+    )
+    governance = dt.load_governance_snapshot()
+    child = _attach_policy(FailedChild(), {"read_file"}, "general-purpose")
+    child._governance_diagnostics = {
+        "profile_id": governance.profile_id,
+        "profile_home": str(governance.profile_home),
+        "fingerprint": governance.fingerprint,
+        "total_bytes": governance.total_bytes,
+    }
+
+    entry = dt._run_single_child(
+        task_index=0,
+        description="fail closed",
+        child=child,
+        parent_agent=_parent(),
+        prompt="perform the delegated task",
+        child_timeout_override=30,
+        subagent_type="general-purpose",
+        workspace_path="/tmp/repo",
+    )
+
+    assert entry["status"] == "failed"
+    assert entry["summary"] == "governance_transport_unverifiable"
+    assert "retention_status" not in entry
+    assert "agent_id" not in entry
+    assert "retained_until" not in entry
+    retain.assert_not_called()
 
 
 def test_run_single_child_surfaces_retention_failure(monkeypatch):
@@ -2135,6 +2487,7 @@ def test_continued_retained_history_projects_handle_only_tool_results(monkeypatc
         def run_conversation(self, **kwargs):
             return {
                 "final_response": "continued",
+                "completed": True,
                 "api_calls": 1,
                 "messages": kwargs["conversation_history"]
                 + [

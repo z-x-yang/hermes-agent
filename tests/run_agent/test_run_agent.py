@@ -3961,7 +3961,7 @@ class TestHandleMaxIterations:
         agent._cached_system_prompt = "You are helpful."
         captured = {}
 
-        def fake_run_codex_stream(kwargs):
+        def fake_run_codex_stream(kwargs, **_kwargs):
             captured.update(kwargs)
             return SimpleNamespace(
                 status="completed",
@@ -5447,8 +5447,10 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("do the kanban work")
 
-        # The agent should have reported the task as not completed.
+        # The agent should have reported the task as not completed. The two
+        # normal attempts plus the governed summary attempt are all billable.
         assert result["completed"] is False
+        assert result["api_calls"] == 3
 
         # _record_task_failure should have been called exactly once for
         # the exhaustion event, with outcome="timed_out".

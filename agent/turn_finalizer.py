@@ -68,7 +68,12 @@ def finalize_turn(
                 "— requesting summary..."
             )
         final_response = agent._handle_max_iterations(messages, api_call_count)
-
+        summary_api_calls = int(
+            getattr(agent, "_last_max_iteration_summary_api_calls", 0) or 0
+        )
+        if summary_api_calls > 0:
+            api_call_count += summary_api_calls
+            agent._api_call_count = api_call_count
         # If running as a kanban worker, signal the dispatcher that the
         # worker could not complete (rather than treating it as a
         # protocol violation).  The agent loop strips tools before calling

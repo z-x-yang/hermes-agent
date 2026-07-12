@@ -4763,26 +4763,32 @@ def refresh_agent_mcp_tools(
         enabled = getattr(agent, "enabled_toolsets", None)
         disabled = getattr(agent, "disabled_toolsets", None)
 
-    # Capture the registry generation this rebuild is derived from BEFORE the
-    # (potentially slow) get_tool_definitions call. Used at publish time to
-    # reject a stale write: if two callers race (e.g. the late-refresh daemon
-    # and the between-turns prologue around turn 1), a slower caller that
-    # computed an OLDER set must not clobber a newer set another caller already
-    # published. ``registry._generation`` bumps on every (de)register.
-    snapshot_generation = registry._generation
-
-    # Registry-derived tools (built-ins + MCP), filtered to the agent's toolsets.
-    # Computed OUTSIDE the lock (get_tool_definitions can be slow); the diff and
-    # publish below happen together in ONE critical section so two concurrent
-    # callers can't torn-publish or compute overlapping ``added`` sets.
-    new_defs = list(
-        get_tool_definitions(
-            enabled_toolsets=enabled,
-            disabled_toolsets=disabled,
-            quiet_mode=quiet_mode,
-        )
-        or []
+    policy = getattr(agent, "_subagent_tool_policy", None)
+    restricted_profile = (
+        policy is not None and policy.allowed_names is not None
     )
+    resolved_defs = []
+    snapshot_generation = -1
+    for _attempt in range(3):
+        candidate_generation = registry._generation
+        resolved_defs = list(
+            get_tool_definitions(
+                enabled_toolsets=enabled,
+                disabled_toolsets=disabled,
+                quiet_mode=quiet_mode,
+                skip_tool_search_assembly=restricted_profile,
+            )
+            or []
+        )
+        if registry._generation == candidate_generation:
+            snapshot_generation = candidate_generation
+            break
+    if snapshot_generation < 0:
+        # The registry never stabilized across a full rebuild. Keep the prior
+        # published surface rather than labeling stale definitions as current.
+        return set()
+
+    new_defs = list(resolved_defs)
     from agent.subagent_tool_policy import filter_tool_definitions_for_policy
 
     new_defs = filter_tool_definitions_for_policy(agent, new_defs)
@@ -4804,7 +4810,11 @@ def refresh_agent_mcp_tools(
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a
     # stale (older-generation) rebuild can't overwrite a newer published one.
-    with _agent_tools_lock:
+    with registry._lock, _agent_tools_lock:
+        if registry._generation != snapshot_generation:
+            # The registry changed after the stable rebuild but before publish.
+            # Drop this snapshot; the next refresh will rebuild the new state.
+            return set()
         # Defensive: the published generation should be an int, but tolerate an
         # agent that never set it (or set a non-int, e.g. a test mock) rather
         # than throwing TypeError on the comparison and silently failing the
@@ -4819,12 +4829,15 @@ def refresh_agent_mcp_tools(
             for t in (getattr(agent, "tools", None) or [])
         }
         if new_names == current:
-            # No change → leave the live snapshot untouched (no churn), but
-            # record the generation so an in-flight older caller can't clobber.
+            # No visible change → leave the live model-facing snapshot untouched
+            # (no cache churn), but refresh the same-generation raw surface used
+            # by restricted profile policy and record the generation.
+            agent._resolved_tool_definitions = tuple(resolved_defs)
             agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
             return set()
         agent.tools = new_defs
         agent.valid_tool_names = new_names
+        agent._resolved_tool_definitions = tuple(resolved_defs)
         # Publish context-engine routing names atomically with the snapshot.
         engine_names = getattr(agent, "_context_engine_tool_names", None)
         if isinstance(engine_names, set):

@@ -1955,7 +1955,7 @@ delegation:
 - nested `True` → reject before child execution;
 - one Batch shares one top-level choice.
 
-`foreground_wait_timeout_seconds` controls how long the parent waits. Expiry hands the same future to background delivery and emits exactly one later completion. `child_run_timeout_seconds` caps work that started in foreground; each `agents.<type>` value overrides the global fallback. `max_foreground_wait_timeout_seconds` is the global wait ceiling. Pure background work does not receive the profile foreground run cap; the older explicit `child_timeout_seconds` remains an independent hard cap.
+`foreground_wait_timeout_seconds` controls how long the parent waits. Expiry hands the same future to background delivery and emits exactly one later completion. `child_run_timeout_seconds` caps every child run, whether it starts in foreground or background; each `agents.<type>` value overrides the global fallback. `max_foreground_wait_timeout_seconds` is the global wait ceiling. The older explicit `child_timeout_seconds` remains an independent hard cap.
 
 ### Profile context and lifecycle
 

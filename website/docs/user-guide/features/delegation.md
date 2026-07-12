@@ -75,7 +75,7 @@ Scheduling uses only `run_in_background`:
 - nested omitted or `False` → foreground;
 - nested `True` → fail closed before child execution.
 
-Foreground waiting and child execution have separate operator-controlled limits. Default wait/run values are Explore `900/1800` seconds, Plan `1800/3600`, and general-purpose `1800/7200`. When the wait limit expires, Hermes backgrounds the same future and later emits exactly one completion; it does not queue or restart the child. Pure background work does not receive the profile foreground run cap.
+Foreground waiting and child execution have separate operator-controlled limits. Default wait/run values are Explore `900/1800` seconds, Plan `1800/3600`, and general-purpose `1800/7200`. The profile run limit applies to every child, including work dispatched directly to background. When a foreground wait limit expires, Hermes backgrounds the same future and later emits exactly one completion; it does not queue or restart the child.
 
 ## Context isolation
 

@@ -194,17 +194,23 @@ def build_child_tool_policy(
 
 
 def apply_tool_policy_to_agent(agent, policy: ToolNamePolicy) -> None:
-    """Persist and expose only tools permitted by a subagent capability policy."""
+    """Persist and expose only tools permitted by a subagent capability policy.
+
+    Restricted profiles must filter the complete resolved registry surface before
+    Tool Search schema compaction.  Filtering an already-compacted surface can
+    silently hide authorized deferred tools while leaving their policy metadata
+    apparently correct.
+    """
     agent._subagent_tool_policy = policy
-    agent.tools = [
-        definition
-        for definition in list(getattr(agent, "tools", []) or [])
-        if policy.allows(definition["function"]["name"])
-    ]
+    definitions = list(getattr(agent, "tools", []) or [])
+    if policy.allowed_names is not None:
+        resolved = getattr(agent, "_resolved_tool_definitions", None)
+        if isinstance(resolved, (list, tuple)):
+            definitions = list(resolved)
+    definitions = filter_tool_definitions_for_policy(agent, definitions)
+    agent.tools = definitions
     agent.valid_tool_names = {
-        name
-        for name in set(getattr(agent, "valid_tool_names", set()) or set())
-        if policy.allows(name)
+        definition["function"]["name"] for definition in definitions
     }
     # Late refresh is allowed, but Task 6 refresh filtering must preserve the
     # original exact identity ceiling. Name-only refresh disabling is removed.

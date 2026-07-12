@@ -1009,35 +1009,23 @@ Enable/disable per platform via `hermes tools` (the curses UI) or the
 
 ## Delegation (`delegate_task`)
 
-`tools/delegate_tool.py` spawns a subagent with an isolated
-context + terminal session. By default the parent waits for the
-child's summary before continuing its own loop. With `background=true`,
-Hermes returns a delegation id immediately and the result re-enters the
-conversation later through the async-delegation completion queue.
+`tools/delegate_tool.py` spawns a subagent with an isolated context and one of three canonical profiles. At top level, omitted `run_in_background` defaults to background execution; nested omission runs foreground. Explicit `run_in_background=false` blocks the parent until the consolidated result returns. Background results re-enter the conversation through the async-delegation completion queue.
 
 Two shapes:
 
-- **Single:** pass `goal` (+ optional `context`, `toolsets`).
-- **Batch (parallel):** pass `tasks: [...]` — each gets its own subagent
-  running concurrently. Concurrency is capped by
-  `delegation.max_concurrent_children` (default 3).
+- **Single:** pass `description`, `prompt`, optional `subagent_type`, and optional `run_in_background`.
+- **Batch (parallel):** pass `tasks: [{description, prompt, subagent_type?}, ...]`. One call returns one batch handle/background unit and one consolidated completion. Live child runners share the `delegation.max_concurrent_children` cap.
 
-Roles:
+Profiles and lifecycle:
 
-- `role="leaf"` (default) — focused worker. Cannot call `delegate_task`,
-  `clarify`, `memory`, `send_message`, `execute_code`.
-- `role="orchestrator"` — retains `delegate_task` so it can spawn its
-  own workers. Gated by `delegation.orchestrator_enabled` (default true)
-  and bounded by `delegation.max_spawn_depth` (default 2).
+- `Explore` — read-only evidence search; one-shot.
+- `Plan` — read-only implementation planning; one-shot.
+- `general-purpose` — multi-step execution with the exact surviving parent ceiling; retained only after explicit successful completion and resumable with `delegate_continue` in the same live parent session.
+- Nested delegation is runtime-derived from profile, depth, the runtime kill switch, and exact current-parent authority. The caller cannot select a privilege role.
 
-Key config knobs (under `delegation:` in `config.yaml`):
-`max_concurrent_children`, `max_spawn_depth`, `child_timeout_seconds`,
-`orchestrator_enabled`, `subagent_auto_approve`, `inherit_mcp_toolsets`,
-`max_iterations`.
+Key config knobs (under `delegation:` in `config.yaml`): `max_concurrent_children`, `max_spawn_depth`, `child_timeout_seconds`, the legacy-named `orchestrator_enabled` runtime nesting kill switch, `subagent_auto_approve`, `max_retained_subagent_bytes`, `max_iterations`, and per-profile `child_run_timeout_seconds` / `foreground_wait_timeout_seconds` overrides.
 
-Durability rule: background `delegate_task` is detached from the current
-turn but still process-local. For work that must survive process restart, use
-`cronjob` or `terminal(background=True, notify_on_complete=True)` instead.
+Durability rule: background delegation and retained continuation state are process-local. For work that must survive process restart, use `cronjob` or `terminal(background=True, notify_on_complete=True)` instead.
 
 ---
 

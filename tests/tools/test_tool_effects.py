@@ -44,6 +44,26 @@ def test_schema_digest_is_compact_sorted_json_sha256_and_rejects_unsafe_values()
         schema_digest({"bad": math.nan})
 
 
+def test_schema_digest_treats_empty_required_as_semantic_absence():
+    without_required = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+    }
+    empty_required = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": [],
+    }
+    nonempty_required = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+    }
+
+    assert schema_digest(without_required) == schema_digest(empty_required)
+    assert schema_digest(without_required) != schema_digest(nonempty_required)
+
+
 def test_builtin_descriptor_roundtrips_sensitive_retention_and_argument_resolver():
     descriptor = builtin_policy_descriptor(
         name="derived_read",

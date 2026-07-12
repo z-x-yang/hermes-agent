@@ -75,7 +75,7 @@ delegate_task(
 - 嵌套省略或 `False` → 前台；
 - 嵌套 `True` → child 执行前 fail closed。
 
-前台等待和 child 运行使用独立的 operator timeout。默认 wait/run 为 Explore `900/1800` 秒、Plan `1800/3600`、general-purpose `1800/7200`。等待超时时，Hermes 把同一个 future 转到后台，之后只投递一次完成结果；不会重排或重启 child。纯后台工作不套用 profile 的 foreground run cap。
+前台等待和 child 运行使用独立的 operator timeout。默认 wait/run 为 Explore `900/1800` 秒、Plan `1800/3600`、general-purpose `1800/7200`。profile run limit 作用于每个 child，包括直接在后台启动的工作。前台等待超时时，Hermes 把同一个 future 转到后台，之后只投递一次完成结果；不会重排或重启 child。
 
 ## 上下文隔离
 

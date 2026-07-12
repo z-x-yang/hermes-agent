@@ -17,6 +17,7 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import hashlib
 import inspect
 import json
 import logging
@@ -646,25 +647,6 @@ def _get_orchestrator_enabled() -> bool:
     return True
 
 
-def _get_inherit_mcp_toolsets() -> bool:
-    """Whether narrowed child toolsets should keep the parent's MCP toolsets."""
-    cfg = _load_config()
-    return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=True)
-
-
-def _is_mcp_toolset_name(name: str) -> bool:
-    """Return True for canonical MCP toolsets and their registered aliases."""
-    if not name:
-        return False
-    if str(name).startswith("mcp-"):
-        return True
-    try:
-        from tools.registry import registry
-
-        target = registry.get_toolset_alias_target(str(name))
-    except Exception:
-        target = None
-    return bool(target and str(target).startswith("mcp-"))
 
 
 def _expand_parent_toolsets(parent_toolsets: set) -> set:
@@ -696,17 +678,6 @@ def _expand_parent_toolsets(parent_toolsets: set) -> set:
         if ts_tools and set(ts_tools).issubset(parent_tool_names):
             expanded.add(ts_name)
     return expanded
-
-
-def _preserve_parent_mcp_toolsets(
-    child_toolsets: List[str], parent_toolsets: set[str]
-) -> List[str]:
-    """Append any parent MCP toolsets that are missing from a narrowed child."""
-    preserved = list(child_toolsets)
-    for toolset_name in sorted(parent_toolsets):
-        if _is_mcp_toolset_name(toolset_name) and toolset_name not in preserved:
-            preserved.append(toolset_name)
-    return preserved
 
 
 DEFAULT_MAX_ITERATIONS = 50
@@ -1345,10 +1316,6 @@ def _build_child_agent(
         # toolset names (e.g. web, terminal) are recognised during intersection.
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [t for t in toolsets if t in expanded_parent]
-        if _get_inherit_mcp_toolsets():
-            child_toolsets = _preserve_parent_mcp_toolsets(
-                child_toolsets, parent_toolsets
-            )
         child_toolsets = _strip_blocked_tools(child_toolsets)
     elif parent_agent and parent_enabled is not None:
         child_toolsets = _strip_blocked_tools(parent_enabled)
@@ -2340,7 +2307,8 @@ def _run_single_child(
         duration = round(time.monotonic() - child_start, 2)
 
         summary = result.get("final_response") or ""
-        completed = result.get("completed", False)
+        completed = result.get("completed") is True
+        failed = result.get("failed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
 
@@ -2353,10 +2321,9 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
-        elif summary and not _empty_sentinel:
-            # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
+        elif failed:
+            status = "failed"
+        elif completed and summary and not _empty_sentinel:
             status = "completed"
         else:
             status = "failed"
@@ -2542,6 +2509,7 @@ def _run_single_child(
         if (
             _should_retain_session(str(subagent_type or ""))
             and status == "completed"
+            and bool(completed)
             and parent_session_id
         ):
             try:
@@ -2587,6 +2555,13 @@ def _run_single_child(
                         workspace_path=str(retained_workspace),
                         model=str(getattr(child, "model", "") or ""),
                         provider=str(getattr(child, "provider", "") or ""),
+                        transport_identity=_delegation_transport_identity(
+                            provider=getattr(child, "provider", None),
+                            base_url=getattr(child, "base_url", None),
+                            api_mode=getattr(child, "api_mode", None),
+                            command=getattr(child, "acp_command", None),
+                            args=getattr(child, "acp_args", None),
+                        ),
                         conversation_history=retained_messages,
                         created_at=now_ts,
                         expires_at=now_ts + _get_retained_session_ttl(),
@@ -2710,6 +2685,11 @@ def _run_single_child(
                 child.close()
         except Exception:
             logger.debug("Failed to close child agent after delegation")
+        finally:
+            try:
+                setattr(child, "_delegate_cleanup_done", True)
+            except Exception:
+                pass
 
 
 def _recover_tasks_from_json_string(
@@ -2735,6 +2715,33 @@ def _recover_tasks_from_json_string(
             f"{type(parsed).__name__} instead."
         )
     return parsed, None
+
+
+def _cleanup_unstarted_children(children, parent_agent) -> None:
+    """Detach and close children whose runner ownership was never accepted."""
+    for _task_index, _task, child in children:
+        if getattr(child, "_delegate_cleanup_done", False) is True:
+            continue
+        if hasattr(parent_agent, "_active_children"):
+            try:
+                lock = getattr(parent_agent, "_active_children_lock", None)
+                if lock:
+                    with lock:
+                        parent_agent._active_children.remove(child)
+                else:
+                    parent_agent._active_children.remove(child)
+            except (ValueError, UnboundLocalError):
+                pass
+        try:
+            if hasattr(child, "close"):
+                child.close()
+        except Exception:
+            logger.debug("Failed to close unstarted child agent", exc_info=True)
+        finally:
+            try:
+                setattr(child, "_delegate_cleanup_done", True)
+            except Exception:
+                pass
 
 
 def delegate_task(
@@ -2860,14 +2867,17 @@ def delegate_task(
         i: None for i in range(n_tasks)
     }
     foreground_wait_timeout_seconds: Optional[float] = None
-    if foreground_started:
-        wait_timeouts = []
+    wait_timeouts = []
+    try:
         for i, task in enumerate(task_list):
             wait_timeout, run_timeout = _resolve_foreground_timeouts(
                 task.get("subagent_type", subagent_type), cfg
             )
             wait_timeouts.append(wait_timeout)
             child_timeout_overrides[i] = run_timeout
+    except ValueError as exc:
+        return tool_error(f"Invalid delegation timeout config: {exc}")
+    if foreground_started:
         # A consolidated mixed batch gets enough wait budget for its slowest
         # selected profile; each child still keeps its own independent run cap.
         foreground_wait_timeout_seconds = max(wait_timeouts)
@@ -2914,6 +2924,23 @@ def delegate_task(
             dispatch_model = creds["model"]
         prepared_children.append((i, t, profile, creds))
 
+    from tools.delegation_capacity import try_reserve_runner_slots
+
+    runner_reservation = try_reserve_runner_slots(n_tasks, limit=max_children)
+    if runner_reservation is None:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "mode": delivery_mode,
+                "count": n_tasks,
+                "error": (
+                    f"Subagent runner capacity reached: reserving this {n_tasks}-child "
+                    f"batch would exceed max_concurrent_children={max_children}."
+                ),
+            },
+            ensure_ascii=False,
+        )
+
     # Save parent tool names BEFORE any child construction mutates the global.
     # _build_child_agent() calls AIAgent() which calls get_tool_definitions(),
     # which overwrites model_tools._last_resolved_tool_names with child's toolset.
@@ -2951,11 +2978,15 @@ def delegate_task(
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             children.append((i, t, child))
+    except BaseException:
+        _cleanup_unstarted_children(children, parent_agent)
+        runner_reservation.release()
+        raise
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
-    def _execute_and_aggregate() -> dict:
+    def _execute_and_aggregate_reserved() -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
         fire subagent_stop hooks + cost rollup, and return the combined result
         dict. Used by BOTH the synchronous path and the background runner. In
@@ -3206,6 +3237,12 @@ def delegate_task(
             "total_duration_seconds": total_duration,
         }
 
+    def _execute_and_aggregate() -> dict:
+        try:
+            return _execute_and_aggregate_reserved()
+        finally:
+            runner_reservation.release()
+
     # ----- Async registry path: background or top-level foreground wait -----
     # Foreground waiting and background delivery share the same future. A wait
     # timeout only flips delivery ownership; it never starts replacement work.
@@ -3276,23 +3313,37 @@ def delegate_task(
                     pass
 
         _descriptions = [t["description"] for t in task_list]
-        dispatch = dispatch_async_delegation_batch(
-            goals=_descriptions,
-            context=None,
-            # Metadata for the completion block only; subagents inherit the
-            # parent's toolsets (no model-facing toolsets arg).
-            toolsets=None,
-            model=dispatch_model,
-            session_key=_session_key,
-            runner=_batch_runner,
-            interrupt_fn=_batch_interrupt,
-            max_async_children=_get_max_async_children(),
-            initial_delivery_mode=(
-                "foreground_waiting"
-                if delivery_mode == "foreground"
-                else "background"
-            ),
-        )
+        try:
+            dispatch = dispatch_async_delegation_batch(
+                goals=_descriptions,
+                context=None,
+                # Metadata for the completion block only; subagents inherit the
+                # parent's toolsets (no model-facing toolsets arg).
+                toolsets=None,
+                model=dispatch_model,
+                session_key=_session_key,
+                runner=_batch_runner,
+                interrupt_fn=_batch_interrupt,
+                max_async_children=_get_max_async_children(),
+                initial_delivery_mode=(
+                    "foreground_waiting"
+                    if delivery_mode == "foreground"
+                    else "background"
+                ),
+            )
+        except Exception as exc:
+            _cleanup_unstarted_children(children, parent_agent)
+            runner_reservation.release()
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "mode": delivery_mode,
+                    "count": len(_descriptions),
+                    "descriptions": _descriptions,
+                    "error": f"Failed to dispatch subagent batch: {exc}",
+                },
+                ensure_ascii=False,
+            )
 
         if dispatch.get("status") == "dispatched":
             if delivery_mode == "foreground":
@@ -3348,14 +3399,13 @@ def delegate_task(
         # Pool at capacity / schedule failure — do NOT run inline. Running a
         # replacement synchronously would exceed the global max_concurrent cap
         # and make a rejected background dispatch still consume another child.
-        # The children were already detached from parent interrupt tracking for
-        # async ownership; because they never started, leave them detached and
-        # return a fail-closed diagnostic.
         logger.info(
             "delegate_task: async registry rejected delegation (%s); child work "
             "was not started.",
             dispatch.get("error", "rejected"),
         )
+        _cleanup_unstarted_children(children, parent_agent)
+        runner_reservation.release()
         return json.dumps(
             {
                 "status": "rejected",
@@ -3471,6 +3521,30 @@ _DELEGATION_TRANSPORT_CONFIG_KEYS = (
     "command",
     "args",
 )
+
+
+def _delegation_transport_identity(
+    *,
+    provider: Optional[str],
+    base_url: Optional[str],
+    api_mode: Optional[str],
+    command: Optional[str] = None,
+    args: Optional[List[str]] = None,
+) -> str:
+    """Return a non-secret identity for one resolved delegation transport."""
+    payload = json.dumps(
+        {
+            "api_mode": str(api_mode or "").strip().lower(),
+            "args": [str(arg) for arg in (args or [])],
+            "base_url": _normalized_runtime_url(base_url),
+            "command": str(command or "").strip(),
+            "provider": str(provider or "").strip().lower(),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
 def _prepare_delegation_credentials_config(
@@ -3669,11 +3743,14 @@ def _load_config() -> dict:
 
 _SUBAGENT_TYPE_SCHEMA = {
     "type": "string",
-    "enum": ["Explore", "Plan", "general-purpose"],
+    "enum": list(SUPPORTED_SUBAGENT_TYPES),
     "description": (
-        "Explore searches and explains read-only evidence; Plan produces a read-only "
-        "implementation plan; general-purpose executes multi-step work. Omission "
-        "resolves to general-purpose."
+        "Available profiles: "
+        + " ".join(
+            f"{name}: {get_subagent_profile(name).description}"
+            for name in SUPPORTED_SUBAGENT_TYPES
+        )
+        + " Omission resolves to general-purpose."
     ),
 }
 

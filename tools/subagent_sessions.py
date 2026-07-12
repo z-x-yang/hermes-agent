@@ -34,6 +34,7 @@ class RetainedSubagentSession:
     canonical_profile_home: str
     original_policy_identities: frozenset[str]
     original_governance_fingerprint: str
+    transport_identity: str = ""
     effective_allowed_tool_names: frozenset[str] = frozenset()
     claim_generation: int = 0
     updated_at: float = 0.0

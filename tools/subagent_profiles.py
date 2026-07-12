@@ -9,8 +9,6 @@ class SubagentProfile:
     name: str
     description: str
     system_instructions: str
-    model: str
-    provider: Optional[str]
     allowed_tool_names: Optional[FrozenSet[str]]
     default_wait_timeout_seconds: int
     default_run_timeout_seconds: int
@@ -58,7 +56,8 @@ _READ_ONLY_TOOLS = frozenset(
 ) | NOTION_PROMPT_READ_TOOL_NAMES | APPLE_MAIL_READ_TOOL_NAMES
 
 _DATA_SOURCE_READ_INSTRUCTIONS = (
-    "For Notion, call notion_ai_ask only with mode=readonly and explicitly tell "
+    "For public web research, use web_search_readonly and web_extract_readonly. "
+    "For Notion, call mcp_notion_ai_notion_ai_ask only with mode=readonly and explicitly tell "
     "it not to create, edit, move, or delete workspace content. For Apple Mail, "
     "use only the provided search/list/get/fetch tools. Never send, reply, forward, "
     "move, delete, flag, or mark mail."
@@ -94,8 +93,6 @@ _PROFILES = {
             + " "
             + EXPLORE_FINAL
         ),
-        model="inherit",
-        provider=None,
         allowed_tool_names=_READ_ONLY_TOOLS,
         default_wait_timeout_seconds=900,
         default_run_timeout_seconds=1800,
@@ -113,8 +110,6 @@ _PROFILES = {
             + " "
             + PLAN_FINAL
         ),
-        model="inherit",
-        provider=None,
         allowed_tool_names=_READ_ONLY_TOOLS,
         default_wait_timeout_seconds=1800,
         default_run_timeout_seconds=3600,
@@ -127,7 +122,7 @@ _PROFILES = {
         ),
         system_instructions=(
             "You are a general-purpose subagent. Complete the scoped task with "
-            "repo-local actions and tests. You may use the exact parent tool surface "
+            "appropriate actions and verification. You may use the exact parent tool surface "
             "that survives the profile ceiling, including named external tools when "
             "the user/task scope and normal tool contracts permit them. Raw "
             "terminal/process access can also reach external systems: this is not a "
@@ -135,8 +130,6 @@ _PROFILES = {
             "not re-delegate the whole task. "
             + GENERAL_FINAL
         ),
-        model="inherit",
-        provider=None,
         allowed_tool_names=None,
         default_wait_timeout_seconds=1800,
         default_run_timeout_seconds=7200,
@@ -164,6 +157,22 @@ def get_subagent_profile(name: str) -> SubagentProfile:
         ) from exc
 
 
+def _positive_timeout(value: Any, *, key: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"delegation.{key} must be a positive integer; got {value!r}")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"delegation.{key} must be a positive integer; got {value!r}"
+        ) from exc
+    if isinstance(value, float) and value != parsed:
+        raise ValueError(f"delegation.{key} must be a positive integer; got {value!r}")
+    if parsed <= 0:
+        raise ValueError(f"delegation.{key} must be a positive integer; got {value!r}")
+    return parsed
+
+
 def resolve_profile_config(
     name: str,
     delegation_config: Mapping[str, Any],
@@ -172,31 +181,43 @@ def resolve_profile_config(
     agent_cfg = dict((delegation_config.get("agents") or {}).get(name) or {})
     model = agent_cfg.get("model", delegation_config.get("model"))
     provider = agent_cfg.get("provider", delegation_config.get("provider"))
-    wait_timeout = int(
+    wait_is_per_agent = "foreground_wait_timeout_seconds" in agent_cfg
+    wait_timeout = _positive_timeout(
         agent_cfg.get(
             "foreground_wait_timeout_seconds",
             delegation_config.get(
                 "foreground_wait_timeout_seconds",
                 profile.default_wait_timeout_seconds,
             ),
-        )
+        ),
+        key=(
+            f"agents.{name}.foreground_wait_timeout_seconds"
+            if wait_is_per_agent
+            else "foreground_wait_timeout_seconds"
+        ),
     )
-    max_wait_timeout = int(
-        delegation_config.get("max_foreground_wait_timeout_seconds", 7200)
+    max_wait_timeout = _positive_timeout(
+        delegation_config.get("max_foreground_wait_timeout_seconds", 7200),
+        key="max_foreground_wait_timeout_seconds",
     )
-    if max_wait_timeout <= 0:
-        max_wait_timeout = 7200
+    run_is_per_agent = "child_run_timeout_seconds" in agent_cfg
+    run_timeout = _positive_timeout(
+        agent_cfg.get(
+            "child_run_timeout_seconds",
+            delegation_config.get(
+                "child_run_timeout_seconds",
+                profile.default_run_timeout_seconds,
+            ),
+        ),
+        key=(
+            f"agents.{name}.child_run_timeout_seconds"
+            if run_is_per_agent
+            else "child_run_timeout_seconds"
+        ),
+    )
     return ResolvedProfileConfig(
         model=model,
         provider=provider,
         foreground_wait_timeout_seconds=min(wait_timeout, max_wait_timeout),
-        child_run_timeout_seconds=int(
-            agent_cfg.get(
-                "child_run_timeout_seconds",
-                delegation_config.get(
-                    "child_run_timeout_seconds",
-                    profile.default_run_timeout_seconds,
-                ),
-            )
-        ),
+        child_run_timeout_seconds=run_timeout,
     )

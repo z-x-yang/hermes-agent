@@ -5588,7 +5588,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False  # let default path handle it
 
         # --- Internal synthetic events must never interrupt/steer ---
-        # Async-delegation completions (delegate_task(background=true)) and
+        # Async-delegation completions (delegate_task(run_in_background=true)) and
         # background-process completions (terminal notify_on_complete) re-enter
         # the originating session as internal MessageEvents. When the session
         # is busy, treating them like a user TEXT message means interrupt-mode
@@ -7584,7 +7584,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         asyncio.create_task(self._handoff_watcher())
 
         # Start background async-delegation watcher — drains completion events
-        # from delegate_task(background=true) subagents and injects each
+        # from delegate_task(run_in_background=true) subagents and injects each
         # result back into its originating session as a new turn, covering the
         # idle case where the subagent finishes with no agent turn running.
         asyncio.create_task(self._async_delegation_watcher())
@@ -15537,7 +15537,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
-        Background subagents (``delegate_task(background=true)``) run on the
+        Background subagents (``delegate_task(run_in_background=true)``) run on the
         async-delegation daemon executor — they have no per-process watcher
         task, so their completion events would only be seen by the post-turn
         queue drain. This watcher covers the IDLE case: when a background

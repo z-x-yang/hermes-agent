@@ -16,6 +16,18 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_delegation_capacity():
+    from tools.delegation_capacity import _reset_for_tests
+
+    _reset_for_tests()
+    yield
+    _reset_for_tests()
+
+
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
@@ -1960,35 +1972,7 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
         mock_resolve_pool.assert_not_called()
 
     @patch("tools.delegate_tool._load_config", return_value={})
-    def test_build_child_agent_preserves_mcp_toolsets_by_default(self, mock_cfg):
-        parent = _make_mock_parent()
-        parent.enabled_toolsets = ["web", "browser", "mcp-MiniMax"]
-
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-            MockAgent.return_value = mock_child
-
-            _build_child_agent(
-                task_index=0,
-                description="Test narrowed toolsets",
-                prompt=None,
-                toolsets=["web", "browser"],
-                model=None,
-                max_iterations=10,
-                parent_agent=parent,
-                task_count=1,
-            )
-
-        self.assertEqual(
-            MockAgent.call_args[1]["enabled_toolsets"],
-            ["web", "browser", "mcp-MiniMax"],
-        )
-
-    @patch(
-        "tools.delegate_tool._load_config",
-        return_value={"inherit_mcp_toolsets": False},
-    )
-    def test_build_child_agent_strict_intersection_when_opted_out(self, mock_cfg):
+    def test_build_child_agent_uses_strict_toolset_intersection(self, mock_cfg):
         parent = _make_mock_parent()
         parent.enabled_toolsets = ["web", "browser", "mcp-MiniMax"]
 

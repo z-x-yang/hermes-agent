@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import model_tools
 from agent.subagent_tool_policy import (
     ToolAuthorizationError,
     apply_tool_policy_to_agent,
@@ -141,3 +142,10 @@ def test_existing_notion_and_mail_readers_form_the_read_profile_data_plane():
         descriptor = registry.get_entry(name).policy_descriptor
         assert descriptor.effects == frozenset({ToolEffect.UNKNOWN})
         assert descriptor.retention is ResultRetention.DEFAULT
+
+
+def test_data_source_fixture_does_not_rebind_model_tools_registry():
+    import model_tools
+    from tools.registry import registry
+
+    assert model_tools.registry is registry

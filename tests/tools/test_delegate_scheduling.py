@@ -7,6 +7,7 @@ import time
 import pytest
 
 from tools import async_delegation as ad
+from tools import delegation_capacity as dc
 from tools.process_registry import process_registry
 from tools.async_delegation import (
     dispatch_async_delegation_batch,
@@ -18,10 +19,12 @@ from tools.delegate_tool import _resolve_run_in_background
 @pytest.fixture(autouse=True)
 def _clean_async_registry():
     ad._reset_for_tests()
+    dc._reset_for_tests()
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
     yield
     ad._reset_for_tests()
+    dc._reset_for_tests()
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
 
@@ -440,6 +443,216 @@ def test_run_agent_model_dispatch_forwards_static_background_boolean():
     assert "_dispatch_origin" not in captured
 
 
+def test_runner_capacity_rejects_second_batch_without_partial_start(monkeypatch):
+    import tools.delegate_tool as dt
+
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+    first_batch_started = threading.Event()
+    release = threading.Event()
+
+    def run_child(task_index, description, **_kwargs):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if active == 3:
+                first_batch_started.set()
+        try:
+            assert release.wait(3)
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": description,
+            }
+        finally:
+            with lock:
+                active -= 1
+
+    built = _install_fake_delegate_runtime(monkeypatch, run_child)
+    monkeypatch.setattr(
+        dt,
+        "_load_config",
+        lambda: {
+            "max_concurrent_children": 3,
+            "foreground_wait_timeout_seconds": 60,
+            "child_run_timeout_seconds": 60,
+        },
+    )
+    tasks = [
+        {"description": f"task-{index}", "prompt": f"task-{index}"}
+        for index in range(3)
+    ]
+
+    first = json.loads(
+        dt.delegate_task(tasks=tasks, run_in_background=True, parent_agent=_parent())
+    )
+    assert first["status"] == "dispatched"
+    assert first_batch_started.wait(1)
+
+    second = json.loads(
+        dt.delegate_task(tasks=tasks, run_in_background=True, parent_agent=_parent())
+    )
+    try:
+        assert second["status"] == "rejected"
+        assert "runner capacity" in second["error"].lower()
+        assert len(built) == 3
+        assert peak <= 3
+    finally:
+        release.set()
+        with ad._records_lock:
+            futures = [
+                record.get("future")
+                for record in ad._records.values()
+                if record.get("future") is not None
+            ]
+        for future in futures:
+            future.result(timeout=3)
+
+
+def test_prepared_children_are_closed_when_async_dispatch_rejects(monkeypatch):
+    import tools.delegate_tool as dt
+
+    built = _install_fake_delegate_runtime(
+        monkeypatch,
+        lambda task_index, description, **_kwargs: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": description,
+        },
+    )
+    parent = _parent()
+    monkeypatch.setattr(
+        "tools.async_delegation.dispatch_async_delegation_batch",
+        lambda **_kwargs: {"status": "rejected", "error": "pool full"},
+    )
+
+    result = json.loads(
+        dt.delegate_task(
+            description="prepared",
+            prompt="prepared",
+            run_in_background=True,
+            parent_agent=parent,
+        )
+    )
+
+    assert result["status"] == "rejected"
+    assert len(built) == 1
+    built[0].close.assert_called_once_with()
+    assert parent._active_children == []
+
+
+def test_prepared_children_are_closed_when_later_child_build_fails(monkeypatch):
+    import tools.delegate_tool as dt
+    from unittest.mock import MagicMock
+
+    _install_fake_delegate_runtime(
+        monkeypatch,
+        lambda task_index, description, **_kwargs: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": description,
+        },
+    )
+    parent = _parent()
+    first = MagicMock()
+    first._subagent_id = "first"
+    build_count = 0
+
+    def _build(**_kwargs):
+        nonlocal build_count
+        build_count += 1
+        if build_count == 1:
+            parent._active_children.append(first)
+            return first
+        raise RuntimeError("second build failed")
+
+    monkeypatch.setattr(dt, "_build_child_agent", _build)
+
+    with pytest.raises(RuntimeError, match="second build failed"):
+        dt.delegate_task(
+            tasks=[
+                {"description": "first", "prompt": "first"},
+                {"description": "second", "prompt": "second"},
+            ],
+            run_in_background=True,
+            parent_agent=parent,
+        )
+
+    first.close.assert_called_once_with()
+    assert parent._active_children == []
+    assert dc.active_runner_slots() == 0
+
+
+def test_runner_reservation_released_when_async_registry_raises(monkeypatch):
+    import tools.delegate_tool as dt
+
+    _install_fake_delegate_runtime(
+        monkeypatch,
+        lambda task_index, description, **_kwargs: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": description,
+        },
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.dispatch_async_delegation_batch",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("registry boom")),
+    )
+
+    result = json.loads(
+        dt.delegate_task(
+            description="first",
+            prompt="first",
+            run_in_background=True,
+            parent_agent=_parent(),
+        )
+    )
+
+    assert result["status"] == "rejected"
+    assert "registry boom" in result["error"]
+    assert dc.active_runner_slots() == 0
+
+
+def test_background_dispatch_applies_profile_run_cap(monkeypatch):
+    import tools.delegate_tool as dt
+
+    seen = []
+
+    def run_child(task_index, description, **kwargs):
+        seen.append(kwargs.get("child_timeout_override"))
+        return {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": "done",
+        }
+
+    _install_fake_delegate_runtime(monkeypatch, run_child)
+
+    def fake_dispatch(*, runner, **_kwargs):
+        runner()
+        return {"status": "dispatched", "delegation_id": "d-background-cap"}
+
+    monkeypatch.setattr(
+        "tools.async_delegation.dispatch_async_delegation_batch",
+        fake_dispatch,
+    )
+
+    result = json.loads(
+        dt.delegate_task(
+            description="inspect",
+            prompt="inspect",
+            subagent_type="Explore",
+            run_in_background=True,
+            parent_agent=_parent(),
+        )
+    )
+
+    assert result["status"] == "dispatched"
+    assert seen == [1800]
+
+
 def test_explicit_foreground_quick_completion_returns_inline_with_profile_run_cap(monkeypatch):
     import tools.delegate_tool as dt
 
@@ -486,7 +699,7 @@ def test_foreground_wait_timeout_backgrounds_same_delegation_then_delivers_once(
         dt,
         "_load_config",
         lambda: {
-            "foreground_wait_timeout_seconds": 0,
+            "foreground_wait_timeout_seconds": 1,
             "child_run_timeout_seconds": 321,
         },
     )
@@ -637,7 +850,7 @@ def test_legacy_model_auto_dispatches_background(monkeypatch):
     gate = threading.Event()
 
     def run_child(task_index, description, **kwargs):
-        assert kwargs["child_timeout_override"] is None
+        assert kwargs["child_timeout_override"] == 7200
         gate.wait(timeout=2)
         return {"task_index": task_index, "status": "completed", "summary": "model bg"}
 
@@ -707,7 +920,7 @@ def test_foreground_on_stateless_endpoint_returns_completed_result_not_handle(mo
     monkeypatch.setattr(
         dt,
         "_load_config",
-        lambda: {"foreground_wait_timeout_seconds": 0},
+        lambda: {"foreground_wait_timeout_seconds": 1},
     )
 
     result = json.loads(
@@ -765,7 +978,7 @@ def test_async_pool_rejection_does_not_run_extra_child_inline(monkeypatch):
     assert parent._active_children == []
 
 
-def test_pure_background_keeps_historical_no_blanket_run_cap(monkeypatch):
+def test_pure_background_uses_general_purpose_profile_run_cap(monkeypatch):
     import tools.delegate_tool as dt
 
     gate = threading.Event()
@@ -785,7 +998,7 @@ def test_pure_background_keeps_historical_no_blanket_run_cap(monkeypatch):
     event = process_registry.completion_queue.get(timeout=2)
 
     assert event["results"][0]["summary"] == "done"
-    assert seen == [(True, None)]
+    assert seen == [(True, 7200)]
 
 
 def test_mixed_explicit_foreground_batch_uses_each_profile_run_cap(monkeypatch):

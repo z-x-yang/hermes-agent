@@ -99,6 +99,10 @@ class TestToolsetIntersection:
         parent._active_children_lock = None
         child = MagicMock()
         child.valid_tool_names = {"read_file", "write_file"}
+        child.tools = [
+            {"type": "function", "function": {"name": name, "parameters": {}}}
+            for name in sorted(child.valid_tool_names)
+        ]
         _set_authority(parent, parent.valid_tool_names)
         _set_authority(child, child.valid_tool_names)
 
@@ -131,6 +135,10 @@ class TestToolsetIntersection:
         parent._active_children_lock = None
         child = MagicMock()
         child.valid_tool_names = {"read_file", "delegate_task"}
+        child.tools = [
+            {"type": "function", "function": {"name": name, "parameters": {}}}
+            for name in sorted(child.valid_tool_names)
+        ]
         _set_authority(parent, parent.valid_tool_names)
         _set_authority(child, child.valid_tool_names)
         monkeypatch.setattr(dt, "_get_orchestrator_enabled", lambda: True)
@@ -180,6 +188,10 @@ class TestToolsetIntersection:
                 "delegate_continue",
                 "clarify",
             }
+            child.tools = [
+                {"type": "function", "function": {"name": name, "parameters": {}}}
+                for name in sorted(child.valid_tool_names)
+            ]
             _set_authority(parent, parent.valid_tool_names)
             _set_authority(child, child.valid_tool_names)
             monkeypatch.setattr(

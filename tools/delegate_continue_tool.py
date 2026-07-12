@@ -119,6 +119,7 @@ def _build_continuation_child(
 
     from tools.delegate_tool import (
         _build_child_agent,
+        _delegation_transport_identity,
         _load_config,
         _prepare_delegation_credentials_config,
         _resolve_delegation_credentials,
@@ -153,13 +154,54 @@ def _build_continuation_child(
 
     parent_provider = str(getattr(parent_agent, "provider", "") or "")
     record_provider = str(record.provider or "")
+    retained_transport_identity = str(
+        getattr(record, "transport_identity", "") or ""
+    ).strip()
     child_cfg = _prepare_delegation_credentials_config(
         cfg,
         model=record.model or resolved_profile.model,
         provider=record_provider or resolved_profile.provider,
-        provider_changed=bool(record_provider and record_provider != parent_provider),
+        provider_changed=bool(
+            record_provider
+            and record_provider != parent_provider
+            and not retained_transport_identity
+        ),
     )
-    if record_provider and record_provider != parent_provider:
+    parent_transport_identity = _delegation_transport_identity(
+        provider=parent_provider,
+        base_url=getattr(parent_agent, "base_url", None),
+        api_mode=getattr(parent_agent, "api_mode", None),
+        command=getattr(parent_agent, "acp_command", None),
+        args=getattr(parent_agent, "acp_args", None),
+    )
+    if (
+        retained_transport_identity
+        and record_provider == parent_provider
+        and retained_transport_identity == parent_transport_identity
+    ):
+        creds = {
+            "model": child_cfg.get("model"),
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "command": None,
+            "args": [],
+        }
+    elif retained_transport_identity:
+        creds = _resolve_delegation_credentials(child_cfg, parent_agent)
+        current_transport_identity = _delegation_transport_identity(
+            provider=creds.get("provider") or record_provider,
+            base_url=creds.get("base_url"),
+            api_mode=creds.get("api_mode"),
+            command=creds.get("command"),
+            args=creds.get("args"),
+        )
+        if current_transport_identity != retained_transport_identity:
+            raise ValueError(
+                "Retained subagent transport changed; refusing continuation."
+            )
+    elif record_provider and record_provider != parent_provider:
         creds = _resolve_delegation_credentials(child_cfg, parent_agent)
     else:
         # Same provider as the live parent: inherit current trusted credentials
@@ -358,9 +400,23 @@ def _run_continuation_entry(
                     timeout_entry["note"] = reason
                 return timeout_entry
             assert result is not None
+        result_dict = result if isinstance(result, dict) else {}
+        summary = result_dict.get("final_response") or ""
+        completed = result_dict.get("completed") is True
+        failed = bool(result_dict.get("failed"))
+        interrupted = bool(result_dict.get("interrupted"))
+        if interrupted:
+            status = "interrupted"
+        elif failed:
+            status = "failed"
+        elif completed and summary:
+            status = "completed"
+        else:
+            status = "failed"
+
         retention_drop_reason = None
-        messages = result.get("messages") if isinstance(result, dict) else None
-        if isinstance(messages, list):
+        messages = result_dict.get("messages")
+        if completed and status == "completed" and isinstance(messages, list):
             from tools.delegate_tool import _get_max_retained_subagent_bytes
             from tools.tool_result_storage import project_messages_for_retention
 
@@ -381,20 +437,18 @@ def _run_continuation_entry(
                 )
             except RetainedClaimCancelled:
                 retention_drop_reason = None
-        summary = (result or {}).get("final_response") or ""
-        status = "completed" if summary else "failed"
         entry: dict[str, Any] = {
             "status": status,
             "agent_id": record.agent_id,
             "summary": summary,
-            "api_calls": (result or {}).get("api_calls", 0),
+            "api_calls": result_dict.get("api_calls", 0),
             "duration_seconds": round(time.monotonic() - start, 2),
             "model": getattr(child, "model", record.model),
             "provider": getattr(child, "provider", record.provider),
             "subagent_type": record.subagent_type,
         }
         if status != "completed":
-            entry["error"] = (result or {}).get("error") or "Subagent did not produce a response."
+            entry["error"] = result_dict.get("error") or "Subagent did not produce a response."
         if retention_drop_reason is not None:
             entry["retention_dropped"] = True
             entry["note"] = retention_drop_reason
@@ -489,22 +543,46 @@ def delegate_continue(
 
     from tools.delegate_tool import (
         _get_max_async_children,
+        _get_max_concurrent_children,
         _load_config,
         _resolve_foreground_timeouts,
     )
 
     foreground_wait_timeout_seconds: Optional[float] = None
     child_run_timeout_seconds: Optional[float] = None
-    if delivery_mode == "foreground":
-        try:
-            cfg = _load_config()
-            (
-                foreground_wait_timeout_seconds,
-                child_run_timeout_seconds,
-            ) = _resolve_foreground_timeouts(record.subagent_type, cfg)
-        except Exception as exc:
-            release_retained_subagent_session(agent_id)
-            return _tool_error(f"Cannot resolve continuation timeouts: {exc}")
+    try:
+        cfg = _load_config()
+        (
+            resolved_wait_timeout_seconds,
+            child_run_timeout_seconds,
+        ) = _resolve_foreground_timeouts(record.subagent_type, cfg)
+        if delivery_mode == "foreground":
+            foreground_wait_timeout_seconds = resolved_wait_timeout_seconds
+    except Exception as exc:
+        release_retained_subagent_session(agent_id)
+        return _tool_error(f"Cannot resolve continuation timeouts: {exc}")
+
+    from tools.delegation_capacity import try_reserve_runner_slots
+
+    runner_limit = _get_max_concurrent_children()
+    runner_reservation = try_reserve_runner_slots(
+        1,
+        limit=runner_limit,
+    )
+    if runner_reservation is None:
+        release_retained_subagent_session(agent_id)
+        return json.dumps(
+            {
+                "status": "rejected",
+                "mode": delivery_mode,
+                "agent_id": record.agent_id,
+                "error": (
+                    "Subagent runner capacity reached: continuation would exceed "
+                    f"max_concurrent_children={runner_limit}."
+                ),
+            },
+            ensure_ascii=False,
+        )
 
     start = time.monotonic()
     interrupt_bridge = _ContinuationInterruptBridge()
@@ -525,6 +603,7 @@ def delegate_continue(
             )
             return _combined_for_async(entry)
         finally:
+            runner_reservation.release()
             release_retained_subagent_session(agent_id)
 
     def _sync_runner() -> dict[str, Any]:
@@ -573,10 +652,12 @@ def delegate_continue(
             ),
         )
     except Exception as exc:
+        runner_reservation.release()
         release_retained_subagent_session(agent_id)
         return _tool_error(f"Failed to dispatch retained subagent continuation: {exc}")
 
     if dispatch.get("status") != "dispatched":
+        runner_reservation.release()
         release_retained_subagent_session(agent_id)
         return json.dumps(
             {

@@ -29,7 +29,8 @@ def test_omitted_type_resolves_to_general_purpose():
 def test_builtin_profile_round_trip(name):
     profile = get_subagent_profile(name)
     assert profile.name == name
-    assert profile.model == "inherit"
+    assert not hasattr(profile, "model")
+    assert not hasattr(profile, "provider")
 
 
 def test_profiles_use_claude_like_type_specific_final_guidance():
@@ -42,6 +43,8 @@ def test_profiles_use_claude_like_type_specific_final_guidance():
         assert "files_changed" not in prompt
         assert "side_effects" not in prompt
     assert "clearly and concisely" in explore
+    assert "mcp_notion_ai_notion_ai_ask" in explore
+    assert "call notion_ai_ask" not in explore
     assert "absolute file paths" in explore
     assert "### Critical Files for Implementation" in plan
     assert "3-5" in plan
@@ -155,7 +158,10 @@ def test_explore_materializes_readonly_aliases_from_raw_parent_authority(monkeyp
 
     import tools.skills_tool  # noqa: F401 — register aliases
     import tools.web_tools  # noqa: F401 — register aliases
-    from agent.subagent_tool_policy import build_child_tool_policy
+    from agent.subagent_tool_policy import (
+        apply_tool_policy_to_agent,
+        build_child_tool_policy,
+    )
     from tools.registry import registry
     from tools.tool_effects import build_authority_snapshot
 
@@ -189,7 +195,22 @@ def test_explore_materializes_readonly_aliases_from_raw_parent_authority(monkeyp
         _parent_tool_authority_snapshot=build_authority_snapshot(
             alias_ids,
             registry_generation=registry._generation,
-        )
+        ),
+        # Simulate Tool Search having hidden the aliases from the model-visible
+        # surface while the same-generation raw surface still contains them.
+        tools=[],
+        valid_tool_names=set(),
+        _resolved_tool_definitions=[
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for name in sorted(alias_names)
+        ],
     )
     profile_allowed_names = get_subagent_profile("Explore").allowed_tool_names
     assert profile_allowed_names is not None
@@ -205,6 +226,9 @@ def test_explore_materializes_readonly_aliases_from_raw_parent_authority(monkeyp
     assert alias_names.issubset(policy.allowed_names)
     assert policy.allowed_names.isdisjoint(raw_names)
 
+    apply_tool_policy_to_agent(child, policy)
+    assert alias_names.issubset(child.valid_tool_names)
+
 
 def test_general_purpose_truthfully_describes_raw_shell_external_effect_capability():
     profile = get_subagent_profile("general-purpose")
@@ -215,6 +239,25 @@ def test_general_purpose_truthfully_describes_raw_shell_external_effect_capabili
     )
     assert "not a no-side-effect sandbox" in profile.system_instructions
     assert "normal tool and terminal approvals" in profile.system_instructions
+    assert "repo-local actions and tests" not in profile.system_instructions
+    assert "appropriate actions and verification" in profile.system_instructions
+
+
+def test_restricted_profile_prompts_name_their_web_read_tools():
+    for name in ("Explore", "Plan"):
+        prompt = get_subagent_profile(name).system_instructions
+        assert "web_search_readonly" in prompt
+        assert "web_extract_readonly" in prompt
+
+
+def test_model_facing_schema_consumes_canonical_profile_descriptions():
+    from tools.delegate_tool import _SUBAGENT_TYPE_SCHEMA
+
+    description = _SUBAGENT_TYPE_SCHEMA["description"]
+    for name in SUPPORTED_SUBAGENT_TYPES:
+        profile = get_subagent_profile(name)
+        assert name in description
+        assert profile.description in description
 
 
 def test_delegation_docs_match_simplified_contract():
@@ -238,6 +281,8 @@ def test_delegation_docs_match_simplified_contract():
         root
         / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/skills/bundled/autonomous-ai-agents"
         / "autonomous-ai-agents-hermes-agent.md",
+        root / "AGENTS.md",
+        root / "skills/autonomous-ai-agents/hermes-agent/SKILL.md",
     ]
     required_claims = (
         "description",
@@ -268,6 +313,7 @@ def test_delegation_docs_match_simplified_contract():
         "project context",
         "complete governance",
         "runtime-derived",
+        "including work dispatched directly to background",
     )
     zh_semantic_claims = (
         "一个 batch handle",
@@ -277,6 +323,7 @@ def test_delegation_docs_match_simplified_contract():
         "项目上下文",
         "完整 governance",
         "运行时派生",
+        "包括直接在后台启动的工作",
     )
     en_text = feature_docs[0].read_text(encoding="utf-8")
     zh_text = feature_docs[1].read_text(encoding="utf-8")
@@ -289,6 +336,37 @@ def test_delegation_docs_match_simplified_contract():
         assert "exact current-parent tool authority" in text or (
             "current parent 精确工具权限" in text
         )
+
+
+def test_bundled_hermes_skill_uses_current_delegation_contract():
+    root = Path(__file__).resolve().parents[2]
+    path = root / "skills/autonomous-ai-agents/hermes-agent/SKILL.md"
+    text = path.read_text(encoding="utf-8")
+    delegation = text.split("### Delegation (`delegate_task`)", 1)[1].split(
+        "### Cron (scheduled jobs)", 1
+    )[0]
+
+    for required in (
+        "description",
+        "prompt",
+        "tasks",
+        "subagent_type",
+        "run_in_background",
+        "delegate_continue",
+        "Explore",
+        "Plan",
+        "general-purpose",
+        "runtime-derived",
+    ):
+        assert required in delegation
+    for stale in (
+        "delegate_task(goal, context)",
+        "{goal,",
+        "delegate_task(background=true)",
+        "`leaf`",
+        "`orchestrator`",
+    ):
+        assert stale not in delegation
 
 
 def test_unknown_profile_fails_closed():
@@ -340,3 +418,58 @@ def test_foreground_wait_timeout_is_clamped_by_positive_maximum():
         },
     )
     assert resolved.foreground_wait_timeout_seconds == 4000
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("foreground_wait_timeout_seconds", True),
+        ("foreground_wait_timeout_seconds", "oops"),
+        ("foreground_wait_timeout_seconds", 0),
+        ("foreground_wait_timeout_seconds", -5),
+        ("child_run_timeout_seconds", False),
+        ("child_run_timeout_seconds", "oops"),
+        ("child_run_timeout_seconds", 0),
+        ("child_run_timeout_seconds", -5),
+        ("max_foreground_wait_timeout_seconds", True),
+        ("max_foreground_wait_timeout_seconds", "oops"),
+        ("max_foreground_wait_timeout_seconds", 0),
+        ("max_foreground_wait_timeout_seconds", -5),
+    ],
+)
+def test_profile_timeout_config_rejects_invalid_positive_integers(key, value):
+    with pytest.raises(ValueError, match=key):
+        resolve_profile_config("Explore", {key: value})
+
+
+def test_per_agent_timeout_config_rejects_invalid_positive_integer():
+    with pytest.raises(ValueError, match="agents.Explore.child_run_timeout_seconds"):
+        resolve_profile_config(
+            "Explore",
+            {"agents": {"Explore": {"child_run_timeout_seconds": "oops"}}},
+        )
+
+
+def test_public_delegation_config_has_no_dead_mcp_inheritance_switch():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert "inherit_mcp_toolsets" not in DEFAULT_CONFIG["delegation"]
+
+
+def test_skills_list_readonly_schema_identity_survives_provider_sanitization():
+    import model_tools
+    from agent.agent_init import _capture_parent_tool_authority
+    from tools.registry import registry
+
+    raw = model_tools.get_tool_definitions(
+        enabled_toolsets=None,
+        disabled_toolsets=None,
+        quiet_mode=True,
+        skip_tool_search_assembly=True,
+    )
+    snapshot = _capture_parent_tool_authority(raw, raw, registry=registry)
+    alias_identity = registry.resolved_policy_identity("skills_list_readonly")
+    source_identity = registry.resolved_policy_identity("skills_list")
+
+    assert alias_identity in snapshot.policy_identities
+    assert source_identity in snapshot.policy_identities

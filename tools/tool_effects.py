@@ -74,15 +74,37 @@ def _sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
+def _normalize_schema_for_identity(value: Any) -> Any:
+    """Remove provider-sanitized, semantically inert schema syntax.
+
+    Tool schemas with no required properties may express that as either an
+    absent ``required`` key or ``required: []``. Provider sanitization removes
+    the empty form before the model sees it, so policy identity must treat the
+    two representations as equivalent while preserving every non-empty
+    requirement and all other schema content.
+    """
+    if isinstance(value, Mapping):
+        return {
+            key: _normalize_schema_for_identity(item)
+            for key, item in value.items()
+            if not (key == "required" and item == [])
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalize_schema_for_identity(item) for item in value]
+    return value
+
+
 def schema_digest(schema: Mapping[str, Any]) -> str:
-    """Return the SHA-256 of compact, sorted-key UTF-8 JSON.
+    """Return the SHA-256 of normalized compact, sorted-key UTF-8 JSON.
 
     ``default=str`` is deliberately forbidden: malformed schemas must fail
     registration instead of silently acquiring a misleading identity.
     """
     if not isinstance(schema, Mapping):
         raise TypeError("tool schema must be a mapping")
-    return hashlib.sha256(_canonical_json(schema)).hexdigest()
+    return hashlib.sha256(
+        _canonical_json(_normalize_schema_for_identity(schema))
+    ).hexdigest()
 
 
 def _callable_parts(fn: Callable[..., Any], *, role: str) -> tuple[str, str]:

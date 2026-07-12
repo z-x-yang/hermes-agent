@@ -2,7 +2,7 @@
 """
 Async (background) delegation registry.
 
-Backs ``delegate_task(background=true)``: the parent agent dispatches a
+Backs ``delegate_task(run_in_background=true)``: the parent agent dispatches a
 subagent that runs on a module-level daemon executor and returns a handle
 immediately, so the user and the model can keep working while the child runs.
 

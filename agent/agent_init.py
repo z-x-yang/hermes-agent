@@ -1133,6 +1133,10 @@ def init_agent(
         raise RuntimeError(
             "tool registry changed while capturing parent authority snapshot"
         )
+    # Keep the exact same-generation unassembled surface alongside the
+    # model-visible Tool Search surface. Restricted subagent profiles filter
+    # this frozen source so deferred-but-authorized tools remain visible.
+    agent._resolved_tool_definitions = tuple(_resolved_parent_tools)
     agent._tool_snapshot_generation = (
         agent._parent_tool_authority_snapshot.registry_generation
     )

@@ -114,7 +114,7 @@ def test_bg_work_blocks_idle_via_background_tasks(monkeypatch):
 
 
 def test_bg_work_blocks_idle_via_async_delegation(monkeypatch):
-    """delegate_task(background=true) lives in tools.async_delegation, not the
+    """delegate_task(run_in_background=true) lives in tools.async_delegation, not the
     process registry. An active background delegation must block suspend too."""
     r = GatewayRunner.__new__(GatewayRunner)
     r._background_tasks = set()

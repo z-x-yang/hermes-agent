@@ -2137,12 +2137,6 @@ DEFAULT_CONFIG = {
                            # "codex_responses", or "anthropic_messages". Empty = auto-detect
                            # from URL (e.g. /anthropic suffix → anthropic_messages). Set this
                            # explicitly for non-standard endpoints the heuristic can't detect.
-        # When delegate_task narrows child toolsets explicitly, preserve any
-        # MCP toolsets the parent already has enabled. On by default so
-        # narrowing (e.g. toolsets=["web","browser"]) expresses "I want these
-        # extras" without silently stripping MCP tools the parent already has.
-        # Set to false for strict intersection.
-        "inherit_mcp_toolsets": True,
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch
@@ -2168,16 +2162,18 @@ DEFAULT_CONFIG = {
                                      # (floor 30s) to enforce a hard cap.
         "reasoning_effort": "",  # subagent effort: "max", "xhigh", "high", "medium",
                                  # "low", "minimal", "none" (empty = inherit parent)
-        "max_concurrent_children": 3,  # unified concurrency cap: max parallel children per batch
-                                       # AND max concurrent background (background=true)
-                                       # delegation units. New async dispatches beyond the cap
-                                       # fall back to synchronous execution. Floor of 1, no ceiling.
+        "max_concurrent_children": 3,  # unified cap for all live child runners across
+                                       # foreground, background, Batch, continuation,
+                                       # and nested paths. Async saturation is rejected;
+                                       # it never falls back to uncounted sync execution.
+                                       # Floor of 1, no ceiling.
                                        # (Replaces the deprecated max_async_children.)
-        # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
-        # and _get_orchestrator_enabled).  Floored at 1, no upper ceiling —
-        # raise deliberately, each level multiplies API cost.
-        "max_spawn_depth": 1,        # depth (1 = flat [default], 2 = orchestrator→leaf, 3+ = deeper)
-        "orchestrator_enabled": True,  # kill switch for role="orchestrator"
+        # Runtime-derived nested-delegation controls (see
+        # tools/delegate_tool.py:_get_max_spawn_depth and
+        # _get_orchestrator_enabled). Floored at 1, no upper ceiling — raise
+        # deliberately because each level multiplies API cost.
+        "max_spawn_depth": 1,        # 1 = flat default; 2+ permits bounded GP nesting
+        "orchestrator_enabled": True,  # legacy-named global nesting kill switch
         # Aggregate UTF-8 JSON byte budget for process-local retained transcripts.
         # Operator-only: intentionally absent from model-facing delegation schemas.
         "max_retained_subagent_bytes": 16777216,
