@@ -11,18 +11,24 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import stat
 import threading
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-from state_db_fts import create_fts_v2, detect_fts_schema, integrity_check_fts_v2
+from state_db_fts import (
+    create_fts_v2,
+    detect_fts_schema,
+    integrity_check_fts_v2,
+    rebuild_fts,
+)
 from state_db_maintenance import (
     TERMINAL_PHASES,
     JournalPhase,
@@ -50,6 +56,22 @@ _PAYLOAD_FIELDS = (
     "codex_message_items",
 )
 
+CONTROLLED_PAIRED_CORPUS_VERSION = "hermes-state-fts-controlled-v1"
+_CONTROLLED_DIR_NAME = "controlled-paired-verification"
+_CONTROLLED_TERMS = {
+    "english": "cpx9d7b4e2a61f38",
+    "unicode": "cafécpx7a91d5e3b62",
+    "user_cjk": "受控检索甲辰玖",
+    "assistant_cjk": "受控检索乙巳捌",
+    "tool_calls_cjk": "受控检索丙午柒",
+    "tool_mixed_like": "cpx5e81a2d9f工具",
+    "tool_cjk_like": "验具",
+    "short_cjk": "短验",
+    "source": "cpx4c7e19a6b35d",
+    "visibility": "cpx8a2f6d1e94b7",
+    "lineage": "cpx3b9e71d5a26f",
+}
+
 
 @dataclass(frozen=True)
 class MigrationPlan:
@@ -69,6 +91,7 @@ class MigrationPlan:
     maintenance_status: str
     can_apply: bool
     reasons: tuple[str, ...]
+    paired_corpus_version: str = CONTROLLED_PAIRED_CORPUS_VERSION
 
 
 @dataclass(frozen=True)
@@ -177,6 +200,34 @@ class VerificationReport:
     latency: tuple[LatencyReport, ...]
     ordering_difference_policy: str = "bm25_corpus_statistics_only"
     eligible_for_live_swap: bool = False
+
+
+@dataclass(frozen=True)
+class ControlledVerificationResult:
+    """Aggregate-only controlled verification authority for the apply state machine."""
+
+    paired_corpus_version: str
+    verification: VerificationReport
+
+
+def controlled_paired_corpus() -> tuple[SearchCase, ...]:
+    """Return the versioned private corpus used only on controlled disposable rows."""
+    terms = _CONTROLLED_TERMS
+    return (
+        SearchCase("english", "english", terms["english"]),
+        SearchCase("english-unicode", "english", terms["unicode"]),
+        SearchCase("default-user-cjk", "default_cjk", terms["user_cjk"], role_filter=("user", "assistant")),
+        SearchCase("default-assistant-cjk", "default_cjk", terms["assistant_cjk"], role_filter=("user", "assistant")),
+        SearchCase("assistant-toolcalls-cjk", "default_cjk", terms["tool_calls_cjk"], role_filter=("user", "assistant")),
+        SearchCase("explicit-tool-english-like", "tool_cjk", terms["tool_mixed_like"], role_filter=("tool",)),
+        SearchCase("explicit-tool-cjk-like", "tool_cjk", terms["tool_cjk_like"], role_filter=("tool",)),
+        SearchCase("short-cjk", "default_cjk", terms["short_cjk"], role_filter=("user", "assistant")),
+        SearchCase("source-include", "english", terms["source"], source_filter=("hermes-controlled-include",)),
+        SearchCase("source-exclude", "english", terms["source"], exclude_sources=("hermes-controlled-exclude",)),
+        SearchCase("active-compacted", "english", terms["visibility"]),
+        SearchCase("include-inactive", "english", terms["visibility"], include_inactive=True),
+        SearchCase("lineage-dedupe", "english", terms["lineage"]),
+    )
 
 
 _FTS_TABLE_NAMES = frozenset(
@@ -764,6 +815,262 @@ def verify_v2_candidate(
         cases=tuple(case_reports),
         latency=tuple(latency),
     )
+
+
+@dataclass(frozen=True)
+class _OriginalInvariant:
+    sha256: str
+    truth_digest: str
+    inventory: dict[str, Any]
+
+
+def _snapshot_original(path: Path) -> _OriginalInvariant:
+    conn = _open_read_only(path)
+    try:
+        truth = _source_truth_digest(conn)
+    finally:
+        conn.close()
+    return _OriginalInvariant(
+        sha256=_sha256_file(path),
+        truth_digest=truth,
+        inventory=state_db_file_inventory(path),
+    )
+
+
+def _assert_original_unchanged(path: Path, expected: _OriginalInvariant) -> None:
+    if _snapshot_original(path) != expected:
+        raise RuntimeError("original verification database changed")
+
+
+def _prepare_controlled_dir(work_dir: Path) -> tuple[Path, Path, Path]:
+    raw = Path(work_dir).expanduser()
+    try:
+        info = raw.lstat()
+    except FileNotFoundError as exc:
+        raise ValueError("controlled verification work_dir must already exist") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ValueError("controlled verification work_dir must be a real directory")
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        raise PermissionError("controlled verification work_dir must have mode 0700")
+    root = raw.resolve(strict=True)
+    owned = root / _CONTROLLED_DIR_NAME
+    try:
+        owned.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise FileExistsError("controlled verification path already exists")
+    owned.mkdir(mode=0o700)
+    os.chmod(owned, 0o700)
+    source_copy = owned / "source.db"
+    candidate_copy = owned / "candidate.db"
+    return owned, source_copy, candidate_copy
+
+
+def _backup_to_private_copy(source: Path, destination: Path) -> None:
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError("controlled verification copy path already exists")
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    source_conn = _open_read_only(source)
+    destination_conn = sqlite3.connect(destination)
+    try:
+        source_conn.backup(destination_conn)
+    finally:
+        destination_conn.close()
+        source_conn.close()
+    os.chmod(destination, 0o600)
+
+
+def _insert_controlled_rows(
+    source_copy: Path,
+    candidate_copy: Path,
+    session_ids: tuple[str, str, str],
+) -> None:
+    connections = [sqlite3.connect(source_copy), sqlite3.connect(candidate_copy)]
+    try:
+        schemas = [detect_fts_schema(conn) for conn in connections]
+        if schemas != ["v1_inline", "v2_external"]:
+            raise RuntimeError("controlled copies do not have the required v1/v2 schemas")
+        required_sessions = {
+            "id", "source", "model", "started_at", "ended_at", "archived", "parent_session_id"
+        }
+        required_messages = {
+            "id", "session_id", "role", "content", "tool_call_id", "tool_calls",
+            "tool_name", "timestamp", "active", "compacted"
+        }
+        for conn in connections:
+            if not required_sessions.issubset(_columns(conn, "sessions")):
+                raise RuntimeError("sessions schema cannot host controlled verification rows")
+            if not required_messages.issubset(_columns(conn, "messages")):
+                raise RuntimeError("messages schema cannot host controlled verification rows")
+            projection = (
+                "coalesce(content,'') || ' ' || coalesce(tool_name,'') || ' ' || "
+                "coalesce(tool_calls,'')"
+            )
+            if any(
+                conn.execute(
+                    f"SELECT 1 FROM messages WHERE instr({projection}, ?) > 0 LIMIT 1",
+                    (term,),
+                ).fetchone()
+                is not None
+                for term in _CONTROLLED_TERMS.values()
+            ):
+                raise RuntimeError("controlled verification term collides with existing data")
+            if any(
+                conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone()
+                is not None
+                for session_id in session_ids
+            ):
+                raise RuntimeError("controlled verification session ID collision")
+        next_ids = [
+            int(conn.execute("SELECT coalesce(max(id),0) FROM messages").fetchone()[0]) + 1
+            for conn in connections
+        ]
+        if next_ids[0] != next_ids[1]:
+            raise RuntimeError("controlled copies do not share an aligned message ID space")
+        base_id = next_ids[0]
+        parent_id, child_id, excluded_id = session_ids
+        session_rows = (
+            (parent_id, "hermes-controlled-include", "controlled", 1.0, None, 0, None),
+            (child_id, "hermes-controlled-include", "controlled", 2.0, None, 0, parent_id),
+            (excluded_id, "hermes-controlled-exclude", "controlled", 3.0, None, 0, None),
+        )
+        terms = _CONTROLLED_TERMS
+        message_rows = (
+            (base_id, parent_id, "user", terms["english"], None, None, None, 10.0, 1, 0),
+            (base_id + 1, parent_id, "assistant", terms["unicode"], None, None, None, 11.0, 1, 0),
+            (base_id + 2, parent_id, "user", terms["user_cjk"], None, None, None, 12.0, 1, 0),
+            (base_id + 3, parent_id, "assistant", terms["assistant_cjk"], None, None, None, 13.0, 1, 0),
+            (base_id + 4, parent_id, "assistant", "", None, json.dumps({"name": terms["tool_calls_cjk"]}, ensure_ascii=False), None, 14.0, 1, 0),
+            (base_id + 5, parent_id, "tool", terms["tool_mixed_like"], "controlled-call-1", None, "terminal", 15.0, 1, 0),
+            (base_id + 6, parent_id, "tool", terms["tool_cjk_like"], "controlled-call-2", None, "terminal", 16.0, 1, 0),
+            (base_id + 7, parent_id, "user", terms["short_cjk"], None, None, None, 17.0, 1, 0),
+            (base_id + 8, parent_id, "user", terms["source"], None, None, None, 18.0, 1, 0),
+            (base_id + 9, excluded_id, "user", terms["source"], None, None, None, 19.0, 1, 0),
+            (base_id + 10, parent_id, "user", terms["visibility"], None, None, None, 20.0, 1, 0),
+            (base_id + 11, parent_id, "assistant", terms["visibility"], None, None, None, 21.0, 0, 1),
+            (base_id + 12, parent_id, "user", terms["visibility"], None, None, None, 22.0, 0, 0),
+            (base_id + 13, parent_id, "user", terms["lineage"], None, None, None, 23.0, 1, 0),
+            (base_id + 14, child_id, "assistant", terms["lineage"], None, None, None, 24.0, 1, 0),
+        )
+        for conn, schema in zip(connections, schemas):
+            conn.executemany(
+                "INSERT INTO sessions(id,source,model,started_at,ended_at,archived,parent_session_id) "
+                "VALUES(?,?,?,?,?,?,?)",
+                session_rows,
+            )
+            conn.executemany(
+                "INSERT INTO messages(id,session_id,role,content,tool_call_id,tool_calls,"
+                "tool_name,timestamp,active,compacted) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                message_rows,
+            )
+            if schema == "v1_inline":
+                rebuild_fts(conn, "v1_inline")
+            else:
+                rebuild_fts(conn, "v2_external")
+            conn.commit()
+    except BaseException:
+        for conn in connections:
+            conn.rollback()
+        raise
+    finally:
+        for conn in connections:
+            conn.close()
+
+
+def _controlled_semantics_passed(report: VerificationReport) -> bool:
+    cases = {case.case_id: case for case in report.cases}
+    expected_ids = {case.case_id for case in controlled_paired_corpus()}
+    if set(cases) != expected_ids:
+        return False
+    if any(
+        case.source_match_count <= 0 or case.candidate_match_count <= 0
+        for case in cases.values()
+    ):
+        return False
+    exact_counts = {
+        "source-include": 1,
+        "source-exclude": 1,
+        "active-compacted": 2,
+        "include-inactive": 3,
+        "lineage-dedupe": 2,
+    }
+    if any(
+        cases[case_id].source_match_count != count
+        or cases[case_id].candidate_match_count != count
+        for case_id, count in exact_counts.items()
+    ):
+        return False
+    lineage = cases["lineage-dedupe"]
+    return (
+        lineage.source_lineage_dedup_count == 1
+        and lineage.candidate_lineage_dedup_count == 1
+    )
+
+
+def _cleanup_controlled_dir(owned: Path) -> None:
+    allowed = {
+        "source.db", "source.db-journal", "source.db-wal", "source.db-shm",
+        "candidate.db", "candidate.db-journal", "candidate.db-wal", "candidate.db-shm",
+    }
+    entries = list(os.scandir(owned))
+    unexpected = [entry.name for entry in entries if entry.name not in allowed]
+    if unexpected:
+        raise RuntimeError("controlled verification directory contains unexpected paths")
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+            raise RuntimeError("controlled verification cleanup encountered unsafe path")
+        os.unlink(entry.path)
+    owned.rmdir()
+
+
+def verify_v2_candidate_with_controlled_corpus(
+    source_copy: Path,
+    candidate: Path,
+    work_dir: Path,
+) -> ControlledVerificationResult:
+    """Verify paired behavior on synthetic disposable copies without touching originals."""
+    source_path = Path(source_copy).expanduser()
+    candidate_path = Path(candidate).expanduser()
+    if source_path.is_symlink() or candidate_path.is_symlink():
+        raise ValueError("controlled verification inputs must not be symlinks")
+    source_path = source_path.resolve(strict=True)
+    candidate_path = candidate_path.resolve(strict=True)
+    if source_path == candidate_path:
+        raise ValueError("controlled verification inputs must be distinct")
+    if not source_path.is_file() or not candidate_path.is_file():
+        raise ValueError("controlled verification inputs must be regular files")
+    source_before = _snapshot_original(source_path)
+    candidate_before = _snapshot_original(candidate_path)
+    owned, disposable_source, disposable_candidate = _prepare_controlled_dir(work_dir)
+    try:
+        _backup_to_private_copy(source_path, disposable_source)
+        _backup_to_private_copy(candidate_path, disposable_candidate)
+        session_ids = tuple(
+            f"hermes-controlled-{secrets.token_hex(24)}" for _ in range(3)
+        )
+        _insert_controlled_rows(
+            disposable_source,
+            disposable_candidate,
+            (session_ids[0], session_ids[1], session_ids[2]),
+        )
+        corpus = controlled_paired_corpus()
+        report = verify_v2_candidate(disposable_source, disposable_candidate, corpus)
+        if not _controlled_semantics_passed(report):
+            report = replace(
+                report,
+                verification_passed=False,
+                candidate_accepted=False,
+            )
+        return ControlledVerificationResult(
+            paired_corpus_version=CONTROLLED_PAIRED_CORPUS_VERSION,
+            verification=report,
+        )
+    finally:
+        _cleanup_controlled_dir(owned)
+        _assert_original_unchanged(source_path, source_before)
+        _assert_original_unchanged(candidate_path, candidate_before)
 
 
 def _open_read_only(db_path: Path) -> sqlite3.Connection:

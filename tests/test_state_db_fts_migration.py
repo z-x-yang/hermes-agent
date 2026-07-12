@@ -18,13 +18,16 @@ from state_db_maintenance import (
     write_maintenance_journal,
 )
 from state_db_fts_migration import (
+    CONTROLLED_PAIRED_CORPUS_VERSION,
     SearchCase,
     build_v2_candidate,
+    controlled_paired_corpus,
     estimate_payload_retention,
     field_digest,
     plan_fts_migration,
     status_fts_migration,
     verify_v2_candidate,
+    verify_v2_candidate_with_controlled_corpus,
 )
 
 
@@ -168,6 +171,7 @@ def test_plan_status_and_estimator_are_file_schema_meta_data_immutable(tmp_path)
     assert plan.session_deletion_candidates == 0
     assert plan.maintenance_status == "malformed"
     assert plan.writer_status == "not_probed_read_only"
+    assert plan.paired_corpus_version == CONTROLLED_PAIRED_CORPUS_VERSION
 
     assert dict(plan.fts_object_bytes) == expected_fts_bytes
 
@@ -574,3 +578,149 @@ def test_paired_search_rejects_marker_two_candidate_with_changed_base_fields(tmp
     assert not report.eligible_for_live_swap
     assert "private mutated payload" not in repr(report)
     assert "private mutated payload" not in json.dumps(asdict(report), sort_keys=True)
+
+
+def _built_candidate(tmp_path: Path) -> tuple[Path, Path, Path]:
+    source = tmp_path / "source" / "state.db"
+    source.parent.mkdir()
+    _candidate_fixture(source)
+    journal, permit = _candidate_access(source)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(mode=0o700)
+    build_v2_candidate(source, work_dir, journal, permit)
+    return source, work_dir / "candidate-build" / "candidate.db", work_dir
+
+
+def test_controlled_provider_exercises_all_required_semantics_without_mutating_originals(
+    tmp_path,
+):
+    source, candidate, work_dir = _built_candidate(tmp_path)
+    source_before = _db_digest(source)
+    candidate_before = _db_digest(candidate)
+    source_inventory = state_db_file_inventory(source)
+    candidate_inventory = state_db_file_inventory(candidate)
+
+    corpus = controlled_paired_corpus()
+    result = verify_v2_candidate_with_controlled_corpus(source, candidate, work_dir)
+
+    assert corpus
+    assert result.paired_corpus_version == CONTROLLED_PAIRED_CORPUS_VERSION
+    assert result.verification.verification_passed
+    assert result.verification.candidate_accepted
+    assert all(case.source_match_count > 0 for case in result.verification.cases)
+    assert all(case.candidate_match_count > 0 for case in result.verification.cases)
+    assert {case.case_id for case in result.verification.cases} == {
+        case.case_id for case in corpus
+    }
+    assert {case.category for case in result.verification.cases} == {
+        "english",
+        "default_cjk",
+        "tool_cjk",
+    }
+    lineage = next(
+        case for case in result.verification.cases if case.case_id == "lineage-dedupe"
+    )
+    assert lineage.source_match_count == lineage.candidate_match_count == 2
+    assert lineage.source_lineage_dedup_count == lineage.candidate_lineage_dedup_count == 1
+    default_visibility = next(
+        case for case in result.verification.cases if case.case_id == "active-compacted"
+    )
+    all_visibility = next(
+        case for case in result.verification.cases if case.case_id == "include-inactive"
+    )
+    assert default_visibility.source_match_count == 2
+    assert all_visibility.source_match_count == 3
+    assert _db_digest(source) == source_before
+    assert _db_digest(candidate) == candidate_before
+    assert state_db_file_inventory(source) == source_inventory
+    assert state_db_file_inventory(candidate) == candidate_inventory
+    assert not (work_dir / "controlled-paired-verification").exists()
+
+
+def test_controlled_verifier_cleans_owned_copies_after_injected_failure(
+    tmp_path, monkeypatch
+):
+    source, candidate, work_dir = _built_candidate(tmp_path)
+    source_before = _db_digest(source)
+    candidate_before = _db_digest(candidate)
+
+    def injected_failure(*args, **kwargs):
+        raise RuntimeError("injected controlled verification failure")
+
+    monkeypatch.setattr(migration, "verify_v2_candidate", injected_failure)
+    try:
+        verify_v2_candidate_with_controlled_corpus(source, candidate, work_dir)
+    except RuntimeError as exc:
+        assert str(exc) == "injected controlled verification failure"
+    else:
+        raise AssertionError("injected verifier failure was swallowed")
+
+    assert _db_digest(source) == source_before
+    assert _db_digest(candidate) == candidate_before
+    assert not (work_dir / "controlled-paired-verification").exists()
+
+
+def test_controlled_verifier_report_is_private_and_rejects_candidate_search_divergence(
+    tmp_path, monkeypatch
+):
+    source, candidate, work_dir = _built_candidate(tmp_path)
+    canonical = migration._search_copy
+    calls = 0
+
+    def divergent_candidate_search(path, corpus):
+        nonlocal calls
+        calls += 1
+        results = canonical(path, corpus)
+        if calls == 2:
+            first = results[0]
+            results[0] = replace(first, matches=[])
+        return results
+
+    monkeypatch.setattr(migration, "_search_copy", divergent_candidate_search)
+    result = verify_v2_candidate_with_controlled_corpus(source, candidate, work_dir)
+
+    assert not result.verification.verification_passed
+    assert not result.verification.candidate_accepted
+    assert not result.verification.all_match_sets_equal
+    serialized = json.dumps(asdict(result), sort_keys=True)
+    representation = repr(result)
+    for secret in (
+        "controlled-paired-verification",
+        "state.db",
+        "candidate.db",
+        "hermes-controlled-",
+        "cpv1_",
+        "受控检索",
+        "tool_calls",
+    ):
+        assert secret not in serialized
+        assert secret not in representation
+    assert not (work_dir / "controlled-paired-verification").exists()
+
+
+def test_controlled_verifier_fails_closed_on_preexisting_or_symlink_owned_path(tmp_path):
+    source, candidate, work_dir = _built_candidate(tmp_path)
+    owned = work_dir / "controlled-paired-verification"
+    owned.mkdir()
+    sentinel = owned / "keep"
+    sentinel.write_text("do not delete", encoding="utf-8")
+    try:
+        verify_v2_candidate_with_controlled_corpus(source, candidate, work_dir)
+    except FileExistsError:
+        pass
+    else:
+        raise AssertionError("pre-existing controlled verification path was accepted")
+    assert sentinel.read_text(encoding="utf-8") == "do not delete"
+
+    sentinel.unlink()
+    owned.rmdir()
+    outside = tmp_path / "outside-controlled"
+    outside.mkdir()
+    owned.symlink_to(outside, target_is_directory=True)
+    try:
+        verify_v2_candidate_with_controlled_corpus(source, candidate, work_dir)
+    except FileExistsError:
+        pass
+    else:
+        raise AssertionError("symlink controlled verification path was accepted")
+    assert owned.is_symlink()
