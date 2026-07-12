@@ -382,7 +382,7 @@ hermes sessions retention-estimate --json
 `fts-plan` reports the current v1/v2 schema, the free-space gate, row counts, maintenance state, and the controlled paired-search corpus version. `fts-status` is safe while a migration journal is active. Always plan before applying.
 
 :::warning Maintenance window required
-A live apply is an explicit maintenance operation, not a startup repair. Budget **30–40 minutes** for a large database. Stop the Gateway, Desktop, and every other process that can open `state.db` before applying. The CLI performs two liveness checks and fails closed if it cannot prove that writers are stopped; it does not stop services for you.
+A live apply is an explicit maintenance operation, not a startup repair. Reserve a **60-minute window** for a large database; recent copy-only verification took about 44 minutes before service stop/restart overhead. Stop the Gateway, Desktop, and every other process that can open `state.db` before applying. The CLI performs two liveness checks and fails closed if it cannot prove that writers are stopped; it does not stop services for you.
 :::
 
 After separately approving a live maintenance window, the state-changing commands are:

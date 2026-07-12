@@ -359,7 +359,7 @@ hermes sessions retention-estimate --json
 `fts-plan` 会报告当前 v1/v2 schema、可用空间门槛、行数、维护状态和受控 paired-search corpus 版本。migration journal 活跃期间仍可安全运行 `fts-status`。任何 apply 前都应先运行 plan。
 
 :::warning 必须安排维护窗口
-Live apply 是显式维护操作，不是 startup repair。大型数据库应预留 **30–40 分钟**。执行前必须停止 Gateway、Desktop，以及所有可能打开 `state.db` 的进程。CLI 会做两次 liveness 检查；无法证明 writers 已停止时会 fail closed，但不会替你停止服务。
+Live apply 是显式维护操作，不是 startup repair。大型数据库应预留 **60 分钟维护窗口**；最近一次 copy-only 验证约耗时 44 分钟，这还不含服务停止与重启开销。执行前必须停止 Gateway、Desktop，以及所有可能打开 `state.db` 的进程。CLI 会做两次 liveness 检查；无法证明 writers 已停止时会 fail closed，但不会替你停止服务。
 :::
 
 另行批准 live 维护窗口后，才使用以下会改变状态的命令：
