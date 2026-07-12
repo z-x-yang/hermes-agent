@@ -2040,7 +2040,15 @@ def rollback_fts_migration(
 
 def _open_read_only(db_path: Path) -> sqlite3.Connection:
     path = Path(db_path).expanduser().resolve(strict=False)
-    conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    # A closed WAL database can have no sidecars. Plain mode=ro may recreate
+    # empty WAL/SHM files merely to register a reader, violating the estimator's
+    # no-side-effect contract. With no sidecars there are no uncheckpointed WAL
+    # frames to observe, so immutable=1 is both accurate and artifact-free.
+    # When either sidecar exists, keep normal mode=ro so committed WAL frames
+    # remain visible; query_only still forbids SQL writes.
+    sidecars_exist = Path(f"{path}-wal").exists() or Path(f"{path}-shm").exists()
+    query = "mode=ro" if sidecars_exist else "mode=ro&immutable=1"
+    conn = sqlite3.connect(f"{path.as_uri()}?{query}", uri=True)
     try:
         conn.execute("PRAGMA query_only=ON")
     except BaseException:

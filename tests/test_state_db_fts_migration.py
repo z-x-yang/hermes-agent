@@ -309,6 +309,48 @@ def test_plan_status_and_estimator_are_file_schema_meta_data_immutable(tmp_path)
     assert not Path(f"{path}-shm").exists()
 
 
+def test_closed_wal_read_only_reports_do_not_create_sidecars(tmp_path):
+    path = tmp_path / "state.db"
+    db = SessionDB(db_path=path)
+    db.create_session(session_id="closed-wal", source="cli")
+    db.append_message("closed-wal", role="assistant", content="payload")
+    db.close()
+    assert not Path(f"{path}-wal").exists()
+    assert not Path(f"{path}-shm").exists()
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    plan_fts_migration(path)
+    estimate_payload_retention(path)
+    status_fts_migration(path)
+
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+    assert not Path(f"{path}-wal").exists()
+    assert not Path(f"{path}-shm").exists()
+
+
+def test_read_only_reports_observe_existing_wal_frames(tmp_path):
+    path = tmp_path / "state.db"
+    db = SessionDB(db_path=path)
+    db.create_session(session_id="live-wal", source="cli")
+    message_id = db.append_message(
+        "live-wal", role="assistant", content="visible-in-wal"
+    )
+    assert Path(f"{path}-wal").exists()
+    assert Path(f"{path}-shm").exists()
+
+    status = status_fts_migration(path)
+
+    assert status["counts"]["messages"] == 1
+    check = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        assert check.execute(
+            "SELECT content FROM messages WHERE id=?", (message_id,)
+        ).fetchone() == ("visible-in-wal",)
+    finally:
+        check.close()
+        db.close()
+
+
 def test_status_exposes_phase_and_only_safe_aggregate_fingerprints(tmp_path):
     path = tmp_path / "state.db"
     _make_v1_fixture(path)
