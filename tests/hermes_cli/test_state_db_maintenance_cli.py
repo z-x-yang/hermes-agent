@@ -270,11 +270,15 @@ def test_destructive_fts_actions_confirm_before_mutation(
         lambda *args, **kwargs: calls.append((args, kwargs))
         or types.SimpleNamespace(phase="complete", completed=True),
     )
-    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+    prompts = []
+    monkeypatch.setattr(
+        "builtins.input", lambda prompt: prompts.append(prompt) or "n"
+    )
 
     _prepare_cli(monkeypatch, argv).main()
 
     assert calls == []
+    assert prompts and "60-minute maintenance window" in prompts[0]
     assert "Cancelled." in capsys.readouterr().out
 
     _prepare_cli(monkeypatch, [*argv, "--yes"]).main()

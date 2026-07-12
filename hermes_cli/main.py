@@ -13557,8 +13557,8 @@ def main():
                 if getattr(args, "yes", False):
                     return True
                 ok = _confirm_prompt(
-                    f"{label} This requires stopped state.db writers and may take "
-                    "30–40 minutes. Continue? [y/N] "
+                    f"{label} This requires stopped state.db writers and a reserved "
+                    "60-minute maintenance window. Continue? [y/N] "
                 )
                 if not ok:
                     print("Cancelled.")
