@@ -207,6 +207,92 @@ class _CompletedRetainableChild:
         pass
 
 
+def test_continuation_helper_interrupt_before_handoff_releases_capacity(monkeypatch):
+    import tools.delegation_capacity as delegation_capacity
+    import tools.delegate_tool as dt
+    from tools.delegate_continue_tool import _run_continuation_entry
+
+    child = _attach_policy(
+        _CompletedRetainableChild(), {"read_file"}, "general-purpose"
+    )
+    monkeypatch.setattr(
+        "tools.delegate_continue_tool._build_continuation_child",
+        lambda *_args, **_kwargs: child,
+    )
+    monkeypatch.setattr(
+        dt,
+        "_run_child_conversation_with_timeout",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            KeyboardInterrupt("before continuation helper acceptance")
+        ),
+    )
+    reservation = delegation_capacity.try_reserve_runner_slots(
+        1,
+        global_limit=1,
+        session_id="root-cont-before-helper",
+        session_limit=1,
+    )
+    assert reservation is not None
+    runner_state = {"handed_off": False}
+
+    with pytest.raises(
+        KeyboardInterrupt, match="before continuation helper acceptance"
+    ):
+        _run_continuation_entry(
+            _record(),
+            "continue",
+            _parent(),
+            child_run_timeout_seconds=30,
+            on_runner_finished=reservation.release_callback(0),
+            _runner_state=runner_state,
+        )
+
+    assert runner_state["handed_off"] is False
+    assert delegation_capacity.active_runner_slots() == 0
+
+
+def test_initial_helper_interrupt_before_handoff_releases_capacity(monkeypatch):
+    import tools.delegation_capacity as delegation_capacity
+    import tools.delegate_tool as dt
+
+    reservation = delegation_capacity.try_reserve_runner_slots(
+        1,
+        global_limit=1,
+        session_id="root-before-helper",
+        session_limit=1,
+    )
+    assert reservation is not None
+    child = _attach_policy(
+        _CompletedRetainableChild(), {"read_file"}, "Explore"
+    )
+    monkeypatch.setattr(
+        dt,
+        "_run_child_conversation_with_timeout",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            KeyboardInterrupt("before helper acceptance")
+        ),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="before helper acceptance"):
+        dt._run_single_child(
+            task_index=0,
+            description="interrupt before handoff",
+            child=child,
+            parent_agent=_parent(),
+            prompt="interrupt",
+            child_timeout_override=30,
+            subagent_type="Explore",
+            workspace_path="/tmp/repo",
+            on_runner_finished=reservation.release_callback(0),
+        )
+
+    assert delegation_capacity.active_runner_slots() == 0
+    assert (
+        delegation_capacity.active_runner_slots(session_id="root-before-helper")
+        == 0
+    )
+
+
 @pytest.mark.parametrize("subagent_type", ["Explore", "Plan"])
 def test_readonly_profiles_are_one_shot(subagent_type):
     import tools.delegate_tool as dt
@@ -939,7 +1025,7 @@ def test_delegate_continue_runner_capacity_counts_inline_nested_continuation(mon
     )
     try:
         assert second["status"] == "rejected"
-        assert "runner capacity" in second["error"].lower()
+        assert "capacity reached" in second["error"].lower()
         assert not second_started.is_set()
     finally:
         release.set()
@@ -1485,10 +1571,14 @@ def test_continue_applies_run_cap_to_foreground_and_background(monkeypatch):
         child_run_timeout_seconds=None,
         interrupt_bridge=None,
         register_with_parent=True,
+        on_runner_finished=None,
+        _runner_state=None,
     ):
         assert interrupt_bridge is not None
         assert register_with_parent is False
         seen_run_caps.append(child_run_timeout_seconds)
+        if on_runner_finished is not None:
+            on_runner_finished()
         return {
             "status": "completed",
             "agent_id": record.agent_id,
@@ -1663,10 +1753,70 @@ def test_run_continuation_entry_interrupts_on_foreground_run_cap(monkeypatch):
     assert interrupted.is_set()
 
 
+def test_continuation_base_exception_after_handoff_keeps_capacity_until_worker_exit(
+    monkeypatch,
+):
+    import tools.delegation_capacity as delegation_capacity
+    from tools.delegate_continue_tool import delegate_continue
+
+    release_worker = threading.Event()
+    worker_exited = threading.Event()
+
+    def handed_off_then_interrupted(
+        _record,
+        _prompt,
+        _parent_agent,
+        *,
+        on_runner_finished,
+        _runner_state,
+        **_kwargs,
+    ):
+        _runner_state["handed_off"] = True
+
+        def underlying_worker():
+            try:
+                assert release_worker.wait(3)
+            finally:
+                worker_exited.set()
+                on_runner_finished()
+
+        threading.Thread(target=underlying_worker, daemon=True).start()
+        raise KeyboardInterrupt("waiting thread interrupted")
+
+    monkeypatch.setattr(
+        "tools.delegate_continue_tool._run_continuation_entry",
+        handed_off_then_interrupted,
+    )
+    retain_subagent_session(_record())
+    parent = _parent()
+    parent._delegate_depth = 1
+
+    try:
+        with pytest.raises(KeyboardInterrupt, match="waiting thread interrupted"):
+            delegate_continue(
+                "agent-1",
+                "continue",
+                None,
+                parent_agent=parent,
+            )
+        assert not worker_exited.is_set()
+        assert delegation_capacity.active_runner_slots() == 1
+        assert delegation_capacity.active_runner_slots(session_id="parent-1") == 1
+    finally:
+        release_worker.set()
+        assert worker_exited.wait(2)
+
+    deadline = time.monotonic() + 1
+    while delegation_capacity.active_runner_slots() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert delegation_capacity.active_runner_slots() == 0
+
+
 def test_foreground_run_cap_poisoned_session_stays_non_resumable_while_worker_lives(
     monkeypatch, tmp_path
 ):
     import tools.async_delegation as async_delegation
+    import tools.delegation_capacity as delegation_capacity
     from tools.delegate_continue_tool import delegate_continue
 
     run_started = threading.Event()
@@ -1693,6 +1843,7 @@ def test_foreground_run_cap_poisoned_session_stays_non_resumable_while_worker_li
         def close(self):
             pass
 
+    delegation_capacity._reset_for_tests()
     async_delegation._reset_for_tests()
     monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
     monkeypatch.setattr(
@@ -1717,6 +1868,10 @@ def test_foreground_run_cap_poisoned_session_stays_non_resumable_while_worker_li
         assert timed_out["retention_dropped"] is True
         assert "no longer resumable" in timed_out["note"]
         assert not worker_exited.is_set()
+        assert delegation_capacity.active_runner_slots() == 1
+        assert (
+            delegation_capacity.active_runner_slots(session_id="parent-1") == 1
+        )
 
         second = json.loads(
             delegate_continue(
@@ -1732,7 +1887,12 @@ def test_foreground_run_cap_poisoned_session_stays_non_resumable_while_worker_li
     finally:
         release_worker.set()
         assert worker_exited.wait(2)
+        deadline = time.monotonic() + 1
+        while delegation_capacity.active_runner_slots() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert delegation_capacity.active_runner_slots() == 0
         async_delegation._reset_for_tests()
+        delegation_capacity._reset_for_tests()
 
     with pytest.raises(RuntimeError, match="no longer resumable after timeout"):
         get_retained_subagent_session("agent-1")

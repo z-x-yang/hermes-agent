@@ -8014,6 +8014,7 @@ def _(rid, params: dict) -> dict:
     from tools.delegate_tool import (
         is_spawn_paused,
         list_active_subagents,
+        _get_max_global_concurrent_children,
         _get_max_concurrent_children,
         _get_max_spawn_depth,
     )
@@ -8024,6 +8025,7 @@ def _(rid, params: dict) -> dict:
             "active": list_active_subagents(),
             "paused": is_spawn_paused(),
             "max_spawn_depth": _get_max_spawn_depth(),
+            "max_global_concurrent_children": _get_max_global_concurrent_children(),
             "max_concurrent_children": _get_max_concurrent_children(),
         },
     )

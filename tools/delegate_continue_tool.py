@@ -331,8 +331,12 @@ def _run_continuation_entry(
     child_run_timeout_seconds: Optional[float] = None,
     interrupt_bridge: Optional[_ContinuationInterruptBridge] = None,
     register_with_parent: bool = True,
+    on_runner_finished=None,
+    _runner_state=None,
 ) -> dict[str, Any]:
     start = time.monotonic()
+    if _runner_state is None:
+        _runner_state = {"handed_off": False}
     child = None
     try:
         try:
@@ -371,7 +375,12 @@ def _run_continuation_entry(
                 clear_task_env_overrides(task_id)
 
         if child_run_timeout_seconds is None:
-            result = _run_child_conversation()
+            try:
+                result = _run_child_conversation()
+            finally:
+                if on_runner_finished is not None:
+                    on_runner_finished()
+            _runner_state["handed_off"] = True
         else:
             from tools.delegate_tool import _run_child_conversation_with_timeout
 
@@ -382,6 +391,8 @@ def _run_continuation_entry(
                 task_index=0,
                 goal=prompt,
                 child_start=start,
+                on_worker_finished=on_runner_finished,
+                handoff_state=_runner_state,
             )
             if timeout_entry is not None:
                 timeout_entry.pop("task_index", None)
@@ -463,6 +474,11 @@ def _run_continuation_entry(
             "duration_seconds": round(time.monotonic() - start, 2),
         }
     finally:
+        if not _runner_state["handed_off"] and on_runner_finished is not None:
+            try:
+                on_runner_finished()
+            except Exception:
+                pass
         if child is not None:
             _remove_active_child(parent_agent, child)
             try:
@@ -522,6 +538,18 @@ def delegate_continue(
         return _tool_error(str(exc))
     delivery_mode = "background" if runs_in_background else "foreground"
 
+    # Import all capacity/config primitives before claiming retained state so an
+    # import failure cannot strand a claim that no cleanup envelope owns yet.
+    from tools.delegate_tool import (
+        _delegation_root_session_id,
+        _get_max_async_children,
+        _get_max_concurrent_children,
+        _get_max_global_concurrent_children,
+        _load_config,
+        _resolve_foreground_timeouts,
+    )
+    from tools.delegation_capacity import try_reserve_runner_slots
+
     try:
         record = claim_retained_subagent_session(agent_id)
     except (KeyError, RuntimeError) as exc:
@@ -541,13 +569,6 @@ def delegate_continue(
         release_retained_subagent_session(agent_id)
         return _tool_error(reason)
 
-    from tools.delegate_tool import (
-        _get_max_async_children,
-        _get_max_concurrent_children,
-        _load_config,
-        _resolve_foreground_timeouts,
-    )
-
     foreground_wait_timeout_seconds: Optional[float] = None
     child_run_timeout_seconds: Optional[float] = None
     try:
@@ -562,12 +583,14 @@ def delegate_continue(
         release_retained_subagent_session(agent_id)
         return _tool_error(f"Cannot resolve continuation timeouts: {exc}")
 
-    from tools.delegation_capacity import try_reserve_runner_slots
-
-    runner_limit = _get_max_concurrent_children()
+    session_runner_limit = _get_max_concurrent_children()
+    global_runner_limit = _get_max_global_concurrent_children()
+    capacity_session_id = _delegation_root_session_id(parent_agent)
     runner_reservation = try_reserve_runner_slots(
         1,
-        limit=runner_limit,
+        global_limit=global_runner_limit,
+        session_id=capacity_session_id,
+        session_limit=session_runner_limit,
     )
     if runner_reservation is None:
         release_retained_subagent_session(agent_id)
@@ -577,21 +600,40 @@ def delegate_continue(
                 "mode": delivery_mode,
                 "agent_id": record.agent_id,
                 "error": (
-                    "Subagent runner capacity reached: continuation would exceed "
-                    f"max_concurrent_children={runner_limit}."
+                    "Subagent runner global or per-session capacity reached: "
+                    "continuation would exceed "
+                    f"max_global_concurrent_children={global_runner_limit} or "
+                    f"max_concurrent_children={session_runner_limit} for this "
+                    "root session."
                 ),
             },
             ensure_ascii=False,
         )
 
-    start = time.monotonic()
-    interrupt_bridge = _ContinuationInterruptBridge()
+    try:
+        start = time.monotonic()
+        interrupt_bridge = _ContinuationInterruptBridge()
+        runner_finished_lock = threading.Lock()
+    except BaseException:
+        runner_reservation.release()
+        release_retained_subagent_session(agent_id)
+        raise
+    runner_finished = False
+
+    def _finish_runner() -> None:
+        nonlocal runner_finished
+        with runner_finished_lock:
+            if runner_finished:
+                return
+            runner_finished = True
+        runner_reservation.release()
 
     def _interrupt_claim() -> None:
         cancel_retained_subagent_claim(record.agent_id, record.claim_generation)
         interrupt_bridge()
 
     def _run(*, register_with_parent: bool) -> dict[str, Any]:
+        runner_state = {"handed_off": False}
         try:
             entry = _run_continuation_entry(
                 record,
@@ -600,10 +642,23 @@ def delegate_continue(
                 child_run_timeout_seconds=child_run_timeout_seconds,
                 interrupt_bridge=interrupt_bridge,
                 register_with_parent=register_with_parent,
+                on_runner_finished=_finish_runner,
+                _runner_state=runner_state,
             )
+            # Non-timeout return means no underlying worker remains. This is
+            # also defensive for test doubles or future implementations that
+            # return without invoking the completion callback.
+            if entry.get("status") != "timeout":
+                _finish_runner()
             return _combined_for_async(entry)
+        except BaseException:
+            # Only pre-handoff failures release here. Once the timeout helper's
+            # Future owns completion, interruption of this waiting thread must
+            # not free capacity while the underlying worker is still live.
+            if not runner_state["handed_off"]:
+                _finish_runner()
+            raise
         finally:
-            runner_reservation.release()
             release_retained_subagent_session(agent_id)
 
     def _sync_runner() -> dict[str, Any]:
@@ -622,6 +677,10 @@ def delegate_continue(
         async_ok = async_delivery_supported()
     except Exception:
         async_ok = True
+    except BaseException:
+        runner_reservation.release()
+        release_retained_subagent_session(agent_id)
+        raise
     if not async_ok:
         combined = _sync_runner()
         entry = combined["results"][0]
@@ -631,11 +690,20 @@ def delegate_continue(
         )
         return json.dumps(entry, ensure_ascii=False)
 
-    from tools.async_delegation import (
-        dispatch_async_delegation_batch,
-        wait_for_async_delegation,
-    )
-    from tools.approval import get_current_session_key
+    try:
+        from tools.async_delegation import (
+            dispatch_async_delegation_batch,
+            wait_for_async_delegation,
+        )
+        from tools.approval import get_current_session_key
+    except Exception as exc:
+        runner_reservation.release()
+        release_retained_subagent_session(agent_id)
+        return _tool_error(f"Cannot prepare continuation dispatch: {exc}")
+    except BaseException:
+        runner_reservation.release()
+        release_retained_subagent_session(agent_id)
+        raise
 
     try:
         dispatch = dispatch_async_delegation_batch(
@@ -655,6 +723,10 @@ def delegate_continue(
         runner_reservation.release()
         release_retained_subagent_session(agent_id)
         return _tool_error(f"Failed to dispatch retained subagent continuation: {exc}")
+    except BaseException:
+        runner_reservation.release()
+        release_retained_subagent_session(agent_id)
+        raise
 
     if dispatch.get("status") != "dispatched":
         runner_reservation.release()

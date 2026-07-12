@@ -28,6 +28,7 @@ import os
 from pathlib import Path
 import threading
 import time
+import uuid
 from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
@@ -63,6 +64,49 @@ def _submit_with_context(executor: ThreadPoolExecutor, fn, *args, **kwargs):
         return fn(*args, **kwargs)
 
     return executor.submit(ctx.run, _call)
+
+
+def _submit_with_context_commit_gate(
+    executor: ThreadPoolExecutor,
+    fn,
+    *args,
+    _handoff_state=None,
+    **kwargs,
+):
+    """Commit executor handoff before allowing *fn* to start.
+
+    ThreadPoolExecutor can enqueue work and then raise while starting a worker.
+    The gate converts that ambiguous state into an aborted no-op. Once committed,
+    a BaseException in the tiny handoff window is suppressed so callers cannot
+    release a slot while the submitted runner is live.
+    """
+
+    ctx = contextvars.copy_context()
+    ready = threading.Event()
+    state = {"committed": False}
+    future = None
+
+    def _gated_call():
+        ready.wait()
+        if not state["committed"]:
+            return None
+        return fn(*args, **kwargs)
+
+    try:
+        future = executor.submit(ctx.run, _gated_call)
+        state["committed"] = True
+        if _handoff_state is not None:
+            _handoff_state["handed_off"] = True
+        ready.set()
+        return future
+    except BaseException:
+        if state["committed"] and future is not None:
+            if _handoff_state is not None:
+                _handoff_state["handed_off"] = True
+            ready.set()
+            return future
+        ready.set()
+        raise
 
 
 def _explicit_session_cwd() -> Optional[str]:
@@ -165,20 +209,21 @@ def _get_subagent_approval_callback():
 # Nested delegation is derived from the GP profile, exact parent authority,
 # depth, and the operator kill switch. The model cannot request toolsets.
 
-_DEFAULT_MAX_CONCURRENT_CHILDREN = 3
+_DEFAULT_MAX_CONCURRENT_CHILDREN = 5
+_DEFAULT_MAX_GLOBAL_CONCURRENT_CHILDREN = 20
 # One-shot guard: the high-concurrency cost advisory is emitted at most once
 # per process. _get_max_concurrent_children() runs on every get_definitions()
 # schema rebuild (via _build_top_level_description / _build_tasks_param_description),
 # so without this flag a config of max_concurrent_children>10 spams the log on
 # every turn / agent spawn even when delegate_task is never called.
 _HIGH_CONCURRENCY_WARNED = False
-MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected unless max_spawn_depth raised.
+MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild (2); depth-2 children cannot spawn.
 # Configurable depth cap consulted by _get_max_spawn_depth; MAX_DEPTH
 # stays as the default fallback and is still the symbol tests import.
 _MIN_SPAWN_DEPTH = 1
-# No upper ceiling on spawn depth — like max_concurrent_children, depth has a
+# No upper ceiling on spawn depth — like the concurrency limits, depth has a
 # floor of 1 and no ceiling. Deeper trees multiply API cost, so the default
-# stays flat (MAX_DEPTH = 1); raising the config knob is an explicit opt-in.
+# stops after one nested orchestrator layer (MAX_DEPTH = 2).
 
 
 # ---------------------------------------------------------------------------
@@ -412,13 +457,11 @@ def _child_can_delegate(
 
 
 def _get_max_concurrent_children() -> int:
-    """Read delegation.max_concurrent_children from config, falling back to
-    DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (3).
+    """Return the per-root-session and single-batch child-runner cap.
 
-    Users can raise this as high as they want; only the floor (1) is enforced.
-
-    Uses the same ``_load_config()`` path that the rest of ``delegate_task``
-    uses, keeping config priority consistent (config.yaml > env > default).
+    Reads ``delegation.max_concurrent_children``, then
+    ``DELEGATION_MAX_CONCURRENT_CHILDREN``, then the default (5).
+    Only the floor (1) is enforced.
     """
     cfg = _load_config()
     val = cfg.get("max_concurrent_children")
@@ -452,23 +495,57 @@ def _get_max_concurrent_children() -> int:
     return _DEFAULT_MAX_CONCURRENT_CHILDREN
 
 
+def _get_max_global_concurrent_children() -> int:
+    """Return the process-wide live child-runner cap (default 20)."""
+
+    cfg = _load_config()
+    val = cfg.get("max_global_concurrent_children")
+    if val is not None:
+        try:
+            return max(1, int(val))
+        except (TypeError, ValueError):
+            logger.warning(
+                "delegation.max_global_concurrent_children=%r is not a valid "
+                "integer; using default %d",
+                val,
+                _DEFAULT_MAX_GLOBAL_CONCURRENT_CHILDREN,
+            )
+            return _DEFAULT_MAX_GLOBAL_CONCURRENT_CHILDREN
+    return _DEFAULT_MAX_GLOBAL_CONCURRENT_CHILDREN
+
+
+def _delegation_root_session_id(parent_agent) -> str:
+    """Return the stable root-session identity shared by nested descendants."""
+
+    inherited = getattr(parent_agent, "_delegate_root_session_id", None)
+    if isinstance(inherited, str) and inherited.strip():
+        return inherited.strip()
+    session_id = getattr(parent_agent, "session_id", None)
+    if isinstance(session_id, str) and session_id.strip():
+        return session_id.strip()
+    # Direct-Python/stateless callers can lack a durable session id. Persist a
+    # random token on the parent object so repeated calls share one owner while
+    # object-id reuse can never transfer capacity to a later object.
+    ephemeral = f"ephemeral-agent:{uuid.uuid4().hex}"
+    try:
+        setattr(parent_agent, "_delegate_root_session_id", ephemeral)
+    except Exception:
+        # An owner that cannot retain a stable identity must fail closed in the
+        # capacity primitive rather than receive a fresh bypass token per call.
+        return ""
+    return ephemeral
+
+
 _LEGACY_MAX_ASYNC_WARNED = False
 
 
 def _get_max_async_children() -> int:
-    """Concurrency cap for background (``background=true``) delegations.
+    """Process-wide cap for active background delegation delivery units.
 
-    DEPRECATED KNOB: ``delegation.max_async_children`` has been unified into
-    ``delegation.max_concurrent_children`` — one cap governs both a single
-    synchronous batch's parallelism and how many background delegation units
-    may run at once. When at capacity, a new async dispatch is REJECTED (not
-    queued or run synchronously) so a runaway model cannot bypass the cap or
-    pile up unbounded background work.
-
-    A leftover ``max_async_children`` in config.yaml is ignored (the config
-    migration removes it, folding a raised value into
-    ``max_concurrent_children``); we log a one-time deprecation warning if
-    one is still present.
+    ``delegation.max_async_children`` remains deprecated. Background units use
+    the process-global delegation ceiling; live child runners are separately
+    and more precisely enforced by ``delegation_capacity`` under both global
+    and root-session limits.
     """
     global _LEGACY_MAX_ASYNC_WARNED
     cfg = _load_config()
@@ -476,10 +553,10 @@ def _get_max_async_children() -> int:
         _LEGACY_MAX_ASYNC_WARNED = True
         logger.warning(
             "delegation.max_async_children is deprecated and ignored; "
-            "delegation.max_concurrent_children now caps background "
-            "delegations too. Remove the stale key from config.yaml."
+            "delegation.max_global_concurrent_children now caps background "
+            "delegation units. Remove the stale key from config.yaml."
         )
-    return _get_max_concurrent_children()
+    return _get_max_global_concurrent_children()
 
 
 def _get_retained_session_ttl() -> int:
@@ -601,15 +678,14 @@ def _get_max_spawn_depth() -> int:
     """Read delegation.max_spawn_depth from config, floored at 1 (no ceiling).
 
     depth 0 = parent agent.  max_spawn_depth = N means agents at depths
-    0..N-1 can spawn; depth N is the leaf floor.  Default 1 is flat:
-    parent spawns children (depth 1), depth-1 children cannot spawn
-    (blocked by this guard AND, for leaf children, by the delegation
-    toolset strip in _strip_blocked_tools).
+    0..N-1 can spawn; depth N is the leaf floor. Default 2 permits one nested
+    orchestrator layer: parent -> child -> grandchild. At that default, only a
+    general-purpose depth-1 child with exact inherited delegation authority can
+    spawn; depth-2 children are leaves.
 
-    Raise to 2+ to allow GP children with exact parent delegation authority
-    to spawn their own workers. Like max_concurrent_children, there is no
-    upper ceiling — but each extra level multiplies API cost, so raise it
-    deliberately.
+    Raise above 2 to allow deeper GP orchestration. Like the two concurrency
+    limits, there is no upper ceiling — but each extra level multiplies API cost,
+    so raise it deliberately.
     """
     cfg = _load_config()
     val = cfg.get("max_spawn_depth")
@@ -1582,8 +1658,14 @@ def _build_child_agent(
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
-    # Set delegation depth so runtime policy can bound grandchildren.
+    # Set delegation depth so runtime policy can bound grandchildren, and carry
+    # one stable root-session capacity identity through every nested level.
     child._delegate_depth = child_depth
+    setattr(
+        child,
+        "_delegate_root_session_id",
+        _delegation_root_session_id(parent_agent),
+    )
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
@@ -1980,22 +2062,61 @@ def _run_child_conversation_with_timeout(
     goal: str,
     child_start: float,
     child_progress_cb=None,
+    on_worker_finished=None,
+    handoff_state=None,
 ) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """Run one child call with the shared interrupt and timeout diagnostics."""
-    from tools.daemon_pool import DaemonThreadPoolExecutor
 
-    timeout_executor = DaemonThreadPoolExecutor(
-        max_workers=1,
-        initializer=_set_subagent_approval_cb,
-        initargs=(_get_subagent_approval_callback(),),
-    )
+    worker_finished_lock = threading.Lock()
+    worker_finished_notified = False
+
+    def _notify_worker_finished() -> None:
+        nonlocal worker_finished_notified
+        with worker_finished_lock:
+            if worker_finished_notified:
+                return
+            worker_finished_notified = True
+        if on_worker_finished is None:
+            return
+        try:
+            on_worker_finished()
+        except Exception:
+            logger.exception("Subagent worker-finished callback failed")
+
+    try:
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        timeout_executor = DaemonThreadPoolExecutor(
+            max_workers=1,
+            initializer=_set_subagent_approval_cb,
+            initargs=(_get_subagent_approval_callback(),),
+        )
+    except BaseException:
+        _notify_worker_finished()
+        raise
     worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}
 
     def _run_with_thread_capture():
         worker_thread_holder["t"] = threading.current_thread()
-        return run_callable()
+        try:
+            return run_callable()
+        finally:
+            _notify_worker_finished()
 
-    child_future = _submit_with_context(timeout_executor, _run_with_thread_capture)
+    try:
+        child_future = _submit_with_context_commit_gate(
+            timeout_executor,
+            _run_with_thread_capture,
+            _handoff_state=handoff_state,
+        )
+    except BaseException:
+        _notify_worker_finished()
+        timeout_executor.shutdown(wait=False)
+        raise
+    # Covers executor-initializer failure and cancellation before the callable
+    # starts. For a running worker this fires only after _run_with_thread_capture
+    # exits; _notify_worker_finished is idempotent across both paths.
+    child_future.add_done_callback(lambda _future: _notify_worker_finished())
     try:
         return child_future.result(timeout=timeout_seconds), None
     except Exception as timeout_exc:
@@ -2097,12 +2218,56 @@ def _run_single_child(
     child_timeout_override: Optional[float] = None,
     subagent_type: Optional[str] = None,
     workspace_path: Optional[str] = None,
+    on_runner_finished=None,
+) -> Dict[str, Any]:
+    """Run one child while guaranteeing pre-worker setup failures free its slot."""
+
+    runner_state = {"handed_off": False}
+    try:
+        return _run_single_child_impl(
+            task_index=task_index,
+            description=description,
+            child=child,
+            parent_agent=parent_agent,
+            prompt=prompt,
+            child_timeout_override=child_timeout_override,
+            subagent_type=subagent_type,
+            workspace_path=workspace_path,
+            on_runner_finished=on_runner_finished,
+            _runner_state=runner_state,
+        )
+    except BaseException:
+        # Before callback ownership transfers to the worker, setup failures
+        # (including credential lease acquisition) must release here. After
+        # handoff, the worker/Future completion callback is the sole owner, so
+        # interrupts cannot prematurely free a still-live runner slot.
+        if not runner_state["handed_off"] and on_runner_finished is not None:
+            try:
+                on_runner_finished()
+            except Exception:
+                logger.exception("Subagent pre-worker release callback failed")
+        raise
+
+
+def _run_single_child_impl(
+    task_index: int,
+    description: str,
+    child=None,
+    parent_agent=None,
+    prompt: str = "",
+    child_timeout_override: Optional[float] = None,
+    subagent_type: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+    on_runner_finished=None,
+    _runner_state=None,
 ) -> Dict[str, Any]:
     """
     Run a pre-built child agent. Called from within a thread.
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    if _runner_state is None:
+        _runner_state = {"handed_off": False}
     _child_terminal_override_task_id: Optional[str] = None
 
     # Get the progress callback from the child agent
@@ -2312,6 +2477,8 @@ def _run_single_child(
             goal=description,
             child_start=child_start,
             child_progress_cb=child_progress_cb,
+            on_worker_finished=on_runner_finished,
+            handoff_state=_runner_state,
         )
         if timeout_entry is not None:
             return timeout_entry
@@ -2647,6 +2814,12 @@ def _run_single_child(
         }
 
     finally:
+        if not _runner_state["handed_off"] and on_runner_finished is not None:
+            try:
+                on_runner_finished()
+            except Exception:
+                logger.exception("Subagent runner-finished callback failed")
+
         # Stop the heartbeat thread so it doesn't keep touching parent activity
         # after the child has finished (or failed).  Guard the join: .start()
         # now lives inside the try block, so if it raised (OS thread
@@ -2801,6 +2974,12 @@ def delegate_task(
     cfg = _load_config()
     effective_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     max_children = _get_max_concurrent_children()
+    max_global_children = _get_max_global_concurrent_children()
+    capacity_session_id = _delegation_root_session_id(parent_agent)
+    if not capacity_session_id:
+        return tool_error(
+            "delegate_task requires a stable root session id for capacity accounting."
+        )
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
     if tasks_error:
         return tool_error(tasks_error)
@@ -2944,9 +3123,20 @@ def delegate_task(
             dispatch_model = creds["model"]
         prepared_children.append((i, t, profile, creds))
 
+    # Save parent tool names before reserving or constructing children. Import or
+    # snapshot failures therefore cannot strand runner capacity.
+    import model_tools as _model_tools
+
+    _parent_tool_names = list(_model_tools._last_resolved_tool_names)
+
     from tools.delegation_capacity import try_reserve_runner_slots
 
-    runner_reservation = try_reserve_runner_slots(n_tasks, limit=max_children)
+    runner_reservation = try_reserve_runner_slots(
+        n_tasks,
+        global_limit=max_global_children,
+        session_id=capacity_session_id,
+        session_limit=max_children,
+    )
     if runner_reservation is None:
         return json.dumps(
             {
@@ -2954,19 +3144,18 @@ def delegate_task(
                 "mode": delivery_mode,
                 "count": n_tasks,
                 "error": (
-                    f"Subagent runner capacity reached: reserving this {n_tasks}-child "
-                    f"batch would exceed max_concurrent_children={max_children}."
+                    f"Subagent runner global or per-session capacity reached: "
+                    f"reserving this {n_tasks}-child batch would exceed "
+                    f"max_global_concurrent_children={max_global_children} or "
+                    f"max_concurrent_children={max_children} for this root session."
                 ),
             },
             ensure_ascii=False,
         )
-
-    # Save parent tool names BEFORE any child construction mutates the global.
-    # _build_child_agent() calls AIAgent() which calls get_tool_definitions(),
-    # which overwrites model_tools._last_resolved_tool_names with child's toolset.
-    import model_tools as _model_tools
-
-    _parent_tool_names = list(_model_tools._last_resolved_tool_names)
+    runner_slot_release_callbacks = [
+        runner_reservation.release_callback(i) for i in range(n_tasks)
+    ]
+    runner_slots_handed_off: set[int] = set()
 
     # Build all child agents on the main thread (thread-safe construction)
     # Wrapped in try/finally so the global is always restored even if a
@@ -3019,6 +3208,7 @@ def delegate_task(
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
+            runner_slots_handed_off.add(_i)
             result = _run_single_child(
                 task_index=_i,
                 description=_t["description"],
@@ -3028,6 +3218,7 @@ def delegate_task(
                 child_timeout_override=child_timeout_overrides[_i],
                 subagent_type=_t.get("subagent_type", subagent_type),
                 workspace_path=_resolve_workspace_hint(parent_agent) or "",
+                on_runner_finished=runner_slot_release_callbacks[_i],
             )
             results.append(result)
         else:
@@ -3042,18 +3233,28 @@ def delegate_task(
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
                 for i, t, child in children:
-                    future = _submit_with_context(
-                        executor,
-                        _run_single_child,
-                        task_index=i,
-                        description=t["description"],
-                        child=child,
-                        parent_agent=parent_agent,
-                        prompt=t["prompt"],
-                        child_timeout_override=child_timeout_overrides[i],
-                        subagent_type=t.get("subagent_type", subagent_type),
-                        workspace_path=_resolve_workspace_hint(parent_agent) or "",
-                    )
+                    # Ownership transfers before submit. The commit gate ensures
+                    # enqueue-then-raise can only run an aborted no-op; this
+                    # callback/cleanup path owns a pre-commit failure.
+                    runner_slots_handed_off.add(i)
+                    try:
+                        future = _submit_with_context_commit_gate(
+                            executor,
+                            _run_single_child,
+                            task_index=i,
+                            description=t["description"],
+                            child=child,
+                            parent_agent=parent_agent,
+                            prompt=t["prompt"],
+                            child_timeout_override=child_timeout_overrides[i],
+                            subagent_type=t.get("subagent_type", subagent_type),
+                            workspace_path=_resolve_workspace_hint(parent_agent) or "",
+                            on_runner_finished=runner_slot_release_callbacks[i],
+                        )
+                    except BaseException:
+                        runner_slot_release_callbacks[i]()
+                        _cleanup_unstarted_children([(i, t, child)], parent_agent)
+                        raise
                     futures[future] = i
 
                 # Poll futures with interrupt checking.  as_completed() blocks
@@ -3260,15 +3461,49 @@ def delegate_task(
     def _execute_and_aggregate() -> dict:
         try:
             return _execute_and_aggregate_reserved()
-        finally:
-            runner_reservation.release()
+        except BaseException:
+            # Runners that accepted ownership release at their true worker exit.
+            # Only children never handed to a runner are safe to close/release.
+            unhanded_children = [
+                item for item in children if item[0] not in runner_slots_handed_off
+            ]
+            _cleanup_unstarted_children(unhanded_children, parent_agent)
+            for slot_index, release_slot in enumerate(
+                runner_slot_release_callbacks
+            ):
+                if slot_index not in runner_slots_handed_off:
+                    release_slot()
+            raise
 
     # ----- Async registry path: background or top-level foreground wait -----
     # Foreground waiting and background delivery share the same future. A wait
     # timeout only flips delivery ownership; it never starts replacement work.
     if use_async_registry:
-        from tools.async_delegation import dispatch_async_delegation_batch
-        from tools.approval import get_current_session_key
+        _descriptions = [t["description"] for t in task_list]
+
+        def _reject_async_preparation(exc: Exception) -> str:
+            _cleanup_unstarted_children(children, parent_agent)
+            runner_reservation.release()
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "mode": delivery_mode,
+                    "count": len(_descriptions),
+                    "descriptions": _descriptions,
+                    "error": f"Failed to prepare subagent batch dispatch: {exc}",
+                },
+                ensure_ascii=False,
+            )
+
+        try:
+            from tools.async_delegation import dispatch_async_delegation_batch
+            from tools.approval import get_current_session_key
+        except Exception as exc:
+            return _reject_async_preparation(exc)
+        except BaseException:
+            _cleanup_unstarted_children(children, parent_agent)
+            runner_reservation.release()
+            raise
 
         # Stateless request/response sessions (the API server / WebUI path)
         # cannot route a detached subagent result back to the agent after the
@@ -3284,11 +3519,18 @@ def delegate_task(
             _async_ok = async_delivery_supported()
         except Exception:
             _async_ok = True
+        except BaseException:
+            _cleanup_unstarted_children(children, parent_agent)
+            runner_reservation.release()
+            raise
         if not _async_ok:
-            logger.info(
-                "delegate_task: async delivery unsupported on this session "
-                "(stateless HTTP API); running the batch synchronously instead."
-            )
+            try:
+                logger.info(
+                    "delegate_task: async delivery unsupported on this session "
+                    "(stateless HTTP API); running the batch synchronously instead."
+                )
+            except BaseException:
+                pass
             _sync_result = _execute_and_aggregate()
             if isinstance(_sync_result, dict):
                 _sync_result["note"] = (
@@ -3299,25 +3541,32 @@ def delegate_task(
                 )
             return json.dumps(_sync_result, ensure_ascii=False)
 
-        _session_key = get_current_session_key(default="")
-        _child_agents = [c for (_, _, c) in children]
+        try:
+            _session_key = get_current_session_key(default="")
+            _child_agents = [c for (_, _, c) in children]
 
-        # Detach every child from the parent's interrupt-propagation list — the
-        # batch's lifecycle is owned by the async registry now, not the parent
-        # turn. _build_child_agent attached them (correct for sync runs).
-        if hasattr(parent_agent, "_active_children"):
-            _ac_lock = getattr(parent_agent, "_active_children_lock", None)
-            for _c in _child_agents:
-                try:
-                    if _ac_lock:
-                        with _ac_lock:
+            # Detach every child from the parent's interrupt-propagation list — the
+            # batch's lifecycle is owned by the async registry now, not the parent
+            # turn. _build_child_agent attached them (correct for sync runs).
+            if hasattr(parent_agent, "_active_children"):
+                _ac_lock = getattr(parent_agent, "_active_children_lock", None)
+                for _c in _child_agents:
+                    try:
+                        if _ac_lock:
+                            with _ac_lock:
+                                parent_agent._active_children.remove(_c)
+                        else:
                             parent_agent._active_children.remove(_c)
-                    else:
-                        parent_agent._active_children.remove(_c)
-                except ValueError:
-                    pass
+                    except ValueError:
+                        pass
 
-        _async_context = contextvars.copy_context()
+            _async_context = contextvars.copy_context()
+        except Exception as exc:
+            return _reject_async_preparation(exc)
+        except BaseException:
+            _cleanup_unstarted_children(children, parent_agent)
+            runner_reservation.release()
+            raise
 
         def _batch_runner():
             return _async_context.run(_execute_and_aggregate)
@@ -3332,7 +3581,6 @@ def delegate_task(
                 except Exception:
                     pass
 
-        _descriptions = [t["description"] for t in task_list]
         try:
             dispatch = dispatch_async_delegation_batch(
                 goals=_descriptions,
@@ -3364,6 +3612,10 @@ def delegate_task(
                 },
                 ensure_ascii=False,
             )
+        except BaseException:
+            _cleanup_unstarted_children(children, parent_agent)
+            runner_reservation.release()
+            raise
 
         if dispatch.get("status") == "dispatched":
             if delivery_mode == "foreground":
@@ -3417,7 +3669,7 @@ def delegate_task(
             return json.dumps(payload, ensure_ascii=False)
 
         # Pool at capacity / schedule failure — do NOT run inline. Running a
-        # replacement synchronously would exceed the global max_concurrent cap
+        # replacement synchronously would exceed the process-global runner cap
         # and make a rejected background dispatch still consume another child.
         logger.info(
             "delegate_task: async registry rejected delegation (%s); child work "
@@ -3436,7 +3688,8 @@ def delegate_task(
                 "note": (
                     "Async delegation was rejected before child execution; child "
                     "work was not started and no replacement inline child was "
-                    "delegation to finish or raise delegation.max_concurrent_children "
+                    "started. Wait for another delegation to finish or raise "
+                    "delegation.max_global_concurrent_children "
                     "in config.yaml."
                 ),
             },

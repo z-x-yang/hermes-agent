@@ -148,15 +148,20 @@ def _install_delegate_task_stubs(monkeypatch, dt, summary_fn):
     def fake_run_single_child(
         task_index, description, child=None, parent_agent=None, **_kw
     ):
-        return {
-            "task_index": task_index,
-            "status": "completed",
-            "summary": summary_fn(),
-            "api_calls": 0,
-            "duration_seconds": 0,
-            "_child_role": "leaf",
-            "_child_cost_usd": 0.0,
-        }
+        try:
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": summary_fn(),
+                "api_calls": 0,
+                "duration_seconds": 0,
+                "_child_role": "leaf",
+                "_child_cost_usd": 0.0,
+            }
+        finally:
+            on_runner_finished = _kw.get("on_runner_finished")
+            if on_runner_finished is not None:
+                on_runner_finished()
 
     monkeypatch.setattr(dt, "_run_single_child", fake_run_single_child)
     return Parent()

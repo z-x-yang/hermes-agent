@@ -527,6 +527,7 @@ def init_agent(
     
     # Subagent delegation state
     agent._delegate_depth = 0        # 0 = top-level agent, incremented for children
+    agent._delegate_root_session_id = ""  # stable capacity owner inherited by descendants
     agent._active_children = []      # Running child AIAgents (for interrupt propagation)
     agent._active_children_lock = threading.Lock()
     

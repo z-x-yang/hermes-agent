@@ -4,6 +4,7 @@ import type { DelegationStatusResponse } from '../gatewayTypes.js'
 
 export interface DelegationState {
   // Last known caps from `delegation.status` RPC.  null until fetched.
+  maxGlobalConcurrentChildren: null | number
   maxConcurrentChildren: null | number
   maxSpawnDepth: null | number
   // True when spawning is globally paused (see tools/delegate_tool.py).
@@ -13,6 +14,7 @@ export interface DelegationState {
 }
 
 const buildState = (): DelegationState => ({
+  maxGlobalConcurrentChildren: null,
   maxConcurrentChildren: null,
   maxSpawnDepth: null,
   paused: false,
@@ -63,6 +65,10 @@ export const applyDelegationStatus = (r: DelegationStatusResponse | null | undef
 
   if (typeof r.max_spawn_depth === 'number') {
     patch.maxSpawnDepth = r.max_spawn_depth
+  }
+
+  if (typeof r.max_global_concurrent_children === 'number') {
+    patch.maxGlobalConcurrentChildren = r.max_global_concurrent_children
   }
 
   if (typeof r.max_concurrent_children === 'number') {

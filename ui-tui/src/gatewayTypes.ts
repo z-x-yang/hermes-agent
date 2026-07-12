@@ -576,6 +576,7 @@ export interface DelegationStatusResponse {
     subagent_id?: string
     tool_count?: number
   }[]
+  max_global_concurrent_children?: number
   max_concurrent_children?: number
   max_spawn_depth?: number
   paused?: boolean

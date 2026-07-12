@@ -64,6 +64,8 @@ delegate_task(
 
 一个 Batch 是一个并发组：一个 batch handle、占用一个 async slot，并在全部 child 结束后发出一次合并完成通知。结果按 task index 排序。Batch item 只有 `description`、`prompt` 和可选 `subagent_type`；整个 Batch 共用顶层 `run_in_background`。
 
+活跃 child runner 同时受两层原子 ceiling 约束：`max_concurrent_children` 限制一个 root session（包括嵌套后代与 continuation），同时也限制单个 Batch width；`max_global_concurrent_children` 限制整个 Hermes 进程。默认每个 root session 最多 5 个、整个进程最多 20 个。一次 reservation 若会超过任一 ceiling，会在任何 child 启动前整批拒绝。
+
 后台池满时，Hermes 返回结构化 `rejected`，不会偷偷同步执行 child。若 endpoint 无法稍后投递，已准备好的工作会同步执行，并带显式说明。
 
 ## 前台、后台与超时
@@ -123,7 +125,7 @@ delegate_continue(
 3. `delegation.orchestrator_enabled` 为 true；
 4. `child_depth < max_spawn_depth`。
 
-`Explore` 和 `Plan` 永远不能继续委派；`delegate_continue` 与 `clarify` 也不提供给 child。默认 `max_spawn_depth=1`，因此默认仍是 flat delegation；调高后也只在上述 gates 全部满足时允许下一层 GP。
+`Explore` 和 `Plan` 永远不能继续委派；`delegate_continue` 与 `clarify` 也不提供给 child。默认 `max_spawn_depth=2`，允许一层有界的 `general-purpose` orchestrator（`parent → child → grandchild`）；depth-2 child 是 leaf，且 nesting 仍须满足上述所有 gates。
 
 ## 中断与持久性
 

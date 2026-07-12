@@ -77,8 +77,16 @@ def _install_fake_delegate_runtime(monkeypatch, run_child):
         built.append(child)
         return child
 
+    def run_child_with_capacity(*args, **kwargs):
+        on_runner_finished = kwargs.get("on_runner_finished")
+        try:
+            return run_child(*args, **kwargs)
+        finally:
+            if on_runner_finished is not None:
+                on_runner_finished()
+
     monkeypatch.setattr(dt, "_build_child_agent", build_child)
-    monkeypatch.setattr(dt, "_run_single_child", run_child)
+    monkeypatch.setattr(dt, "_run_single_child", run_child_with_capacity)
     monkeypatch.setattr(
         dt,
         "_resolve_delegation_credentials",
@@ -496,7 +504,7 @@ def test_runner_capacity_rejects_second_batch_without_partial_start(monkeypatch)
     )
     try:
         assert second["status"] == "rejected"
-        assert "runner capacity" in second["error"].lower()
+        assert "capacity reached" in second["error"].lower()
         assert len(built) == 3
         assert peak <= 3
     finally:
@@ -509,6 +517,200 @@ def test_runner_capacity_rejects_second_batch_without_partial_start(monkeypatch)
             ]
         for future in futures:
             future.result(timeout=3)
+
+
+def test_runner_capacity_combines_global_and_root_session_limits(monkeypatch):
+    import tools.delegate_tool as dt
+
+    active = 0
+    lock = threading.Lock()
+    first_session_full = threading.Event()
+    global_full = threading.Event()
+    release = threading.Event()
+
+    def run_child(task_index, description, **_kwargs):
+        nonlocal active
+        with lock:
+            active += 1
+            if active >= 2:
+                first_session_full.set()
+            if active >= 4:
+                global_full.set()
+        try:
+            assert release.wait(3)
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": description,
+            }
+        finally:
+            with lock:
+                active -= 1
+
+    built = _install_fake_delegate_runtime(monkeypatch, run_child)
+    monkeypatch.setattr(
+        dt,
+        "_load_config",
+        lambda: {
+            "max_concurrent_children": 2,
+            "max_global_concurrent_children": 4,
+            "foreground_wait_timeout_seconds": 60,
+            "child_run_timeout_seconds": 60,
+        },
+    )
+    two_tasks = [
+        {"description": f"task-{index}", "prompt": f"task-{index}"}
+        for index in range(2)
+    ]
+    parent_a = _parent()
+    parent_a.session_id = "root-a"
+    parent_b = _parent()
+    parent_b.session_id = "root-b"
+    parent_c = _parent()
+    parent_c.session_id = "root-c"
+
+    first = json.loads(
+        dt.delegate_task(
+            tasks=two_tasks,
+            run_in_background=True,
+            parent_agent=parent_a,
+        )
+    )
+    assert first["status"] == "dispatched"
+    assert first_session_full.wait(1)
+
+    nested_parent_a = _parent(depth=1)
+    nested_parent_a.session_id = "child-session-a"
+    nested_parent_a._delegate_root_session_id = "root-a"
+    same_session = json.loads(
+        dt.delegate_task(
+            description="overflow-a",
+            prompt="overflow-a",
+            run_in_background=False,
+            parent_agent=nested_parent_a,
+        )
+    )
+    assert same_session["status"] == "rejected"
+    assert "per-session" in same_session["error"]
+    assert len(built) == 2
+
+    second = json.loads(
+        dt.delegate_task(
+            tasks=two_tasks,
+            run_in_background=True,
+            parent_agent=parent_b,
+        )
+    )
+    assert second["status"] == "dispatched"
+    assert global_full.wait(1)
+
+    global_overflow = json.loads(
+        dt.delegate_task(
+            description="overflow-global",
+            prompt="overflow-global",
+            run_in_background=True,
+            parent_agent=parent_c,
+        )
+    )
+    try:
+        assert global_overflow["status"] == "rejected"
+        assert "global" in global_overflow["error"]
+        assert len(built) == 4
+        assert dc.active_runner_slots() == 4
+        assert dc.active_runner_slots(session_id="root-a") == 2
+        assert dc.active_runner_slots(session_id="root-b") == 2
+    finally:
+        release.set()
+        with ad._records_lock:
+            futures = [
+                record.get("future")
+                for record in ad._records.values()
+                if record.get("future") is not None
+            ]
+        for future in futures:
+            assert future is not None
+            future.result(timeout=3)
+
+    assert dc.active_runner_slots() == 0
+
+
+def test_initial_timeout_keeps_capacity_until_underlying_worker_exits(monkeypatch):
+    import tools.delegate_tool as dt
+
+    release_worker = threading.Event()
+    worker_exited = threading.Event()
+
+    _install_fake_delegate_runtime(
+        monkeypatch,
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("wrapped fake must be replaced")
+        ),
+    )
+
+    def timeout_child(task_index, on_runner_finished, **_kwargs):
+        def underlying_worker():
+            try:
+                assert release_worker.wait(3)
+            finally:
+                worker_exited.set()
+                on_runner_finished()
+
+        threading.Thread(target=underlying_worker, daemon=True).start()
+        return {
+            "task_index": task_index,
+            "status": "timeout",
+            "summary": None,
+            "error": "timed out while worker remains live",
+            "exit_reason": "timeout",
+            "api_calls": 1,
+            "duration_seconds": 0.05,
+        }
+
+    monkeypatch.setattr(dt, "_run_single_child", timeout_child)
+    monkeypatch.setattr(
+        dt,
+        "_load_config",
+        lambda: {
+            "max_concurrent_children": 1,
+            "max_global_concurrent_children": 1,
+            "foreground_wait_timeout_seconds": 2,
+            "child_run_timeout_seconds": 1,
+        },
+    )
+    parent = _parent()
+
+    try:
+        timed_out = json.loads(
+            dt.delegate_task(
+                description="timeout",
+                prompt="timeout",
+                run_in_background=False,
+                parent_agent=parent,
+            )
+        )
+        assert timed_out["results"][0]["status"] == "timeout"
+        assert not worker_exited.is_set()
+        assert dc.active_runner_slots() == 1
+        assert dc.active_runner_slots(session_id="parent-session") == 1
+
+        rejected = json.loads(
+            dt.delegate_task(
+                description="must not bypass cap",
+                prompt="must not bypass cap",
+                run_in_background=False,
+                parent_agent=parent,
+            )
+        )
+        assert rejected["status"] == "rejected"
+        assert "capacity reached" in rejected["error"]
+    finally:
+        release_worker.set()
+        assert worker_exited.wait(2)
+
+    deadline = time.monotonic() + 1
+    while dc.active_runner_slots() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert dc.active_runner_slots() == 0
 
 
 def test_prepared_children_are_closed_when_async_dispatch_rejects(monkeypatch):
@@ -582,6 +784,38 @@ def test_prepared_children_are_closed_when_later_child_build_fails(monkeypatch):
 
     first.close.assert_called_once_with()
     assert parent._active_children == []
+    assert dc.active_runner_slots() == 0
+
+
+def test_runner_reservation_released_when_async_preparation_raises(monkeypatch):
+    import tools.delegate_tool as dt
+
+    built = _install_fake_delegate_runtime(
+        monkeypatch,
+        lambda task_index, description, **_kwargs: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": description,
+        },
+    )
+    monkeypatch.setattr(
+        "tools.approval.get_current_session_key",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("session key boom")),
+    )
+
+    result = json.loads(
+        dt.delegate_task(
+            description="first",
+            prompt="first",
+            run_in_background=True,
+            parent_agent=_parent(),
+        )
+    )
+
+    assert result["status"] == "rejected"
+    assert "session key boom" in result["error"]
+    assert len(built) == 1
+    built[0].close.assert_called_once_with()
     assert dc.active_runner_slots() == 0
 
 

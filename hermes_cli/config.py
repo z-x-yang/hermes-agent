@@ -2162,17 +2162,18 @@ DEFAULT_CONFIG = {
                                      # (floor 30s) to enforce a hard cap.
         "reasoning_effort": "",  # subagent effort: "max", "xhigh", "high", "medium",
                                  # "low", "minimal", "none" (empty = inherit parent)
-        "max_concurrent_children": 3,  # unified cap for all live child runners across
-                                       # foreground, background, Batch, continuation,
-                                       # and nested paths. Async saturation is rejected;
-                                       # it never falls back to uncounted sync execution.
+        "max_global_concurrent_children": 20,  # process-wide live child-runner cap
+        "max_concurrent_children": 5,  # per-root-session live runner + single-batch cap
+                                       # across foreground, background, Batch,
+                                       # continuation, and nested paths. Saturation is
+                                       # rejected; it never falls back to uncounted sync.
                                        # Floor of 1, no ceiling.
                                        # (Replaces the deprecated max_async_children.)
         # Runtime-derived nested-delegation controls (see
         # tools/delegate_tool.py:_get_max_spawn_depth and
         # _get_orchestrator_enabled). Floored at 1, no upper ceiling — raise
         # deliberately because each level multiplies API cost.
-        "max_spawn_depth": 1,        # 1 = flat default; 2+ permits bounded GP nesting
+        "max_spawn_depth": 2,        # 1 = flat; 2 permits orchestrator → worker nesting
         "orchestrator_enabled": True,  # legacy-named global nesting kill switch
         # Aggregate UTF-8 JSON byte budget for process-local retained transcripts.
         # Operator-only: intentionally absent from model-facing delegation schemas.
@@ -3169,7 +3170,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 33,
+    "_config_version": 34,
 }
 
 # =============================================================================
@@ -5829,12 +5830,10 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                     "legacy surface-aware behavior."
                 )
 
-    # ── Version 32 → 33: unify delegation concurrency caps ──
-    # delegation.max_async_children is deprecated: max_concurrent_children now
-    # caps both a single batch's parallelism and concurrent background
-    # delegation units. Fold a raised max_async_children into
-    # max_concurrent_children (take the max so nobody loses headroom), then
-    # drop the stale key.
+    # ── Version 32 → 33: retire the old async-unit cap ──
+    # A config can migrate directly from v32 to v34 in this invocation. Preserve
+    # max_async_children as process-global headroom without overwriting the
+    # independently configured per-session/Batch max_concurrent_children.
     if current_ver < 33:
         config = read_raw_config()
         raw_deleg = config.get("delegation")
@@ -5844,24 +5843,57 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                 old_async_i = int(old_async)
             except (TypeError, ValueError):
                 old_async_i = None
-            if old_async_i is not None and old_async_i > 3:
+            if old_async_i is not None and old_async_i > 0:
                 try:
-                    cur_children = int(raw_deleg.get("max_concurrent_children", 3))
+                    cur_children = int(raw_deleg.get("max_concurrent_children", 0))
                 except (TypeError, ValueError):
-                    cur_children = 3
-                if old_async_i > cur_children:
-                    raw_deleg["max_concurrent_children"] = old_async_i
-                    results["config_added"].append(
-                        f"delegation.max_concurrent_children={old_async_i} "
-                        f"(folded from deprecated max_async_children)"
+                    cur_children = 0
+                try:
+                    cur_global = int(
+                        raw_deleg.get("max_global_concurrent_children", 0)
                     )
+                except (TypeError, ValueError):
+                    cur_global = 0
+                global_cap = max(20, old_async_i, cur_children, cur_global)
+                raw_deleg["max_global_concurrent_children"] = global_cap
+                results["config_added"].append(
+                    f"delegation.max_global_concurrent_children={global_cap} "
+                    f"(preserved from deprecated max_async_children)"
+                )
             config["delegation"] = raw_deleg
             _persist_migration(config)
             if not quiet:
                 print(
-                    "  ✓ Removed deprecated delegation.max_async_children — "
-                    "delegation.max_concurrent_children now caps background "
-                    "delegations too."
+                    "  ✓ Removed deprecated delegation.max_async_children and "
+                    "preserved its process-global headroom."
+                )
+
+    # ── Version 33 → 34: split global and per-session delegation caps ──
+    # max_concurrent_children now owns one root session (and one Batch width),
+    # while max_global_concurrent_children bounds all live child runners in the
+    # process. Preserve any larger legacy unified value as global headroom.
+    if current_ver < 34:
+        config = read_raw_config()
+        raw_deleg = config.get("delegation")
+        if (
+            isinstance(raw_deleg, dict)
+            and "max_global_concurrent_children" not in raw_deleg
+        ):
+            try:
+                legacy_cap = int(raw_deleg.get("max_concurrent_children", 0))
+            except (TypeError, ValueError):
+                legacy_cap = 0
+            global_cap = max(20, legacy_cap)
+            raw_deleg["max_global_concurrent_children"] = global_cap
+            config["delegation"] = raw_deleg
+            _persist_migration(config)
+            results["config_added"].append(
+                f"delegation.max_global_concurrent_children={global_cap}"
+            )
+            if not quiet:
+                print(
+                    "  ✓ Split delegation capacity into process-global and "
+                    "per-session limits."
                 )
 
     # ── Post-migration: disable exfiltration-shaped MCP stdio entries ──

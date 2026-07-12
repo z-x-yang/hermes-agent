@@ -1545,7 +1545,7 @@ class TestVerifyOnStopMigration:
             assert raw["agent"]["verify_on_stop"] is True
 
 class TestDelegationCapUnificationMigration:
-    """v32 → v33: fold deprecated max_async_children into max_concurrent_children."""
+    """v32 → v34: retire async cap without widening a root session."""
 
     def _write(self, tmp_path, body):
         (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
@@ -1563,7 +1563,7 @@ class TestDelegationCapUnificationMigration:
         # Default-valued (3) async cap must not shrink a raised children cap.
         assert raw["delegation"]["max_concurrent_children"] == 15
 
-    def test_raised_async_cap_folded_into_children_cap(self, tmp_path):
+    def test_raised_async_cap_becomes_global_without_widening_session(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             self._write(
                 tmp_path,
@@ -1572,8 +1572,22 @@ class TestDelegationCapUnificationMigration:
             )
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            effective = load_config()
         assert "max_async_children" not in raw["delegation"]
-        assert raw["delegation"]["max_concurrent_children"] == 20
+        assert effective["delegation"]["max_global_concurrent_children"] == 20
+        assert effective["delegation"]["max_concurrent_children"] == 5
+
+    def test_raised_async_cap_above_default_preserves_global_headroom(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            self._write(
+                tmp_path,
+                "_config_version: 32\ndelegation:\n  max_async_children: 30\n"
+                "  max_concurrent_children: 5\n",
+            )
+            migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        assert raw["delegation"]["max_global_concurrent_children"] == 30
+        assert raw["delegation"]["max_concurrent_children"] == 5
 
     def test_higher_children_cap_wins(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
@@ -1597,6 +1611,40 @@ class TestDelegationCapUnificationMigration:
 
     def test_default_config_has_no_max_async_children(self):
         assert "max_async_children" not in DEFAULT_CONFIG["delegation"]
+
+
+class TestDelegationDualCapacityMigration:
+    """v33 → v34: split process-global and per-session delegation limits."""
+
+    def _migrate(self, tmp_path, delegation_yaml):
+        body = "_config_version: 33\ndelegation:\n" + delegation_yaml
+        (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            migrate_config(interactive=False, quiet=True)
+            return yaml.safe_load((tmp_path / "config.yaml").read_text())
+
+    def test_adds_global_default_without_changing_session_cap(self, tmp_path):
+        raw = self._migrate(tmp_path, "  max_concurrent_children: 5\n")
+        assert raw["_config_version"] == 34
+        assert raw["delegation"]["max_concurrent_children"] == 5
+        # Schema defaults are intentionally not materialized to disk.
+        assert "max_global_concurrent_children" not in raw["delegation"]
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            effective = load_config()
+        assert effective["delegation"]["max_global_concurrent_children"] == 20
+
+    def test_raised_legacy_unified_cap_preserves_global_headroom(self, tmp_path):
+        raw = self._migrate(tmp_path, "  max_concurrent_children: 30\n")
+        assert raw["delegation"]["max_concurrent_children"] == 30
+        assert raw["delegation"]["max_global_concurrent_children"] == 30
+
+    def test_existing_explicit_global_cap_is_preserved(self, tmp_path):
+        raw = self._migrate(
+            tmp_path,
+            "  max_concurrent_children: 5\n"
+            "  max_global_concurrent_children: 12\n",
+        )
+        assert raw["delegation"]["max_global_concurrent_children"] == 12
 
 
 class TestConfigNormalizationDoesNotOverwriteUserValues:

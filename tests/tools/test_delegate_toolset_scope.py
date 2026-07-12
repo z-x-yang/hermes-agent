@@ -122,6 +122,42 @@ class TestToolsetIntersection:
         assert built._subagent_profile.name == "general-purpose"
         assert built.valid_tool_names == {"read_file"}
 
+    def test_builder_inherits_root_session_capacity_identity(self):
+        parent = MagicMock()
+        parent._delegate_depth = 1
+        parent._delegate_root_session_id = "root-session"
+        parent.session_id = "child-parent-session"
+        parent.valid_tool_names = {"read_file"}
+        parent.enabled_toolsets = {"file"}
+        parent._active_children = []
+        parent._active_children_lock = None
+        child = MagicMock()
+        child.valid_tool_names = {"read_file"}
+        child.tools = [
+            {
+                "type": "function",
+                "function": {"name": "read_file", "parameters": {}},
+            }
+        ]
+        _set_authority(parent, parent.valid_tool_names)
+        _set_authority(child, child.valid_tool_names)
+
+        with patch("run_agent.AIAgent", return_value=child):
+            built = _build_child_agent(
+                task_index=0,
+                description="nested inspect",
+                prompt="inspect",
+                toolsets=None,
+                model=None,
+                max_iterations=5,
+                task_count=1,
+                parent_agent=parent,
+                profile=get_subagent_profile("general-purpose"),
+            )
+
+        assert getattr(built, "_delegate_depth") == 2
+        assert getattr(built, "_delegate_root_session_id") == "root-session"
+
     def test_general_purpose_automatically_gets_delegate_task_only_when_all_gates_allow(
         self, monkeypatch
     ):

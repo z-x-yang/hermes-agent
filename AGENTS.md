@@ -1014,7 +1014,7 @@ Enable/disable per platform via `hermes tools` (the curses UI) or the
 Two shapes:
 
 - **Single:** pass `description`, `prompt`, optional `subagent_type`, and optional `run_in_background`.
-- **Batch (parallel):** pass `tasks: [{description, prompt, subagent_type?}, ...]`. One call returns one batch handle/background unit and one consolidated completion. Live child runners share the `delegation.max_concurrent_children` cap.
+- **Batch (parallel):** pass `tasks: [{description, prompt, subagent_type?}, ...]`. One call returns one batch handle/background unit and one consolidated completion. Live child runners are capped atomically at 5 per root session (also the Batch-width cap) and 20 process-wide by default.
 
 Profiles and lifecycle:
 
@@ -1023,7 +1023,7 @@ Profiles and lifecycle:
 - `general-purpose` — multi-step execution with the exact surviving parent ceiling; retained only after explicit successful completion and resumable with `delegate_continue` in the same live parent session.
 - Nested delegation is runtime-derived from profile, depth, the runtime kill switch, and exact current-parent authority. The caller cannot select a privilege role.
 
-Key config knobs (under `delegation:` in `config.yaml`): `max_concurrent_children`, `max_spawn_depth`, `child_timeout_seconds`, the legacy-named `orchestrator_enabled` runtime nesting kill switch, `subagent_auto_approve`, `max_retained_subagent_bytes`, `max_iterations`, and per-profile `child_run_timeout_seconds` / `foreground_wait_timeout_seconds` overrides.
+Key config knobs (under `delegation:` in `config.yaml`): `max_global_concurrent_children`, `max_concurrent_children`, `max_spawn_depth`, `child_timeout_seconds`, the legacy-named `orchestrator_enabled` runtime nesting kill switch, `subagent_auto_approve`, `max_retained_subagent_bytes`, `max_iterations`, and per-profile `child_run_timeout_seconds` / `foreground_wait_timeout_seconds` overrides.
 
 Durability rule: background delegation and retained continuation state are process-local. For work that must survive process restart, use `cronjob` or `terminal(background=True, notify_on_complete=True)` instead.
 

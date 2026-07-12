@@ -35,6 +35,82 @@ def _drain_one(timeout=5.0):
     return None
 
 
+def test_enqueue_then_raise_executor_cannot_start_rejected_dispatch(monkeypatch):
+    runner_called = threading.Event()
+    queued_wrapper_exited = threading.Event()
+
+    class EnqueueThenRaiseExecutor:
+        def submit(self, fn, *args):
+            def queued():
+                try:
+                    fn(*args)
+                finally:
+                    queued_wrapper_exited.set()
+
+            threading.Thread(target=queued, daemon=True).start()
+            raise RuntimeError("submit raised after enqueue")
+
+    monkeypatch.setattr(ad, "_get_executor", lambda _limit: EnqueueThenRaiseExecutor())
+
+    def runner():
+        runner_called.set()
+        return {"status": "completed"}
+
+    res = ad.dispatch_async_delegation(
+        goal="must abort",
+        context=None,
+        toolsets=None,
+        model="m",
+        session_key="",
+        runner=runner,
+        max_async_children=1,
+    )
+
+    assert res["status"] == "rejected"
+    assert "after enqueue" in res["error"]
+    assert queued_wrapper_exited.wait(1)
+    assert not runner_called.is_set()
+    assert ad.active_count() == 0
+
+
+def test_enqueue_then_raise_executor_cannot_start_rejected_batch(monkeypatch):
+    runner_called = threading.Event()
+    queued_wrapper_exited = threading.Event()
+
+    class EnqueueThenRaiseExecutor:
+        def submit(self, fn, *args):
+            def queued():
+                try:
+                    fn(*args)
+                finally:
+                    queued_wrapper_exited.set()
+
+            threading.Thread(target=queued, daemon=True).start()
+            raise RuntimeError("batch submit raised after enqueue")
+
+    monkeypatch.setattr(ad, "_get_executor", lambda _limit: EnqueueThenRaiseExecutor())
+
+    def runner():
+        runner_called.set()
+        return {"status": "completed", "results": []}
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["must abort"],
+        context=None,
+        toolsets=None,
+        model="m",
+        session_key="",
+        runner=runner,
+        max_async_children=1,
+    )
+
+    assert res["status"] == "rejected"
+    assert "after enqueue" in res["error"]
+    assert queued_wrapper_exited.wait(1)
+    assert not runner_called.is_set()
+    assert ad.active_count() == 0
+
+
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 

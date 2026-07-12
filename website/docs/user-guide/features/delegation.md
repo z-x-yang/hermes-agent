@@ -64,6 +64,8 @@ delegate_task(
 
 A Batch is one concurrent group with one batch handle, one occupied async slot, and one consolidated completion after all children finish. Results remain ordered by task index. Batch items contain only `description`, `prompt`, and optional `subagent_type`; the whole Batch shares one top-level `run_in_background` choice.
 
+Live child runners reserve against two atomic ceilings: `max_concurrent_children` limits one root session (including its nested descendants and continuations) and also limits one Batch width; `max_global_concurrent_children` limits the whole Hermes process. Defaults are 5 per root session and 20 process-wide. A reservation that would exceed either ceiling rejects the whole Batch before any child starts.
+
 If the background pool is full, Hermes returns a structured `rejected` result and runs no child synchronously. If the endpoint cannot deliver later messages, prepared work runs synchronously with an explicit note rather than silently changing semantics.
 
 ## Foreground, background, and timeouts
@@ -131,7 +133,7 @@ Nested delegation is runtime-derived, not caller-selected. A child receives `del
 3. `delegation.orchestrator_enabled` is true;
 4. `child_depth < max_spawn_depth`.
 
-`Explore` and `Plan` never delegate. `delegate_continue` and `clarify` remain unavailable to children. The default `max_spawn_depth=1` keeps delegation flat; raising it permits another GP layer only under the same gates.
+`Explore` and `Plan` never delegate. `delegate_continue` and `clarify` remain unavailable to children. The default `max_spawn_depth=2` permits one bounded `general-purpose` orchestrator layer (`parent → child → grandchild`) under the same gates; depth-2 children are leaves.
 
 ## Interrupts and durability
 

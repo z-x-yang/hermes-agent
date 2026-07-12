@@ -73,6 +73,39 @@ _executor: Optional[ThreadPoolExecutor] = None
 _executor_lock = threading.Lock()
 _executor_max_workers: int = 0
 
+
+def _submit_with_commit_gate(executor, fn):
+    """Submit *fn* without exposing an enqueue-before-return handoff race.
+
+    Some executor implementations can enqueue work and then raise while growing
+    their worker pool. The gated wrapper cannot call *fn* until submission is
+    committed. If submission raises first, queued work wakes only to exit. Once
+    committed, a BaseException in this tiny handoff window is suppressed so the
+    caller cannot mistake a live worker for a rejected dispatch.
+    """
+
+    ready = threading.Event()
+    state = {"committed": False}
+    future = None
+
+    def _gated():
+        ready.wait()
+        if not state["committed"]:
+            return None
+        return fn()
+
+    try:
+        future = executor.submit(propagate_context_to_thread(_gated))
+        state["committed"] = True
+        ready.set()
+        return future
+    except BaseException:
+        if state["committed"] and future is not None:
+            ready.set()
+            return future
+        ready.set()
+        raise
+
 _records_lock = threading.Lock()
 # delegation_id -> record dict. Kept for the lifetime of the run plus a short
 # tail after completion so `list_async_delegations()` can show recent results.
@@ -185,6 +218,13 @@ def dispatch_async_delegation(
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
     }
+    try:
+        executor = _get_executor(max_async_children)
+    except Exception as exc:
+        return {
+            "status": "rejected",
+            "error": f"Failed to prepare async delegation executor: {exc}",
+        }
     # Capacity check and record insert under ONE lock hold — checking
     # active_count() separately would let two concurrent dispatches (e.g.
     # from different gateway sessions) both pass the check and exceed the cap.
@@ -199,13 +239,11 @@ def dispatch_async_delegation(
                     f"Async delegation capacity reached ({max_async_children} "
                     f"running). Wait for one to finish (its result will re-enter "
                     f"the chat), or run this task synchronously "
-                    f"(background=false). Raise delegation.max_concurrent_children in "
+                    f"(background=false). Raise delegation.max_global_concurrent_children in "
                     f"config.yaml to allow more concurrent background subagents."
                 ),
             }
         _records[delegation_id] = record
-
-    executor = _get_executor(max_async_children)
 
     def _worker() -> None:
         result: Dict[str, Any] = {}
@@ -227,9 +265,7 @@ def dispatch_async_delegation(
             _finalize(delegation_id, result, status)
 
     try:
-        # Propagate the dispatching profile so the detached child resolves
-        # get_hermes_home() under the right profile.
-        executor.submit(propagate_context_to_thread(_worker))
+        _submit_with_commit_gate(executor, _worker)
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)
@@ -237,11 +273,18 @@ def dispatch_async_delegation(
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
         }
+    except BaseException:
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        raise
 
-    logger.info(
-        "Dispatched async delegation %s (session_key=%s): %s",
-        delegation_id, session_key or "<cli>", (goal or "")[:80],
-    )
+    try:
+        logger.info(
+            "Dispatched async delegation %s (session_key=%s): %s",
+            delegation_id, session_key or "<cli>", (goal or "")[:80],
+        )
+    except BaseException:
+        pass
     return {"status": "dispatched", "delegation_id": delegation_id}
 
 
@@ -371,6 +414,13 @@ def dispatch_async_delegation_batch(
         "future": None,
         "inject_fn": inject_fn,
     }
+    try:
+        executor = _get_executor(max_async_children)
+    except Exception as exc:
+        return {
+            "status": "rejected",
+            "error": f"Failed to prepare async delegation batch executor: {exc}",
+        }
     with _records_lock:
         running = sum(
             1 for r in _records.values() if r.get("status") == "running"
@@ -381,13 +431,11 @@ def dispatch_async_delegation_batch(
                 "error": (
                     f"Async delegation capacity reached ({max_async_children} "
                     f"running). Wait for one to finish (its result will re-enter "
-                    f"the chat), or raise delegation.max_concurrent_children in "
+                    f"the chat), or raise delegation.max_global_concurrent_children in "
                     f"config.yaml to allow more concurrent background units."
                 ),
             }
         _records[delegation_id] = record
-
-    executor = _get_executor(max_async_children)
 
     def _worker() -> None:
         combined: Dict[str, Any] = {}
@@ -415,12 +463,7 @@ def dispatch_async_delegation_batch(
             _finalize_batch(delegation_id, combined, status)
 
     try:
-        # Propagate the dispatching profile to the detached batch children.
-        future = executor.submit(propagate_context_to_thread(_worker))
-        with _records_lock:
-            current = _records.get(delegation_id)
-            if current is not None:
-                current["future"] = future
+        future = _submit_with_commit_gate(executor, _worker)
     except Exception as exc:  # pragma: no cover
         with _records_lock:
             _records.pop(delegation_id, None)
@@ -428,11 +471,28 @@ def dispatch_async_delegation_batch(
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
         }
+    except BaseException:
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        raise
 
-    logger.info(
-        "Dispatched async delegation batch %s (%d task(s), session_key=%s)",
-        delegation_id, n, session_key or "<cli>",
-    )
+    # Handoff is committed. From here onward never propagate a bookkeeping or
+    # logging failure as a rejected dispatch while the worker may be live.
+    try:
+        with _records_lock:
+            current = _records.get(delegation_id)
+            if current is not None:
+                current["future"] = future
+    except BaseException:
+        pass
+
+    try:
+        logger.info(
+            "Dispatched async delegation batch %s (%d task(s), session_key=%s)",
+            delegation_id, n, session_key or "<cli>",
+        )
+    except BaseException:
+        pass
     return {"status": "dispatched", "delegation_id": delegation_id}
 
 

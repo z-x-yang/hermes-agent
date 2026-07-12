@@ -11,7 +11,7 @@ import { FACES } from '../content/faces.js'
 import { VERBS } from '../content/verbs.js'
 import { fmtDuration } from '../domain/messages.js'
 import { stickyPromptFromViewport } from '../domain/viewport.js'
-import { buildSubagentTree, treeTotals, widthByDepth } from '../lib/subagentTree.js'
+import { buildSubagentTree, treeTotals } from '../lib/subagentTree.js'
 import { fmtK } from '../lib/text.js'
 import { useScrollbarSnapshot, useViewportSnapshot } from '../lib/viewportStore.js'
 import type { Theme } from '../theme.js'
@@ -285,14 +285,11 @@ function SpawnHud({ t }: { t: Theme }) {
   const depth = Math.max(0, totals.maxDepthFromHere)
   const active = totals.activeCount
 
-  // `max_concurrent_children` is a per-parent cap, not a global one.
-  // `activeCount` sums every running agent across the tree and would
-  // over-warn for multi-orchestrator runs.  The widest level of the tree
-  // is a closer proxy to "most concurrent spawns that could be hitting a
-  // single parent's slot budget".
-  const widestLevel = widthByDepth(tree).reduce((a, b) => Math.max(a, b), 0)
+  // `max_concurrent_children` is the cap for this root session, including
+  // nested descendants and continuations, so compare it to the whole active
+  // tree rather than a per-level width proxy.
   const depthRatio = maxDepth ? depth / maxDepth : 0
-  const concRatio = maxConc ? widestLevel / maxConc : 0
+  const concRatio = maxConc ? active / maxConc : 0
   const ratio = Math.max(depthRatio, concRatio)
 
   const color = delegation.paused || ratio >= 1 ? t.color.error : ratio >= 0.66 ? t.color.warn : t.color.muted
@@ -308,13 +305,8 @@ function SpawnHud({ t }: { t: Theme }) {
     pieces.push(`d${depthLabel}`)
 
     if (active > 0) {
-      // Label pairs the widest-level count (drives concRatio above) with
-      // the total active count for context.  `W/cap` triggers the warn,
-      // `+N` is everything else currently running across the tree.
-      const extra = Math.max(0, active - widestLevel)
-      const widthLabel = maxConc ? `${widestLevel}/${maxConc}` : `${widestLevel}`
-      const suffix = extra > 0 ? `+${extra}` : ''
-      pieces.push(`⚡${widthLabel}${suffix}`)
+      const activeLabel = maxConc ? `${active}/${maxConc}` : `${active}`
+      pieces.push(`⚡${activeLabel}`)
     }
   }
 

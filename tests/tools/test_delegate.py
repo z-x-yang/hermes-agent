@@ -1184,10 +1184,11 @@ class TestBlockedTools(unittest.TestCase):
             _get_max_spawn_depth, _get_orchestrator_enabled,
             _MIN_SPAWN_DEPTH,
         )
-        self.assertEqual(_get_max_concurrent_children(), 3)
-        self.assertEqual(MAX_DEPTH, 1)
-        self.assertEqual(_get_max_spawn_depth(), 1)       # default: flat
-        self.assertTrue(_get_orchestrator_enabled())      # default
+        with patch("tools.delegate_tool._load_config", return_value={}):
+            self.assertEqual(_get_max_concurrent_children(), 5)
+            self.assertEqual(_get_max_spawn_depth(), 2)  # default: two levels
+            self.assertTrue(_get_orchestrator_enabled())  # default
+        self.assertEqual(MAX_DEPTH, 2)
         self.assertEqual(_MIN_SPAWN_DEPTH, 1)
 
 
@@ -2884,13 +2885,13 @@ class TestDelegateEventEnum(unittest.TestCase):
 
 
 class TestConcurrencyDefaults(unittest.TestCase):
-    """Tests for the concurrency default and no hard ceiling."""
+    """Tests for the per-session concurrency default and no hard ceiling."""
 
     @patch("tools.delegate_tool._load_config", return_value={})
-    def test_default_is_three(self, mock_cfg):
+    def test_default_is_five(self, mock_cfg):
         # Clear env var if set
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(_get_max_concurrent_children(), 3)
+            self.assertEqual(_get_max_concurrent_children(), 5)
 
     @patch("tools.delegate_tool._load_config",
            return_value={"max_concurrent_children": 10})
@@ -2920,27 +2921,33 @@ class TestConcurrencyDefaults(unittest.TestCase):
         self.assertEqual(_get_max_concurrent_children(), 6)
 
 
-class TestAsyncCapUnified(unittest.TestCase):
-    """max_async_children is deprecated: the async cap IS max_concurrent_children."""
+class TestAsyncCapGlobal(unittest.TestCase):
+    """Background delivery units follow the process-global delegation cap."""
 
     @patch("tools.delegate_tool._load_config",
-           return_value={"max_concurrent_children": 15})
-    def test_async_cap_follows_concurrent_children(self, mock_cfg):
+           return_value={"max_global_concurrent_children": 15})
+    def test_async_cap_follows_global_concurrent_children(self, mock_cfg):
         from tools.delegate_tool import _get_max_async_children
         self.assertEqual(_get_max_async_children(), 15)
 
     @patch("tools.delegate_tool._load_config",
-           return_value={"max_concurrent_children": 15, "max_async_children": 3})
+           return_value={"max_global_concurrent_children": 15, "max_async_children": 3})
     def test_stale_max_async_children_ignored(self, mock_cfg):
         """A leftover max_async_children in config must not shrink the cap."""
         from tools.delegate_tool import _get_max_async_children
         self.assertEqual(_get_max_async_children(), 15)
 
     @patch("tools.delegate_tool._load_config", return_value={})
-    def test_default_matches_concurrent_children_default(self, mock_cfg):
-        from tools.delegate_tool import _get_max_async_children
+    def test_default_matches_global_children_default(self, mock_cfg):
+        from tools.delegate_tool import (
+            _get_max_async_children,
+            _get_max_global_concurrent_children,
+        )
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(_get_max_async_children(), _get_max_concurrent_children())
+            self.assertEqual(
+                _get_max_async_children(),
+                _get_max_global_concurrent_children(),
+            )
 
 
 # =========================================================================
@@ -2951,9 +2958,9 @@ class TestMaxSpawnDepth(unittest.TestCase):
     """Tests for _get_max_spawn_depth clamping and fallback behavior."""
 
     @patch("tools.delegate_tool._load_config", return_value={})
-    def test_max_spawn_depth_defaults_to_1(self, mock_cfg):
+    def test_max_spawn_depth_defaults_to_2(self, mock_cfg):
         from tools.delegate_tool import _get_max_spawn_depth
-        self.assertEqual(_get_max_spawn_depth(), 1)
+        self.assertEqual(_get_max_spawn_depth(), 2)
 
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 0})
@@ -2976,7 +2983,7 @@ class TestMaxSpawnDepth(unittest.TestCase):
            return_value={"max_spawn_depth": "not-a-number"})
     def test_max_spawn_depth_invalid_falls_back_to_default(self, mock_cfg):
         from tools.delegate_tool import _get_max_spawn_depth
-        self.assertEqual(_get_max_spawn_depth(), 1)
+        self.assertEqual(_get_max_spawn_depth(), 2)
 
 
 class TestFallbackModelInheritance(unittest.TestCase):

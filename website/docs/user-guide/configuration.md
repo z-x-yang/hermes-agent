@@ -1917,8 +1917,9 @@ delegation:
   # api_key: "local-key"
   # api_mode: ""  # chat_completions, codex_responses, anthropic_messages, or auto
 
-  max_concurrent_children: 3
-  max_spawn_depth: 1
+  max_global_concurrent_children: 20
+  max_concurrent_children: 5
+  max_spawn_depth: 2
   orchestrator_enabled: true
 
   # Optional global fallbacks; per-profile values take precedence.
@@ -1971,9 +1972,9 @@ Retained records do not store credentials or custom endpoint secrets. Continuati
 
 ### Width and runtime-derived depth
 
-`max_concurrent_children` caps both Batch width and concurrent background units (default `3`, floor `1`). Oversized batches reject rather than truncate. One accepted Batch consumes one slot, returns one handle, and emits one consolidated completion.
+`max_global_concurrent_children` caps live child runners across the entire Hermes process (default `20`, floor `1`). `max_concurrent_children` caps live runners owned by one root session, including nested descendants and continuations, and also caps one Batch width (default `5`, floor `1`). Reservations are atomic across both ceilings: oversized or saturated batches reject before any child starts. One accepted Batch returns one handle and emits one consolidated completion even though each child consumes one runner slot.
 
-`max_spawn_depth=1` keeps delegation flat. At higher depths, only a `general-purpose` child whose current parent actually exposes `delegate_task` may receive nesting, and only while `orchestrator_enabled` is true and another depth remains. `Explore` and `Plan` never delegate. Each extra level can multiply cost and concurrency, so raise depth deliberately.
+`max_spawn_depth=2` permits one bounded `general-purpose` orchestrator layer (`parent → child → grandchild`). Only a GP child whose current parent actually exposes `delegate_task` may receive nesting, and only while `orchestrator_enabled` is true and another depth remains. `Explore` and `Plan` never delegate. Each extra level can multiply cost and concurrency, so raise depth deliberately.
 
 ## Clarify
 

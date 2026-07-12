@@ -1040,15 +1040,16 @@ code_execution:
 # Subagent Delegation
 # =============================================================================
 # The delegate_task tool spawns child agents with isolated context.
-# Supports single tasks and batch mode (default 3 parallel, configurable).
+# Supports single tasks and Batch mode. Defaults: 20 live runners process-wide,
+# 5 per root session and Batch, and nesting depth 2.
 delegation:
   max_iterations: 50                          # Max tool-calling turns per child (default: 50)
-  # max_concurrent_children: 3                # Max parallel child agents per batch (default: 3, floor: 1, no ceiling).
-                                              # WARNING: values above 10 multiply API cost linearly.
-  # max_spawn_depth: 1                        # Delegation tree depth cap (range: 1-3, default: 1 = flat).
-                                              # Raise to 2 to allow workers to spawn their own subagents.
-                                              # Requires role="orchestrator" on intermediate agents.
-  # orchestrator_enabled: true                # Kill switch for role="orchestrator" children (default: true).
+  # max_global_concurrent_children: 20         # Process-wide live runner cap (default: 20, floor: 1).
+  # max_concurrent_children: 5                 # Per-root-session live runner cap and max Batch width (default: 5).
+                                               # WARNING: larger values multiply API cost and resource use.
+  # max_spawn_depth: 2                         # Delegation tree depth cap (default: 2; positive integer).
+                                               # Parent -> child -> grandchild; depth-2 children are leaves.
+  # orchestrator_enabled: true                 # Kill switch for nested general-purpose delegation (default: true).
   # subagent_auto_approve: false              # When a subagent hits a dangerous-command approval prompt, auto-deny (default: false)
                                               # or auto-approve "once" (true) instead of blocking on stdin.
                                               # The parent TUI owns stdin, so blocking would deadlock; non-interactive resolution is required.

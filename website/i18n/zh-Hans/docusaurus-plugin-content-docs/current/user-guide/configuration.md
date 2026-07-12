@@ -1629,8 +1629,9 @@ delegation:
   # api_key: "local-key"
   # api_mode: ""
 
-  max_concurrent_children: 3
-  max_spawn_depth: 1
+  max_global_concurrent_children: 20
+  max_concurrent_children: 5
+  max_spawn_depth: 2
   orchestrator_enabled: true
 
   # foreground_wait_timeout_seconds: 1800
@@ -1676,9 +1677,9 @@ Retained record 不保存 credentials 或自定义 endpoint secret；continuatio
 
 ### Width 与运行时派生 depth
 
-`max_concurrent_children` 同时限制 Batch width 和 concurrent background units（默认 `3`，下限 `1`）。超宽 Batch 会拒绝而不是截断；一个 accepted Batch 占一个 slot、返回一个 handle、发出一次 consolidated completion。
+`max_global_concurrent_children` 限制整个 Hermes 进程中的活跃 child runner（默认 `20`，下限 `1`）。`max_concurrent_children` 限制一个 root session 拥有的活跃 runner（包括嵌套后代与 continuation），同时也限制单个 Batch width（默认 `5`，下限 `1`）。两层容量通过一次原子 reservation 同时检查；超宽或容量不足的 Batch 会在任何 child 启动前整批拒绝。一个 accepted Batch 仍只返回一个 handle，并只发出一次 consolidated completion，但每个 child 各占一个 runner slot。
 
-`max_spawn_depth=1` 保持 flat delegation。更高 depth 下，也只有 current parent 实际暴露 `delegate_task` 的 `general-purpose` child 才可能获得 nesting，并且必须 `orchestrator_enabled=true` 且仍有剩余 depth。`Explore` 和 `Plan` 永远不能委派。每增加一层都可能成倍增加成本和并发，请谨慎调整。
+`max_spawn_depth=2` 允许一层有界的 `general-purpose` orchestrator（`parent → child → grandchild`）。只有 current parent 实际暴露 `delegate_task` 的 GP child 才可能获得 nesting，并且必须 `orchestrator_enabled=true` 且仍有剩余 depth。`Explore` 和 `Plan` 永远不能委派。每增加一层都可能成倍增加成本和并发，请谨慎调整。
 
 ## 澄清
 
