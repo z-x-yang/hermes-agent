@@ -368,6 +368,38 @@ Database size: 12.4 MB
 
 For deeper analytics — token usage, cost estimates, tool breakdown, and activity patterns — use [`hermes insights`](/reference/cli-commands#hermes-insights).
 
+### State DB FTS v2 Maintenance
+
+FTS v2 removes duplicated inline FTS content shadows while preserving message and session rows. Use the read-only commands first:
+
+```bash
+hermes sessions fts-plan
+hermes sessions fts-status
+hermes sessions retention-estimate
+hermes sessions retention-estimate --json
+```
+
+`fts-plan` reports the current v1/v2 schema, the free-space gate, row counts, maintenance state, and the controlled paired-search corpus version. `fts-status` is safe while a migration journal is active. Always plan before applying.
+
+:::warning Maintenance window required
+A live apply is an explicit maintenance operation, not a startup repair. Budget **30–40 minutes** for a large database. Stop the Gateway, Desktop, and every other process that can open `state.db` before applying. The CLI performs two liveness checks and fails closed if it cannot prove that writers are stopped; it does not stop services for you.
+:::
+
+After separately approving a live maintenance window, the state-changing commands are:
+
+```bash
+hermes sessions fts-migrate --apply --yes
+hermes sessions fts-resume --yes
+hermes sessions fts-abort --yes
+hermes sessions fts-rollback --yes
+# Optional: require this exact journal-recorded backup
+hermes sessions fts-rollback /path/to/state.db.pre-v2.backup --yes
+```
+
+Without `--yes`, each state-changing command asks for confirmation before writing the journal or touching database files. `fts-abort` is only valid before the live swap. `fts-rollback` preserves the current v2 bundle in quarantine, restores the recorded v1 bundle, and verifies it with a write/read/search canary. Consistent backups and quarantined candidates are retained for operator-controlled cleanup.
+
+The retention estimator is **read-only**. Until `messages.compacted_at` exists, it reports `clock_status=unavailable` and labels timestamp-based rows as `non_actionable_upper_bound`; those numbers are not deletion candidates. This release does **not** add `compacted_at`, truncate message/tool payloads, or delete sessions.
+
 ## Session Search Tool
 
 The agent has a built-in `session_search` tool that performs full-text search across all past conversations using SQLite's FTS5 engine — and lets the agent scroll through any session it finds. No LLM calls, no summarization, no truncation. Every shape returns actual messages from the DB.

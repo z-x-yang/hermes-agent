@@ -345,6 +345,38 @@ Database size: 12.4 MB
 
 如需更深入的分析——token 用量、费用估算、工具分解和活动模式——请使用 [`hermes insights`](/reference/cli-commands#hermes-insights)。
 
+### State DB FTS v2 维护
+
+FTS v2 会移除 inline FTS 中重复保存的正文 shadow，同时完整保留 message 和 session 行。先运行只读命令：
+
+```bash
+hermes sessions fts-plan
+hermes sessions fts-status
+hermes sessions retention-estimate
+hermes sessions retention-estimate --json
+```
+
+`fts-plan` 会报告当前 v1/v2 schema、可用空间门槛、行数、维护状态和受控 paired-search corpus 版本。migration journal 活跃期间仍可安全运行 `fts-status`。任何 apply 前都应先运行 plan。
+
+:::warning 必须安排维护窗口
+Live apply 是显式维护操作，不是 startup repair。大型数据库应预留 **30–40 分钟**。执行前必须停止 Gateway、Desktop，以及所有可能打开 `state.db` 的进程。CLI 会做两次 liveness 检查；无法证明 writers 已停止时会 fail closed，但不会替你停止服务。
+:::
+
+另行批准 live 维护窗口后，才使用以下会改变状态的命令：
+
+```bash
+hermes sessions fts-migrate --apply --yes
+hermes sessions fts-resume --yes
+hermes sessions fts-abort --yes
+hermes sessions fts-rollback --yes
+# 可选：要求使用 journal 中记录的这个精确 backup
+hermes sessions fts-rollback /path/to/state.db.pre-v2.backup --yes
+```
+
+不传 `--yes` 时，每个写命令都会在写 journal 或移动数据库文件前要求确认。`fts-abort` 只适用于 live swap 之前。`fts-rollback` 会把当前 v2 main/WAL/SHM 整体移入 quarantine，再恢复已记录的 v1 bundle，并运行 write/read/search canary。consistent backup 和 quarantined candidate 会保留，直到 operator 明确清理。
+
+Retention estimator **只读**。在 `messages.compacted_at` 尚不存在时，它会报告 `clock_status=unavailable`，并把基于 message timestamp 的结果标为 `non_actionable_upper_bound`；这些数字不是删除候选。本版本不会添加 `compacted_at`，不会截断 message/tool payload，也不会删除 session。
+
 ## Session 搜索工具
 
 Agent 内置了 `session_search` 工具，使用 SQLite 的 FTS5 引擎对所有历史对话进行全文搜索，并允许 agent 滚动浏览找到的任何 session。无需 LLM 调用、无需摘要、无截断。每种调用形式都从数据库返回实际消息。

@@ -1,6 +1,9 @@
 from argparse import Namespace
+from dataclasses import fields
 import contextlib
+import hashlib
 import io
+import json
 import sys
 import types
 
@@ -142,3 +145,214 @@ def test_doctor_preserves_read_only_corruption_reason_during_maintenance(
     assert "readonly-corruption-evidence" in rendered
     assert "fails a read-only health check" in rendered
     assert "fails a write-health probe" not in rendered
+
+
+_NEW_SESSION_ACTIONS = (
+    "fts-plan",
+    "fts-status",
+    "fts-migrate",
+    "fts-resume",
+    "fts-abort",
+    "fts-rollback",
+    "retention-estimate",
+)
+
+
+def _prepare_cli(monkeypatch, argv):
+    from hermes_cli import main as main_mod
+
+    monkeypatch.setattr(main_mod, "_prepare_agent_startup", lambda args: None)
+    monkeypatch.setattr(sys, "argv", ["hermes", "sessions", *argv])
+    return main_mod
+
+
+def test_sessions_help_lists_safe_fts_actions_and_no_permit_flags(monkeypatch, capsys):
+    main_mod = _prepare_cli(monkeypatch, ["--help"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        main_mod.main()
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    for action in _NEW_SESSION_ACTIONS:
+        assert action in output
+
+    main_mod = _prepare_cli(monkeypatch, ["fts-status", "--operation-id", "forged"])
+    with pytest.raises(SystemExit) as exc_info:
+        main_mod.main()
+    assert exc_info.value.code == 2
+
+
+def test_read_only_fts_actions_dispatch_before_sessiondb(tmp_path, monkeypatch, capsys):
+    import hermes_state
+    import state_db_fts_migration as migration
+
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.close()
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+    monkeypatch.setattr(
+        hermes_state,
+        "SessionDB",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("read-only command constructed SessionDB")
+        ),
+    )
+    monkeypatch.setattr(
+        migration,
+        "plan_fts_migration",
+        lambda path: types.SimpleNamespace(
+            schema_kind="v1_inline",
+            schema_marker=None,
+            db_bytes=10,
+            wal_bytes=0,
+            shm_bytes=0,
+            free_bytes=100,
+            required_free_bytes=20,
+            message_count=2,
+            session_count=1,
+            archived_session_holds=0,
+            session_deletion_candidates=0,
+            fts_object_bytes=(),
+            writer_status="not_checked",
+            maintenance_status="none",
+            can_apply=False,
+            reasons=("explicit apply required",),
+            paired_corpus_version="controlled-v1",
+        ),
+    )
+    monkeypatch.setattr(
+        migration,
+        "status_fts_migration",
+        lambda path: {
+            "schema_kind": "v1_inline",
+            "schema_marker": None,
+            "counts": {"messages": 2, "sessions": 1},
+            "maintenance_status": "none",
+            "file_fingerprints": {},
+            "read_only": True,
+        },
+    )
+
+    _prepare_cli(monkeypatch, ["fts-plan"]).main()
+    plan_output = capsys.readouterr().out
+    assert "v1_inline" in plan_output
+    assert "can apply: no" in plan_output.lower()
+
+    _prepare_cli(monkeypatch, ["fts-status"]).main()
+    status_output = capsys.readouterr().out
+    assert "v1_inline" in status_output
+    assert "read-only: yes" in status_output.lower()
+
+
+@pytest.mark.parametrize(
+    ("argv", "function_name"),
+    [
+        (["fts-migrate", "--apply"], "apply_fts_migration"),
+        (["fts-resume"], "resume_fts_migration"),
+        (["fts-abort"], "abort_fts_migration"),
+        (["fts-rollback"], "rollback_fts_migration"),
+    ],
+)
+def test_destructive_fts_actions_confirm_before_mutation(
+    tmp_path, monkeypatch, capsys, argv, function_name
+):
+    import hermes_state
+    import state_db_fts_migration as migration
+
+    db_path = tmp_path / "state.db"
+    db_path.write_bytes(b"fixture")
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+    calls = []
+    monkeypatch.setattr(
+        migration,
+        function_name,
+        lambda *args, **kwargs: calls.append((args, kwargs))
+        or types.SimpleNamespace(phase="complete", completed=True),
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+
+    _prepare_cli(monkeypatch, argv).main()
+
+    assert calls == []
+    assert "Cancelled." in capsys.readouterr().out
+
+    _prepare_cli(monkeypatch, [*argv, "--yes"]).main()
+    assert len(calls) == 1
+
+
+def test_fts_rollback_passes_explicit_backup_after_confirmation(
+    tmp_path, monkeypatch
+):
+    import hermes_state
+    import state_db_fts_migration as migration
+
+    db_path = tmp_path / "state.db"
+    db_path.write_bytes(b"fixture")
+    backup = tmp_path / "state.db.pre-v2.backup"
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+    calls = []
+    monkeypatch.setattr(
+        migration,
+        "rollback_fts_migration",
+        lambda path, backup=None: calls.append((path, backup))
+        or types.SimpleNamespace(phase="rolled_back", completed=False),
+    )
+
+    _prepare_cli(
+        monkeypatch, ["fts-rollback", str(backup), "--yes"]
+    ).main()
+
+    assert calls == [(db_path, backup)]
+
+
+def test_fts_migrate_requires_apply_and_failures_exit_nonzero(
+    tmp_path, monkeypatch, capsys
+):
+    import hermes_state
+    import state_db_fts_migration as migration
+
+    db_path = tmp_path / "state.db"
+    db_path.write_bytes(b"fixture")
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+
+    with pytest.raises(SystemExit) as exc_info:
+        _prepare_cli(monkeypatch, ["fts-migrate", "--yes"]).main()
+    assert exc_info.value.code != 0
+    assert "--apply" in capsys.readouterr().out
+
+    def blocked(path):
+        raise RuntimeError("write blocked by active maintenance")
+
+    monkeypatch.setattr(migration, "apply_fts_migration", blocked)
+    with pytest.raises(SystemExit) as exc_info:
+        _prepare_cli(monkeypatch, ["fts-migrate", "--apply", "--yes"]).main()
+    output = capsys.readouterr().out
+    assert exc_info.value.code == 1
+    assert "write blocked by active maintenance" in output
+    assert "fts-status" in output
+    assert "fts-resume" in output or "fts-rollback" in output
+
+
+def test_retention_estimate_json_is_stable_and_read_only(tmp_path, monkeypatch, capsys):
+    import hermes_state
+    from state_db_fts_migration import RetentionEstimate
+
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.create_session(session_id="s", source="cli")
+    db.append_message("s", role="assistant", content="payload")
+    db.close()
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+    before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    before_names = sorted(path.name for path in tmp_path.iterdir())
+
+    _prepare_cli(monkeypatch, ["retention-estimate", "--json"]).main()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload) == {field.name for field in fields(RetentionEstimate)}
+    assert payload["clock_status"] == "unavailable"
+    assert payload["rows_by_age_basis"] == "non_actionable_upper_bound"
+    assert payload["session_deletion_candidates"] == 0
+    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before
+    assert sorted(path.name for path in tmp_path.iterdir()) == before_names
