@@ -17414,8 +17414,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     verb_drops_preview,
                 )
                 _pl = get_tool_preview_max_len()
-                _cap = _pl if _pl > 0 else 40
-                if len(preview) > _cap:
+                # Discord delegation previews carry bounded, structured
+                # profile/mode metadata and per-task labels. Preserve that
+                # structure by default; an explicit user cap still wins.
+                # Other tools and platforms keep the historical 40-character
+                # gateway default.
+                _cap = (
+                    _pl
+                    if _pl > 0
+                    else (
+                        0
+                        if tool_name == "delegate_task"
+                        and source.platform == Platform.DISCORD
+                        else 40
+                    )
+                )
+                if _cap > 0 and len(preview) > _cap:
                     preview = preview[:_cap - 3] + "..."
                 # Friendly labels: render a human-phrased line for built-in
                 # tools ("🔍 Searching the web for ...") by prefixing the verb

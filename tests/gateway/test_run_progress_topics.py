@@ -186,6 +186,29 @@ class LongPreviewAgent:
         }
 
 
+class DelegationProgressAgent:
+    """Agent that emits the resolved multi-line delegation preview."""
+
+    PREVIEW = (
+        "3 Explore tasks · background\n"
+        "Classic methods | Modern practice | Research workflows"
+    )
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        assert self.tool_progress_callback is not None
+        self.tool_progress_callback("tool.started", "delegate_task", self.PREVIEW, {})
+        time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class DelayedProgressAgent:
     def __init__(self, **kwargs):
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
@@ -494,6 +517,115 @@ async def test_run_agent_feishu_progress_replies_inside_existing_thread(monkeypa
 # ---------------------------------------------------------------------------
 # Preview truncation tests (all/new mode respects tool_preview_length)
 # ---------------------------------------------------------------------------
+
+
+async def _run_delegation_progress_helper(
+    monkeypatch,
+    tmp_path,
+    *,
+    platform: Platform,
+    preview_length: int,
+):
+    import yaml
+
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    platform_key = platform.value
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({
+            "display": {
+                "tool_preview_length": preview_length,
+                "platforms": {platform_key: {"tool_progress": "all"}},
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = DelegationProgressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.delegate_tool  # noqa: F401 - register delegate_task emoji
+
+    adapter = ProgressCaptureAdapter(platform=platform)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    source = SessionSource(
+        platform=platform,
+        chat_id="daily-chat",
+        chat_type="group",
+        thread_id=None,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id=f"sess-delegation-progress-{platform_key}",
+        session_key=f"agent:main:{platform_key}:group:daily-chat",
+    )
+    return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_discord_delegation_progress_keeps_resolved_profile_and_mode(
+    monkeypatch, tmp_path
+):
+    """Structured Discord metadata must not be lost to the generic 40-char cap."""
+    adapter, result = await _run_delegation_progress_helper(
+        monkeypatch,
+        tmp_path,
+        platform=Platform.DISCORD,
+        preview_length=0,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    assert adapter.sent[0]["content"] == (
+        "🔀 Delegating 3 Explore tasks · background\n"
+        "Classic methods | Modern practice | Research workflows"
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_discord_delegation_progress_keeps_default_40_char_cap(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_delegation_progress_helper(
+        monkeypatch,
+        tmp_path,
+        platform=Platform.TELEGRAM,
+        preview_length=0,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent[0]["content"] == (
+        "🔀 Delegating 3 Explore tasks · background\nClassic ..."
+    )
+
+
+@pytest.mark.asyncio
+async def test_discord_delegation_progress_respects_explicit_preview_cap(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_delegation_progress_helper(
+        monkeypatch,
+        tmp_path,
+        platform=Platform.DISCORD,
+        preview_length=50,
+    )
+
+    assert result["final_response"] == "done"
+    rendered_preview = adapter.sent[0]["content"].removeprefix("🔀 Delegating ")
+    assert len(rendered_preview) == 50
+    assert rendered_preview.endswith("...")
 
 
 def _extract_progress_preview(content: str) -> str | None:

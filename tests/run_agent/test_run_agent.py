@@ -2279,6 +2279,37 @@ class TestExecuteToolCalls:
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
 
+    def test_delegate_task_progress_shows_resolved_profile_and_background_mode(self, agent):
+        agent.valid_tool_names.add("delegate_task")
+        agent._delegate_depth = 0
+        agent._dispatch_delegate_task = lambda args: json.dumps({"status": "accepted"})
+        progress = []
+        agent.tool_progress_callback = (
+            lambda event, name, preview, args, **kw:
+            progress.append((event, name, preview, args))
+        )
+        tc = _mock_tool_call(
+            name="delegate_task",
+            arguments=json.dumps({
+                "tasks": [
+                    {"description": "Classic methods", "prompt": "Inspect classic methods", "subagent_type": "Explore"},
+                    {"description": "Modern practice", "prompt": "Inspect modern practice", "subagent_type": "Explore"},
+                    {"description": "Research workflows", "prompt": "Inspect research workflows", "subagent_type": "Explore"},
+                ],
+            }),
+            call_id="delegate-progress-1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+
+        agent._execute_tool_calls_sequential(mock_msg, [], "task-1")
+
+        assert progress[0][0:3] == (
+            "tool.started",
+            "delegate_task",
+            "3 Explore tasks · background\n"
+            "Classic methods | Modern practice | Research workflows",
+        )
+
     def test_sequential_delegate_continue_uses_live_parent_and_emits_one_post_hook(
         self, agent, monkeypatch
     ):

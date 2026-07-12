@@ -143,6 +143,17 @@ def _ra():
     return run_agent
 
 
+def _build_progress_preview(agent, tool_name: str, args: dict) -> str | None:
+    """Build a progress preview with runtime context the display layer cannot infer."""
+    if tool_name == "delegate_task":
+        return _build_tool_preview(
+            tool_name,
+            args,
+            delegate_depth=getattr(agent, "_delegate_depth", 0),
+        )
+    return _build_tool_preview(tool_name, args)
+
+
 def _is_interpreter_shutdown_submit_error(exc: RuntimeError) -> bool:
     return "cannot schedule new futures after interpreter shutdown" in str(exc)
 
@@ -759,7 +770,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         if agent.tool_progress_callback:
             try:
                 display_args = _redact_tool_args_for_display(name, args) or args
-                preview = _build_tool_preview(name, display_args)
+                preview = _build_progress_preview(agent, name, display_args)
                 agent.tool_progress_callback("tool.started", name, preview, display_args)
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
@@ -1395,7 +1406,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if not _execution_blocked and agent.tool_progress_callback:
             try:
                 display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
-                preview = _build_tool_preview(function_name, display_args)
+                preview = _build_progress_preview(
+                    agent, function_name, display_args
+                )
                 agent.tool_progress_callback("tool.started", function_name, preview, display_args)
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")

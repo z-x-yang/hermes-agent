@@ -175,7 +175,7 @@ class TestBuildToolPreview:
             "delegate_task",
             {"description": "Review gateway", "prompt": "Review gateway status"},
         )
-        assert result == "Review gateway"
+        assert result == "general-purpose · background: Review gateway"
 
     def test_delegate_task_batch_description_preview(self):
         result = build_tool_preview(
@@ -185,7 +185,53 @@ class TestBuildToolPreview:
                 {"description": "Review PR B", "prompt": "Inspect PR B"},
             ]},
         )
-        assert result == "2 tasks: Review PR A | Review PR B"
+        assert result == (
+            "2 general-purpose tasks · background\n"
+            "Review PR A | Review PR B"
+        )
+
+    def test_delegate_task_batch_preview_recovers_json_string_tasks(self):
+        tasks = [
+            {"description": "Inspect code", "prompt": "Inspect", "subagent_type": "Explore"},
+            {"description": "Draft plan", "prompt": "Plan", "subagent_type": "Plan"},
+        ]
+        result = build_tool_preview(
+            "delegate_task",
+            {"tasks": json.dumps(tasks), "run_in_background": False},
+        )
+        assert result == (
+            "2 tasks · foreground\n"
+            "├ Explore — Inspect code\n"
+            "└ Plan — Draft plan"
+        )
+
+    def test_delegate_task_mixed_profiles_preview(self):
+        result = build_tool_preview(
+            "delegate_task",
+            {"tasks": [
+                {"description": "Inspect code", "prompt": "Inspect", "subagent_type": "Explore"},
+                {"description": "Draft plan", "prompt": "Plan", "subagent_type": "Plan"},
+                {"description": "Implement", "prompt": "Build"},
+            ], "run_in_background": False},
+        )
+        assert result == (
+            "3 tasks · foreground\n"
+            "├ Explore — Inspect code\n"
+            "├ Plan — Draft plan\n"
+            "└ general-purpose — Implement"
+        )
+
+    def test_delegate_task_nested_omission_resolves_foreground(self):
+        result = build_tool_preview(
+            "delegate_task",
+            {
+                "description": "Inspect nested task",
+                "prompt": "Inspect",
+                "subagent_type": "Explore",
+            },
+            delegate_depth=1,
+        )
+        assert result == "Explore · foreground: Inspect nested task"
 
     def test_delegate_task_batch_preview_handles_missing_non_string_descriptions(self):
         result = build_tool_preview(
@@ -196,7 +242,7 @@ class TestBuildToolPreview:
                 "not-a-task",
             ]},
         )
-        assert result == "2 tasks: ? | 123"
+        assert result == "2 general-purpose tasks · background\n? | 123"
 
     def test_delegate_task_batch_preview_respects_max_len(self):
         result = build_tool_preview(
@@ -207,8 +253,55 @@ class TestBuildToolPreview:
             ]},
             max_len=30,
         )
-        assert result == "2 tasks: AAAAAAAAAAAAAAAAAA..."
+        assert result == "2 general-purpose tasks · b..."
         assert len(result) == 30
+
+    def test_delegate_task_batch_preview_bounds_visible_tasks(self):
+        result = build_tool_preview(
+            "delegate_task",
+            {"tasks": [
+                {
+                    "description": f"Task {index}",
+                    "prompt": "Inspect",
+                    "subagent_type": "Explore",
+                }
+                for index in range(10)
+            ]},
+        )
+        assert result == (
+            "10 Explore tasks · background\n"
+            "Task 0 | Task 1 | Task 2 | Task 3 | Task 4 | Task 5 | Task 6 | Task 7 | +2 more"
+        )
+
+    def test_delegate_task_bounded_mixed_preview_keeps_hidden_profile_counts(self):
+        tasks = [
+            {
+                "description": f"Task {index}",
+                "prompt": "Inspect",
+                "subagent_type": "Explore",
+            }
+            for index in range(9)
+        ]
+        tasks.append({
+            "description": "Plan hidden work",
+            "prompt": "Plan",
+            "subagent_type": "Plan",
+        })
+
+        result = build_tool_preview("delegate_task", {"tasks": tasks})
+
+        assert result == (
+            "10 tasks · background · Explore×9, Plan×1\n"
+            "├ Explore — Task 0\n"
+            "├ Explore — Task 1\n"
+            "├ Explore — Task 2\n"
+            "├ Explore — Task 3\n"
+            "├ Explore — Task 4\n"
+            "├ Explore — Task 5\n"
+            "├ Explore — Task 6\n"
+            "├ Explore — Task 7\n"
+            "└ +2 more"
+        )
 
     def test_false_like_args_zero(self):
         """Non-dict falsy values should return None, not crash."""

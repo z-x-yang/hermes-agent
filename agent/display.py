@@ -413,11 +413,19 @@ def _delegate_task_description_parts(
     return len(descriptions), descriptions
 
 
-def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
+def build_tool_preview(
+    tool_name: str,
+    args: dict,
+    max_len: int | None = None,
+    *,
+    delegate_depth: int = 0,
+) -> str | None:
     """Build a short preview of a tool call's primary argument for display.
 
     *max_len* controls truncation.  ``None`` (default) defers to the global
     ``_tool_preview_max_len`` set via config; ``0`` means unlimited.
+    ``delegate_depth`` lets delegation previews use the same top-level versus
+    nested scheduling rule as the runtime instead of guessing from raw args.
     """
     if max_len is None:
         max_len = _tool_preview_max_len
@@ -437,23 +445,93 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         "clarify": "question", "skill_manage": "name",
     }
 
-    # delegate_task: show description (single) or task descriptions (batch)
+    # delegate_task: render the runtime-resolved profile(s) and scheduling mode.
     if tool_name == "delegate_task":
+        from tools.delegate_tool import (
+            _recover_tasks_from_json_string,
+            _resolve_run_in_background,
+        )
+        from tools.subagent_profiles import resolve_subagent_type
+
+        try:
+            runs_in_background = _resolve_run_in_background(
+                args.get("run_in_background"),
+                is_subagent=delegate_depth > 0,
+            )
+            delivery_mode = "background" if runs_in_background else "foreground"
+        except ValueError:
+            delivery_mode = "invalid mode"
+
         tasks = args.get("tasks")
+        recovered_tasks, _recovery_error = _recover_tasks_from_json_string(tasks)
+        if recovered_tasks is not None:
+            tasks = recovered_tasks
         if tasks and isinstance(tasks, list):
-            task_count, descriptions = _delegate_task_description_parts(
-                tasks, per_description_len=40
-            )
-            preview = (
-                f"{task_count} tasks: " + " | ".join(descriptions)
-                if descriptions else f"{len(tasks)} parallel tasks"
-            )
+            resolved_tasks: list[tuple[str, str]] = []
+            for task in tasks:
+                if not isinstance(task, dict):
+                    continue
+                raw_description = task.get("description")
+                description = "?" if raw_description is None else _oneline(str(raw_description))
+                try:
+                    task_type = resolve_subagent_type(
+                        task.get("subagent_type") or args.get("subagent_type")
+                    )
+                except ValueError:
+                    task_type = str(task.get("subagent_type") or "invalid profile")
+                resolved_tasks.append(
+                    (task_type, _truncate_preview(description or "?", 40))
+                )
+
+            if not resolved_tasks:
+                return _truncate_preview(f"{len(tasks)} parallel tasks · {delivery_mode}", max_len)
+
+            profile_counts: dict[str, int] = {}
+            for task_type, _ in resolved_tasks:
+                profile_counts[task_type] = profile_counts.get(task_type, 0) + 1
+            profile_names = set(profile_counts)
+            visible_tasks = resolved_tasks[:8]
+            hidden_count = len(resolved_tasks) - len(visible_tasks)
+            if len(profile_names) == 1:
+                profile_name = resolved_tasks[0][0]
+                header = f"{len(resolved_tasks)} {profile_name} tasks · {delivery_mode}"
+                descriptions = [description for _, description in visible_tasks]
+                if hidden_count:
+                    descriptions.append(f"+{hidden_count} more")
+                body = " | ".join(descriptions)
+                preview = f"{header}\n{body}"
+            else:
+                header = f"{len(resolved_tasks)} tasks · {delivery_mode}"
+                if hidden_count:
+                    distribution = ", ".join(
+                        f"{profile_name}×{count}"
+                        for profile_name, count in profile_counts.items()
+                    )
+                    header += f" · {distribution}"
+                lines = [header]
+                for index, (task_type, description) in enumerate(visible_tasks):
+                    is_last_visible = index == len(visible_tasks) - 1
+                    branch = "└" if is_last_visible and not hidden_count else "├"
+                    lines.append(f"{branch} {task_type} — {description}")
+                if hidden_count:
+                    lines.append(f"└ +{hidden_count} more")
+                preview = "\n".join(lines)
             return _truncate_preview(preview, max_len)
+
         description = args.get("description", "")
         if description is None:
             return None
         preview = _oneline(str(description))
-        return _truncate_preview(preview, max_len) if preview else None
+        if not preview:
+            return None
+        try:
+            task_type = resolve_subagent_type(args.get("subagent_type"))
+        except ValueError:
+            task_type = str(args.get("subagent_type") or "invalid profile")
+        return _truncate_preview(
+            f"{task_type} · {delivery_mode}: {preview}",
+            max_len,
+        )
 
     if tool_name == "process":
         action = args.get("action", "")
