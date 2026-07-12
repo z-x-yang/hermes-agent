@@ -39,7 +39,7 @@ def test_build_button_styles_and_labels():
     assert b.build_button("choice2", PID).item.custom_id == f"ntask:v1:choice2:{PID}"
     assert b.build_button("other", PID).item.label == "Other"
     ack = b.build_button("ack", PID)
-    assert ack.item.label == "已接手"
+    assert ack.item.label == "接手"
     assert ack.item.custom_id == f"ntask:v1:ack:{PID}"
 
 

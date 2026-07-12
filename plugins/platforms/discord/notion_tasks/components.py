@@ -26,7 +26,7 @@ _ACTION_MARK = {
     "choice2": "2.",
     "choice3": "3.",
     "other": "Other",
-    "ack": "已接手",
+    "ack": "接手",
     "done": "✓",
     "undo": "↩",
     "snooze": "⏰",
@@ -41,7 +41,7 @@ _LEGACY_LABEL = {
     "choice2": "2.",
     "choice3": "3.",
     "other": "Other",
-    "ack": "已接手",
+    "ack": "接手",
     "done": LABEL_DONE,
     "undo": LABEL_UNDO,
     "snooze": LABEL_SNOOZE,
@@ -391,7 +391,7 @@ def task_clarify_components(card: dict) -> list[dict]:
                 primary.append(_raw_button(action, page_id, f"{idx}."))
         if (card.get("otherChoice") or {}).get("enabled", True):
             primary.append(_raw_button("other", page_id, "Other"))
-        primary.append(_raw_button("ack", page_id, "已接手"))
+        primary.append(_raw_button("ack", page_id, "接手"))
     rows = []
     if primary:
         rows.append({"type": 1, "components": primary[:_MAX_PER_ROW]})

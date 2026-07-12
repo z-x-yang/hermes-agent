@@ -455,7 +455,7 @@ async def test_task_clarify_undo_restores_authored_body_not_bare_link():
     assert "合作者回了论文修改意见" in kwargs["embed"].description
     assert "**可选下一步**" in kwargs["embed"].description
     labels = [_item(child).label for child in kwargs["view"].children]
-    assert labels == ["1.", "2.", "3.", "Other", "已接手", "🧵", "⏰", "⏸", "🗑", "✓"]
+    assert labels == ["1.", "2.", "3.", "Other", "接手", "🧵", "⏰", "⏸", "🗑", "✓"]
 
 
 @pytest.mark.asyncio
@@ -490,7 +490,7 @@ async def test_task_clarify_done_then_undo_restores_original_choices():
     assert "已选择：完成" not in desc
     assert "状态：已完成" not in desc
     labels = [_item(child).label for child in kwargs["view"].children]
-    assert labels == ["1.", "2.", "3.", "Other", "已接手", "🧵", "⏰", "⏸", "🗑", "✓"]
+    assert labels == ["1.", "2.", "3.", "Other", "接手", "🧵", "⏰", "⏸", "🗑", "✓"]
 
 
 @pytest.mark.asyncio
@@ -966,7 +966,7 @@ async def test_task_clarify_snooze_picker_preserves_authored_card_body():
     assert "合作者回了论文修改意见" in kwargs["embed"].description
     assert "**可选下一步**" in kwargs["embed"].description
     labels = [_item(child).label for child in kwargs["view"].children if hasattr(child, "item")]
-    assert labels == ["1.", "2.", "3.", "Other", "已接手", "🧵", "⏰", "⏸", "🗑", "✓"]
+    assert labels == ["1.", "2.", "3.", "Other", "接手", "🧵", "⏰", "⏸", "🗑", "✓"]
     assert any(getattr(child, "custom_id", "").startswith("ntask:snooze-select:")
                for child in kwargs["view"].children)
 
@@ -1056,7 +1056,7 @@ async def test_open_thread_returns_existing_binding_without_creating():
     inter.response.edit_message.assert_awaited_once()
     kwargs = inter.response.edit_message.call_args.kwargs
     labels = [_item(child).label for child in kwargs["view"].children]
-    assert labels == ["1.", "2.", "3.", "Other", "已接手", "🧵", "⏰", "⏸", "🗑", "✓"]
+    assert labels == ["1.", "2.", "3.", "Other", "接手", "🧵", "⏰", "⏸", "🗑", "✓"]
     assert _item(kwargs["view"].children[5]).url == "https://discord.com/channels/147/777"
 
 

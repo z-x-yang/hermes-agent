@@ -85,7 +85,7 @@ _TASK_CLARIFY_SHORT_LABELS = {
     "choice2": "2.",
     "choice3": "3.",
     "other": "Other",
-    "ack": "已接手",
+    "ack": "接手",
     "open_thread": "🧵",
     "undo": "↩",
     "snooze": "⏰",

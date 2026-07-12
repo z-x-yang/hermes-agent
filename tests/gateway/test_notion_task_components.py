@@ -313,7 +313,7 @@ class TestTaskClarifyCard:
     def test_components_keep_primary_buttons_numeric_and_secondary_separate(self):
         rows = c.task_clarify_components(self.card())
         labels = [b["label"] for row in rows for b in row["components"]]
-        assert labels[:5] == ["1.", "2.", "3.", "Other", "已接手"]
+        assert labels[:5] == ["1.", "2.", "3.", "Other", "接手"]
         assert labels[5:] == ["🧵", "⏰", "⏸", "🗑", "✓"]
         custom_ids = [b["custom_id"] for row in rows for b in row["components"]]
         assert custom_ids[0] == f"ntask:v1:choice1:{self.PID}"
