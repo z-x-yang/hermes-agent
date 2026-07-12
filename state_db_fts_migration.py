@@ -15,9 +15,10 @@ import secrets
 import shutil
 import sqlite3
 import stat
+import subprocess
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -36,9 +37,12 @@ from state_db_maintenance import (
     MaintenanceJournal,
     MaintenancePermit,
     assert_state_db_maintenance_access,
+    fingerprint_path,
+    issue_maintenance_permit,
     load_maintenance_journal,
     maintenance_journal_path,
     state_db_file_inventory,
+    write_maintenance_journal,
 )
 
 _GIB = 1024**3
@@ -208,6 +212,23 @@ class ControlledVerificationResult:
 
     paired_corpus_version: str
     verification: VerificationReport
+
+
+@dataclass(frozen=True)
+class LivenessReport:
+    """Aggregate-only proof that no process has a state DB bundle open."""
+
+    status: str
+    holder_count: int
+
+
+@dataclass(frozen=True)
+class MigrationResult:
+    """Aggregate-only terminal result; paths and operation identifiers stay private."""
+
+    phase: str
+    completed: bool
+    paired_corpus_version: str = CONTROLLED_PAIRED_CORPUS_VERSION
 
 
 def controlled_paired_corpus() -> tuple[SearchCase, ...]:
@@ -1071,6 +1092,629 @@ def verify_v2_candidate_with_controlled_corpus(
         _cleanup_controlled_dir(owned)
         _assert_original_unchanged(source_path, source_before)
         _assert_original_unchanged(candidate_path, candidate_before)
+
+
+def _run_lsof(paths: tuple[Path, ...]):
+    """Private deterministic seam for the production lsof invocation."""
+    return subprocess.run(
+        ["lsof", "-Fpf", "--", *(str(path) for path in paths)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def find_live_state_db_users(db_path: Path) -> LivenessReport:
+    """Return aggregate liveness, failing closed on unavailable or ambiguous lsof."""
+    path = Path(db_path).expanduser().resolve(strict=False)
+    paths = tuple(
+        candidate
+        for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm"))
+        if candidate.exists()
+    )
+    if not paths:
+        raise RuntimeError("lsof cannot prove liveness for a missing database bundle")
+    try:
+        result = _run_lsof(paths)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("lsof unavailable; writer liveness is unknown") from exc
+    output = result.stdout
+    if result.returncode == 1 and not output.strip():
+        return LivenessReport(status="clear", holder_count=0)
+    if result.returncode != 0:
+        raise RuntimeError("lsof failed; writer liveness is unknown")
+    if not output.strip():
+        raise RuntimeError("lsof returned ambiguous empty success")
+    holders: set[int] = set()
+    active_pid: int | None = None
+    for line in output.splitlines():
+        if not line:
+            continue
+        field, value = line[0], line[1:]
+        if field == "p" and value.isdigit():
+            active_pid = int(value)
+            holders.add(active_pid)
+        elif field == "f" and active_pid is not None and value:
+            continue
+        else:
+            raise RuntimeError("lsof returned ambiguous machine output")
+    if not holders:
+        raise RuntimeError("lsof returned no process records")
+    return LivenessReport(status="live", holder_count=len(holders))
+
+
+def _require_no_live_users(db_path: Path) -> None:
+    if find_live_state_db_users(db_path).status != "clear":
+        raise RuntimeError("state DB writers are still live")
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as stream:
+        os.fsync(stream.fileno())
+
+
+def _transition(
+    db_path: Path,
+    journal: MaintenanceJournal,
+    phase: JournalPhase,
+    *,
+    fingerprints: dict[str, dict[str, int | str] | None] | None = None,
+    backup_path: Path | None = None,
+    work_path: Path | None = None,
+    candidate_path: Path | None = None,
+    expected_row_counts: dict[str, int] | None = None,
+) -> MaintenanceJournal:
+    merged = dict(journal.fingerprints)
+    if fingerprints:
+        merged.update(fingerprints)
+    updated = replace(
+        journal,
+        phase=phase,
+        backup_path=str(backup_path) if backup_path is not None else journal.backup_path,
+        work_path=str(work_path) if work_path is not None else journal.work_path,
+        candidate_path=str(candidate_path) if candidate_path is not None else journal.candidate_path,
+        fingerprints=merged,
+        expected_row_counts=(
+            expected_row_counts
+            if expected_row_counts is not None
+            else dict(journal.expected_row_counts)
+        ),
+        updated_at=str(time.time_ns()),
+    )
+    write_maintenance_journal(db_path, updated)
+    return updated
+
+
+def _permit(db_path: Path, journal: MaintenanceJournal) -> MaintenancePermit:
+    return issue_maintenance_permit(
+        db_path, journal.operation_id, frozenset({journal.phase})
+    )
+
+
+def _checkpoint_source(
+    db_path: Path, journal: MaintenanceJournal, permit: MaintenancePermit
+) -> tuple[int, int, int]:
+    assert_state_db_maintenance_access(db_path, write_capable=True, permit=permit)
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if row is None or len(row) != 3:
+            raise RuntimeError("checkpoint returned an invalid result")
+        return (int(row[0]), int(row[1]), int(row[2]))
+    finally:
+        conn.close()
+
+
+def _same_fingerprint(
+    actual: dict[str, int | str] | None,
+    expected: object,
+) -> bool:
+    if actual is None or not isinstance(expected, Mapping):
+        return actual is None and expected is None
+    return all(
+        actual.get(key) == expected.get(key)
+        for key in ("size", "mtime_ns", "device", "inode", "sha256")
+    )
+
+
+def _require_fingerprint(path: Path, expected: object, label: str) -> None:
+    if not _same_fingerprint(fingerprint_path(path), expected):
+        raise RuntimeError(f"unknown {label} fingerprint; no files changed")
+
+
+def _bundle_paths(db_path: Path) -> dict[str, Path]:
+    return {
+        "db": db_path,
+        "wal": Path(f"{db_path}-wal"),
+        "shm": Path(f"{db_path}-shm"),
+    }
+
+
+def _original_paths(db_path: Path) -> dict[str, Path]:
+    return {
+        "db": db_path.with_name(f"{db_path.name}.pre-v2.original"),
+        "wal": db_path.with_name(f"{db_path.name}.pre-v2.original-wal"),
+        "shm": db_path.with_name(f"{db_path.name}.pre-v2.original-shm"),
+    }
+
+
+def _quarantine_paths(db_path: Path) -> dict[str, Path]:
+    return {
+        "db": db_path.with_name(f"{db_path.name}.v2.quarantine"),
+        "wal": db_path.with_name(f"{db_path.name}.v2.quarantine-wal"),
+        "shm": db_path.with_name(f"{db_path.name}.v2.quarantine-shm"),
+    }
+
+
+def _source_inventory_fingerprints(db_path: Path) -> dict[str, dict[str, int | str] | None]:
+    inventory = state_db_file_inventory(db_path)
+    return {name: inventory[name] for name in ("db", "wal", "shm")}
+
+
+def _validate_live_source(db_path: Path, journal: MaintenanceJournal) -> None:
+    for name, path in _bundle_paths(db_path).items():
+        _require_fingerprint(path, journal.fingerprints.get(name), f"source {name}")
+
+
+def _create_sqlite_backup(
+    source: Path,
+    destination: Path,
+    permit: MaintenancePermit,
+) -> None:
+    assert_state_db_maintenance_access(source, write_capable=True, permit=permit)
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError("backup path already exists")
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    source_conn = _open_read_only(source)
+    destination_conn = sqlite3.connect(destination)
+    try:
+        source_conn.backup(destination_conn)
+    finally:
+        destination_conn.close()
+        source_conn.close()
+    os.chmod(destination, 0o600)
+    check = _open_read_only(destination)
+    try:
+        if check.execute("PRAGMA quick_check").fetchone() != ("ok",):
+            raise RuntimeError("rollback backup quick_check failed")
+    finally:
+        check.close()
+    _fsync_file(destination)
+    _fsync_directory(destination.parent)
+
+
+def _migration_paths(db_path: Path) -> tuple[Path, Path, Path]:
+    backup = db_path.with_name(f"{db_path.name}.pre-v2.backup")
+    work = db_path.parent / f".{db_path.name}.fts-v2-work"
+    candidate = work / "candidate-build" / "candidate.db"
+    return backup, work, candidate
+
+
+def _move_recorded_bundle_to_original(
+    db_path: Path, journal: MaintenanceJournal
+) -> MaintenanceJournal:
+    live = _bundle_paths(db_path)
+    original = _original_paths(db_path)
+    actions: list[tuple[Path, Path]] = []
+    for name in ("db", "wal", "shm"):
+        expected = journal.fingerprints.get(name)
+        source_fp = fingerprint_path(live[name])
+        destination_fp = fingerprint_path(original[name])
+        if expected is None:
+            if source_fp is not None or destination_fp is not None:
+                raise RuntimeError(f"unknown source {name} inventory; no files changed")
+            continue
+        source_matches = _same_fingerprint(source_fp, expected)
+        destination_matches = _same_fingerprint(destination_fp, expected)
+        if source_matches == destination_matches:
+            raise RuntimeError(f"unknown source {name} rename state; no files changed")
+        if source_matches:
+            actions.append((live[name], original[name]))
+    for source, destination in actions:
+        os.replace(source, destination)
+        _fsync_directory(db_path.parent)
+    originals = {
+        f"original_{name}": fingerprint_path(path) for name, path in original.items()
+    }
+    return _transition(db_path, journal, JournalPhase.OLD_MOVED, fingerprints=originals)
+
+
+def _install_recorded_candidate(
+    db_path: Path, journal: MaintenanceJournal
+) -> MaintenanceJournal:
+    if journal.candidate_path is None:
+        raise RuntimeError("candidate path missing from journal")
+    candidate = Path(journal.candidate_path)
+    expected = journal.fingerprints.get("candidate")
+    live = _bundle_paths(db_path)
+    for name in ("wal", "shm"):
+        if live[name].exists():
+            raise RuntimeError("stale sidecar remains at live basename")
+    candidate_fp = fingerprint_path(candidate)
+    live_fp = fingerprint_path(db_path)
+    at_candidate = _same_fingerprint(candidate_fp, expected)
+    at_live = _same_fingerprint(live_fp, expected)
+    if at_candidate == at_live:
+        raise RuntimeError("unknown candidate rename state; no files changed")
+    if at_candidate:
+        os.replace(candidate, db_path)
+        _fsync_directory(db_path.parent)
+    return _transition(
+        db_path,
+        journal,
+        JournalPhase.CANDIDATE_LIVE,
+        fingerprints=_source_inventory_fingerprints(db_path),
+    )
+
+
+def _run_v2_canary(db_path: Path, journal: MaintenanceJournal) -> None:
+    permit = _permit(db_path, journal)
+    assert_state_db_maintenance_access(db_path, write_capable=True, permit=permit)
+    conn = sqlite3.connect(db_path)
+    token = f"hermescanary{secrets.token_hex(12)}"
+    try:
+        if detect_fts_schema(conn) != "v2_external":
+            raise RuntimeError("live candidate is not v2_external")
+        row = conn.execute("SELECT id FROM messages ORDER BY id LIMIT 1").fetchone()
+        if row is None:
+            raise RuntimeError("canary requires a message row")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE messages SET content=coalesce(content,'') || ? WHERE id=?",
+                (f" {token}", row[0]),
+            )
+            if conn.execute("SELECT content FROM messages WHERE id=?", (row[0],)).fetchone() is None:
+                raise RuntimeError("canary read failed")
+            found = conn.execute(
+                "SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?",
+                (f'"{token}"',),
+            ).fetchone()
+            if found is None:
+                raise RuntimeError("canary search failed")
+        finally:
+            conn.rollback()
+    finally:
+        conn.close()
+    permit = _permit(db_path, journal)
+    checkpoint = _checkpoint_source(db_path, journal, permit)
+    if checkpoint != (0, 0, 0):
+        raise RuntimeError("canary checkpoint did not return exact (0,0,0)")
+
+
+def apply_fts_migration(db_path: Path) -> MigrationResult:
+    """Start and fully execute the explicit recoverable v1-to-v2 migration."""
+    path = Path(db_path).expanduser()
+    if path.is_symlink():
+        raise ValueError("database must not be a symlink")
+    path = path.resolve(strict=True)
+    if load_maintenance_journal(path) is not None:
+        raise RuntimeError("maintenance journal already exists; use resume")
+    _require_no_live_users(path)
+    plan = plan_fts_migration(path)
+    if plan.schema_kind != "v1_inline":
+        raise RuntimeError("only a verified v1_inline database can be migrated")
+    if plan.free_bytes < plan.required_free_bytes:
+        raise RuntimeError("insufficient free space for migration")
+    operation_id = secrets.token_hex(32)
+    inventory = _source_inventory_fingerprints(path)
+    journal = replace(
+        MaintenanceJournal.new(operation_id, path),
+        fingerprints=inventory,
+        expected_row_counts={"messages": plan.message_count, "sessions": plan.session_count},
+    )
+    write_maintenance_journal(path, journal)
+    return resume_fts_migration(path)
+
+
+def resume_fts_migration(db_path: Path) -> MigrationResult:
+    """Resume exactly one journaled action at each crash-durable phase."""
+    path = Path(db_path).expanduser().resolve(strict=False)
+    journal = load_maintenance_journal(path)
+    if journal is None:
+        raise RuntimeError("no maintenance journal to resume")
+    if Path(journal.db_path).resolve(strict=False) != path:
+        raise RuntimeError("journal database path mismatch")
+    while True:
+        phase = journal.phase
+        if phase in TERMINAL_PHASES:
+            return MigrationResult(phase=phase.value, completed=phase is JournalPhase.COMPLETE)
+        if phase is JournalPhase.PLANNED:
+            _validate_live_source(path, journal)
+            _require_no_live_users(path)
+            journal = _transition(path, journal, JournalPhase.WRITERS_STOPPED)
+        elif phase is JournalPhase.WRITERS_STOPPED:
+            _validate_live_source(path, journal)
+            checkpoint = _checkpoint_source(path, journal, _permit(path, journal))
+            if checkpoint != (0, 0, 0):
+                raise RuntimeError("checkpoint did not return exact (0,0,0)")
+            backup, work, candidate = _migration_paths(path)
+            journal = _transition(
+                path,
+                journal,
+                JournalPhase.CHECKPOINTED,
+                backup_path=backup,
+                work_path=work,
+                candidate_path=candidate,
+                fingerprints=_source_inventory_fingerprints(path),
+            )
+        elif phase is JournalPhase.CHECKPOINTED:
+            _validate_live_source(path, journal)
+            if journal.backup_path is None or journal.work_path is None or journal.candidate_path is None:
+                raise RuntimeError("checkpointed paths missing from journal")
+            backup = Path(journal.backup_path)
+            work = Path(journal.work_path)
+            candidate = Path(journal.candidate_path)
+            if work.is_symlink():
+                raise RuntimeError("migration work path is unsafe")
+            if work.exists():
+                if not work.is_dir() or any(work.iterdir()):
+                    raise FileExistsError("migration work path contains unknown files")
+            else:
+                work.mkdir(mode=0o700)
+                os.chmod(work, 0o700)
+                _fsync_directory(work.parent)
+            expected_backup = journal.fingerprints.get("backup")
+            pending_backup = backup.with_name(f".{backup.name}.pending")
+            if expected_backup is None:
+                if backup.exists() or backup.is_symlink() or pending_backup.exists() or pending_backup.is_symlink():
+                    raise FileExistsError("unrecorded backup path already exists")
+                _create_sqlite_backup(path, pending_backup, _permit(path, journal))
+                journal = _transition(
+                    path,
+                    journal,
+                    JournalPhase.CHECKPOINTED,
+                    fingerprints={
+                        **_source_inventory_fingerprints(path),
+                        "backup": fingerprint_path(pending_backup),
+                    },
+                )
+                expected_backup = journal.fingerprints.get("backup")
+            pending_matches = _same_fingerprint(fingerprint_path(pending_backup), expected_backup)
+            final_matches = _same_fingerprint(fingerprint_path(backup), expected_backup)
+            if pending_matches == final_matches:
+                raise RuntimeError("unknown rollback backup install state")
+            if pending_matches:
+                os.replace(pending_backup, backup)
+                _fsync_directory(backup.parent)
+            journal = _transition(
+                path,
+                journal,
+                JournalPhase.BACKUP_READY,
+                backup_path=backup,
+                work_path=work,
+                candidate_path=candidate,
+                fingerprints={
+                    **_source_inventory_fingerprints(path),
+                    "backup": fingerprint_path(backup),
+                },
+            )
+        elif phase is JournalPhase.BACKUP_READY:
+            _validate_live_source(path, journal)
+            if journal.backup_path is None or journal.work_path is None or journal.candidate_path is None:
+                raise RuntimeError("backup-ready paths missing from journal")
+            _require_fingerprint(Path(journal.backup_path), journal.fingerprints.get("backup"), "backup")
+            report = build_v2_candidate(path, Path(journal.work_path), journal, _permit(path, journal))
+            candidate = Path(journal.candidate_path)
+            if report.candidate_sha256 != _sha256_file(candidate):
+                raise RuntimeError("candidate builder hash mismatch")
+            controlled = verify_v2_candidate_with_controlled_corpus(
+                Path(journal.backup_path), candidate, Path(journal.work_path)
+            )
+            if (
+                controlled.paired_corpus_version != CONTROLLED_PAIRED_CORPUS_VERSION
+                or not controlled.verification.verification_passed
+                or not controlled.verification.candidate_accepted
+            ):
+                raise RuntimeError("controlled paired candidate verification failed")
+            work_db = Path(journal.work_path) / "candidate-build" / "work.db"
+            journal = _transition(
+                path,
+                journal,
+                JournalPhase.CANDIDATE_READY,
+                fingerprints={
+                    "candidate": fingerprint_path(candidate),
+                    "work": fingerprint_path(work_db),
+                },
+            )
+        elif phase is JournalPhase.CANDIDATE_READY:
+            _validate_live_source(path, journal)
+            if journal.candidate_path is None:
+                raise RuntimeError("candidate path missing from journal")
+            _require_fingerprint(
+                Path(journal.candidate_path), journal.fingerprints.get("candidate"), "candidate"
+            )
+            journal = _transition(path, journal, JournalPhase.SWAPPING)
+        elif phase is JournalPhase.SWAPPING:
+            journal = _move_recorded_bundle_to_original(path, journal)
+        elif phase is JournalPhase.OLD_MOVED:
+            journal = _install_recorded_candidate(path, journal)
+        elif phase is JournalPhase.CANDIDATE_LIVE:
+            _run_v2_canary(path, journal)
+            journal = _transition(
+                path,
+                journal,
+                JournalPhase.CANARY_PASSED,
+                fingerprints=_source_inventory_fingerprints(path),
+            )
+        elif phase is JournalPhase.CANARY_PASSED:
+            _require_fingerprint(path, journal.fingerprints.get("db"), "live candidate")
+            _fsync_file(path)
+            _fsync_directory(path.parent)
+            journal = _transition(path, journal, JournalPhase.COMPLETE)
+        else:
+            raise RuntimeError("unsupported migration phase")
+
+
+def _remove_owned_work(journal: MaintenanceJournal) -> None:
+    if journal.work_path is None:
+        return
+    root = Path(journal.work_path)
+    if not root.exists():
+        return
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError("owned work path is unsafe")
+    allowed = {
+        root / "candidate-build" / "candidate.db": journal.fingerprints.get("candidate"),
+        root / "candidate-build" / "work.db": journal.fingerprints.get("work"),
+    }
+    files = [path for path in root.rglob("*") if path.is_file() or path.is_symlink()]
+    if any(path not in allowed or path.is_symlink() for path in files):
+        raise RuntimeError("owned work directory contains unknown files")
+    for path in files:
+        expected = allowed[path]
+        if expected is None:
+            raise RuntimeError("owned work file lacks a recorded fingerprint")
+        _require_fingerprint(path, expected, "owned work file")
+        path.unlink()
+    build = root / "candidate-build"
+    if build.exists():
+        build.rmdir()
+    root.rmdir()
+    _fsync_directory(root.parent)
+
+
+def abort_fts_migration(db_path: Path) -> MigrationResult:
+    """Abort only while the exact recorded v1 bundle is still live."""
+    path = Path(db_path).expanduser().resolve(strict=False)
+    journal = load_maintenance_journal(path)
+    if journal is None:
+        raise RuntimeError("no maintenance journal to abort")
+    safe = {
+        JournalPhase.PLANNED,
+        JournalPhase.WRITERS_STOPPED,
+        JournalPhase.CHECKPOINTED,
+        JournalPhase.BACKUP_READY,
+        JournalPhase.CANDIDATE_READY,
+    }
+    if journal.phase not in safe:
+        if journal.phase is JournalPhase.ABORTED:
+            return MigrationResult(phase="aborted", completed=False)
+        raise RuntimeError("post-swap migration requires rollback")
+    _validate_live_source(path, journal)
+    _remove_owned_work(journal)
+    journal = _transition(path, journal, JournalPhase.ABORTED)
+    return MigrationResult(phase=journal.phase.value, completed=False)
+
+
+def _restore_original_bundle(path: Path, journal: MaintenanceJournal) -> None:
+    live = _bundle_paths(path)
+    original = _original_paths(path)
+    actions: list[tuple[Path, Path]] = []
+    for name in ("db", "wal", "shm"):
+        expected = journal.fingerprints.get(f"original_{name}") or journal.fingerprints.get(name)
+        source_fp = fingerprint_path(original[name])
+        live_fp = fingerprint_path(live[name])
+        if expected is None:
+            if source_fp is not None or live_fp is not None:
+                raise RuntimeError(f"unknown original {name} inventory")
+            continue
+        at_original = _same_fingerprint(source_fp, expected)
+        at_live = _same_fingerprint(live_fp, expected)
+        if at_original == at_live:
+            raise RuntimeError(f"unknown original {name} restore state")
+        if at_original:
+            actions.append((original[name], live[name]))
+    for source, destination in actions:
+        os.replace(source, destination)
+        _fsync_directory(path.parent)
+
+
+def rollback_fts_migration(
+    db_path: Path, backup: Path | None = None
+) -> MigrationResult:
+    """Quarantine a recorded live v2 bundle and restore the exact v1 bundle."""
+    path = Path(db_path).expanduser().resolve(strict=False)
+    journal = load_maintenance_journal(path)
+    if journal is None:
+        raise RuntimeError("no maintenance journal to rollback")
+    if journal.phase is JournalPhase.ROLLED_BACK:
+        return MigrationResult(phase="rolled_back", completed=False)
+    if journal.phase in {
+        JournalPhase.PLANNED,
+        JournalPhase.WRITERS_STOPPED,
+        JournalPhase.CHECKPOINTED,
+        JournalPhase.BACKUP_READY,
+        JournalPhase.CANDIDATE_READY,
+    }:
+        raise RuntimeError("pre-swap migration must use abort")
+    if backup is not None:
+        if journal.backup_path is None or Path(backup).resolve(strict=False) != Path(journal.backup_path).resolve(strict=False):
+            raise RuntimeError("rollback backup does not match journal")
+        _require_fingerprint(Path(backup), journal.fingerprints.get("backup"), "rollback backup")
+    if "rollback_liveness" not in journal.fingerprints:
+        _require_no_live_users(path)
+        current_bundle = {
+            name: fingerprint_path(item) for name, item in _bundle_paths(path).items()
+        }
+        next_phase = (
+            JournalPhase.CANDIDATE_LIVE
+            if journal.phase in {JournalPhase.CANARY_PASSED, JournalPhase.COMPLETE}
+            else journal.phase
+        )
+        journal = _transition(
+            path,
+            journal,
+            next_phase,
+            fingerprints={
+                "rollback_liveness": {"size": 0, "mtime_ns": 0, "device": 0, "inode": 0, "sha256": "proved"},
+                **{f"rollback_{name}": value for name, value in current_bundle.items()},
+            },
+        )
+    if journal.phase is JournalPhase.SWAPPING:
+        # Normalize any partially moved source bundle, then restore it.
+        journal = _move_recorded_bundle_to_original(path, journal)
+    if journal.phase is JournalPhase.OLD_MOVED:
+        _restore_original_bundle(path, journal)
+    else:
+        live = _bundle_paths(path)
+        quarantine = _quarantine_paths(path)
+        current = {name: fingerprint_path(item) for name, item in live.items()}
+        if current["db"] is not None and "rollback_db" not in journal.fingerprints:
+            # Persist exact rollback intent before the first rename.
+            journal = _transition(
+                path,
+                journal,
+                JournalPhase.CANDIDATE_LIVE,
+                fingerprints={f"rollback_{name}": value for name, value in current.items()},
+            )
+        actions: list[tuple[Path, Path]] = []
+        for name in ("db", "wal", "shm"):
+            expected = journal.fingerprints.get(f"rollback_{name}")
+            live_fp = fingerprint_path(live[name])
+            quarantine_fp = fingerprint_path(quarantine[name])
+            if expected is None:
+                if live_fp is not None or quarantine_fp is not None:
+                    raise RuntimeError(f"unknown candidate {name} rollback inventory")
+                continue
+            at_live = _same_fingerprint(live_fp, expected)
+            at_quarantine = _same_fingerprint(quarantine_fp, expected)
+            if at_live == at_quarantine:
+                raise RuntimeError(f"unknown candidate {name} quarantine state")
+            if at_live:
+                actions.append((live[name], quarantine[name]))
+        for source, destination in actions:
+            os.replace(source, destination)
+            _fsync_directory(path.parent)
+        _restore_original_bundle(path, journal)
+    _fsync_file(path)
+    _fsync_directory(path.parent)
+    journal = _transition(
+        path,
+        journal,
+        JournalPhase.ROLLED_BACK,
+        fingerprints=_source_inventory_fingerprints(path),
+    )
+    return MigrationResult(phase=journal.phase.value, completed=False)
 
 
 def _open_read_only(db_path: Path) -> sqlite3.Connection:

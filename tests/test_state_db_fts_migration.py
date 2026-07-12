@@ -6,13 +6,16 @@ import os
 import sqlite3
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import state_db_fts_migration as migration
+import pytest
 from state_db_fts import create_fts_v1, rebuild_fts
 from state_db_maintenance import (
     JournalPhase,
     MaintenanceBlockedError,
     MaintenanceJournal,
+    assert_state_db_maintenance_access,
     issue_maintenance_permit,
     state_db_file_inventory,
     write_maintenance_journal,
@@ -20,11 +23,16 @@ from state_db_maintenance import (
 from state_db_fts_migration import (
     CONTROLLED_PAIRED_CORPUS_VERSION,
     SearchCase,
+    abort_fts_migration,
+    apply_fts_migration,
     build_v2_candidate,
     controlled_paired_corpus,
     estimate_payload_retention,
     field_digest,
+    find_live_state_db_users,
     plan_fts_migration,
+    resume_fts_migration,
+    rollback_fts_migration,
     status_fts_migration,
     verify_v2_candidate,
     verify_v2_candidate_with_controlled_corpus,
@@ -102,6 +110,104 @@ def _sha256(path: Path) -> str | None:
     if not path.exists():
         return None
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _lsof_result(returncode: int = 0, stdout: str = ""):
+    return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+
+
+def test_liveness_report_parses_machine_output_and_fails_closed(monkeypatch, tmp_path):
+    path = tmp_path / "state.db"
+    _make_v1_fixture(path)
+    monkeypatch.setattr(
+        migration, "_run_lsof", lambda paths: _lsof_result(stdout="p123\nf9\n")
+    )
+
+    report = find_live_state_db_users(path)
+
+    assert report.status == "live"
+    assert report.holder_count == 1
+    assert "123" not in repr(report)
+
+    monkeypatch.setattr(migration, "_run_lsof", lambda paths: _lsof_result(1, ""))
+    assert find_live_state_db_users(path).status == "clear"
+    monkeypatch.setattr(migration, "_run_lsof", lambda paths: _lsof_result(2, ""))
+    try:
+        find_live_state_db_users(path)
+    except RuntimeError as exc:
+        assert "lsof" in str(exc)
+    else:
+        raise AssertionError("unknown lsof failure was accepted")
+
+
+def test_apply_refuses_live_holder_before_planned(monkeypatch, tmp_path):
+    path = tmp_path / "state.db"
+    _make_v1_fixture(path)
+    monkeypatch.setattr(
+        migration, "_run_lsof", lambda paths: _lsof_result(stdout="p123\nf9\n")
+    )
+
+    try:
+        apply_fts_migration(path)
+    except RuntimeError as exc:
+        assert "writers" in str(exc)
+    else:
+        raise AssertionError("apply accepted a live writer")
+
+    assert not (tmp_path / "state-db-maintenance.json").exists()
+
+
+def test_apply_rechecks_liveness_after_planned(monkeypatch, tmp_path):
+    path = tmp_path / "state.db"
+    _make_v1_fixture(path)
+    calls = 0
+
+    def lsof_after_planned(paths):
+        nonlocal calls
+        calls += 1
+        return _lsof_result(1, "") if calls == 1 else _lsof_result(stdout="p456\nf9\n")
+
+    monkeypatch.setattr(migration, "_run_lsof", lsof_after_planned)
+    monkeypatch.setattr(
+        migration.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=20 * 1024**3, used=0, free=20 * 1024**3),
+    )
+
+    try:
+        apply_fts_migration(path)
+    except RuntimeError as exc:
+        assert "writers" in str(exc)
+    else:
+        raise AssertionError("second liveness proof was skipped")
+
+    journal = migration.load_maintenance_journal(path)
+    assert journal is not None
+    assert journal.phase is JournalPhase.PLANNED
+
+
+def test_apply_requires_exact_empty_checkpoint_before_backup(monkeypatch, tmp_path):
+    path = tmp_path / "state.db"
+    _make_v1_fixture(path)
+    monkeypatch.setattr(migration, "_run_lsof", lambda paths: _lsof_result(1, ""))
+    monkeypatch.setattr(
+        migration.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=20 * 1024**3, used=0, free=20 * 1024**3),
+    )
+    monkeypatch.setattr(migration, "_checkpoint_source", lambda *args: (0, 1, 1))
+
+    try:
+        apply_fts_migration(path)
+    except RuntimeError as exc:
+        assert "checkpoint" in str(exc)
+    else:
+        raise AssertionError("non-empty checkpoint was accepted")
+
+    journal = migration.load_maintenance_journal(path)
+    assert journal is not None
+    assert journal.phase is JournalPhase.WRITERS_STOPPED
+    assert journal.backup_path is None
 
 
 def _db_digest(path: Path) -> dict[str, object]:
@@ -724,3 +830,371 @@ def test_controlled_verifier_fails_closed_on_preexisting_or_symlink_owned_path(t
     else:
         raise AssertionError("symlink controlled verification path was accepted")
     assert owned.is_symlink()
+
+
+def _allow_apply(monkeypatch):
+    monkeypatch.setattr(migration, "_run_lsof", lambda paths: _lsof_result(1, ""))
+    monkeypatch.setattr(migration, "_checkpoint_source", lambda *args: (0, 0, 0))
+    monkeypatch.setattr(
+        migration.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=20 * 1024**3, used=0, free=20 * 1024**3),
+    )
+
+
+def test_apply_runs_exact_phase_sequence_and_installs_verified_candidate(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.db"
+    _candidate_fixture(path)
+    _allow_apply(monkeypatch)
+    phases = []
+    canonical_write = migration.write_maintenance_journal
+
+    def recording_write(db_path, journal):
+        canonical_write(db_path, journal)
+        phases.append(journal.phase.value)
+
+    monkeypatch.setattr(migration, "write_maintenance_journal", recording_write)
+
+    result = apply_fts_migration(path)
+
+    assert result.phase == "complete"
+    assert result.completed
+    phase_transitions = [
+        phase for index, phase in enumerate(phases) if index == 0 or phase != phases[index - 1]
+    ]
+    assert phase_transitions == [
+        "planned",
+        "writers_stopped",
+        "checkpointed",
+        "backup_ready",
+        "candidate_ready",
+        "swapping",
+        "old_moved",
+        "candidate_live",
+        "canary_passed",
+        "complete",
+    ]
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        assert migration.detect_fts_schema(conn) == "v2_external"
+        assert conn.execute(
+            "SELECT value FROM state_meta WHERE key='fts_schema_version'"
+        ).fetchone() == ("2",)
+    finally:
+        conn.close()
+    assert not Path(f"{path}-wal").exists()
+    assert not Path(f"{path}-shm").exists()
+    assert (tmp_path / "state.db.pre-v2.original").exists()
+    assert (tmp_path / "state.db.pre-v2.backup").exists()
+    serialized = json.dumps(asdict(result), sort_keys=True)
+    assert "state.db" not in serialized
+    assert "candidate" not in serialized
+
+
+def test_candidate_ready_abort_preserves_backup_and_unblocks_writers(tmp_path, monkeypatch):
+    path = tmp_path / "state.db"
+    _candidate_fixture(path)
+    _allow_apply(monkeypatch)
+    before = _db_digest(path)
+    canonical_transition = migration._transition
+    stopped = False
+
+    def stop_after_candidate(*args, **kwargs):
+        nonlocal stopped
+        journal = canonical_transition(*args, **kwargs)
+        if journal.phase is JournalPhase.CANDIDATE_READY and not stopped:
+            stopped = True
+            raise RuntimeError("injected candidate-ready crash")
+        return journal
+
+    monkeypatch.setattr(migration, "_transition", stop_after_candidate)
+    try:
+        apply_fts_migration(path)
+    except RuntimeError as exc:
+        assert str(exc) == "injected candidate-ready crash"
+    else:
+        raise AssertionError("crash injection did not stop apply")
+
+    result = abort_fts_migration(path)
+
+    assert result.phase == "aborted"
+    assert _db_digest(path) == before
+    assert (tmp_path / "state.db.pre-v2.backup").exists()
+    assert not (tmp_path / ".state.db.fts-v2-work").exists()
+    assert abort_fts_migration(path) == result
+    assert_state_db_maintenance_access(path, write_capable=True)
+
+
+def test_complete_rollback_quarantines_candidate_and_restores_exact_v1(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.db"
+    _candidate_fixture(path)
+    _allow_apply(monkeypatch)
+    before = _db_digest(path)
+    apply_fts_migration(path)
+
+    result = rollback_fts_migration(path)
+
+    assert result.phase == "rolled_back"
+    assert _db_digest(path) == before
+    assert (tmp_path / "state.db.v2.quarantine").exists()
+    assert not Path(f"{path}-wal").exists()
+    assert not Path(f"{path}-shm").exists()
+    assert rollback_fts_migration(path) == result
+    assert_state_db_maintenance_access(path, write_capable=True)
+
+
+def test_resume_unknown_planned_fingerprint_preserves_every_file(tmp_path, monkeypatch):
+    path = tmp_path / "state.db"
+    _candidate_fixture(path)
+    _allow_apply(monkeypatch)
+    journal = replace(
+        MaintenanceJournal.new("unknown-fingerprint-operation", path),
+        fingerprints=state_db_file_inventory(path),
+    )
+    write_maintenance_journal(path, journal)
+    with path.open("ab") as stream:
+        stream.write(b"unexpected")
+    file_before = path.read_bytes()
+    journal_path = tmp_path / "state-db-maintenance.json"
+    journal_before = journal_path.read_bytes()
+
+    try:
+        resume_fts_migration(path)
+    except RuntimeError as exc:
+        assert "unknown" in str(exc)
+    else:
+        raise AssertionError("unknown fingerprint was accepted")
+
+    assert path.read_bytes() == file_before
+    assert journal_path.read_bytes() == journal_before
+
+
+@pytest.mark.parametrize(
+    "crash_phase",
+    [
+        JournalPhase.WRITERS_STOPPED,
+        JournalPhase.CHECKPOINTED,
+        JournalPhase.BACKUP_READY,
+        JournalPhase.CANDIDATE_READY,
+        JournalPhase.SWAPPING,
+        JournalPhase.OLD_MOVED,
+        JournalPhase.CANDIDATE_LIVE,
+        JournalPhase.CANARY_PASSED,
+    ],
+)
+def test_resume_after_each_recorded_phase_boundary(tmp_path, monkeypatch, crash_phase):
+    path = tmp_path / "state.db"
+    _candidate_fixture(path)
+    _allow_apply(monkeypatch)
+    canonical_transition = migration._transition
+    injected = False
+
+    def crash_after_transition(*args, **kwargs):
+        nonlocal injected
+        journal = canonical_transition(*args, **kwargs)
+        if journal.phase is crash_phase and not injected:
+            injected = True
+            raise RuntimeError("injected phase crash")
+        return journal
+
+    monkeypatch.setattr(migration, "_transition", crash_after_transition)
+    with pytest.raises(RuntimeError, match="injected phase crash"):
+        apply_fts_migration(path)
+
+    result = resume_fts_migration(path)
+
+    assert result.phase == "complete"
+    assert result.completed
+
+
+def test_resume_completes_source_bundle_after_crash_between_renames(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.db"
+    _candidate_fixture(path)
+    _allow_apply(monkeypatch)
+    canonical_replace = migration.os.replace
+    crashed = False
+    original_main = tmp_path / "state.db.pre-v2.original"
+
+    def crash_after_main(source, destination):
+        nonlocal crashed
+        canonical_replace(source, destination)
+        if Path(source) == path and Path(destination) == original_main and not crashed:
+            crashed = True
+            raise RuntimeError("injected source rename crash")
+
+    monkeypatch.setattr(migration.os, "replace", crash_after_main)
+    with pytest.raises(RuntimeError, match="injected source rename crash"):
+        apply_fts_migration(path)
+    assert migration.load_maintenance_journal(path).phase is JournalPhase.SWAPPING
+    monkeypatch.setattr(migration.os, "replace", canonical_replace)
+
+    assert resume_fts_migration(path).phase == "complete"
+    assert original_main.exists()
+
+
+def test_resume_completes_candidate_install_after_rename_before_journal(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.db"
+    _candidate_fixture(path)
+    _allow_apply(monkeypatch)
+    canonical_replace = migration.os.replace
+    crashed = False
+
+    def crash_after_candidate(source, destination):
+        nonlocal crashed
+        canonical_replace(source, destination)
+        if Path(source).name == "candidate.db" and Path(destination) == path and not crashed:
+            crashed = True
+            raise RuntimeError("injected candidate rename crash")
+
+    monkeypatch.setattr(migration.os, "replace", crash_after_candidate)
+    with pytest.raises(RuntimeError, match="injected candidate rename crash"):
+        apply_fts_migration(path)
+    assert migration.load_maintenance_journal(path).phase is JournalPhase.OLD_MOVED
+    monkeypatch.setattr(migration.os, "replace", canonical_replace)
+
+    assert resume_fts_migration(path).phase == "complete"
+
+
+def test_zero_frame_sidecars_move_with_original_and_never_remain_live(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.db"
+    _candidate_fixture(path)
+    _allow_apply(monkeypatch)
+    canonical_transition = migration._transition
+
+    def add_zero_sidecars(*args, **kwargs):
+        journal = canonical_transition(*args, **kwargs)
+        if journal.phase is JournalPhase.CANDIDATE_READY:
+            Path(f"{path}-wal").touch()
+            Path(f"{path}-shm").touch()
+            journal = canonical_transition(
+                path,
+                journal,
+                JournalPhase.CANDIDATE_READY,
+                fingerprints=migration._source_inventory_fingerprints(path),
+            )
+        return journal
+
+    monkeypatch.setattr(migration, "_transition", add_zero_sidecars)
+
+    assert apply_fts_migration(path).phase == "complete"
+    assert (tmp_path / "state.db.pre-v2.original-wal").read_bytes() == b""
+    assert (tmp_path / "state.db.pre-v2.original-shm").read_bytes() == b""
+    assert not Path(f"{path}-wal").exists()
+    assert not Path(f"{path}-shm").exists()
+
+
+def test_rollback_resumes_after_candidate_main_quarantine_crash(tmp_path, monkeypatch):
+    path = tmp_path / "state.db"
+    _candidate_fixture(path)
+    _allow_apply(monkeypatch)
+    before = _db_digest(path)
+    apply_fts_migration(path)
+    canonical_replace = migration.os.replace
+    quarantine = tmp_path / "state.db.v2.quarantine"
+    crashed = False
+
+    def crash_after_quarantine(source, destination):
+        nonlocal crashed
+        canonical_replace(source, destination)
+        if Path(source) == path and Path(destination) == quarantine and not crashed:
+            crashed = True
+            raise RuntimeError("injected quarantine crash")
+
+    monkeypatch.setattr(migration.os, "replace", crash_after_quarantine)
+    with pytest.raises(RuntimeError, match="injected quarantine crash"):
+        rollback_fts_migration(path)
+    monkeypatch.setattr(migration.os, "replace", canonical_replace)
+
+    assert rollback_fts_migration(path).phase == "rolled_back"
+    assert _db_digest(path) == before
+
+
+def test_abort_rejects_swap_phase_and_requires_rollback(tmp_path):
+    path = tmp_path / "state.db"
+    _candidate_fixture(path)
+    journal = replace(
+        MaintenanceJournal.new("swap-operation", path),
+        phase=JournalPhase.SWAPPING,
+        fingerprints=state_db_file_inventory(path),
+    )
+    write_maintenance_journal(path, journal)
+
+    with pytest.raises(RuntimeError, match="requires rollback"):
+        abort_fts_migration(path)
+
+
+def test_production_checkpoint_returns_exact_empty_wal_tuple(tmp_path):
+    path = tmp_path / "state.db"
+    _candidate_fixture(path)
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+    finally:
+        conn.close()
+    journal = replace(
+        MaintenanceJournal.new("checkpoint-operation", path),
+        phase=JournalPhase.WRITERS_STOPPED,
+        fingerprints=state_db_file_inventory(path),
+    )
+    write_maintenance_journal(path, journal)
+    permit = issue_maintenance_permit(
+        path, journal.operation_id, frozenset({JournalPhase.WRITERS_STOPPED})
+    )
+
+    assert migration._checkpoint_source(path, journal, permit) == (0, 0, 0)
+
+
+def test_lsof_unavailable_empty_success_and_malformed_output_fail_closed(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.db"
+    _candidate_fixture(path)
+
+    def unavailable(paths):
+        raise FileNotFoundError("lsof missing")
+
+    monkeypatch.setattr(migration, "_run_lsof", unavailable)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        find_live_state_db_users(path)
+    monkeypatch.setattr(migration, "_run_lsof", lambda paths: _lsof_result(0, ""))
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        find_live_state_db_users(path)
+    monkeypatch.setattr(
+        migration, "_run_lsof", lambda paths: _lsof_result(0, "not-machine-output\n")
+    )
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        find_live_state_db_users(path)
+
+
+def test_unknown_sidecar_fingerprint_does_not_partially_move_main(tmp_path):
+    path = tmp_path / "state.db"
+    _candidate_fixture(path)
+    wal = Path(f"{path}-wal")
+    wal.write_bytes(b"recorded-zero-frame")
+    journal = replace(
+        MaintenanceJournal.new("unknown-sidecar-operation", path),
+        phase=JournalPhase.SWAPPING,
+        fingerprints=state_db_file_inventory(path),
+    )
+    write_maintenance_journal(path, journal)
+    wal.write_bytes(b"changed-after-record")
+    main_before = path.read_bytes()
+    journal_path = tmp_path / "state-db-maintenance.json"
+    journal_before = journal_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="unknown source wal"):
+        resume_fts_migration(path)
+
+    assert path.read_bytes() == main_before
+    assert not (tmp_path / "state.db.pre-v2.original").exists()
+    assert journal_path.read_bytes() == journal_before
