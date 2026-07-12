@@ -984,6 +984,7 @@ class SessionDB:
                     timeout=1.0,
                     isolation_level=None,
                 )
+                self._conn.execute("PRAGMA query_only=ON")
                 self._conn.row_factory = sqlite3.Row
                 return
 

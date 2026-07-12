@@ -5148,3 +5148,19 @@ def test_archive_and_compact_returning_ids_reports_fresh_active_rows(db):
         "current user",
     ]
     assert len(db.get_messages("s-rowids", include_inactive=True)) == 4
+
+
+def test_sessiondb_read_only_connection_enables_query_only(tmp_path):
+    path = tmp_path / "state.db"
+    writable = SessionDB(db_path=path)
+    writable.close()
+
+    read_only = SessionDB(db_path=path, read_only=True)
+    try:
+        conn = read_only._conn
+        assert conn is not None
+        assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("INSERT INTO state_meta(key,value) VALUES('x','y')")
+    finally:
+        read_only.close()
