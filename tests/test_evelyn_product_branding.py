@@ -12,6 +12,7 @@ import re
 import struct
 import subprocess
 import tomllib
+import zlib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +24,75 @@ def _json(relative_path: str):
 
 def _text(relative_path: str):
     return (ROOT / relative_path).read_text(encoding="utf-8")
+
+
+def _png_corner_alphas(data: bytes) -> tuple[int, int, int, int]:
+    """Decode 8-bit RGBA PNG rows and return the four corner alpha values."""
+    assert data.startswith(b"\x89PNG\r\n\x1a\n")
+    offset = 8
+    width = height = None
+    compressed = bytearray()
+    while offset < len(data):
+        length = struct.unpack(">I", data[offset : offset + 4])[0]
+        kind = data[offset + 4 : offset + 8]
+        payload = data[offset + 8 : offset + 8 + length]
+        offset += length + 12
+        if kind == b"IHDR":
+            width, height, depth, color_type, _, _, interlace = struct.unpack(
+                ">IIBBBBB", payload
+            )
+            assert depth == 8 and color_type == 6 and interlace == 0
+        elif kind == b"IDAT":
+            compressed.extend(payload)
+        elif kind == b"IEND":
+            break
+
+    assert width and height
+    raw = zlib.decompress(bytes(compressed))
+    stride = width * 4
+    rows: list[bytearray] = []
+
+    def paeth(a: int, b: int, c: int) -> int:
+        estimate = a + b - c
+        distances = (abs(estimate - a), abs(estimate - b), abs(estimate - c))
+        return (a, b, c)[distances.index(min(distances))]
+
+    cursor = 0
+    for _ in range(height):
+        filter_type = raw[cursor]
+        cursor += 1
+        filtered = raw[cursor : cursor + stride]
+        cursor += stride
+        row = bytearray(stride)
+        previous = rows[-1] if rows else bytearray(stride)
+        for index, value in enumerate(filtered):
+            left = row[index - 4] if index >= 4 else 0
+            above = previous[index]
+            upper_left = previous[index - 4] if index >= 4 else 0
+            predictor = {
+                0: 0,
+                1: left,
+                2: above,
+                3: (left + above) // 2,
+                4: paeth(left, above, upper_left),
+            }[filter_type]
+            row[index] = (value + predictor) & 0xFF
+        rows.append(row)
+
+    return rows[0][3], rows[0][-1], rows[-1][3], rows[-1][-1]
+
+
+def _icns_png_payloads(data: bytes) -> list[bytes]:
+    assert data.startswith(b"icns")
+    payloads = []
+    offset = 8
+    while offset + 8 <= len(data):
+        length = struct.unpack(">I", data[offset + 4 : offset + 8])[0]
+        chunk = data[offset + 8 : offset + length]
+        if chunk.startswith(b"\x89PNG\r\n\x1a\n"):
+            payloads.append(chunk)
+        offset += length
+    return payloads
 
 
 def test_evelyn_is_the_preferred_cli_without_breaking_hermes():
@@ -110,10 +180,26 @@ def test_visual_identity_uses_discord_derived_evelyn_assets():
     assert png_shape("apps/bootstrap-installer/src-tauri/icons/128x128.png")[:2] == (128, 128)
     assert png_shape("apps/bootstrap-installer/src-tauri/icons/128x128@2x.png")[:2] == (256, 256)
 
+    for relative_path in (
+        "apps/desktop/assets/icon.png",
+        "apps/bootstrap-installer/src-tauri/icons/32x32.png",
+        "apps/bootstrap-installer/src-tauri/icons/128x128.png",
+        "apps/bootstrap-installer/src-tauri/icons/128x128@2x.png",
+    ):
+        assert _png_corner_alphas((ROOT / relative_path).read_bytes()) == (0, 0, 0, 0)
+
     assert (ROOT / "apps/desktop/assets/icon.icns").read_bytes().startswith(b"icns")
     assert (ROOT / "apps/desktop/assets/icon.ico").read_bytes().startswith(b"\x00\x00\x01\x00")
     assert (ROOT / "apps/bootstrap-installer/src-tauri/icons/icon.icns").read_bytes().startswith(b"icns")
     assert (ROOT / "apps/bootstrap-installer/src-tauri/icons/icon.ico").read_bytes().startswith(b"\x00\x00\x01\x00")
+
+    for relative_path in (
+        "apps/desktop/assets/icon.icns",
+        "apps/bootstrap-installer/src-tauri/icons/icon.icns",
+    ):
+        payloads = _icns_png_payloads((ROOT / relative_path).read_bytes())
+        assert payloads, relative_path
+        assert all(_png_corner_alphas(payload) == (0, 0, 0, 0) for payload in payloads)
 
     for component in (
         "apps/desktop/src/components/brand-mark.tsx",
