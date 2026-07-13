@@ -15726,7 +15726,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # eligibility across Gateway/CLI/TUI. During an unresolved
                 # process.kill race, keep the watcher parked; after a confirmed
                 # expected kill or agent-consumed completion, end silently.
-                from tools.process_registry import format_process_notification, process_registry as _pr_check
+                from tools.process_registry import (
+                    format_full_output_reference,
+                    format_process_notification,
+                    process_registry as _pr_check,
+                )
                 completion_decision = _pr_check.completion_notification_decision(session_id)
                 if completion_decision == "defer":
                     continue
@@ -15746,14 +15750,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # snap to the nearest preceding newline, then prepend a
                     # truncation marker when output was cut.
                     _LIMIT = 2000
-                    if len(_raw) > _LIMIT:
+                    _notification_was_truncated = len(_raw) > _LIMIT
+                    if _notification_was_truncated:
                         _tail = _raw[-_LIMIT:]
                         _nl = _tail.find("\n")
                         _tail = _tail[_nl + 1:] if _nl != -1 else _tail
                         _out = f"[… output truncated — showing last {len(_tail)} chars]\n{_tail}"
                     else:
                         _out = _raw
-                    synth_text = format_process_notification({
+                    completion_event = {
                         "type": "completion",
                         "session_id": session_id,
                         "command": session.command,
@@ -15761,7 +15766,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "completion_reason": getattr(session, "completion_reason", "exited"),
                         "termination_source": getattr(session, "termination_source", ""),
                         "output": _out,
-                    })
+                    }
+                    _full_output_path = str(getattr(session, "output_log_path", "") or "")
+                    _output_is_partial = bool(
+                        _notification_was_truncated
+                        or getattr(session, "output_was_truncated", False)
+                    )
+                    if _full_output_path and _output_is_partial:
+                        completion_event["full_output_path"] = _full_output_path
+                        completion_event["output_is_partial"] = True
+                    synth_text = format_process_notification(completion_event)
                     if not synth_text:
                         break
                     source = self._build_process_event_source({
@@ -15814,15 +15828,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     or (notify_mode == "error" and session.exit_code not in {0, None})
                 )
                 if should_notify:
+                    _text_output_was_truncated = len(session.output_buffer or "") > 1000
                     new_output = session.output_buffer[-1000:] if session.output_buffer else ""
                     if new_output:
                         from agent.redact import redact_terminal_output
                         new_output = redact_terminal_output(
                             new_output, getattr(session, "command", "") or ""
                         )
+                    _full_output_ref = format_full_output_reference(
+                        getattr(session, "output_log_path", ""),
+                        bool(
+                            _text_output_was_truncated
+                            or getattr(session, "output_was_truncated", False)
+                        ),
+                    )
+                    _full_output_footer = f"\n\n{_full_output_ref}" if _full_output_ref else ""
                     message_text = (
                         f"[Background process {session_id} finished with exit code {session.exit_code}~ "
-                        f"Here's the final output:\n{new_output}]"
+                        f"Here's the final output:\n{new_output}{_full_output_footer}]"
                     )
                     adapter = None
                     for p, a in self.adapters.items():

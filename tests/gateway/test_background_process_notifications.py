@@ -9,6 +9,7 @@ Contributed by @PeterFile (PR #593), reimplemented on current main.
 
 import asyncio
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -324,6 +325,79 @@ async def test_agent_notification_carries_message_id_reply_anchor(monkeypatch, t
     assert synth_event.internal is True
     assert synth_event.message_id == "555"
     assert synth_event.source.thread_id == "24296"
+
+
+@pytest.mark.asyncio
+async def test_agent_notification_links_full_spool_when_output_is_truncated(monkeypatch, tmp_path):
+    import tools.process_registry as pr_module
+
+    verdict = "FINAL_REVIEW_VERDICT"
+    full_output = ("x" * (2001 - len(verdict))) + verdict
+    log_path = tmp_path / "stdout.log"
+    log_path.write_text(full_output, encoding="utf-8")
+    sessions = [SimpleNamespace(
+        output_buffer=full_output,
+        output_log_path=str(log_path),
+        exited=True,
+        exit_code=0,
+        command="codex review --uncommitted",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    watcher = {
+        "session_id": "proc_review",
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123:24296",
+        "platform": "telegram",
+        "chat_id": "123",
+        "thread_id": "24296",
+        "message_id": "555",
+        "notify_on_complete": True,
+    }
+
+    await runner._run_process_watcher(watcher)
+
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert f"Full output saved to: {log_path}" in synth_event.text
+    assert "Use read_file with offset and limit" in synth_event.text
+
+
+@pytest.mark.asyncio
+async def test_text_only_completion_links_full_spool_when_output_is_truncated(monkeypatch, tmp_path):
+    import tools.process_registry as pr_module
+
+    full_output = "HEAD_MARKER\n" + ("x" * 5000) + "\nFINAL_REVIEW_VERDICT\n"
+    log_path = tmp_path / "stdout.log"
+    log_path.write_text(full_output, encoding="utf-8")
+    sessions = [SimpleNamespace(
+        output_buffer=full_output,
+        output_log_path=str(log_path),
+        output_was_truncated=True,
+        exited=True,
+        exit_code=0,
+        command="long review",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "result")
+    adapter = cast(Any, runner.adapters[Platform.TELEGRAM])
+
+    await runner._run_process_watcher(_watcher_dict("proc_text_only"))
+
+    adapter.send.assert_awaited_once()
+    message_text = adapter.send.await_args.args[1]
+    assert f"Full output saved to: {log_path}" in message_text
+    assert "Use read_file with offset and limit" in message_text
 
 
 @pytest.mark.asyncio

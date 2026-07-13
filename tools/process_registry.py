@@ -2,8 +2,8 @@
 Process Registry -- In-memory registry for managed background processes.
 
 Tracks processes spawned via terminal(background=true), providing:
-  - Output buffering (rolling 200KB window)
-  - Status polling and log retrieval
+  - Output buffering (rolling 200KB window) with a lossless local durable spool
+  - Status polling and retained-log retrieval with full-spool recovery handles
   - Blocking wait with interrupt support
   - Process killing
   - Crash recovery via JSON checkpoint file
@@ -29,6 +29,7 @@ Usage:
     process_registry.kill(session.id)
 """
 
+import codecs
 import json
 import logging
 import os
@@ -63,7 +64,7 @@ PROCESS_LOG_DIR = HERMES_HOME / "process_logs"
 
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
-PROCESS_LOG_MAX_BYTES = MAX_OUTPUT_CHARS  # durable local log cap per background process
+OUTPUT_LOG_READ_CHUNK_BYTES = 65_536
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
@@ -118,6 +119,8 @@ class ProcessSession:
     output_log_path: str = ""                   # Durable stdout/stderr log for restart-safe local bg jobs
     exit_code_path: str = ""                    # Durable exit-code sidecar for restart-safe local bg jobs
     output_log_offset: int = 0                  # Bytes consumed from output_log_path
+    output_was_truncated: bool = False          # Rolling memory tail dropped earlier local spool output
+    _output_decode_carry: bytes = field(default=b"", repr=False)  # Incomplete UTF-8 suffix across drains
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
@@ -145,6 +148,7 @@ class ProcessSession:
     _watch_strike_candidate: bool = field(default=False, repr=False)
     _watch_consecutive_strikes: int = field(default=0, repr=False)
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    _output_drain_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _kill_intent_pending: bool = field(default=False, repr=False)
     _completion_deferred_for_kill: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -249,54 +253,95 @@ class ProcessRegistry:
         except (ValueError, IndexError):
             return None
 
-    def _drain_output_log(self, session: ProcessSession) -> str:
-        """Append new bytes from a durable output log into session.output_buffer.
+    def _record_output_chunk(
+        self,
+        session: ProcessSession,
+        text: str,
+        *,
+        emit_live: bool = True,
+    ) -> None:
+        """Append one decoded chunk while keeping the model/UI tail bounded."""
+        if not text:
+            return
+        with session._lock:
+            session.output_buffer += text
+            if len(session.output_buffer) > session.max_output_chars:
+                session.output_was_truncated = True
+                session.output_buffer = session.output_buffer[-session.max_output_chars:]
+        self._check_watch_patterns(session, text)
+        if emit_live:
+            self._emit_output(session, text)
 
-        Local background jobs used to be stdout-pipe backed. A restarted Gateway
-        cannot reattach to that anonymous pipe, so restart-safe jobs write to a
-        durable log and this method tails it from the persisted byte offset.
+    def _drain_output_log(self, session: ProcessSession, *, final: bool = False) -> str:
+        """Stream one stat-bounded durable-log snapshot into the output tail.
+
+        Reads are deliberately chunked: the durable spool may be arbitrarily
+        larger than the in-memory view, especially after Gateway restart.
         """
         path = getattr(session, "output_log_path", "") or ""
         if not path:
             return ""
-        try:
-            log_path = Path(path)
-            size = log_path.stat().st_size
-        except OSError:
-            return ""
 
-        with session._lock:
-            offset = max(0, int(getattr(session, "output_log_offset", 0) or 0))
-        if offset > size:
-            # Log was truncated/rotated. Start over rather than wedging forever
-            # past EOF; the buffer is capped so duplicate small logs are cheap.
-            offset = 0
+        last_chunk = ""
+        emit_tail = ""
+        with session._output_drain_lock:
+            try:
+                log_path = Path(path)
+                size = log_path.stat().st_size
+            except OSError:
+                return ""
 
-        try:
-            with log_path.open("rb") as fh:
-                fh.seek(offset)
-                raw = fh.read()
-                new_offset = fh.tell()
-        except OSError:
-            return ""
-
-        if not raw:
             with session._lock:
-                session.output_log_offset = new_offset
-            return ""
+                offset = max(0, int(getattr(session, "output_log_offset", 0) or 0))
+                decode_carry = bytes(getattr(session, "_output_decode_carry", b"") or b"")
+            if offset > size:
+                # A legacy capped/rotated log may be shorter than its old offset.
+                offset = 0
+                decode_carry = b""
 
-        chunk = raw.decode("utf-8", errors="replace")
-        if offset == 0:
-            chunk = self._clean_shell_noise(chunk)
-        with session._lock:
-            session.output_log_offset = new_offset
-            session.output_buffer += chunk
-            if len(session.output_buffer) > session.max_output_chars:
-                session.output_buffer = session.output_buffer[-session.max_output_chars:]
-        if chunk:
-            self._check_watch_patterns(session, chunk)
-            self._emit_output(session, chunk)
-        return chunk
+            try:
+                with log_path.open("rb") as fh:
+                    fh.seek(offset)
+                    remaining = max(0, size - offset)
+                    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                    decoder.setstate((decode_carry, 0))
+                    first_chunk = offset == 0
+                    while remaining > 0:
+                        read_size = min(OUTPUT_LOG_READ_CHUNK_BYTES, remaining)
+                        raw = fh.read(read_size)
+                        if not raw:
+                            break
+                        remaining -= len(raw)
+                        text = decoder.decode(raw, final=False)
+                        if first_chunk:
+                            text = self._clean_shell_noise(text)
+                            first_chunk = False
+                        with session._lock:
+                            session.output_log_offset = fh.tell()
+                        self._record_output_chunk(session, text, emit_live=False)
+                        if text:
+                            last_chunk = text
+                            emit_tail = (emit_tail + text)[-session.max_output_chars:]
+
+                    if final:
+                        final_text = decoder.decode(b"", final=True)
+                        decode_carry = b""
+                    else:
+                        final_text = ""
+                        decode_carry = decoder.getstate()[0]
+                    if final_text:
+                        self._record_output_chunk(session, final_text, emit_live=False)
+                        last_chunk = final_text
+                        emit_tail = (emit_tail + final_text)[-session.max_output_chars:]
+                    with session._lock:
+                        session.output_log_offset = fh.tell()
+                        session._output_decode_carry = decode_carry
+            except OSError:
+                return ""
+
+        if emit_tail:
+            self._emit_output(session, emit_tail)
+        return last_chunk
 
     def _emit_output(self, session: ProcessSession, chunk: str) -> None:
         """Forward a freshly-read chunk to the live-output sink, if one is set.
@@ -802,8 +847,19 @@ class ProcessRegistry:
             started_at=time.time(),
         )
 
+        # Every local background mode, including PTY, gets the same canonical
+        # durable stdout/stderr spool. The in-memory buffer remains only a tail.
+        log_dir = PROCESS_LOG_DIR / session.id
+        log_dir.mkdir(parents=True, exist_ok=True)
+        output_log_path = log_dir / "stdout.log"
+        output_log_path.touch(exist_ok=True)
+        session.output_log_path = str(output_log_path)
+        session.output_log_offset = output_log_path.stat().st_size
+
         if use_pty:
             # Try PTY mode for interactive CLI tools
+            pty_spool = None
+            pty_proc = None
             try:
                 if _IS_WINDOWS:
                     from winpty import PtyProcess as _PtyProcessCls
@@ -820,13 +876,14 @@ class ProcessRegistry:
                 )
                 session.pid = pty_proc.pid
                 session.host_start_time = self._safe_host_start_time(session.pid)
+                pty_spool = open(output_log_path, "ab", buffering=0)
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
 
                 # PTY reader thread
                 reader = threading.Thread(
                     target=self._pty_reader_loop,
-                    args=(session,),
+                    args=(session, pty_spool),
                     daemon=True,
                     name=f"proc-pty-reader-{session.id}",
                 )
@@ -844,6 +901,16 @@ class ProcessRegistry:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
+            if pty_spool is not None:
+                try:
+                    pty_spool.close()
+                except OSError:
+                    pass
+            if pty_proc is not None:
+                try:
+                    pty_proc.terminate(force=True)
+                except Exception:
+                    pass
 
         # Standard Popen path (non-PTY or PTY fallback)
         # Use the user's login shell for consistency with LocalEnvironment --
@@ -859,61 +926,64 @@ class ProcessRegistry:
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
-        log_dir = PROCESS_LOG_DIR / session.id
-        log_dir.mkdir(parents=True, exist_ok=True)
-        output_log_path = log_dir / "stdout.log"
         exit_code_path = log_dir / "exit_code"
         fifo_path = log_dir / "stdout.fifo"
         done_path = log_dir / "stdout.done"
-        output_log_path.touch(exist_ok=True)
-        session.output_log_path = str(output_log_path)
+        drained_path = log_dir / "stdout.drained"
         session.exit_code_path = str(exit_code_path)
-        session.output_log_offset = 0
 
         # Run the user's command in a nested copy of the same shell.  If the
         # command calls `exit`, only the inner shell exits; the outer wrapper can
         # still persist the exit code for post-restart recovery.  stdout/stderr
-        # go through an independent bounded log writer, so the durable log stays
-        # capped even if Gateway is down and no Python reader thread is alive.
+        # go through an independent lossless log writer. The wrapper waits for
+        # that writer's final drain before publishing process completion.
         quoted_shell = shlex.quote(user_shell)
         quoted_command = shlex.quote(command)
         quoted_exit_path = shlex.quote(str(exit_code_path))
         quoted_log_path = shlex.quote(str(output_log_path))
         quoted_fifo_path = shlex.quote(str(fifo_path))
         quoted_done_path = shlex.quote(str(done_path))
+        quoted_drained_path = shlex.quote(str(drained_path))
         quoted_python = shlex.quote(sys.executable)
         log_writer_code = r'''
 import os, select, sys, time
 fifo_path = sys.argv[1]
 log_path = sys.argv[2]
-limit = max(1, int(sys.argv[3]))
-done_path = sys.argv[4]
+done_path = sys.argv[3]
+drained_path = sys.argv[4]
 chunk_size = 8192
+drained = False
+done_seen_at = None
+barrier_max_wait = 1.0
 fd = os.open(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
 try:
     with os.fdopen(fd, "rb", buffering=0) as stream, open(log_path, "ab", buffering=0) as out:
         while True:
+            if done_seen_at is None and os.path.exists(done_path):
+                done_seen_at = time.monotonic()
             readable, _, _ = select.select([stream], [], [], 0.1)
             if not readable:
+                if os.path.exists(done_path) and not drained:
+                    open(drained_path, "ab").close()
+                    drained = True
                 continue
             chunk = stream.read(chunk_size)
             if not chunk:
                 if os.path.exists(done_path):
+                    if not drained:
+                        open(drained_path, "ab").close()
+                        drained = True
                     break
                 time.sleep(0.05)
                 continue
             out.write(chunk)
-            try:
-                size = os.path.getsize(log_path)
-                if size > limit:
-                    with open(log_path, "rb+") as fh:
-                        fh.seek(-limit, os.SEEK_END)
-                        tail = fh.read()
-                        fh.seek(0)
-                        fh.write(tail)
-                        fh.truncate()
-            except OSError:
-                pass
+            if (
+                done_seen_at is not None
+                and not drained
+                and time.monotonic() - done_seen_at >= barrier_max_wait
+            ):
+                open(drained_path, "ab").close()
+                drained = True
 finally:
     try:
         os.close(fd)
@@ -922,16 +992,25 @@ finally:
 '''.strip()
         quoted_writer_code = shlex.quote(log_writer_code)
         wrapped_command = (
-            f"rm -f {quoted_fifo_path} {quoted_done_path}; mkfifo {quoted_fifo_path} || exit 125; "
+            f"rm -f {quoted_fifo_path} {quoted_done_path} {quoted_drained_path}; mkfifo {quoted_fifo_path} || exit 125; "
             f"{quoted_python} -c {quoted_writer_code} {quoted_fifo_path} {quoted_log_path} "
-            f"{int(PROCESS_LOG_MAX_BYTES)} {quoted_done_path} & "
+            f"{quoted_done_path} {quoted_drained_path} & "
             "__hermes_log_pid=$!; "
             f"{quoted_shell} -lic {quoted_command} > {quoted_fifo_path} 2>&1; "
             "__hermes_rc=$?; "
             f"printf '%s\\n' \"$__hermes_rc\" > {quoted_exit_path}; "
             f": > {quoted_done_path}; "
+            f"while kill -0 \"$__hermes_log_pid\" 2>/dev/null && [ ! -e {quoted_drained_path} ]; do sleep 0.01; done; "
+            f"if [ -e {quoted_drained_path} ]; then "
+            # Descendant output after the command-era drain barrier is kept for
+            # compatibility, but is best-effort and cannot delay command completion.
+            f"rm -f {quoted_fifo_path}; disown \"$__hermes_log_pid\" 2>/dev/null || true; exit \"$__hermes_rc\"; fi; "
+            "wait \"$__hermes_log_pid\"; __hermes_log_rc=$?; "
             f"rm -f {quoted_fifo_path}; "
-            "disown \"$__hermes_log_pid\" 2>/dev/null || true; "
+            "if [ \"$__hermes_log_rc\" -ne 0 ]; then "
+            f"printf '\\n[Hermes output spool writer failed; full output may be incomplete.]\\n' >> {quoted_log_path}; "
+            f"printf '125\\n' > {quoted_exit_path}; "
+            "exit 125; fi; "
             "exit \"$__hermes_rc\""
         )
 
@@ -1232,28 +1311,53 @@ finally:
                 self._move_to_finished(session)
                 return
 
-    def _pty_reader_loop(self, session: ProcessSession):
-        """Background thread: read output from a PTY process."""
+    def _pty_reader_loop(self, session: ProcessSession, output_spool):
+        """Background thread: spool PTY output before updating the rolling tail."""
         pty = session._pty
+        spool_failed = False
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         try:
-            while pty.isalive():
+            while True:
                 try:
                     chunk = pty.read(4096)
-                    if chunk:
-                        # ptyprocess returns bytes
-                        text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="replace")
+                    if not chunk:
+                        if not pty.isalive():
+                            break
+                        time.sleep(0.01)
+                        continue
+                    raw = chunk.encode("utf-8", errors="replace") if isinstance(chunk, str) else bytes(chunk)
+                    try:
+                        with session._output_drain_lock:
+                            output_spool.write(raw)
+                            with session._lock:
+                                session.output_log_offset = output_spool.tell()
+                    except OSError as e:
+                        logger.error("PTY output spool failed for %s: %s", session.id, e)
                         with session._lock:
-                            session.output_buffer += text
-                            if len(session.output_buffer) > session.max_output_chars:
-                                session.output_buffer = session.output_buffer[-session.max_output_chars:]
-                        self._check_watch_patterns(session, text)
-                        self._emit_output(session, text)
+                            session.completion_reason = "lost"
+                            session.termination_source = "output_spool_failed"
+                        spool_failed = True
+                        try:
+                            pty.terminate(force=True)
+                        except Exception:
+                            pass
+                        break
+                    text = chunk if isinstance(chunk, str) else decoder.decode(raw, final=False)
+                    self._record_output_chunk(session, text)
                 except EOFError:
                     break
                 except Exception:
                     break
         except Exception as e:
             logger.debug("PTY stdout reader ended: %s", e)
+        finally:
+            final_text = decoder.decode(b"", final=True)
+            if final_text:
+                self._record_output_chunk(session, final_text)
+            try:
+                output_spool.close()
+            except OSError:
+                pass
 
         # Process exited
         try:
@@ -1261,9 +1365,11 @@ finally:
         except Exception as e:
             logger.debug("PTY wait timed out or failed: %s", e)
         session.exited = True
-        if session.completion_reason != "killed":
+        if session.completion_reason not in {"killed", "lost"}:
             session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
             session.completion_reason = "exited"
+        elif spool_failed and session.exit_code is None:
+            session.exit_code = -1
         self._move_to_finished(session)
 
     def _move_to_finished(self, session: ProcessSession):
@@ -1274,7 +1380,7 @@ finally:
         completion notification is enqueued.
         """
         try:
-            self._drain_output_log(session)
+            self._drain_output_log(session, final=True)
         except Exception:
             pass
         with self._lock:
@@ -1306,7 +1412,7 @@ finally:
         """Queue one notify_on_complete event using the session's terminal state."""
         from tools.ansi_strip import strip_ansi
         output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
-        self.completion_queue.put({
+        event = {
             "type": "completion",
             "session_id": session.id,
             "session_key": session.session_key,
@@ -1315,7 +1421,9 @@ finally:
             "completion_reason": session.completion_reason,
             "termination_source": session.termination_source,
             "output": output_tail,
-        })
+        }
+        self._attach_full_output_metadata(event, session, output_tail)
+        self.completion_queue.put(event)
 
     # ----- Query Methods -----
 
@@ -1519,6 +1627,33 @@ finally:
         )
         self._move_to_finished(session)
 
+    @staticmethod
+    def _attach_full_output_metadata(
+        result: dict,
+        session: ProcessSession,
+        visible_output: str,
+    ) -> dict:
+        """Attach a validated local spool handle without expanding tool output."""
+        path = str(getattr(session, "output_log_path", "") or "")
+        if not path or not os.path.isfile(path):
+            return result
+        try:
+            full_output_bytes = os.path.getsize(path)
+        except OSError:
+            return result
+        visible_bytes = len((visible_output or "").encode("utf-8", errors="replace"))
+        from tools.ansi_strip import strip_ansi
+        with session._lock:
+            retained_output = strip_ansi(session.output_buffer or "")
+        result["full_output_path"] = path
+        result["full_output_bytes"] = full_output_bytes
+        result["output_is_partial"] = bool(
+            getattr(session, "output_was_truncated", False)
+            or (visible_output or "") != retained_output
+            or full_output_bytes > visible_bytes
+        )
+        return result
+
     def poll(self, session_id: str) -> dict:
         """Check status and get new output for a background process."""
         from tools.ansi_strip import strip_ansi
@@ -1555,10 +1690,10 @@ finally:
         if session.detached:
             result["detached"] = True
             result["note"] = "Process recovered after restart -- output restored from durable log when available"
-        return result
+        return self._attach_full_output_metadata(result, session, output_preview)
 
     def read_log(self, session_id: str, offset: int = 0, limit: int = 200) -> dict:
-        """Read the full output log with optional pagination by lines."""
+        """Read retained output with pagination and expose the full local spool."""
         from tools.ansi_strip import strip_ansi
 
         session = self.get(session_id)
@@ -1588,7 +1723,7 @@ finally:
         }
         if session.exited:
             self._mark_completion_consumed(session_id)
-        return result
+        return self._attach_full_output_metadata(result, session, result["output"])
 
     def wait(self, session_id: str, timeout: int = None) -> dict:
         """
@@ -1648,7 +1783,7 @@ finally:
                 }
                 if timeout_note:
                     result["timeout_note"] = timeout_note
-                return result
+                return self._attach_full_output_metadata(result, session, result["output"])
 
             if _is_interrupted():
                 result = {
@@ -1659,7 +1794,7 @@ finally:
                 }
                 if timeout_note:
                     result["timeout_note"] = timeout_note
-                return result
+                return self._attach_full_output_metadata(result, session, result["output"])
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1675,7 +1810,7 @@ finally:
             result["timeout_note"] = timeout_note
         else:
             result["timeout_note"] = f"Waited {effective_timeout}s, process still running"
-        return result
+        return self._attach_full_output_metadata(result, session, result["output"])
 
     def kill_process(self, session_id: str, *, source: str = "process.kill") -> dict:
         """Kill a background process."""
@@ -2195,7 +2330,7 @@ finally:
                         notify_on_complete=entry.get("notify_on_complete", False),
                         watch_patterns=entry.get("watch_patterns", []),
                     )
-                    self._drain_output_log(session)
+                    self._drain_output_log(session, final=True)
                     session.exited = True
                     session.exit_code = self._read_exit_code_path(session.exit_code_path)
                     with self._lock:
@@ -2422,6 +2557,22 @@ def _format_async_delegation(evt: dict) -> str:
     return "\n".join(lines)
 
 
+def format_full_output_reference(full_output_path: str, output_is_partial: bool) -> str:
+    """Return a recovery footer only for a currently readable partial spool."""
+    path = str(full_output_path or "")
+    if not path or not output_is_partial:
+        return ""
+    try:
+        with open(path, "rb"):
+            pass
+    except OSError:
+        return ""
+    return (
+        f"Full output saved to: {path}\n"
+        "Use read_file with offset and limit to inspect it."
+    )
+
+
 def format_process_notification(evt: dict) -> "str | None":
     """Format a process notification event into a [IMPORTANT: ...] message.
 
@@ -2470,11 +2621,17 @@ def format_process_notification(evt: dict) -> "str | None":
         _status = "completed normally"
     else:
         _status = "exited"
+    _full_output_ref = format_full_output_reference(
+        evt.get("full_output_path", ""),
+        bool(evt.get("output_is_partial")),
+    )
+    if _full_output_ref:
+        _full_output_ref = f"\n\n{_full_output_ref}"
     return (
         f"[IMPORTANT: Background process {_sid} {_status} "
         f"(exit code {_exit}{_signal}).\n"
         f"Command: {_cmd}\n"
-        f"Output:\n{_out}]"
+        f"Output:\n{_out}{_full_output_ref}]"
     )
 
 
@@ -2488,9 +2645,12 @@ PROCESS_SCHEMA = {
     "description": (
         "Manage background processes started with terminal(background=true). "
         "Actions: 'list' (show all), 'poll' (check status + new output), "
-        "'log' (full output with pagination), 'wait' (block until done or timeout), "
+        "'log' (retained output with pagination plus full local spool path when available), "
+        "'wait' (block until done or timeout), "
         "'kill' (terminate), 'write' (send raw stdin data without newline), "
-        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF)."
+        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF). "
+        "When bounded output is partial and a local durable spool exists, poll/wait/log results "
+        "include full_output_path and output_is_partial for recovery."
     ),
     "parameters": {
         "type": "object",

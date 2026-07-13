@@ -1,5 +1,6 @@
 """Tests for tools/process_registry.py — ProcessRegistry query methods, pruning, checkpoint."""
 
+import io
 import json
 import os
 import signal
@@ -8,6 +9,8 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -140,6 +143,24 @@ class TestGetAndPoll:
         result = registry.poll(s.id)
         assert result["status"] == "exited"
         assert result["exit_code"] == 0
+
+    def test_poll_exposes_full_output_path_when_preview_is_partial(self, registry, tmp_path):
+        full_output = "HEAD_MARKER\n" + ("x" * 250000) + "\nFINAL_REVIEW_VERDICT\n"
+        log_path = tmp_path / "stdout.log"
+        log_path.write_text(full_output, encoding="utf-8")
+        s = _make_session(
+            exited=True,
+            exit_code=0,
+            output=full_output[-200000:],
+        )
+        s.output_log_path = str(log_path)
+        s.output_log_offset = log_path.stat().st_size
+        registry._finished[s.id] = s
+
+        result = registry.poll(s.id)
+
+        assert result["full_output_path"] == str(log_path)
+        assert result["output_is_partial"] is True
 
 
 def test_request_close_terminal_without_sink_is_desktop_only_error(registry):
@@ -408,6 +429,25 @@ class TestOrphanedPipeReconciliation:
 
 
 # =========================================================================
+# Wait output metadata
+# =========================================================================
+
+class TestWaitOutputMetadata:
+    def test_wait_exposes_full_output_path_when_tail_is_partial(self, registry, tmp_path):
+        full_output = "HEAD_MARKER\n" + ("x" * 5000) + "\nFINAL_REVIEW_VERDICT\n"
+        log_path = tmp_path / "stdout.log"
+        log_path.write_text(full_output, encoding="utf-8")
+        s = _make_session(exited=True, exit_code=0, output=full_output[-2000:])
+        s.output_log_path = str(log_path)
+        registry._finished[s.id] = s
+
+        result = registry.wait(s.id, timeout=1)
+
+        assert result["full_output_path"] == str(log_path)
+        assert result["output_is_partial"] is True
+
+
+# =========================================================================
 # Read log
 # =========================================================================
 
@@ -437,6 +477,20 @@ class TestReadLog:
         registry._running[s.id] = s
         result = registry.read_log(s.id, offset=10, limit=5)
         assert "5 lines" in result["showing"]
+
+    def test_read_log_exposes_full_output_path_when_retained_tail_is_partial(self, registry, tmp_path):
+        full_output = "HEAD_MARKER\n" + ("x" * 250000) + "\nFINAL_REVIEW_VERDICT\n"
+        log_path = tmp_path / "stdout.log"
+        log_path.write_text(full_output, encoding="utf-8")
+        s = _make_session(output=full_output[-200000:])
+        s.output_log_path = str(log_path)
+        s.output_log_offset = log_path.stat().st_size
+        registry._running[s.id] = s
+
+        result = registry.read_log(s.id, limit=10)
+
+        assert result["full_output_path"] == str(log_path)
+        assert result["output_is_partial"] is True
 
 
 # =========================================================================
@@ -1156,15 +1210,17 @@ class TestCheckpoint:
             assert os.path.exists(session.output_log_path)
             assert os.path.exists(session.exit_code_path)
 
-    def test_spawn_local_keeps_durable_log_bounded(self, registry, tmp_path):
-        """Persistent logs are restart evidence, not an unbounded disk sink."""
+    def test_spawn_local_preserves_full_durable_log_beyond_rolling_buffer(self, registry, tmp_path):
+        """The durable spool is lossless even when the in-memory tail is bounded."""
         command = (
             f"{shlex.quote(sys.executable)} -c "
-            "\"import sys; sys.stdout.write('x' * 4096); print('END_MARKER')\""
+            "\"import sys; "
+            "print('HEAD_MARKER'); "
+            "sys.stdout.write('x' * 250000); "
+            "print('FINAL_REVIEW_VERDICT')\""
         )
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"), \
-             patch("tools.process_registry.PROCESS_LOG_DIR", tmp_path / "process_logs"), \
-             patch("tools.process_registry.PROCESS_LOG_MAX_BYTES", 128):
+             patch("tools.process_registry.PROCESS_LOG_DIR", tmp_path / "process_logs"):
             session = registry.spawn_local(command, cwd=str(tmp_path))
 
             assert _wait_until(
@@ -1173,12 +1229,198 @@ class TestCheckpoint:
             )
             poll_result = registry.poll(session.id)
             assert poll_result["exit_code"] == 0
-            assert "END_MARKER" in poll_result["output_preview"]
-            assert os.path.getsize(session.output_log_path) <= 128
+            durable_output = Path(session.output_log_path).read_text(encoding="utf-8")
+            assert "HEAD_MARKER" in durable_output
+            assert "FINAL_REVIEW_VERDICT" in durable_output
+            assert len(durable_output) > session.max_output_chars
+            assert len(session.output_buffer) <= session.max_output_chars
+
+    def test_spawn_local_does_not_complete_before_spool_writer_finishes(self, registry, tmp_path):
+        real_python = sys.executable
+        slow_writer_python = tmp_path / "slow-writer-python"
+        slow_writer_python.write_text(
+            f"#!{real_python}\n"
+            "import os, sys\n"
+            "code = sys.argv[2].replace('out.write(chunk)', "
+            "'time.sleep(0.2); out.write(chunk)')\n"
+            f"os.execv({real_python!r}, [{real_python!r}, '-c', code, *sys.argv[3:]])\n",
+            encoding="utf-8",
+        )
+        slow_writer_python.chmod(0o755)
+        command = (
+            f"{shlex.quote(real_python)} -c "
+            "\"import sys; sys.stdout.write('HEAD_MARKER' + ('x' * 20000) + "
+            "'FINAL_REVIEW_VERDICT'); sys.stdout.flush()\""
+        )
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"), \
+             patch("tools.process_registry.PROCESS_LOG_DIR", tmp_path / "process_logs"), \
+             patch("tools.process_registry.sys.executable", str(slow_writer_python)):
+            session = registry.spawn_local(command, cwd=str(tmp_path))
+            assert _wait_until(lambda: session.exited, timeout=5.0)
+            durable_output = Path(session.output_log_path).read_text(encoding="utf-8")
+
+        assert "HEAD_MARKER" in durable_output
+        assert "FINAL_REVIEW_VERDICT" in durable_output
+
+    def test_spawn_local_marks_non_utf8_rolling_tail_partial(self, registry, tmp_path):
+        """Replacement-character expansion must not hide durable output truncation."""
+        command = (
+            f"{shlex.quote(sys.executable)} -c "
+            "\"import sys; sys.stdout.buffer.write(b'\\xff' * 250000)\""
+        )
+        with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"), \
+             patch("tools.process_registry.PROCESS_LOG_DIR", tmp_path / "process_logs"):
+            session = registry.spawn_local(command, cwd=str(tmp_path))
+
+            assert _wait_until(lambda: session.exited, timeout=5.0)
+            result = registry.read_log(session.id, limit=200)
+
+            assert result["status"] == "exited"
+            assert len(session.output_buffer) <= session.max_output_chars
+            assert Path(session.output_log_path).stat().st_size > session.max_output_chars
+            assert result["full_output_path"] == session.output_log_path
+            assert result["output_is_partial"] is True
+
+    def test_drain_output_log_reads_large_spool_in_bounded_chunks(self, registry, tmp_path):
+        data = b"HEAD_MARKER\n" + (b"x" * 500000) + b"\nFINAL_REVIEW_VERDICT\n"
+        log_path = tmp_path / "stdout.log"
+        log_path.write_bytes(data)
+        read_sizes = []
+
+        class _GuardedReader(io.BytesIO):
+            def read(self, size=None):
+                read_sizes.append(size)
+                assert size is not None and 0 < size <= 65536, f"unbounded spool read requested: {size}"
+                return super().read(size)
+
+        session = _make_session(output="")
+        session.output_log_path = str(log_path)
+        emitted = []
+        registry.on_output = lambda _session, chunk: emitted.append(chunk)
+        guarded = _GuardedReader(data)
+        with patch.object(Path, "open", return_value=guarded):
+            registry._drain_output_log(session)
+
+        assert read_sizes
+        assert session.output_log_offset == len(data)
+        assert len(session.output_buffer) <= session.max_output_chars
+        assert "FINAL_REVIEW_VERDICT" in session.output_buffer
+        assert sum(len(chunk) for chunk in emitted) <= session.max_output_chars
+        assert "FINAL_REVIEW_VERDICT" in "".join(emitted)
+
+    def test_drain_output_log_stops_at_stat_snapshot(self, registry, tmp_path):
+        snapshot = b"x" * 100000
+        log_path = tmp_path / "stdout.log"
+        log_path.write_bytes(snapshot)
+        read_sizes = []
+
+        class _GrowingReader:
+            def __init__(self):
+                self.position = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def seek(self, offset):
+                self.position = offset
+
+            def tell(self):
+                return self.position
+
+            def read(self, size=None):
+                assert size is not None
+                read_sizes.append(size)
+                assert len(read_sizes) <= 2, "drain chased bytes appended after its stat snapshot"
+                self.position += size
+                return b"x" * size
+
+        session = _make_session(output="")
+        session.output_log_path = str(log_path)
+        with patch.object(Path, "open", return_value=_GrowingReader()):
+            registry._drain_output_log(session)
+
+        assert read_sizes == [65536, 34464]
+        assert session.output_log_offset == len(snapshot)
+
+    def test_drain_output_log_preserves_utf8_split_across_calls(self, registry, tmp_path):
+        log_path = tmp_path / "stdout.log"
+        log_path.write_bytes(b"\xe2\x82")
+        session = _make_session(output="")
+        session.output_log_path = str(log_path)
+
+        registry._drain_output_log(session)
+        assert session.output_buffer == ""
+
+        with log_path.open("ab") as fh:
+            fh.write(b"\xac")
+        registry._drain_output_log(session)
+
+        assert session.output_buffer == "€"
+
+    def test_pty_reader_drains_buffer_after_child_exit(self, registry, tmp_path):
+        class _ExitedPtyWithUnreadOutput:
+            exitstatus = 0
+
+            def __init__(self):
+                self.reads = 0
+
+            def isalive(self):
+                return False
+
+            def read(self, _size):
+                self.reads += 1
+                if self.reads == 1:
+                    return b"FINAL_REVIEW_VERDICT"
+                raise EOFError
+
+            def wait(self):
+                return 0
+
+        log_path = tmp_path / "stdout.log"
+        session = _make_session(output="")
+        session.output_log_path = str(log_path)
+        session._pty = _ExitedPtyWithUnreadOutput()
+        registry._running[session.id] = session
+
+        output_spool = open(log_path, "ab", buffering=0)
+        registry._pty_reader_loop(session, output_spool)
+
+        assert "FINAL_REVIEW_VERDICT" in log_path.read_text(encoding="utf-8")
+        assert "FINAL_REVIEW_VERDICT" in session.output_buffer
+
+    def test_spawn_local_pty_preserves_full_durable_log(self, registry, tmp_path):
+        command = (
+            f"{shlex.quote(sys.executable)} -c "
+            "\"import sys; print('HEAD_MARKER'); "
+            "sys.stdout.write('x' * 250000); print('FINAL_REVIEW_VERDICT')\""
+        )
+        with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"), \
+             patch("tools.process_registry.PROCESS_LOG_DIR", tmp_path / "process_logs"):
+            session = registry.spawn_local(command, cwd=str(tmp_path), use_pty=True)
+
+            assert _wait_until(lambda: session.exited, timeout=10.0)
+            result = registry.poll(session.id)
+
+            assert session.output_log_path
+            durable_output = Path(session.output_log_path).read_text(encoding="utf-8", errors="replace")
+            assert "HEAD_MARKER" in durable_output
+            assert "FINAL_REVIEW_VERDICT" in durable_output
+            assert len(durable_output) > session.max_output_chars
+            assert len(session.output_buffer) <= session.max_output_chars
+            assert result["full_output_path"] == session.output_log_path
+            assert result["output_is_partial"] is True
 
     def test_spawn_local_exits_when_daemon_inherits_stdout(self, registry, tmp_path):
         """A daemon that keeps stdout open must not keep the shell wrapper running."""
-        child_code = "import sys,time; print('daemon inherited stdout'); sys.stdout.flush(); time.sleep(3)"
+        child_code = (
+            "import sys,time; "
+            "print('daemon inherited stdout'); sys.stdout.flush(); "
+            "time.sleep(0.3); print('daemon later output'); sys.stdout.flush(); time.sleep(0.1)"
+        )
         parent_code = (
             "import subprocess, sys; "
             f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
@@ -1196,6 +1438,41 @@ class TestCheckpoint:
             poll_result = registry.poll(session.id)
             assert poll_result["exit_code"] == 0
             assert "parent done" in poll_result["output_preview"]
+            assert _wait_until(
+                lambda: "daemon later output" in Path(session.output_log_path).read_text(
+                    encoding="utf-8", errors="replace"
+                ),
+                timeout=2.0,
+            )
+
+    def test_spawn_local_completes_with_continuously_logging_inherited_daemon(self, registry, tmp_path):
+        ready_path = tmp_path / "daemon.ready"
+        child_code = (
+            "import sys,time; "
+            f"open({str(ready_path)!r}, 'w').close(); "
+            "[(print(f'daemon tick {i}'), sys.stdout.flush(), time.sleep(0.02)) "
+            "for i in range(150)]"
+        )
+        wait_code = (
+            f"while not os.path.exists({str(ready_path)!r}):\n"
+            "    time.sleep(0.001)"
+        )
+        parent_code = (
+            "import os, subprocess, sys, time; "
+            f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+            f"exec({wait_code!r}); "
+            "print('parent done')"
+        )
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(parent_code)}"
+        with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"), \
+             patch("tools.process_registry.PROCESS_LOG_DIR", tmp_path / "process_logs"):
+            session = registry.spawn_local(command, cwd=str(tmp_path))
+
+            assert _wait_until(lambda: session.exited, timeout=2.0)
+            assert session.exit_code == 0
+            assert "parent done" in Path(session.output_log_path).read_text(
+                encoding="utf-8", errors="replace"
+            )
 
     def test_recover_finished_sidecar_rebuilds_log_tail_after_offset_checkpoint(self, registry, tmp_path):
         """Recovered sessions have no in-memory buffer, so persisted offsets are stale."""
@@ -1635,6 +1912,83 @@ def test_format_completion_event():
     assert "exit code 0" in result
     assert "Command: sleep 5" in result
     assert "Output:\ndone]" in result
+
+
+def test_format_completion_event_includes_full_output_path(tmp_path):
+    log_path = tmp_path / "stdout.log"
+    log_path.write_text("complete output", encoding="utf-8")
+    evt = {
+        "type": "completion",
+        "session_id": "proc_review",
+        "command": "codex review --uncommitted",
+        "exit_code": 0,
+        "output": "[… output truncated — showing last 1000 chars]\nFINAL_REVIEW_VERDICT",
+        "full_output_path": str(log_path),
+        "output_is_partial": True,
+    }
+
+    result = format_process_notification(evt)
+
+    assert result is not None
+    assert f"Full output saved to: {log_path}" in result
+    assert "Use read_file with offset and limit" in result
+
+
+def test_format_completion_event_omits_stale_full_output_path(tmp_path):
+    stale_path = tmp_path / "missing.log"
+    evt = {
+        "type": "completion",
+        "session_id": "proc_review",
+        "command": "codex review --uncommitted",
+        "exit_code": 0,
+        "output": "truncated tail",
+        "full_output_path": str(stale_path),
+        "output_is_partial": True,
+    }
+
+    result = format_process_notification(evt)
+
+    assert result is not None
+    assert "Full output saved to:" not in result
+
+
+def test_completion_queue_event_carries_full_output_handle(registry, tmp_path):
+    full_output = "HEAD_MARKER\n" + ("x" * 5000) + "\nFINAL_REVIEW_VERDICT\n"
+    log_path = tmp_path / "stdout.log"
+    log_path.write_text(full_output, encoding="utf-8")
+    session = _make_session(
+        sid="proc_review",
+        command="codex review --uncommitted",
+        exited=True,
+        exit_code=0,
+        output=full_output[-2000:],
+    )
+    session.output_log_path = str(log_path)
+
+    registry._enqueue_completion_notification(session)
+    evt = registry.completion_queue.get_nowait()
+
+    assert evt["full_output_path"] == str(log_path)
+    assert evt["output_is_partial"] is True
+
+
+def test_completion_queue_marks_short_invalid_utf8_tail_partial(registry, tmp_path):
+    log_path = tmp_path / "stdout.log"
+    log_path.write_bytes(b"\xff" * 2501)
+    session = _make_session(
+        sid="proc_invalid_utf8",
+        exited=True,
+        exit_code=0,
+        output="�" * 2501,
+    )
+    session.output_log_path = str(log_path)
+
+    registry._enqueue_completion_notification(session)
+    evt = registry.completion_queue.get_nowait()
+
+    assert len(evt["output"]) == 2000
+    assert evt["output_is_partial"] is True
+    assert evt["full_output_path"] == str(log_path)
 
 
 def test_format_killed_completion_event_names_source_and_signal():
