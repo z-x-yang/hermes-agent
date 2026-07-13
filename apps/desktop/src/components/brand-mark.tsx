@@ -2,7 +2,8 @@ import { cn } from '@/lib/utils'
 
 const assetPath = (path: string) => `${import.meta.env.BASE_URL}${path.replace(/^\/+/, '')}`
 
-// Brand badge: nous-girl mark on a white tile, identical in light/dark.
+// Evelyn brand badge: Discord-derived color cutout on a white tile,
+// intentionally distinct from the monochrome system app icon.
 // Fills the tile (softly rounded); size via className (default size-14).
 export function BrandMark({ className, ...props }: React.ComponentProps<'span'>) {
   return (
@@ -13,7 +14,7 @@ export function BrandMark({ className, ...props }: React.ComponentProps<'span'>)
       )}
       {...props}
     >
-      <img alt="" className="size-full object-contain" src={assetPath('nous-girl.jpg')} />
+      <img alt="" className="size-full object-contain" src={assetPath('evelyn-brand-mark.png')} />
     </span>
   )
 }

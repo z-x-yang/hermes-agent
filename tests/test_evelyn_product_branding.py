@@ -8,6 +8,7 @@ configuration continue to work.
 from pathlib import Path
 import json
 import re
+import struct
 import tomllib
 
 
@@ -89,6 +90,53 @@ def test_desktop_runtime_and_installer_display_evelyn():
     assert tauri["app"]["windows"][0]["title"] == "Evelyn"
     assert tauri["identifier"] == "com.nousresearch.hermes.setup"
     assert 'name = "Evelyn-Setup"' in _text("apps/bootstrap-installer/src-tauri/Cargo.toml")
+
+
+def test_visual_identity_uses_discord_derived_evelyn_assets():
+    def png_shape(relative_path: str) -> tuple[int, int, int]:
+        data = (ROOT / relative_path).read_bytes()
+        assert data.startswith(b"\x89PNG\r\n\x1a\n"), relative_path
+        width, height = struct.unpack(">II", data[16:24])
+        color_type = data[25]
+        return width, height, color_type
+
+    assert png_shape("apps/desktop/assets/icon.png")[:2] == (1024, 1024)
+    assert png_shape("apps/desktop/public/apple-touch-icon.png")[:2] == (1024, 1024)
+    assert png_shape("apps/desktop/public/evelyn-brand-mark.png") == (1024, 1024, 6)
+    assert png_shape("apps/bootstrap-installer/public/evelyn-brand-mark.png") == (1024, 1024, 6)
+    assert png_shape("apps/bootstrap-installer/src-tauri/icons/32x32.png")[:2] == (32, 32)
+    assert png_shape("apps/bootstrap-installer/src-tauri/icons/128x128.png")[:2] == (128, 128)
+    assert png_shape("apps/bootstrap-installer/src-tauri/icons/128x128@2x.png")[:2] == (256, 256)
+
+    assert (ROOT / "apps/desktop/assets/icon.icns").read_bytes().startswith(b"icns")
+    assert (ROOT / "apps/desktop/assets/icon.ico").read_bytes().startswith(b"\x00\x00\x01\x00")
+    assert (ROOT / "apps/bootstrap-installer/src-tauri/icons/icon.icns").read_bytes().startswith(b"icns")
+    assert (ROOT / "apps/bootstrap-installer/src-tauri/icons/icon.ico").read_bytes().startswith(b"\x00\x00\x01\x00")
+
+    for component in (
+        "apps/desktop/src/components/brand-mark.tsx",
+        "apps/bootstrap-installer/src/components/brand-mark.tsx",
+    ):
+        source = _text(component)
+        assert "evelyn-brand-mark.png" in source
+        assert "nous-girl" not in source
+
+    for retired in (
+        "apps/desktop/public/nous-girl.jpg",
+        "apps/bootstrap-installer/public/nous-girl.jpg",
+        "apps/desktop/public/hermes.png",
+        "apps/desktop/public/hermes-sprite.png",
+        "apps/desktop/public/hermes-frames",
+    ):
+        assert not (ROOT / retired).exists(), retired
+
+    banner = _text("hermes_cli/banner.py")
+    assert "EVELYN_PORTRAIT" in banner
+    assert "☾" in banner
+    assert "HERMES_CADUCEUS = EVELYN_PORTRAIT" in banner
+    assert "else EVELYN_PORTRAIT" in banner
+    assert "_hero = EVELYN_PORTRAIT" in banner
+    assert "⣴⣾⣿⣿⣇⠸⣿⣿" not in banner  # retired caduceus art
 
 
 def test_secondary_user_interfaces_display_evelyn():
