@@ -38,6 +38,22 @@ class TestUserSystemdPrivateSocketPreflight:
         assert calls == ["env"]
 
 
+class TestSystemdHomeSync:
+    def test_sync_pins_both_home_envs_when_evelyn_home_is_stale(self, monkeypatch):
+        monkeypatch.setenv("EVELYN_HOME", "/stale/evelyn")
+        monkeypatch.setenv("HERMES_HOME", "/stale/hermes")
+        monkeypatch.setattr(
+            gateway_cli,
+            "_read_systemd_unit_environment",
+            lambda system=True: {"HERMES_HOME": "/srv/evelyn"},
+        )
+
+        gateway_cli._sync_hermes_home_from_systemd_unit(system=True)
+
+        assert os.environ["EVELYN_HOME"] == "/srv/evelyn"
+        assert os.environ["HERMES_HOME"] == "/srv/evelyn"
+
+
 class TestSystemdServiceRefresh:
     def test_systemd_install_repairs_outdated_unit_without_force(self, tmp_path, monkeypatch):
         unit_path = tmp_path / "hermes-gateway.service"
@@ -447,6 +463,18 @@ class TestGeneratedSystemdUnits:
 
         assert "/home/test/.nvm/versions/node/v24.14.0/bin" in unit
 
+    def test_user_unit_pins_evelyn_and_hermes_home_to_same_root(
+        self, tmp_path, monkeypatch
+    ):
+        resolved_home = tmp_path / ".hermes"
+        resolved_home.mkdir()
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: resolved_home)
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+
+        assert f'Environment="EVELYN_HOME={resolved_home}"' in unit
+        assert f'Environment="HERMES_HOME={resolved_home}"' in unit
+
     def test_user_unit_does_not_leak_profile_node_symlink_target(self, tmp_path, monkeypatch):
         # Regression for the multi-profile gateway restart-loop flap (#48700):
         # ~/.local/bin/node is often a symlink into a *specific* profile's node
@@ -489,6 +517,21 @@ class TestGeneratedSystemdUnits:
         assert str(local_bin) in plist
         assert str(profile_node_bin) not in plist
 
+    def test_launchd_plist_pins_evelyn_and_hermes_home_to_same_root(
+        self, tmp_path, monkeypatch
+    ):
+        resolved_home = str(tmp_path / ".hermes")
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_hermes_home",
+            lambda: Path(resolved_home),
+        )
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert f"<key>EVELYN_HOME</key>\n        <string>{resolved_home}</string>" in plist
+        assert f"<key>HERMES_HOME</key>\n        <string>{resolved_home}</string>" in plist
+
     def test_user_unit_includes_wsl_windows_interop_paths(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "is_wsl", lambda: True)
         monkeypatch.setenv(
@@ -525,6 +568,24 @@ class TestGeneratedSystemdUnits:
         unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
 
         assert "/mnt/c/WINDOWS/system32" in unit
+
+    def test_system_unit_pins_evelyn_and_hermes_home_to_same_root(self, monkeypatch):
+        resolved_home = "/home/alice/.hermes"
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", "/home/alice"),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_hermes_home_for_target_user",
+            lambda home: resolved_home,
+        )
+
+        unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
+
+        assert f'Environment="EVELYN_HOME={resolved_home}"' in unit
+        assert f'Environment="HERMES_HOME={resolved_home}"' in unit
 
     def test_system_unit_avoids_recursive_execstop_and_uses_extended_stop_timeout(self, monkeypatch):
         monkeypatch.setattr(
@@ -1966,11 +2027,12 @@ class TestDetectVenvDir:
 
 
 class TestSystemUnitHermesHome:
-    """HERMES_HOME in system units must reference the target user, not root."""
+    """Gateway home envs in system units must reference the target user, not root."""
 
     def test_system_unit_uses_target_user_home_not_calling_user(self, monkeypatch):
         # Simulate sudo: Path.home() returns /root, target user is alice
         monkeypatch.setattr(Path, "home", staticmethod(lambda: Path("/root")))
+        monkeypatch.delenv("EVELYN_HOME", raising=False)
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setattr(
             gateway_cli, "_system_service_identity",
@@ -1983,8 +2045,9 @@ class TestSystemUnitHermesHome:
 
         unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
 
-        assert 'HERMES_HOME=/home/alice/.hermes' in unit
-        assert '/root/.hermes' not in unit
+        assert 'EVELYN_HOME=/home/alice/.evelyn' in unit
+        assert 'HERMES_HOME=/home/alice/.evelyn' in unit
+        assert '/root/.evelyn' not in unit
 
     def test_system_unit_remaps_profile_to_target_user(self, monkeypatch):
         # Simulate sudo with a profile: HERMES_HOME was resolved under root
@@ -2001,6 +2064,7 @@ class TestSystemUnitHermesHome:
 
         unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
 
+        assert 'EVELYN_HOME=/home/alice/.hermes/profiles/coder' in unit
         assert 'HERMES_HOME=/home/alice/.hermes/profiles/coder' in unit
         assert '/root/' not in unit
 
@@ -2019,6 +2083,7 @@ class TestSystemUnitHermesHome:
 
         unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
 
+        assert 'EVELYN_HOME=/opt/hermes-shared' in unit
         assert 'HERMES_HOME=/opt/hermes-shared' in unit
 
     def test_user_unit_unaffected_by_change(self):
@@ -2026,18 +2091,50 @@ class TestSystemUnitHermesHome:
         unit = gateway_cli.generate_systemd_unit(system=False)
 
         hermes_home = str(gateway_cli.get_hermes_home().resolve())
+        assert f'EVELYN_HOME={hermes_home}' in unit
         assert f'HERMES_HOME={hermes_home}' in unit
 
 
 class TestHermesHomeForTargetUser:
     """Unit tests for _hermes_home_for_target_user()."""
 
+    def test_remaps_fresh_evelyn_default_to_target_user(self, tmp_path, monkeypatch):
+        calling_home = tmp_path / "root"
+        target_home = tmp_path / "alice"
+        current_root = calling_home / ".evelyn"
+        current_root.mkdir(parents=True)
+        target_home.mkdir()
+        monkeypatch.delenv("EVELYN_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: calling_home))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: current_root)
+
+        result = gateway_cli._hermes_home_for_target_user(str(target_home))
+
+        assert result == str(target_home / ".evelyn")
+
+    def test_prefers_existing_legacy_root_for_target_user(self, tmp_path, monkeypatch):
+        calling_home = tmp_path / "root"
+        target_home = tmp_path / "alice"
+        current_root = calling_home / ".evelyn"
+        current_root.mkdir(parents=True)
+        (target_home / ".hermes").mkdir(parents=True)
+        monkeypatch.delenv("EVELYN_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: calling_home))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: current_root)
+
+        result = gateway_cli._hermes_home_for_target_user(str(target_home))
+
+        assert result == str(target_home / ".hermes")
+
     def test_remaps_default_home(self, monkeypatch):
         monkeypatch.setattr(Path, "home", staticmethod(lambda: Path("/root")))
+        monkeypatch.delenv("EVELYN_HOME", raising=False)
         monkeypatch.delenv("HERMES_HOME", raising=False)
 
         result = gateway_cli._hermes_home_for_target_user("/home/alice")
-        assert result == "/home/alice/.hermes"
+        assert result == "/home/alice/.evelyn"
 
     def test_remaps_profile_path(self, monkeypatch):
         monkeypatch.setattr(Path, "home", staticmethod(lambda: Path("/root")))
@@ -2055,10 +2152,11 @@ class TestHermesHomeForTargetUser:
 
     def test_noop_when_same_user(self, monkeypatch):
         monkeypatch.setattr(Path, "home", staticmethod(lambda: Path("/home/alice")))
+        monkeypatch.delenv("EVELYN_HOME", raising=False)
         monkeypatch.delenv("HERMES_HOME", raising=False)
 
         result = gateway_cli._hermes_home_for_target_user("/home/alice")
-        assert result == "/home/alice/.hermes"
+        assert result == "/home/alice/.evelyn"
 
 
 class TestGeneratedUnitUsesDetectedVenv:
@@ -2439,6 +2537,31 @@ class TestProfileArg:
         assert "ExecStart=" in unit
         assert "--profile mybot gateway run" in unit
         assert f'HERMES_HOME={target_home / ".hermes" / "profiles" / "mybot"}' in unit
+
+    def test_systemd_unit_for_target_user_includes_evelyn_profile(
+        self, tmp_path, monkeypatch
+    ):
+        root_home = tmp_path / "root"
+        target_home = tmp_path / "home" / "alice"
+        root_profile = root_home / ".evelyn" / "profiles" / "mybot"
+        root_profile.mkdir(parents=True)
+
+        monkeypatch.setattr(Path, "home", lambda: root_home)
+        monkeypatch.setenv("EVELYN_HOME", str(root_profile))
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: root_profile)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", str(target_home)),
+        )
+
+        unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
+
+        target_profile = target_home / ".evelyn" / "profiles" / "mybot"
+        assert "--profile mybot gateway run" in unit
+        assert f'EVELYN_HOME={target_profile}' in unit
+        assert f'HERMES_HOME={target_profile}' in unit
 
     def test_launchd_plist_includes_profile(self, tmp_path, monkeypatch):
         """generate_launchd_plist should include --profile in ProgramArguments for named profiles."""

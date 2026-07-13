@@ -930,23 +930,28 @@ def _read_systemd_unit_environment(system: bool = False) -> dict[str, str]:
 
 
 def _sync_hermes_home_from_systemd_unit(system: bool) -> None:
-    """When acting on a system-scope unit, adopt its ``HERMES_HOME``.
+    """For a system-scope unit, adopt its pinned Evelyn/Hermes data root.
 
-    Under ``sudo``, ``HERMES_HOME`` is stripped and ``HOME=/root``, so
-    :func:`get_hermes_home` falls back to ``/root/.hermes`` — the wrong
-    profile. The unit file pins ``HERMES_HOME`` for the actual gateway
-    process, so we mirror that into our own environment to make
-    ``read_runtime_status`` / ``get_running_pid`` read the correct files.
+    Under ``sudo``, the caller may have no home override or a stale override
+    from another profile. The unit is authoritative for the gateway process, so
+    mirror its Evelyn-first value into both compatibility variables before
+    reading runtime status or PID files.
     """
     if not system:
         return
     env = _read_systemd_unit_environment(system=True)
-    unit_home = env.get("HERMES_HOME", "").strip()
+    unit_home = (
+        env.get("EVELYN_HOME", "").strip()
+        or env.get("HERMES_HOME", "").strip()
+    )
     if not unit_home:
         return
-    current = os.environ.get("HERMES_HOME", "").strip()
-    if current == unit_home:
+    if all(
+        os.environ.get(name, "").strip() == unit_home
+        for name in ("EVELYN_HOME", "HERMES_HOME")
+    ):
         return
+    os.environ["EVELYN_HOME"] = unit_home
     os.environ["HERMES_HOME"] = unit_home
 
 
@@ -1728,13 +1733,17 @@ def _profile_arg(hermes_home: str | None = None, default_root: str | Path | None
 
 
 def _profile_arg_for_target_user(hermes_home: str, target_home_dir: str) -> str:
-    """Return the profile arg for a system service running as another user."""
-    target_root = Path(target_home_dir) / ".hermes"
-    try:
-        Path(hermes_home).resolve().relative_to(target_root.resolve())
-        return _profile_arg(hermes_home, default_root=target_root)
-    except ValueError:
-        return _profile_arg(hermes_home)
+    """Return a profile arg under either target-user default data root."""
+    resolved_home = Path(hermes_home).resolve()
+    target_home = Path(target_home_dir)
+    for default_name in (".evelyn", ".hermes"):
+        target_root = target_home / default_name
+        try:
+            resolved_home.relative_to(target_root.resolve())
+            return _profile_arg(hermes_home, default_root=target_root)
+        except ValueError:
+            continue
+    return _profile_arg(hermes_home)
 
 
 def get_service_name() -> str:
@@ -2559,29 +2568,42 @@ def _remap_path_for_user(path: str, target_home_dir: str) -> str:
 
 
 def _hermes_home_for_target_user(target_home_dir: str) -> str:
-    """Remap the current HERMES_HOME to the equivalent under a target user's home.
+    """Remap the current data root to the equivalent under a target user's home.
 
-    When installing a system service via sudo, get_hermes_home() resolves to
-    root's home.  This translates it to the target user's equivalent path:
-      /root/.hermes                    → /home/alice/.hermes
-      /root/.hermes/profiles/coder     → /home/alice/.hermes/profiles/coder
-      /opt/custom-hermes               → /opt/custom-hermes  (kept as-is)
+    System-service installation may run via sudo, so the calling user's default
+    root must not leak into the target user's service. Preserve profile-relative
+    paths while supporting both Evelyn's preferred root and Hermes' legacy root.
     """
-    current_hermes = get_hermes_home().resolve()
-    current_default = (Path.home() / ".hermes").resolve()
-    target_default = Path(target_home_dir) / ".hermes"
+    current_root = get_hermes_home().resolve()
+    calling_home = Path.home()
+    target_home = Path(target_home_dir)
+    target_preferred = target_home / ".evelyn"
+    target_legacy = target_home / ".hermes"
+    target_default = (
+        target_preferred
+        if target_preferred.is_dir() or not target_legacy.is_dir()
+        else target_legacy
+    )
+    has_explicit_root = bool(
+        os.environ.get("EVELYN_HOME", "").strip()
+        or os.environ.get("HERMES_HOME", "").strip()
+    )
 
-    # Default ~/.hermes → remap to target user's default
-    if current_hermes == current_default:
-        return str(target_default)
+    for default_name in (".evelyn", ".hermes"):
+        calling_default = (calling_home / default_name).resolve()
+        destination_default = (
+            target_home / default_name if has_explicit_root else target_default
+        )
+        if current_root == calling_default:
+            return str(destination_default)
+        try:
+            relative = current_root.relative_to(calling_default)
+            return str(destination_default / relative)
+        except ValueError:
+            continue
 
-    # Profile or subdir of ~/.hermes → preserve the relative structure
-    try:
-        relative = current_hermes.relative_to(current_default)
-        return str(target_default / relative)
-    except ValueError:
-        # Completely custom path (not under ~/.hermes) — keep as-is
-        return str(current_hermes)
+    # Completely custom path (not under either default root) — keep as-is.
+    return str(current_root)
 
 
 def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
@@ -2719,6 +2741,7 @@ Environment="USER={username}"
 Environment="LOGNAME={username}"
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
+Environment="EVELYN_HOME={hermes_home}"
 Environment="HERMES_HOME={hermes_home}"
 Restart=always
 RestartSec=5
@@ -2753,6 +2776,7 @@ ExecStart={python_path} -m hermes_cli.main{f" {profile_arg}" if profile_arg else
 WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
+Environment="EVELYN_HOME={hermes_home}"
 Environment="HERMES_HOME={hermes_home}"
 Restart=always
 RestartSec=5
@@ -3869,6 +3893,8 @@ def generate_launchd_plist() -> str:
         <string>{sane_path}</string>
         <key>VIRTUAL_ENV</key>
         <string>{venv_dir}</string>
+        <key>EVELYN_HOME</key>
+        <string>{hermes_home}</string>
         <key>HERMES_HOME</key>
         <string>{hermes_home}</string>
     </dict>
