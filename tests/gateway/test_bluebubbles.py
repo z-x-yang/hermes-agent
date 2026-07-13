@@ -137,10 +137,12 @@ class TestBlueBubblesHelpers:
         adapter = _make_adapter(monkeypatch, server_url="localhost:1234")
         assert adapter.server_url == "http://localhost:1234"
 
-    def test_default_mention_patterns_match_hermes_variants(self, monkeypatch):
+    def test_default_mention_patterns_match_evelyn_and_legacy_hermes(self, monkeypatch):
         adapter = _make_adapter(monkeypatch, require_mention=True)
 
         assert adapter.require_mention is True
+        assert adapter._message_matches_mention_patterns("Evelyn, summarize this")
+        assert adapter._message_matches_mention_patterns("@Evelyn help")
         assert adapter._message_matches_mention_patterns("Hermes, summarize this")
         assert adapter._message_matches_mention_patterns("@Hermes agent help")
         assert not adapter._message_matches_mention_patterns("casual family chatter")

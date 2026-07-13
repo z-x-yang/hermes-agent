@@ -56,6 +56,10 @@ test('mode predicates classify what each mode removes', () => {
 
 test('resolveRemovableAppPath finds the .app bundle on macOS', () => {
   assert.equal(
+    resolveRemovableAppPath('/Applications/Evelyn.app/Contents/MacOS/Evelyn', 'darwin'),
+    '/Applications/Evelyn.app'
+  )
+  assert.equal(
     resolveRemovableAppPath('/Applications/Hermes.app/Contents/MacOS/Hermes', 'darwin'),
     '/Applications/Hermes.app'
   )
@@ -79,6 +83,10 @@ test('resolveRemovableAppPath: dev-run .app resolves (safety is shouldRemoveAppB
 })
 
 test('resolveRemovableAppPath finds the install dir on Windows', () => {
+  assert.equal(
+    resolveRemovableAppPath('C:\\Users\\x\\AppData\\Local\\Programs\\Evelyn\\Evelyn.exe', 'win32'),
+    'C:\\Users\\x\\AppData\\Local\\Programs\\Evelyn'
+  )
   assert.equal(
     resolveRemovableAppPath('C:\\Users\\x\\AppData\\Local\\Programs\\Hermes\\Hermes.exe', 'win32'),
     'C:\\Users\\x\\AppData\\Local\\Programs\\Hermes'

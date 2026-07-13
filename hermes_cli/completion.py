@@ -97,9 +97,9 @@ def generate_bash(parser: argparse.ArgumentParser) -> str:
 
     cases_str = "\n".join(cases)
 
-    return f"""# Hermes Agent bash completion
+    return f"""# Evelyn bash completion (Hermes-compatible)
 # Add to ~/.bashrc:
-#   eval "$(hermes completion bash)"
+#   eval "$(evelyn completion bash)"
 
 _hermes_profiles() {{
     local profiles_dir="$HOME/.hermes/profiles"
@@ -135,7 +135,7 @@ _hermes_completion() {{
     fi
 }}
 
-complete -F _hermes_completion hermes
+complete -F _hermes_completion evelyn hermes
 """
 
 
@@ -199,10 +199,10 @@ def generate_zsh(parser: argparse.ArgumentParser) -> str:
             )
     sub_cases_str = "\n".join(sub_cases)
 
-    return f"""#compdef hermes
-# Hermes Agent zsh completion
+    return f"""#compdef evelyn hermes
+# Evelyn zsh completion (Hermes-compatible)
 # Add to ~/.zshrc:
-#   eval "$(hermes completion zsh)"
+#   eval "$(evelyn completion zsh)"
 
 _hermes_profiles() {{
     local -a profiles
@@ -240,7 +240,7 @@ _hermes() {{
     esac
 }}
 
-compdef _hermes hermes
+compdef _hermes evelyn hermes
 """
 
 
@@ -254,9 +254,9 @@ def generate_fish(parser: argparse.ArgumentParser) -> str:
     top_cmds_str = " ".join(top_cmds)
 
     lines: list[str] = [
-        "# Hermes Agent fish completion",
+        "# Evelyn fish completion (Hermes-compatible)",
         "# Add to your config:",
-        "#   hermes completion fish | source",
+        "#   evelyn completion fish | source",
         "",
         "# Helper: list available profiles",
         "function __hermes_profiles",
@@ -316,4 +316,11 @@ def generate_fish(parser: argparse.ArgumentParser) -> str:
                 )
 
     lines.append("")
-    return "\n".join(lines)
+    # Fish accepts one command per `complete` declaration. Emit Evelyn first
+    # as the preferred entrypoint, then the legacy Hermes alias.
+    expanded: list[str] = []
+    for line in lines:
+        if line.startswith("complete -c hermes"):
+            expanded.append(line.replace("complete -c hermes", "complete -c evelyn", 1))
+        expanded.append(line)
+    return "\n".join(expanded)

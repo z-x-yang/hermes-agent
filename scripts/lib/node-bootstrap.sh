@@ -268,7 +268,7 @@ heal_managed_node() {
     if ! _nb_managed_node_needs_heal; then
         return 0
     fi
-    _nb_log "Hermes-managed Node is broken — redownloading to $HERMES_HOME/node/..."
+    _nb_log "Evelyn-managed Node is broken — redownloading to $HERMES_HOME/node/..."
     _nb_install_bundled_node
 }
 
@@ -292,7 +292,7 @@ ensure_node() {
     if [ -x "$HERMES_HOME/node/bin/node" ]; then
         export PATH="$HERMES_HOME/node/bin:$PATH"
         if _nb_have_modern_node; then
-            _nb_ok "Node $(node --version) found (Hermes-managed)"
+            _nb_ok "Node $(node --version) found (Evelyn-managed)"
             HERMES_NODE_AVAILABLE=true
             return 0
         fi

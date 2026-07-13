@@ -1,4 +1,4 @@
-# Hermes statiese boodskap-katalogus -- Afrikaans
+# Evelyn statiese boodskap-katalogus -- Afrikaans
 # See locales/en.yaml for the source of truth; keep keys in sync.
 
 approval:
@@ -100,7 +100,7 @@ gateway:
     header:                "**Ontfoutverslag opgelaai:**"
     auto_delete:           "⏱ Plakke sal outomaties oor 6 uur uitgevee word."
     full_logs_hint:        "Vir volledige loglae, gebruik `hermes debug share` vanaf die CLI."
-    share_hint:            "Deel hierdie skakels met die Hermes-span vir ondersteuning."
+    share_hint:            "Deel hierdie skakels met die Evelyn-span vir ondersteuning."
 
   deny:
     stale:                 "❌ Opdrag geweier (goedkeuring was verouderd)."
@@ -137,7 +137,7 @@ gateway:
     set:                   "⊙ Doelwit gestel ({budget}-beurt-begroting): {goal}\nEk sal aanhou werk totdat die doelwit klaar is, jy dit pouseer/verwyder, of die begroting opgebruik is.\nBeheer: /goal status · /goal pause · /goal resume · /goal clear"
 
   help:
-    header:                "📖 **Hermes-opdragte**\n"
+    header:                "📖 **Evelyn-opdragte**\n"
     skill_header:          "\n⚡ **Vaardigheidsopdragte** ({count} aktief):"
     more_use_commands:     "\n... en nog {count}. Gebruik `/commands` vir die volledige bladsy-lys."
 
@@ -233,7 +233,7 @@ gateway:
 Use quotes around titles with spaces, for example: `/resume \"Project A Plan\"`."
     matrix_no_named_sessions: "No named sessions found for this Matrix room.
 Use `/title My Session` to name the current room session, `/resume --all` to list all Matrix sessions, or `/resume --cross-room <session name>` to explicitly cross room boundaries."
-    matrix_blocked_no_origin: "⚠️ Matrix /resume blocked: this named session has no recorded room origin, so Hermes will not resume it inside the current room by default. Use `/resume --cross-room {name}` if you intentionally want to cross room boundaries."
+    matrix_blocked_no_origin: "⚠️ Matrix /resume blocked: this named session has no recorded room origin, so Evelyn will not resume it inside the current room by default. Use `/resume --cross-room {name}` if you intentionally want to cross room boundaries."
     matrix_blocked_other_room: "⚠️ Matrix /resume blocked: that session belongs to a different Matrix room ({room}). Use `/resume --cross-room {name}` if you intentionally want to resume it here."
     matrix_cross_room_success: "⚠️ Cross-room resume: resumed **{title}** inside Matrix room **{room}**.
 Future messages in this room will use that transcript until `/reset` or another `/resume`.{msg_part}"
@@ -269,7 +269,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     success:               "✅ Tuiste-kanaal gestel op **{name}** (ID: {chat_id}).\nKron-take en kruisplatform-boodskappe sal hier afgelewer word."
 
   status:
-    header:                "📊 **Hermes Gateway Status**"
+    header:                "📊 **Evelyn Gateway Status**"
     matrix_scope_header:   "**Matrix scope:**"
     matrix_scope_room:     "  room: {room}"
     matrix_scope_room_id:  "  room_id: {room_id}"
@@ -314,7 +314,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     topics_user_disallowed:  "Telegram-onderwerpe is geaktiveer, maar gebruikers mag nie onderwerpe skep nie.\n\nOpen @BotFather → kies jou bot → Bot Settings → Threads Settings, en skakel dan 'Disallow users to create new threads' af.\n\nStuur dan weer /topic."
     enable_failed:           "Kon nie Telegram-onderwerpmodus aktiveer nie: {error}"
     bound_status:            "Hierdie onderwerp is gekoppel aan:\nSessie: {label}\nID: {session_id}\n\nGebruik /new om hierdie onderwerp met 'n vars sessie te vervang.\nVir parallelle werk, open All Messages en stuur 'n boodskap daar om 'n ander onderwerp te skep."
-    thread_ready:            "Telegram multi-sessie-onderwerpe is geaktiveer.\n\nHierdie onderwerp sal as 'n onafhanklike Hermes-sessie gebruik word. Gebruik /new om hierdie onderwerp se huidige sessie te vervang. Vir parallelle werk, open All Messages en stuur 'n boodskap daar om 'n ander onderwerp te skep."
+    thread_ready:            "Telegram multi-sessie-onderwerpe is geaktiveer.\n\nHierdie onderwerp sal as 'n onafhanklike Evelyn-sessie gebruik word. Gebruik /new om hierdie onderwerp se huidige sessie te vervang. Vir parallelle werk, open All Messages en stuur 'n boodskap daar om 'n ander onderwerp te skep."
     untitled_session:        "Sessie sonder titel"
 
   undo:
@@ -325,9 +325,9 @@ Future messages in this room will use that transcript until `/reset` or another 
   update:
     platform_not_messaging:  "✗ /update is slegs beskikbaar vanaf boodskapplatforms. Voer `hermes update` vanaf die terminale uit."
     not_git_repo:            "✗ Nie 'n git-bewaarplek nie — kan nie opdateer nie."
-    hermes_cmd_not_found:    "✗ Kon nie die `hermes`-opdrag vind nie. Hermes loop, maar die opdateeropdrag kon nie die uitvoerbare lêer op PATH of via die huidige Python-vertolker vind nie. Probeer `hermes update` met die hand in jou terminale uitvoer."
+    hermes_cmd_not_found:    "✗ Kon nie die `hermes`-opdrag vind nie. Evelyn loop, maar die opdateeropdrag kon nie die uitvoerbare lêer op PATH of via die huidige Python-vertolker vind nie. Probeer `hermes update` met die hand in jou terminale uitvoer."
     start_failed:            "✗ Kon nie opdatering begin nie: {error}"
-    starting:                "⚕ Begin Hermes-opdatering… Ek sal vordering hier stroom."
+    starting:                "⚕ Begin Evelyn-opdatering… Ek sal vordering hier stroom."
 
   usage:
     rate_limits:              "⏱️ **Tariefperke:** {state}"

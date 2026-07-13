@@ -92,31 +92,32 @@ class TestCliSkinPromptIntegration:
 
 
 class TestCompactBannerSkinIntegration:
-    def test_default_compact_banner_keeps_legacy_nous_hermes_branding(self):
+    def test_default_compact_banner_uses_evelyn_branding(self):
         set_active_skin("default")
 
         with patch("cli.shutil.get_terminal_size", return_value=SimpleNamespace(columns=90)), \
-             patch.dict(_build_compact_banner.__globals__, {"format_banner_version_label": lambda: "Hermes Agent v0.1.0 (test)"}):
+             patch.dict(_build_compact_banner.__globals__, {"format_banner_version_label": lambda: "Evelyn v0.1.0 (test) · powered by Hermes Agent"}):
             banner = _build_compact_banner()
 
-        assert "NOUS HERMES" in banner
+        assert "EVELYN" in banner
+        assert "NOUS HERMES" not in banner
 
-    def test_poseidon_compact_banner_uses_skin_branding_instead_of_nous_hermes(self):
+    def test_poseidon_compact_banner_uses_skin_branding_instead_of_evelyn(self):
         set_active_skin("poseidon")
 
         with patch("cli.shutil.get_terminal_size", return_value=SimpleNamespace(columns=90)), \
-             patch.dict(_build_compact_banner.__globals__, {"format_banner_version_label": lambda: "Hermes Agent v0.1.0 (test)"}):
+             patch.dict(_build_compact_banner.__globals__, {"format_banner_version_label": lambda: "Evelyn v0.1.0 (test) · powered by Hermes Agent"}):
             banner = _build_compact_banner()
 
         assert "Poseidon Agent" in banner
-        assert "NOUS HERMES" not in banner
+        assert "EVELYN" not in banner
 
     def test_poseidon_compact_banner_uses_skin_colors(self):
         set_active_skin("poseidon")
         skin = get_active_skin()
 
         with patch("cli.shutil.get_terminal_size", return_value=SimpleNamespace(columns=90)), \
-             patch.dict(_build_compact_banner.__globals__, {"format_banner_version_label": lambda: "Hermes Agent v0.1.0 (test)"}):
+             patch.dict(_build_compact_banner.__globals__, {"format_banner_version_label": lambda: "Evelyn v0.1.0 (test) · powered by Hermes Agent"}):
             banner = _build_compact_banner()
 
         assert skin.get_color("banner_border") in banner
@@ -127,7 +128,8 @@ class TestCompactBannerSkinIntegration:
         set_active_skin("default")
 
         with patch("cli.shutil.get_terminal_size", return_value=SimpleNamespace(columns=90)), \
-             patch.dict(_build_compact_banner.__globals__, {"format_banner_version_label": lambda: "Hermes Agent v1.0 (test) · upstream abc12345"}):
+             patch.dict("os.environ", {"HERMES_FAST_STARTUP_BANNER": "0"}), \
+             patch.dict(_build_compact_banner.__globals__, {"format_banner_version_label": lambda: "Evelyn v1.0 (test) · powered by Hermes Agent · upstream abc12345"}):
             banner = _build_compact_banner()
 
         assert "upstream abc12345" in banner

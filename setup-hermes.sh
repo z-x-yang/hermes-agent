@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# Hermes Agent Setup Script
+# Evelyn Setup Script (powered by Hermes Agent)
 # ============================================================================
 # Quick setup for developers who cloned the repo manually.
 # Uses uv for desktop/server setup and Python's stdlib venv + pip on Termux.
@@ -56,7 +56,7 @@ get_command_link_display_dir() {
 }
 
 echo ""
-echo -e "${CYAN}⚕ Hermes Agent Setup${NC}"
+echo -e "${CYAN}✦ Evelyn Setup · powered by Hermes Agent${NC}"
 echo ""
 
 # ============================================================================
@@ -342,17 +342,44 @@ else
 fi
 
 # ============================================================================
-# PATH setup — symlink hermes into a user-facing bin dir
+# PATH setup — prefer evelyn and retain the hermes compatibility command
 # ============================================================================
 
-echo -e "${CYAN}→${NC} Setting up hermes command..."
+echo -e "${CYAN}→${NC} Setting up evelyn command (with hermes compatibility)..."
 
+EVELYN_BIN="$SCRIPT_DIR/venv/bin/evelyn"
 HERMES_BIN="$SCRIPT_DIR/venv/bin/hermes"
 COMMAND_LINK_DIR="$(get_command_link_dir)"
 COMMAND_LINK_DISPLAY_DIR="$(get_command_link_display_dir)"
 mkdir -p "$COMMAND_LINK_DIR"
-ln -sf "$HERMES_BIN" "$COMMAND_LINK_DIR/hermes"
-echo -e "${GREEN}✓${NC} Symlinked hermes → $COMMAND_LINK_DISPLAY_DIR/hermes"
+
+install_command_link() {
+    local source="$1"
+    local destination="$2"
+    local label="$3"
+
+    if [ -L "$destination" ] && [ "$(readlink "$destination" 2>/dev/null || true)" = "$source" ]; then
+        echo -e "${GREEN}✓${NC} $label already points to $source"
+        return 0
+    fi
+
+    if [ -e "$destination" ] || [ -L "$destination" ]; then
+        local backup="${destination}.evelyn-migrated-backup"
+        local suffix=1
+        while [ -e "$backup" ] || [ -L "$backup" ]; do
+            backup="${destination}.evelyn-migrated-backup.${suffix}"
+            suffix=$((suffix + 1))
+        done
+        mv "$destination" "$backup"
+        echo -e "${YELLOW}⚠${NC} Preserved existing $label command at $backup"
+    fi
+
+    ln -s "$source" "$destination"
+    echo -e "${GREEN}✓${NC} Symlinked $label → $destination"
+}
+
+install_command_link "$EVELYN_BIN" "$COMMAND_LINK_DIR/evelyn" "evelyn"
+install_command_link "$HERMES_BIN" "$COMMAND_LINK_DIR/hermes" "hermes compatibility command"
 
 if is_termux; then
     export PATH="$COMMAND_LINK_DIR:$PATH"
@@ -383,7 +410,7 @@ else
         if ! echo "$PATH" | tr ':' '\n' | grep -q "^$HOME/.local/bin$"; then
             if ! grep -q '\.local/bin' "$SHELL_CONFIG" 2>/dev/null; then
                 echo "" >> "$SHELL_CONFIG"
-                echo "# Hermes Agent — ensure ~/.local/bin is on PATH" >> "$SHELL_CONFIG"
+                echo "# Evelyn — ensure ~/.local/bin is on PATH" >> "$SHELL_CONFIG"
                 echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$SHELL_CONFIG"
                 echo -e "${GREEN}✓${NC} Added ~/.local/bin to PATH in $SHELL_CONFIG"
             else

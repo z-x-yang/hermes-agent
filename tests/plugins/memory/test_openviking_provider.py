@@ -370,7 +370,7 @@ def test_post_setup_create_remote_user_profile_can_mirror_to_openviking_store(tm
         _prompt_from_values({
             "OpenViking server URL": "https://openviking.example",
             "OpenViking user API key": "user-secret",
-            "Hermes peer ID in OpenViking": "hermes",
+            "Evelyn peer ID in OpenViking": "hermes",
             "OpenViking profile name": "VPS",
         }),
     )
@@ -412,7 +412,7 @@ def test_post_setup_create_remote_user_can_keep_hermes_only(tmp_path, monkeypatc
         _prompt_from_values({
             "OpenViking server URL": "https://openviking.example",
             "OpenViking user API key": "user-secret",
-            "Hermes peer ID in OpenViking": "agent",
+            "Evelyn peer ID in OpenViking": "agent",
         }),
     )
     config = {"memory": {}}
@@ -456,7 +456,7 @@ def test_post_setup_create_openviking_service_validates_after_api_key(tmp_path, 
         _prompt_from_values(
             {
                 "OpenViking API key": "service-secret",
-                "Hermes peer ID in OpenViking": "agent",
+                "Evelyn peer ID in OpenViking": "agent",
             },
             forbidden={"OpenViking server URL", "OpenViking user API key", "OpenViking root API key"},
         ),
@@ -541,7 +541,7 @@ def test_post_setup_user_key_path_can_route_detected_root_key_to_root_setup(tmp_
             "OpenViking user API key": "root-secret",
             "OpenViking account": "acct",
             "OpenViking user": "alice",
-            "Hermes peer ID in OpenViking": "agent",
+            "Evelyn peer ID in OpenViking": "agent",
         }
         return values.get(label, default or "")
 
@@ -550,7 +550,7 @@ def test_post_setup_user_key_path_can_route_detected_root_key_to_root_setup(tmp_
 
     OpenVikingMemoryProvider().post_setup(str(hermes_home), config)
 
-    assert prompt_events.count("Hermes peer ID in OpenViking") == 1
+    assert prompt_events.count("Evelyn peer ID in OpenViking") == 1
     env_text = (hermes_home / ".env").read_text(encoding="utf-8")
     assert "OPENVIKING_API_KEY=root-secret" in env_text
     assert "OPENVIKING_ACCOUNT=acct" in env_text
@@ -581,7 +581,7 @@ def test_post_setup_root_key_path_can_route_detected_user_key_to_user_setup(tmp_
             {
                 "OpenViking server URL": "https://openviking.example",
                 "OpenViking root API key": "user-secret",
-                "Hermes peer ID in OpenViking": "agent",
+                "Evelyn peer ID in OpenViking": "agent",
             },
             forbidden={"OpenViking user API key", "OpenViking account", "OpenViking user"},
         ),
@@ -617,7 +617,7 @@ def test_manual_root_key_flow_prints_validation_progress(monkeypatch, capsys):
             "OpenViking root API key": "root-secret",
             "OpenViking account": "acct",
             "OpenViking user": "alice",
-            "Hermes peer ID in OpenViking": "agent",
+            "Evelyn peer ID in OpenViking": "agent",
         }),
         lambda *args, **kwargs: next(choices),
         -1,
@@ -700,7 +700,7 @@ def test_https_local_endpoint_is_not_runtime_autostart_eligible(monkeypatch):
     assert provider._client is None
     assert warnings == [
         "Remote OpenViking server at https://localhost:1934 is not reachable; "
-        "OpenViking memory disabled for this Hermes run. "
+        "OpenViking memory disabled for this Evelyn run. "
         "Check the configured endpoint and network connectivity."
     ]
 
@@ -733,7 +733,7 @@ def test_runtime_does_not_autostart_when_local_server_reports_unhealthy(monkeypa
     assert provider._client is None
     assert warnings == [
         "OpenViking server at http://localhost:1934 responded but reported unhealthy status. "
-        "OpenViking memory disabled for this Hermes run."
+        "OpenViking memory disabled for this Evelyn run."
     ]
 
 
@@ -945,7 +945,7 @@ def test_runtime_openviking_waiter_warns_when_background_start_times_out(monkeyp
     assert warnings == [
         "Local OpenViking server at http://127.0.0.1:1934 is not reachable. "
         "Tried to start openviking-server, but it did not become reachable "
-        "within 60 seconds. OpenViking memory disabled for this Hermes run."
+        "within 60 seconds. OpenViking memory disabled for this Evelyn run."
     ]
 
 
@@ -1038,7 +1038,7 @@ def test_initialize_emits_cli_warning_when_local_runtime_autostart_fails(monkeyp
     assert warnings == [
         "Local OpenViking server at http://localhost:1934 is not reachable. "
         "openviking-server was not found on PATH. "
-        "OpenViking memory disabled for this Hermes run."
+        "OpenViking memory disabled for this Evelyn run."
     ]
 
 
@@ -1092,7 +1092,7 @@ def test_post_setup_local_server_down_can_offer_autostart(tmp_path, monkeypatch)
         "_prompt",
         _prompt_from_values({
             "OpenViking server URL": "localhost",
-            "Hermes peer ID in OpenViking": "agent",
+            "Evelyn peer ID in OpenViking": "agent",
         }),
     )
     config = {"memory": {}}
@@ -1127,7 +1127,7 @@ def test_post_setup_invalid_env_profile_can_create_new_config(tmp_path, monkeypa
         _prompt_from_values({
             "OpenViking server URL": "https://openviking.example",
             "OpenViking user API key": "user-secret",
-            "Hermes peer ID in OpenViking": "agent",
+            "Evelyn peer ID in OpenViking": "agent",
         }),
     )
     config = {"memory": {}}
@@ -1964,7 +1964,7 @@ def test_validate_openviking_root_access_uses_admin_endpoint(monkeypatch):
             assert api_key == "root-key"
             assert account == ""
             assert user == ""
-            assert agent == "hermes"
+            assert agent == "evelyn"
 
         def validate_root_access(self):
             events.append("admin")

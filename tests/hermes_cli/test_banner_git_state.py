@@ -7,7 +7,7 @@ def test_format_banner_version_label_without_git_state():
     with patch.object(banner, "get_git_banner_state", return_value=None):
         value = banner.format_banner_version_label()
 
-    assert value == f"Hermes Agent v{banner.VERSION} ({banner.RELEASE_DATE})"
+    assert value == f"Evelyn v{banner.VERSION} ({banner.RELEASE_DATE}) · powered by Hermes Agent"
 
 
 def test_format_banner_version_label_on_upstream_main():

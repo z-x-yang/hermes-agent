@@ -27,7 +27,7 @@ TELEGRAM_ONBOARDING_URL_ENV = "TELEGRAM_ONBOARDING_URL"
 # actual deep link, so this is only used by local helpers/tests.
 DEFAULT_MANAGER_BOT = "HermesSetupBot"
 
-DEFAULT_BOT_NAME = "Hermes Agent"
+DEFAULT_BOT_NAME = "Evelyn"
 DEFAULT_POLL_TIMEOUT = 180
 POLL_INTERVAL = 2
 
@@ -130,7 +130,7 @@ def generate_bot_username(profile_name: Optional[str] = None) -> str:
     carry enough entropy for backend correlation.
     """
     _ = profile_name
-    return f"hermes_{generate_username_slug()}_bot"
+    return f"evelyn_{generate_username_slug()}_bot"
 
 
 def generate_deep_link(
@@ -286,11 +286,11 @@ def auto_setup_telegram_bot_result(
     _ = manager_bot, profile_name
     resolved_api_url = _api_url(api_url)
     print()
-    print(f"  Contacting Hermes Telegram onboarding service: {resolved_api_url}")
+    print(f"  Contacting Evelyn Telegram onboarding service: {resolved_api_url}")
     sys.stdout.flush()
     pairing = create_pairing(resolved_api_url)
     if not pairing:
-        print("  ✗ Could not reach the Hermes Telegram onboarding service.")
+        print("  ✗ Could not reach the Evelyn Telegram onboarding service.")
         print("    Try the manual setup instead, or check your network.")
         return None
 

@@ -30,7 +30,7 @@ def _extract_setup_path_shim_block() -> str:
     """Return the install.sh shim-write block used by setup_path()."""
     text = INSTALL_SH.read_text()
     match = re.search(
-        r"(?P<block>mkdir -p \"\$command_link_dir\".*?chmod \+x \"\$command_link_dir/hermes\")",
+        r"(?P<block>mkdir -p \"\$command_link_dir\".*?chmod \+x \"\$command_link_dir/evelyn\" \"\$command_link_dir/hermes\")",
         text,
         re.DOTALL,
     )
@@ -43,10 +43,13 @@ def _extract_setup_path_shim_block() -> str:
 def test_setup_path_shim_block_removes_old_link_before_writing() -> None:
     """Static guard: the rm must precede the cat heredoc, not follow it."""
     block = _extract_setup_path_shim_block()
-    rm_idx = block.find('rm -f "$command_link_dir/hermes"')
-    cat_idx = block.find('cat > "$command_link_dir/hermes" <<EOF')
+    rm_idx = block.find('rm -f "$command_link_dir/evelyn" "$command_link_dir/hermes"')
+    cat_idx = min(
+        block.find('cat > "$command_link_dir/evelyn" <<EOF'),
+        block.find('cat > "$command_link_dir/hermes" <<EOF'),
+    )
     assert rm_idx != -1, (
-        "setup_path() must `rm -f` $command_link_dir/hermes before the "
+        "setup_path() must remove the Evelyn and Hermes shims before the "
         "`cat >` heredoc, otherwise an existing symlink (left by older "
         "installs) will be followed and the pip entry point overwritten. "
         "See #21454."
@@ -79,6 +82,10 @@ def test_re_running_setup_path_block_preserves_pip_entry_point(tmp_path: Path) -
     pip_marker = "#!/usr/bin/env python\n# pip-generated entry point — must not be overwritten\n"
     pip_entry.write_text(pip_marker)
     pip_entry.chmod(pip_entry.stat().st_mode | stat.S_IXUSR)
+    evelyn_entry = venv_bin / "evelyn"
+    evelyn_marker = "#!/usr/bin/env python\n# Evelyn pip entry point — must not be overwritten\n"
+    evelyn_entry.write_text(evelyn_marker)
+    evelyn_entry.chmod(evelyn_entry.stat().st_mode | stat.S_IXUSR)
 
     command_link_dir = tmp_path / "local_bin"
     command_link_dir.mkdir()
@@ -86,11 +93,17 @@ def test_re_running_setup_path_block_preserves_pip_entry_point(tmp_path: Path) -
     # Reproduce the prior-install state: shim path is a symlink to the
     # pip-generated entry point.
     shim_path.symlink_to(pip_entry)
+    evelyn_shim_path = command_link_dir / "evelyn"
+    evelyn_shim_path.symlink_to(evelyn_entry)
     assert shim_path.is_symlink()
+    assert evelyn_shim_path.is_symlink()
 
     block = _extract_setup_path_shim_block()
     # Drive the block with the real env vars setup_path() sets.
-    script = f'set -e\nHERMES_BIN={pip_entry!s}\ncommand_link_dir={command_link_dir!s}\n{block}\n'
+    script = (
+        f'set -e\nEVELYN_BIN={evelyn_entry!s}\nHERMES_BIN={pip_entry!s}\n'
+        f'command_link_dir={command_link_dir!s}\n{block}\n'
+    )
     result = subprocess.run(
         ["bash", "-c", script],
         capture_output=True,
@@ -107,6 +120,7 @@ def test_re_running_setup_path_block_preserves_pip_entry_point(tmp_path: Path) -
         "venv/bin/hermes was overwritten by setup_path() — symlink-stomp "
         "regression (#21454)."
     )
+    assert evelyn_entry.read_text() == evelyn_marker
 
     # The shim path itself must now be a regular file holding the launcher.
     assert shim_path.exists()
@@ -120,3 +134,8 @@ def test_re_running_setup_path_block_preserves_pip_entry_point(tmp_path: Path) -
     assert f'exec "{pip_entry}"' in shim_text
     shim_mode = shim_path.stat().st_mode
     assert shim_mode & stat.S_IXUSR, "shim must be user-executable"
+
+    assert evelyn_shim_path.exists()
+    assert not evelyn_shim_path.is_symlink()
+    assert f'exec "{evelyn_entry}"' in evelyn_shim_path.read_text()
+    assert evelyn_shim_path.stat().st_mode & stat.S_IXUSR

@@ -162,9 +162,9 @@ async fn run_update(app: AppHandle) -> Result<()> {
         None
     };
 
-    let hermes = resolve_hermes(&install_root).ok_or_else(|| {
+    let hermes = resolve_cli(&install_root).ok_or_else(|| {
         let msg = format!(
-            "Could not find the hermes CLI under {}. Is Hermes installed? \
+            "Could not find the Evelyn CLI (or legacy hermes alias) under {}. Is Evelyn installed? \
              Re-run the installer to repair the install.",
             install_root.display()
         );
@@ -222,8 +222,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
         &format!("[update] updating against branch {update_branch}"),
     );
     let child_env = update_child_env(&install_root);
-    let mut update_args: Vec<String> =
-        vec!["update".into(), "--yes".into(), "--gateway".into()];
+    let mut update_args: Vec<String> = vec!["update".into(), "--yes".into(), "--gateway".into()];
     // --force skips `hermes update`'s Windows running-exe guard (which would
     // `sys.exit(2)` and dead-end the handoff). By contract the desktop has
     // already exited and waited for the install locks to clear before launching
@@ -292,7 +291,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
             emit_stage(&app, "update", StageState::Succeeded, Some(update_ms), None);
         }
         Some(code) if code == UPDATE_EXIT_CONCURRENT => {
-            let msg = "Hermes is still running. Close all Hermes windows and try \
+            let msg = "Evelyn is still running. Close all Evelyn windows and try \
                        the update again."
                 .to_string();
             emit_stage(
@@ -405,7 +404,13 @@ async fn run_update(app: AppHandle) -> Result<()> {
         );
         return Err(anyhow!(msg));
     }
-    emit_stage(&app, "rebuild", StageState::Succeeded, Some(rebuild_ms), None);
+    emit_stage(
+        &app,
+        "rebuild",
+        StageState::Succeeded,
+        Some(rebuild_ms),
+        None,
+    );
 
     let launch_target = if let Some(target_app) = target_app {
         let started = Instant::now();
@@ -459,11 +464,14 @@ async fn run_update(app: AppHandle) -> Result<()> {
                 &app,
                 None,
                 LogStream::Stderr,
-                &format!("[update] could not auto-launch desktop: {err}. Launch Hermes manually."),
+                &format!("[update] could not auto-launch desktop: {err}. Launch Evelyn manually."),
             );
         }
-    } else if let Err(err) =
-        crate::bootstrap::launch_hermes_desktop(app.clone(), install_root.to_string_lossy().into_owned()).await
+    } else if let Err(err) = crate::bootstrap::launch_hermes_desktop(
+        app.clone(),
+        install_root.to_string_lossy().into_owned(),
+    )
+    .await
     {
         // Launch failed: don't hard-fail the update (it succeeded); surface a
         // log line so the success screen can still tell the user to launch
@@ -472,7 +480,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
             &app,
             None,
             LogStream::Stdout,
-            &format!("[update] could not auto-launch desktop: {err}. Launch Hermes manually."),
+            &format!("[update] could not auto-launch desktop: {err}. Launch Evelyn manually."),
         );
     }
 
@@ -486,7 +494,12 @@ pub(crate) async fn wait_for_install_locks_free(install_root: &Path, app: &AppHa
     let lock_targets = install_lock_probe_paths(install_root);
     let deadline = Instant::now() + DESKTOP_EXIT_WAIT;
 
-    emit_log(app, Some(stage), LogStream::Stdout, "[handoff] waiting for Hermes to exit…");
+    emit_log(
+        app,
+        Some(stage),
+        LogStream::Stdout,
+        "[handoff] waiting for Evelyn to exit…",
+    );
 
     loop {
         let locked = locked_paths(&lock_targets);
@@ -507,7 +520,7 @@ pub(crate) async fn wait_for_install_locks_free(install_root: &Path, app: &AppHa
                 Some(stage),
                 LogStream::Stdout,
                 &format!(
-                    "[handoff] Hermes still holding install files ({}); force-killing stragglers…",
+                    "[handoff] Evelyn still holding install files ({}); force-killing stragglers…",
                     format_locked_paths(&locked)
                 ),
             );
@@ -539,7 +552,7 @@ pub(crate) async fn wait_for_install_locks_free(install_root: &Path, app: &AppHa
 }
 
 fn install_lock_probe_paths(install_root: &Path) -> Vec<PathBuf> {
-    let mut paths = vec![venv_hermes(install_root)];
+    let mut paths = vec![venv_evelyn(install_root), venv_hermes(install_root)];
     paths.extend(desktop_app_payload_paths(install_root));
     paths
 }
@@ -548,16 +561,47 @@ fn desktop_app_payload_paths(install_root: &Path) -> Vec<PathBuf> {
     let release = install_root.join("apps").join("desktop").join("release");
     if cfg!(target_os = "windows") {
         vec![
-            release.join("win-unpacked").join("resources").join("app.asar"),
-            release.join("win-arm64-unpacked").join("resources").join("app.asar"),
+            release
+                .join("win-unpacked")
+                .join("resources")
+                .join("app.asar"),
+            release
+                .join("win-arm64-unpacked")
+                .join("resources")
+                .join("app.asar"),
         ]
     } else if cfg!(target_os = "macos") {
         vec![
-            release.join("mac").join("Hermes.app").join("Contents").join("Resources").join("app.asar"),
-            release.join("mac-arm64").join("Hermes.app").join("Contents").join("Resources").join("app.asar"),
+            release
+                .join("mac")
+                .join("Evelyn.app")
+                .join("Contents")
+                .join("Resources")
+                .join("app.asar"),
+            release
+                .join("mac-arm64")
+                .join("Evelyn.app")
+                .join("Contents")
+                .join("Resources")
+                .join("app.asar"),
+            release
+                .join("mac")
+                .join("Hermes.app")
+                .join("Contents")
+                .join("Resources")
+                .join("app.asar"),
+            release
+                .join("mac-arm64")
+                .join("Hermes.app")
+                .join("Contents")
+                .join("Resources")
+                .join("app.asar"),
         ]
     } else {
-        vec![release.join("linux-unpacked").join("resources").join("app.asar")]
+        vec![release
+            .join("linux-unpacked")
+            .join("resources")
+            .join("app.asar")]
     }
 }
 
@@ -566,10 +610,19 @@ fn locked_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 fn format_locked_paths(paths: &[PathBuf]) -> String {
-    paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-/// Force-kill any `hermes.exe` other than this process. Windows-only; a no-op
+#[cfg(any(target_os = "windows", test))]
+fn windows_straggler_process_names() -> [&'static str; 2] {
+    ["Evelyn.exe", "hermes.exe"]
+}
+
+/// Force-kill any Evelyn or legacy Hermes CLI process other than this process. Windows-only; a no-op
 /// elsewhere (POSIX has no mandatory-lock contention). We can't selectively
 /// target "the backend" by PID here — the desktop already exited and we never
 /// knew its children — so we kill the whole `hermes.exe` image tree via
@@ -591,18 +644,13 @@ fn force_kill_other_hermes() {
     {
         let my_pid = std::process::id();
         // /FI excludes our own PID; /T kills the tree; /F forces.
-        let _ = std::process::Command::new("taskkill")
-            .args([
-                "/F",
-                "/T",
-                "/IM",
-                "hermes.exe",
-                "/FI",
-                &format!("PID ne {my_pid}"),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        for image in windows_straggler_process_names() {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/IM", image, "/FI", &format!("PID ne {my_pid}")])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
     }
 }
 
@@ -614,7 +662,11 @@ fn is_locked(path: &Path) -> bool {
     if !path.exists() {
         return false;
     }
-    match std::fs::OpenOptions::new().read(true).write(true).open(path) {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
         Ok(_) => false,
         Err(_) => true,
     }
@@ -687,7 +739,10 @@ async fn run_streamed(
         emit_log(app, stage_owned.as_deref(), LogStream::Stderr, &l);
     }
 
-    let status = child.wait().await.map_err(|e| anyhow!("waiting for child: {e}"))?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| anyhow!("waiting for child: {e}"))?;
     Ok(CmdResult {
         exit_code: status.code(),
     })
@@ -697,7 +752,16 @@ struct CmdResult {
     exit_code: Option<i32>,
 }
 
-/// Path to the venv hermes shim under an install root, regardless of existence.
+/// Path to the preferred venv Evelyn shim under an install root.
+fn venv_evelyn(install_root: &Path) -> PathBuf {
+    if cfg!(target_os = "windows") {
+        install_root.join("venv").join("Scripts").join("evelyn.exe")
+    } else {
+        install_root.join("venv").join("bin").join("evelyn")
+    }
+}
+
+/// Path to the legacy-compatible venv Hermes shim under an install root.
 fn venv_hermes(install_root: &Path) -> PathBuf {
     if cfg!(target_os = "windows") {
         install_root.join("venv").join("Scripts").join("hermes.exe")
@@ -706,21 +770,31 @@ fn venv_hermes(install_root: &Path) -> PathBuf {
     }
 }
 
-/// Resolve the hermes CLI to drive. Prefer the venv shim in the install we
-/// just updated; fall back to `hermes` on PATH.
-fn resolve_hermes(install_root: &Path) -> Option<PathBuf> {
-    let shim = venv_hermes(install_root);
-    if shim.exists() {
-        return Some(shim);
+/// Resolve the CLI to drive. Prefer Evelyn, then the legacy Hermes alias.
+fn resolve_cli(install_root: &Path) -> Option<PathBuf> {
+    for shim in [venv_evelyn(install_root), venv_hermes(install_root)] {
+        if shim.exists() {
+            return Some(shim);
+        }
     }
     // PATH fallback. which-style probe via env, kept dependency-free.
-    let exe = if cfg!(target_os = "windows") { "hermes.exe" } else { "hermes" };
     if let Ok(path) = std::env::var("PATH") {
-        let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
-        for dir in path.split(sep) {
-            let cand = Path::new(dir).join(exe);
-            if cand.exists() {
-                return Some(cand);
+        let sep = if cfg!(target_os = "windows") {
+            ';'
+        } else {
+            ':'
+        };
+        let names = if cfg!(target_os = "windows") {
+            ["evelyn.exe", "hermes.exe"]
+        } else {
+            ["evelyn", "hermes"]
+        };
+        for name in names {
+            for dir in path.split(sep) {
+                let cand = Path::new(dir).join(name);
+                if cand.exists() {
+                    return Some(cand);
+                }
             }
         }
     }
@@ -778,6 +852,41 @@ where
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("app"))
 }
 
+fn macos_app_install_target(target_app: &Path) -> PathBuf {
+    if target_app.file_name().and_then(|name| name.to_str()) == Some("Hermes.app") {
+        return target_app.with_file_name("Evelyn.app");
+    }
+    target_app.to_path_buf()
+}
+
+fn next_legacy_macos_backup(target_app: &Path) -> PathBuf {
+    let base = PathBuf::from(format!("{}.evelyn-migrated-backup", target_app.display()));
+    if !base.exists() {
+        return base;
+    }
+    for suffix in 1_u32.. {
+        let candidate = PathBuf::from(format!(
+            "{}.evelyn-migrated-backup.{suffix}",
+            target_app.display()
+        ));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("the backup suffix space cannot be exhausted in practice")
+}
+
+fn validate_macos_app_install_target(target_app: &Path, install_target: &Path) -> Result<()> {
+    if target_app != install_target && install_target.exists() {
+        return Err(anyhow!(
+            "refusing to replace existing Evelyn app at {} while migrating legacy app {}",
+            install_target.display(),
+            target_app.display()
+        ));
+    }
+    Ok(())
+}
+
 fn arg_value_from_args<I, S>(args: I, name: &str) -> Option<String>
 where
     I: IntoIterator<Item = S>,
@@ -807,17 +916,21 @@ async fn install_macos_app_update(
             target_app.display()
         ));
     }
+    let install_target = macos_app_install_target(target_app);
+    validate_macos_app_install_target(target_app, &install_target)?;
+    let legacy_target = (install_target != target_app).then_some(target_app);
 
-    let rebuilt_app = crate::bootstrap::resolve_hermes_desktop_app(install_root).ok_or_else(|| {
-        anyhow!(
-            "desktop rebuild succeeded but no Hermes.app was found under {}",
-            install_root.join("apps").join("desktop").join("release").display()
-        )
-    })?;
+    let rebuilt_app =
+        crate::bootstrap::resolve_hermes_desktop_app(install_root).ok_or_else(|| {
+            anyhow!(
+                "desktop rebuild succeeded but no Evelyn.app (or legacy Hermes.app) was found under {}",
+                install_root.join("apps").join("desktop").join("release").display()
+            )
+        })?;
 
-    let same = match (rebuilt_app.canonicalize(), target_app.canonicalize()) {
+    let same = match (rebuilt_app.canonicalize(), install_target.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
-        _ => rebuilt_app == target_app,
+        _ => rebuilt_app == install_target,
     };
     if same {
         emit_log(
@@ -826,10 +939,10 @@ async fn install_macos_app_update(
             LogStream::Stdout,
             &format!(
                 "[update] rebuilt app is already the launch target: {}",
-                target_app.display()
+                install_target.display()
             ),
         );
-        return Ok(target_app.to_path_buf());
+        return Ok(install_target);
     }
 
     emit_log(
@@ -839,15 +952,15 @@ async fn install_macos_app_update(
         &format!(
             "[update] installing rebuilt app {} -> {}",
             rebuilt_app.display(),
-            target_app.display()
+            install_target.display()
         ),
     );
 
-    if let Some(parent) = target_app.parent() {
+    if let Some(parent) = install_target.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let tmp = PathBuf::from(format!("{}.hermes-update-new", target_app.display()));
-    let old = PathBuf::from(format!("{}.hermes-update-old", target_app.display()));
+    let tmp = PathBuf::from(format!("{}.hermes-update-new", install_target.display()));
+    let old = PathBuf::from(format!("{}.hermes-update-old", install_target.display()));
     remove_dir_if_exists(&tmp).await;
     remove_dir_if_exists(&old).await;
 
@@ -868,17 +981,41 @@ async fn install_macos_app_update(
     // Atomic-as-possible swap with rollback. Extracted so the invariant
     // (target is never left deleted-with-no-replacement) can be unit-tested
     // without ditto / a real .app bundle.
-    swap_in_new_bundle(&tmp, target_app, &old).await?;
+    swap_in_new_bundle(&tmp, &install_target, &old).await?;
+
+    if let Some(legacy_target) = legacy_target.filter(|path| path.exists()) {
+        let backup = next_legacy_macos_backup(legacy_target);
+        emit_log(
+            app,
+            Some("install"),
+            LogStream::Stdout,
+            &format!(
+                "[update] archiving legacy app {} -> {}",
+                legacy_target.display(),
+                backup.display()
+            ),
+        );
+        tokio::fs::rename(legacy_target, &backup)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "installed Evelyn at {} but could not archive legacy app {} to {}: {e}",
+                    install_target.display(),
+                    legacy_target.display(),
+                    backup.display()
+                )
+            })?;
+    }
 
     let _ = Command::new("/usr/bin/xattr")
         .arg("-dr")
         .arg("com.apple.quarantine")
-        .arg(target_app)
+        .arg(&install_target)
         .current_dir(crate::paths::hermes_home())
         .status()
         .await;
 
-    Ok(target_app.to_path_buf())
+    Ok(install_target)
 }
 
 /// Move a freshly-staged bundle (`tmp`) into place at `target`, parking any
@@ -911,7 +1048,10 @@ async fn swap_in_new_bundle(tmp: &Path, target: &Path, old: &Path) -> Result<()>
             let _ = tokio::fs::rename(old, target).await;
         }
         remove_dir_if_exists(tmp).await;
-        return Err(anyhow!("installing updated app at {}: {err}", target.display()));
+        return Err(anyhow!(
+            "installing updated app at {}: {err}",
+            target.display()
+        ));
     }
     remove_dir_if_exists(old).await;
     Ok(())
@@ -1034,11 +1174,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn venv_hermes_is_under_install_root() {
+    fn venv_cli_shims_are_under_install_root() {
         let root = Path::new("/x/hermes-agent");
-        let shim = venv_hermes(root);
-        assert!(shim.starts_with(root));
-        assert!(shim.to_string_lossy().contains("venv"));
+        for shim in [venv_evelyn(root), venv_hermes(root)] {
+            assert!(shim.starts_with(root));
+            assert!(shim.to_string_lossy().contains("venv"));
+        }
+    }
+
+    #[test]
+    fn resolve_cli_prefers_evelyn_venv_shim() {
+        let root = unique_tmp_dir("resolve-evelyn-cli");
+        let evelyn = venv_evelyn(&root);
+        let hermes = venv_hermes(&root);
+        std::fs::create_dir_all(evelyn.parent().unwrap()).unwrap();
+        std::fs::write(&evelyn, b"").unwrap();
+        std::fs::write(&hermes, b"").unwrap();
+
+        assert_eq!(resolve_cli(&root), Some(evelyn));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_straggler_cleanup_covers_evelyn_and_hermes() {
+        assert_eq!(
+            windows_straggler_process_names(),
+            ["Evelyn.exe", "hermes.exe"]
+        );
     }
 
     #[test]
@@ -1052,13 +1214,30 @@ mod tests {
         let probes = install_lock_probe_paths(root);
 
         assert!(
-            probes.iter().any(|p| p == &venv_hermes(root)),
-            "venv shim remains part of the update lock probe"
+            probes.iter().any(|p| p == &venv_evelyn(root)),
+            "preferred Evelyn shim is part of the update lock probe"
         );
         assert!(
-            probes.iter().any(|p| p.ends_with(Path::new("resources/app.asar"))),
-            "packaged app.asar must be probed so repair/re-clone waits for the old desktop to exit"
+            probes.iter().any(|p| p == &venv_hermes(root)),
+            "legacy Hermes shim remains part of the update lock probe"
         );
+        let payloads = desktop_app_payload_paths(root);
+        assert!(!payloads.is_empty());
+        assert!(
+            payloads
+                .iter()
+                .all(|p| p.file_name().is_some_and(|name| name == "app.asar")),
+            "every packaged desktop payload probe must end at app.asar"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            assert!(payloads
+                .iter()
+                .any(|p| p.components().any(|part| part.as_os_str() == "Evelyn.app")));
+            assert!(payloads
+                .iter()
+                .any(|p| p.components().any(|part| part.as_os_str() == "Hermes.app")));
+        }
     }
 
     #[test]
@@ -1112,6 +1291,31 @@ mod tests {
     }
 
     #[test]
+    fn legacy_macos_app_targets_evelyn_and_a_unique_reversible_backup() {
+        let root = unique_tmp_dir("legacy-macos-app-brand");
+        std::fs::create_dir_all(&root).unwrap();
+        let legacy = root.join("Hermes.app");
+        let first_backup = root.join("Hermes.app.evelyn-migrated-backup");
+        std::fs::create_dir_all(&first_backup).unwrap();
+
+        let evelyn = root.join("Evelyn.app");
+        assert_eq!(macos_app_install_target(&legacy), evelyn);
+        assert!(validate_macos_app_install_target(&legacy, &evelyn).is_ok());
+        assert_eq!(
+            next_legacy_macos_backup(&legacy),
+            root.join("Hermes.app.evelyn-migrated-backup.1")
+        );
+        std::fs::create_dir_all(&evelyn).unwrap();
+        assert!(
+            validate_macos_app_install_target(&legacy, &evelyn).is_err(),
+            "legacy migration must not overwrite an existing Evelyn.app"
+        );
+        assert!(validate_macos_app_install_target(&evelyn, &evelyn).is_ok());
+        assert_eq!(macos_app_install_target(&evelyn), evelyn);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn parses_update_branch_from_space_or_equals_args() {
         assert_eq!(
             update_branch_from_args(["--update", "--branch", "bb/test"]),
@@ -1156,8 +1360,14 @@ mod tests {
 
     #[test]
     fn rebuild_retries_only_on_failure() {
-        assert!(!rebuild_needs_retry(Some(0)), "a clean rebuild must not retry");
-        assert!(rebuild_needs_retry(Some(1)), "a failed rebuild retries once");
+        assert!(
+            !rebuild_needs_retry(Some(0)),
+            "a clean rebuild must not retry"
+        );
+        assert!(
+            rebuild_needs_retry(Some(1)),
+            "a failed rebuild retries once"
+        );
         assert!(
             rebuild_needs_retry(None),
             "a killed/signalled rebuild (no exit code) retries once"
@@ -1170,7 +1380,10 @@ mod tests {
             target_app_from_args(["--update", "--target-app", "/Applications/Hermes.app"]),
             Some(PathBuf::from("/Applications/Hermes.app"))
         );
-        assert_eq!(target_app_from_args(["--target-app", "/tmp/not-an-app"]), None);
+        assert_eq!(
+            target_app_from_args(["--target-app", "/tmp/not-an-app"]),
+            None
+        );
     }
 
     // Helpers for the swap tests: make a throwaway dir tree we can rename.
@@ -1233,8 +1446,14 @@ mod tests {
 
         let result = swap_in_new_bundle(&tmp, &target, &old).await;
 
-        assert!(result.is_err(), "swap should fail when neither move can complete");
-        assert!(target.exists(), "original app must NOT be deleted on failure");
+        assert!(
+            result.is_err(),
+            "swap should fail when neither move can complete"
+        );
+        assert!(
+            target.exists(),
+            "original app must NOT be deleted on failure"
+        );
         assert_eq!(
             std::fs::read_to_string(target.join("marker.txt")).unwrap(),
             "OLD",
@@ -1256,12 +1475,18 @@ mod tests {
         let result = swap_in_new_bundle(&tmp, &target, &old).await;
 
         assert!(result.is_err());
-        assert!(target.exists(), "original must be restored after failed install");
+        assert!(
+            target.exists(),
+            "original must be restored after failed install"
+        );
         assert_eq!(
             std::fs::read_to_string(target.join("marker.txt")).unwrap(),
             "OLD"
         );
-        assert!(!old.exists(), "backup should be rolled back, not left behind");
+        assert!(
+            !old.exists(),
+            "backup should be rolled back, not left behind"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }
