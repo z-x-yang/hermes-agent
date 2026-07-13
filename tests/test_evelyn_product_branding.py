@@ -95,6 +95,86 @@ def _icns_png_payloads(data: bytes) -> list[bytes]:
     return payloads
 
 
+def test_default_agent_identity_and_help_use_evelyn_skill_surface():
+    prompt_builder = _text("agent/prompt_builder.py")
+
+    assert '"You are Evelyn, an intelligent AI assistant' in prompt_builder
+    assert (
+        "Load the `evelyn-agent` skill with skill_view(name='evelyn-agent')"
+        in prompt_builder
+    )
+    assert "skill_view(name='hermes-agent')" not in prompt_builder
+    assert "load the `hermes-agent` skill" not in prompt_builder
+    assert "Load the `hermes-agent` skill" not in prompt_builder
+    background_review = _text("agent/background_review.py")
+    assert "e.g. 'evelyn-agent'" in background_review
+    assert "e.g. 'hermes-agent'" not in background_review
+
+
+def test_bundled_skill_ids_use_evelyn_without_old_active_aliases():
+    renamed = {
+        "skills/autonomous-ai-agents/evelyn-agent/SKILL.md": "evelyn-agent",
+        "skills/software-development/evelyn-agent-skill-authoring/SKILL.md": (
+            "evelyn-agent-skill-authoring"
+        ),
+    }
+    old_paths = (
+        "skills/autonomous-ai-agents/hermes-agent",
+        "skills/software-development/hermes-agent-skill-authoring",
+    )
+
+    for relative_path, skill_name in renamed.items():
+        text = _text(relative_path)
+        assert re.search(rf"(?m)^name: {re.escape(skill_name)}$", text)
+    for relative_path in old_paths:
+        assert not (ROOT / relative_path).exists()
+
+    generated_surface = "\n".join(
+        (
+            _text("website/docs/reference/skills-catalog.md"),
+            _text("website/sidebars.ts"),
+            _text(
+                "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/"
+                "reference/skills-catalog.md"
+            ),
+        )
+    )
+    assert "autonomous-ai-agents-evelyn-agent" in generated_surface
+    assert "software-development-evelyn-agent-skill-authoring" in generated_surface
+    assert "autonomous-ai-agents-hermes-agent" not in generated_surface
+    assert "software-development-hermes-agent-skill-authoring" not in generated_surface
+    old_ids = {
+        "hermes-agent",
+        "hermes-agent-skill-authoring",
+        "hermes-context-audit",
+        "hermes-profile-distribution",
+        "hermes-provider-routing-ops",
+        "hermes-runtime-ops",
+        "hermes-workbench-analytics",
+        "hermes-context-compression-engineering",
+        "hermes-cron-development",
+        "hermes-delegation-engineering",
+    }
+    reference_markers = ("related_skills", "Related skills", "Sibling skills")
+    roots = (
+        ROOT / "skills",
+        ROOT / "optional-skills",
+        ROOT / "website/docs/user-guide/skills",
+    )
+    stale_references = []
+    for root in roots:
+        for path in root.rglob("*.md"):
+            for line_number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                if any(marker in line for marker in reference_markers) and any(
+                    re.search(rf"(?<![a-z0-9-]){re.escape(old)}(?![a-z0-9-])", line)
+                    for old in old_ids
+                ):
+                    stale_references.append(f"{path.relative_to(ROOT)}:{line_number}")
+    assert stale_references == []
+
+
 def test_evelyn_is_the_preferred_cli_without_breaking_hermes():
     with (ROOT / "pyproject.toml").open("rb") as handle:
         scripts = tomllib.load(handle)["project"]["scripts"]

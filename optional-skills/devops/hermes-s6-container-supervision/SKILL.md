@@ -9,7 +9,7 @@ environments: [s6]
 metadata:
   hermes:
     tags: [docker, s6, supervision, gateway, profiles]
-    related_skills: [hermes-agent, hermes-agent-dev]
+    related_skills: [evelyn-agent, hermes-agent-dev]
 ---
 
 # Hermes s6-overlay Container Supervision

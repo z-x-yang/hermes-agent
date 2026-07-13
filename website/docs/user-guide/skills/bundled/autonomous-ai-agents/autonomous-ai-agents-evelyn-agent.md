@@ -1,18 +1,35 @@
 ---
-name: hermes-agent
-description: "Configure, extend, or contribute to Hermes Agent."
-version: 2.3.0
-author: Hermes Agent + Teknium
-license: MIT
-platforms: [linux, macos, windows]
-metadata:
-  hermes:
-    tags: [hermes, setup, configuration, multi-agent, spawning, cli, gateway, development]
-    homepage: https://github.com/NousResearch/hermes-agent
-    related_skills: [claude-code, codex, opencode]
+title: "Evelyn Agent — Configure, extend, or contribute to Evelyn and its Hermes Agent upstream"
+sidebar_label: "Evelyn Agent"
+description: "Configure, extend, or contribute to Evelyn and its Hermes Agent upstream"
 ---
 
-# Hermes Agent
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Evelyn Agent
+
+Configure, extend, or contribute to Evelyn and its Hermes Agent upstream.
+
+## Skill metadata
+
+| | |
+|---|---|
+| Source | Bundled (installed by default) |
+| Path | `skills/autonomous-ai-agents/evelyn-agent` |
+| Version | `2.3.0` |
+| Author | Hermes Agent + Teknium |
+| License | MIT |
+| Platforms | linux, macos, windows |
+| Tags | `hermes`, `setup`, `configuration`, `multi-agent`, `spawning`, `cli`, `gateway`, `development` |
+| Related skills | [`claude-code`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-claude-code), [`codex`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-codex), [`opencode`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-opencode) |
+
+## Reference: full SKILL.md
+
+:::info
+The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
+:::
+
+# Evelyn Agent
 
 Hermes Agent is an open-source AI agent framework by Nous Research that runs in your terminal, a native desktop app, messaging platforms, and IDEs. It's in the same category as Claude Code (Anthropic), Codex (OpenAI), and OpenClaw — autonomous coding and task-execution agents that use tool calling to interact with your system. Hermes works with any LLM provider (OpenRouter, Anthropic, OpenAI, Google, DeepSeek, xAI, local models, and 20+ others) and runs on Linux, macOS, Windows, and WSL.
 
@@ -155,7 +172,7 @@ hermes mcp configure NAME   Toggle tool selection
 
 How the built-in MCP client connects servers (stdio/HTTP), auto-discovers
 their tools, and exposes them as first-class tools, plus catalog install
-(`hermes mcp install <name>`): `skill_view(name="hermes-agent", file_path="references/native-mcp.md")`.
+(`hermes mcp install <name>`): `skill_view(name="evelyn-agent", file_path="references/native-mcp.md")`.
 
 ### Gateway (Messaging Platforms)
 
@@ -206,7 +223,7 @@ hermes webhook test NAME    Send a test POST
 ```
 
 Full setup, route config, payload templating, and event-driven agent-run
-patterns: `skill_view(name="hermes-agent", file_path="references/webhooks.md")`.
+patterns: `skill_view(name="evelyn-agent", file_path="references/webhooks.md")`.
 
 ### Profiles
 
@@ -967,6 +984,7 @@ For occasional contributors and PR authors. Full developer docs: https://hermes-
 
 ### Project Layout
 
+<!-- ascii-guard-ignore -->
 ```
 hermes-agent/
 ├── run_agent.py          # AIAgent — core conversation loop
@@ -987,6 +1005,7 @@ hermes-agent/
 ├── tests/                # Extensive pytest suite (run via scripts/run_tests.sh)
 └── website/              # Docusaurus docs site
 ```
+<!-- ascii-guard-ignore-end -->
 
 Config: `~/.hermes/config.yaml` (settings), `~/.hermes/.env` (API keys) — both under `$HERMES_HOME` when it is set.
 

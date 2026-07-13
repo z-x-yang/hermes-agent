@@ -21,7 +21,7 @@ description: "将编码任务委托给 OpenAI Codex CLI（功能开发、PR）"
 | 许可证 | MIT |
 | 平台 | linux, macos, windows |
 | 标签 | `Coding-Agent`, `Codex`, `OpenAI`, `Code-Review`, `Refactoring` |
-| 相关 skill | [`claude-code`](/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-claude-code), [`hermes-agent`](/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent) |
+| 相关 skill | [`claude-code`](/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-claude-code), [`evelyn-agent`](/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-evelyn-agent) |
 
 ## 参考：完整 SKILL.md
 

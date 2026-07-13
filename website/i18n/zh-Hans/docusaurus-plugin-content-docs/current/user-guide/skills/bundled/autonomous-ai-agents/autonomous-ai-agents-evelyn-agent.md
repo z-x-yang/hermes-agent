@@ -1,22 +1,22 @@
 ---
-title: "Hermes Agent — 配置、扩展或贡献 Hermes Agent"
-sidebar_label: "Hermes Agent"
-description: "配置、扩展或贡献 Hermes Agent"
+title: "Evelyn Agent — 配置、扩展 Evelyn 及其 Hermes Agent 上游"
+sidebar_label: "Evelyn Agent"
+description: "配置、扩展 Evelyn 及其 Hermes Agent 上游"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
-# Hermes Agent
+# Evelyn Agent
 
-配置、扩展或贡献 Hermes Agent。
+配置、扩展 Evelyn 及其 Hermes Agent 上游。
 
 ## Skill 元数据
 
 | | |
 |---|---|
 | 来源 | 内置（默认安装） |
-| 路径 | `skills/autonomous-ai-agents/hermes-agent` |
-| 版本 | `2.1.0` |
+| 路径 | `skills/autonomous-ai-agents/evelyn-agent` |
+| 版本 | `2.3.0` |
 | 作者 | Hermes Agent + Teknium |
 | 许可证 | MIT |
 | 平台 | linux, macos, windows |
@@ -26,10 +26,10 @@ description: "配置、扩展或贡献 Hermes Agent"
 ## 参考：完整 SKILL.md
 
 :::info
-以下是 Hermes 在触发此 skill 时加载的完整 skill 定义。这是 agent 在 skill 激活时看到的指令内容。
+以下是 Evelyn 在触发此 skill 时加载的完整 skill 定义。这是 agent 在 skill 激活时看到的指令内容。
 :::
 
-# Hermes Agent
+# Evelyn Agent
 
 Hermes Agent 是 Nous Research 开发的开源 AI agent 框架，可在终端、消息平台和 IDE 中运行。它与 Claude Code（Anthropic）、Codex（OpenAI）和 OpenClaw 同属一类——使用工具调用（tool calling）与系统交互的自主编码和任务执行 agent。Hermes 支持任意 LLM 提供商（OpenRouter、Anthropic、OpenAI、DeepSeek、本地模型及 15+ 其他提供商），可在 Linux、macOS 和 WSL 上运行。
 

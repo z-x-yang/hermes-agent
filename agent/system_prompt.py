@@ -202,7 +202,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
-    # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
+    # Pointer to the evelyn-agent skill + upstream docs for product help.
     stable_parts.append(
         _adapt_skills_prompt_for_readonly_aliases(
             HERMES_AGENT_HELP_GUIDANCE,

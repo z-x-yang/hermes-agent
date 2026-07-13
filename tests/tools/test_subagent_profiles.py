@@ -278,12 +278,12 @@ def test_delegation_docs_match_simplified_contract():
         / "configuration.md",
         root
         / "website/docs/user-guide/skills/bundled/autonomous-ai-agents"
-        / "autonomous-ai-agents-hermes-agent.md",
+        / "autonomous-ai-agents-evelyn-agent.md",
         root
         / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/skills/bundled/autonomous-ai-agents"
-        / "autonomous-ai-agents-hermes-agent.md",
+        / "autonomous-ai-agents-evelyn-agent.md",
         root / "AGENTS.md",
-        root / "skills/autonomous-ai-agents/hermes-agent/SKILL.md",
+        root / "skills/autonomous-ai-agents/evelyn-agent/SKILL.md",
     ]
     required_claims = (
         "description",
@@ -339,9 +339,9 @@ def test_delegation_docs_match_simplified_contract():
         )
 
 
-def test_bundled_hermes_skill_uses_current_delegation_contract():
+def test_bundled_evelyn_skill_uses_current_delegation_contract():
     root = Path(__file__).resolve().parents[2]
-    path = root / "skills/autonomous-ai-agents/hermes-agent/SKILL.md"
+    path = root / "skills/autonomous-ai-agents/evelyn-agent/SKILL.md"
     text = path.read_text(encoding="utf-8")
     delegation = text.split("### Delegation (`delegate_task`)", 1)[1].split(
         "### Cron (scheduled jobs)", 1

@@ -1,17 +1,35 @@
 ---
-name: hermes-agent-skill-authoring
-description: "Author in-repo SKILL.md: frontmatter, validator, structure, and writing-quality principles."
-version: 1.1.0
-author: Hermes Agent
-license: MIT
-platforms: [linux, macos, windows]
-metadata:
-  hermes:
-    tags: [skills, authoring, hermes-agent, conventions, skill-md]
-    related_skills: [plan, requesting-code-review]
+title: "Evelyn Agent Skill Authoring — Author in-repo SKILL"
+sidebar_label: "Evelyn Agent Skill Authoring"
+description: "Author in-repo SKILL"
 ---
 
-# Authoring Hermes-Agent Skills (in-repo)
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Evelyn Agent Skill Authoring
+
+Author in-repo SKILL.md: frontmatter, validator, structure, and writing-quality principles.
+
+## Skill metadata
+
+| | |
+|---|---|
+| Source | Bundled (installed by default) |
+| Path | `skills/software-development/evelyn-agent-skill-authoring` |
+| Version | `1.1.0` |
+| Author | Hermes Agent |
+| License | MIT |
+| Platforms | linux, macos, windows |
+| Tags | `skills`, `authoring`, `hermes-agent`, `conventions`, `skill-md` |
+| Related skills | [`plan`](/docs/user-guide/skills/bundled/software-development/software-development-plan), [`requesting-code-review`](/docs/user-guide/skills/bundled/software-development/software-development-requesting-code-review) |
+
+## Reference: full SKILL.md
+
+:::info
+The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
+:::
+
+# Authoring Evelyn Skills (in-repo)
 
 ## Overview
 
