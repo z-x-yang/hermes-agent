@@ -187,15 +187,15 @@ function collectRelaunchArgs(argv) {
 
 // Env keys whose values define the relaunched instance's context (which
 // backend/profile/root it talks to). Anything HERMES_DESKTOP_* is preserved
-// plus HERMES_HOME. We snapshot the values, not the live env, so the new
-// instance comes up pointed at the same place this one was.
+// plus both home aliases. The caller pins both aliases to `resolvedHome`, so
+// the new instance cannot recompute a different root after the parent exits.
 // ELECTRON_DISABLE_SANDBOX is preserved for the same reason --no-sandbox is kept
 // in the replayed args: if a relaunch is only safe because the user opted out of
 // the SUID sandbox, the relaunched instance must inherit that opt-out too.
-const PRESERVED_ENV_KEYS = ['HERMES_HOME', 'ELECTRON_DISABLE_SANDBOX']
+const PRESERVED_ENV_KEYS = ['EVELYN_HOME', 'HERMES_HOME', 'ELECTRON_DISABLE_SANDBOX']
 const PRESERVED_ENV_PREFIXES = ['HERMES_DESKTOP_']
 
-function collectRelaunchEnv(env) {
+function collectRelaunchEnv(env, resolvedHome) {
   const out = {}
   if (!env || typeof env !== 'object') return out
   for (const [key, value] of Object.entries(env)) {
@@ -203,6 +203,10 @@ function collectRelaunchEnv(env) {
     if (PRESERVED_ENV_KEYS.includes(key) || PRESERVED_ENV_PREFIXES.some(p => key.startsWith(p))) {
       out[key] = String(value)
     }
+  }
+  if (resolvedHome != null && String(resolvedHome).trim()) {
+    out.EVELYN_HOME = String(resolvedHome)
+    out.HERMES_HOME = String(resolvedHome)
   }
   return out
 }

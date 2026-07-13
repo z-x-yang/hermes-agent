@@ -34,8 +34,8 @@ pub type CancelRx = mpsc::Receiver<()>;
 
 /// Spawns install.ps1 / install.sh with the given args and streams output.
 ///
-/// `hermes_home_override` propagates to the child as $HERMES_HOME so the
-/// install script writes to the same directory the installer is reading from.
+/// `hermes_home_override` propagates under both home env names so new and
+/// legacy installers write to the same directory the GUI resolved.
 pub async fn run_script(
     script_path: &Path,
     args: &[String],
@@ -54,6 +54,7 @@ pub async fn run_script(
     }
 
     if let Some(home) = hermes_home_override {
+        cmd.env("EVELYN_HOME", home);
         cmd.env("HERMES_HOME", home);
     }
 

@@ -347,6 +347,10 @@ async fn run_bootstrap(
     cancel_rx_holder: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
 ) -> Result<String> {
     let kind = ScriptKind::for_current_os();
+    let hermes_home = args
+        .hermes_home
+        .clone()
+        .unwrap_or_else(|| crate::paths::hermes_home().to_string_lossy().into_owned());
 
     let pin = Pin {
         commit: args
@@ -426,7 +430,7 @@ async fn run_bootstrap(
         &app,
         &script.path,
         &manifest_args_full,
-        args.hermes_home.as_deref(),
+        Some(hermes_home.as_str()),
         None,
         Some("__manifest__".to_string()),
     )
@@ -534,7 +538,7 @@ async fn run_bootstrap(
             &app,
             &script.path,
             &stage_args,
-            args.hermes_home.as_deref(),
+            Some(hermes_home.as_str()),
             local_cancel_rx,
             Some(stage.name.clone()),
         )
@@ -644,10 +648,6 @@ async fn run_bootstrap(
     // 4. Resolve install_root. install.ps1 doesn't (yet) report this back
     // explicitly; we infer it from $HermesHome which Stage-Repository clones
     // the repo INTO at $HermesHome\hermes-agent. Mirrors hermes_constants.
-    let hermes_home = args
-        .hermes_home
-        .clone()
-        .unwrap_or_else(|| crate::paths::hermes_home().to_string_lossy().into_owned());
     let install_root = PathBuf::from(&hermes_home).join("hermes-agent");
 
     // Copy ourselves to HERMES_HOME/hermes-setup.exe so the desktop app can

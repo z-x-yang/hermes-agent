@@ -1,16 +1,8 @@
 //! Filesystem paths + logging setup.
 //!
-//! Mirrors `hermes_constants.get_hermes_home()` from the Python CLI:
-//!   Windows: %LOCALAPPDATA%\hermes
-//!   macOS:   ~/.hermes
-//!   Linux:   ~/.hermes  (override via $HERMES_HOME)
-//!
-//! NOTE (macOS): Python's get_hermes_home(), scripts/install.sh, and the
-//! Electron desktop's resolveHermesHome() ALL use ~/.hermes on macOS — there
-//! is no ~/Library/Application Support branch anywhere else. An earlier
-//! version of this file used Application Support, which drifted from every
-//! other component: the installer wrote the install to one dir and the
-//! desktop looked for it in another, so first launch never found the backend.
+//! Mirrors `hermes_constants.get_hermes_home()` from the Python CLI. Fresh
+//! installs use the Evelyn namespace; an existing Hermes root remains the
+//! fallback so state is not split across two homes.
 //!
 //! IMPORTANT: this must match exactly. Drift here means install.ps1
 //! writes to one place and the installer reads from another, breaking
@@ -21,31 +13,66 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing_appender::non_blocking::WorkerGuard;
 
-/// Returns the canonical Hermes home directory, respecting $HERMES_HOME if set.
-pub fn hermes_home() -> PathBuf {
-    if let Ok(override_path) = std::env::var("HERMES_HOME") {
-        if !override_path.trim().is_empty() {
-            return PathBuf::from(override_path);
+fn nonempty_env(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).and_then(|value| {
+        if value.to_string_lossy().trim().is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(value))
         }
+    })
+}
+
+fn select_home(preferred: PathBuf, legacy: &[PathBuf]) -> PathBuf {
+    if preferred.is_dir() {
+        return preferred;
+    }
+    for candidate in legacy {
+        if candidate.is_dir() {
+            return candidate.clone();
+        }
+    }
+    preferred
+}
+
+/// Returns the canonical data home. EVELYN_HOME is preferred; HERMES_HOME is
+/// the compatibility override for existing automation and profiles.
+pub fn hermes_home() -> PathBuf {
+    if let Some(override_path) = nonempty_env("EVELYN_HOME") {
+        return override_path;
+    }
+    if let Some(override_path) = nonempty_env("HERMES_HOME") {
+        return override_path;
     }
 
     #[cfg(target_os = "windows")]
     {
-        // %LOCALAPPDATA%\hermes — matches scripts/install.ps1's $HermesHome.
-        if let Some(local_app_data) = dirs::data_local_dir() {
-            return local_app_data.join("hermes");
+        let home = dirs::home_dir();
+        let local_app_data = dirs::data_local_dir()
+            .or_else(|| home.as_ref().map(|path| path.join("AppData").join("Local")));
+        if let Some(local_app_data) = local_app_data {
+            let preferred = local_app_data.join("evelyn");
+            let legacy_local = local_app_data.join("hermes");
+            let legacy_dot = home.map(|path| path.join(".hermes"));
+            let legacy = legacy_dot
+                .into_iter()
+                .fold(vec![legacy_local], |mut paths, path| {
+                    paths.push(path);
+                    paths
+                });
+            return select_home(preferred, &legacy);
         }
     }
 
-    // macOS + Linux + fallback: ~/.hermes (matches Python get_hermes_home(),
-    // install.sh, and the Electron desktop's resolveHermesHome()).
+    // macOS + Linux.
+    #[cfg(not(target_os = "windows"))]
     if let Some(home) = dirs::home_dir() {
-        return home.join(".hermes");
+        return select_home(home.join(".evelyn"), &[home.join(".hermes")]);
     }
 
     // Last resort — current dir, almost certainly wrong but at least
     // doesn't panic.
-    PathBuf::from(".hermes")
+    PathBuf::from(".evelyn")
 }
 
 pub fn log_dir() -> PathBuf {
@@ -207,4 +234,79 @@ pub fn open_log_dir(app: tauri::AppHandle) -> Result<(), String> {
     app.opener()
         .open_path(path.to_string_lossy(), None::<&str>)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_home;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn sandbox(name: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("evelyn-home-{name}-{nonce}"));
+        fs::create_dir_all(&root).expect("sandbox");
+        root
+    }
+
+    #[test]
+    fn fresh_install_selects_evelyn() {
+        let root = sandbox("fresh");
+        assert_eq!(
+            select_home(root.join(".evelyn"), &[root.join(".hermes")]),
+            root.join(".evelyn")
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn existing_hermes_root_is_legacy_fallback() {
+        let root = sandbox("legacy");
+        fs::create_dir(root.join(".hermes")).expect("legacy root");
+        assert_eq!(
+            select_home(root.join(".evelyn"), &[root.join(".hermes")]),
+            root.join(".hermes")
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn first_existing_legacy_candidate_wins() {
+        let root = sandbox("legacy-order");
+        let local_legacy = root.join("local-hermes");
+        let dot_legacy = root.join(".hermes");
+        fs::create_dir(&local_legacy).expect("local legacy root");
+        fs::create_dir(&dot_legacy).expect("dot legacy root");
+        assert_eq!(
+            select_home(root.join(".evelyn"), &[local_legacy.clone(), dot_legacy]),
+            local_legacy
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn existing_evelyn_root_wins_when_both_exist() {
+        let root = sandbox("both");
+        fs::create_dir(root.join(".evelyn")).expect("evelyn root");
+        fs::create_dir(root.join(".hermes")).expect("hermes root");
+        assert_eq!(
+            select_home(root.join(".evelyn"), &[root.join(".hermes")]),
+            root.join(".evelyn")
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn preferred_file_does_not_shadow_legacy_directory() {
+        let root = sandbox("preferred-file");
+        fs::create_dir_all(&root).expect("sandbox root");
+        fs::write(root.join(".evelyn"), b"not a directory").expect("preferred file");
+        let legacy = root.join(".hermes");
+        fs::create_dir(&legacy).expect("legacy root");
+        assert_eq!(select_home(root.join(".evelyn"), &[legacy.clone()]), legacy);
+        fs::remove_dir_all(root).ok();
+    }
 }

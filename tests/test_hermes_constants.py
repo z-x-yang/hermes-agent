@@ -30,12 +30,51 @@ from hermes_constants import (
 class TestGetDefaultHermesRoot:
     """Tests for get_default_hermes_root() — Docker/custom deployment awareness."""
 
-    def test_no_hermes_home_returns_native(self, tmp_path, monkeypatch):
-        """When HERMES_HOME is not set, returns ~/.hermes."""
+    def test_no_explicit_home_returns_fresh_evelyn_root(self, tmp_path, monkeypatch):
+        """A fresh install defaults to ~/.evelyn."""
+        monkeypatch.delenv("EVELYN_HOME", raising=False)
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        assert get_default_hermes_root() == tmp_path / ".hermes"
+        assert get_default_hermes_root() == tmp_path / ".evelyn"
+
+    def test_existing_legacy_root_is_used_when_evelyn_root_is_absent(self, tmp_path, monkeypatch):
+        """Existing Hermes users keep one data root instead of splitting state."""
+        legacy = tmp_path / ".hermes"
+        legacy.mkdir()
+        monkeypatch.delenv("EVELYN_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        assert get_default_hermes_root() == legacy
+
+    def test_evelyn_root_wins_when_both_default_roots_exist(self, tmp_path, monkeypatch):
+        (tmp_path / ".hermes").mkdir()
+        (tmp_path / ".evelyn").mkdir()
+        monkeypatch.delenv("EVELYN_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        assert get_default_hermes_root() == tmp_path / ".evelyn"
+
+    def test_evelyn_file_does_not_shadow_existing_hermes_directory(self, tmp_path, monkeypatch):
+        (tmp_path / ".evelyn").write_text("not a directory")
+        legacy = tmp_path / ".hermes"
+        legacy.mkdir()
+        monkeypatch.delenv("EVELYN_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        assert get_default_hermes_root() == legacy
+
+    def test_evelyn_home_env_precedes_legacy_hermes_home(self, tmp_path, monkeypatch):
+        preferred = tmp_path / "preferred"
+        legacy = tmp_path / "legacy"
+        monkeypatch.setenv("EVELYN_HOME", str(preferred))
+        monkeypatch.setenv("HERMES_HOME", str(legacy))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        assert get_default_hermes_root() == preferred
 
     def test_hermes_home_is_native(self, tmp_path, monkeypatch):
         """When HERMES_HOME = ~/.hermes, returns ~/.hermes."""
@@ -80,40 +119,82 @@ class TestGetDefaultHermesRoot:
         monkeypatch.setenv("HERMES_HOME", str(profile))
         assert get_default_hermes_root() == docker_root
 
-    def test_no_hermes_home_returns_localappdata_root_on_windows(self, tmp_path, monkeypatch):
-        """Native Windows falls back to %LOCALAPPDATA%\\hermes, not ~/.hermes."""
+    def test_fresh_windows_install_uses_localappdata_evelyn(self, tmp_path, monkeypatch):
+        """Fresh native Windows installs use %LOCALAPPDATA%\\evelyn."""
         local_appdata = tmp_path / "LocalAppData"
+        monkeypatch.delenv("EVELYN_HOME", raising=False)
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "Home")
         monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
 
-        assert get_default_hermes_root() == local_appdata / "hermes"
+        assert get_default_hermes_root() == local_appdata / "evelyn"
 
     def test_no_hermes_home_uses_windows_path_when_localappdata_missing(self, tmp_path, monkeypatch):
-        """Windows fallback still uses AppData/Local/hermes without LOCALAPPDATA."""
+        """Windows fallback still uses AppData/Local/evelyn without LOCALAPPDATA."""
         home = tmp_path / "Home"
+        monkeypatch.delenv("EVELYN_HOME", raising=False)
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.delenv("LOCALAPPDATA", raising=False)
         monkeypatch.setattr(Path, "home", lambda: home)
         monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
 
-        assert get_default_hermes_root() == home / "AppData" / "Local" / "hermes"
+        assert get_default_hermes_root() == home / "AppData" / "Local" / "evelyn"
+
+    def test_windows_dot_hermes_is_final_legacy_fallback(self, tmp_path, monkeypatch):
+        home = tmp_path / "Home"
+        local_appdata = tmp_path / "LocalAppData"
+        dot_legacy = home / ".hermes"
+        dot_legacy.mkdir(parents=True)
+        monkeypatch.delenv("EVELYN_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+
+        assert get_default_hermes_root() == dot_legacy
+
+    def test_windows_local_legacy_precedes_dot_legacy(self, tmp_path, monkeypatch):
+        home = tmp_path / "Home"
+        local_appdata = tmp_path / "LocalAppData"
+        local_legacy = local_appdata / "hermes"
+        dot_legacy = home / ".hermes"
+        local_legacy.mkdir(parents=True)
+        dot_legacy.mkdir(parents=True)
+        monkeypatch.delenv("EVELYN_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+
+        assert get_default_hermes_root() == local_legacy
 
 
 class TestGetHermesHome:
     """Tests for get_hermes_home() platform-aware fallback."""
 
-    def test_windows_fallback_uses_localappdata(self, tmp_path, monkeypatch):
-        """When HERMES_HOME is unset on Windows, use %LOCALAPPDATA%\\hermes."""
+    def test_fresh_windows_fallback_uses_localappdata_evelyn(self, tmp_path, monkeypatch):
+        """When no explicit home exists on Windows, use %LOCALAPPDATA%\\evelyn."""
         local_appdata = tmp_path / "LocalAppData"
+        monkeypatch.delenv("EVELYN_HOME", raising=False)
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "Home")
         monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
         monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", False)
 
-        assert get_hermes_home() == local_appdata / "hermes"
+        assert get_hermes_home() == local_appdata / "evelyn"
+
+    def test_posix_existing_hermes_home_is_fallback(self, tmp_path, monkeypatch):
+        legacy = tmp_path / ".hermes"
+        legacy.mkdir()
+        monkeypatch.delenv("EVELYN_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(hermes_constants.sys, "platform", "darwin")
+        monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", False)
+
+        assert get_hermes_home() == legacy
 
 
 class TestHermesManagedNode:

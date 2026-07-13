@@ -147,6 +147,7 @@ test('buildPosixCleanupScript waits for the PID, runs the uninstall module, remo
   assert.match(script, /seq 1 60/)
   assert.match(script, /'-m' 'hermes_cli\.uninstall' '--mode' 'gui'/)
   assert.match(script, /rm -rf '\/opt\/hermes\/linux-unpacked'/)
+  assert.match(script, /export EVELYN_HOME='\/home\/x\/\.hermes'/)
   assert.match(script, /export HERMES_HOME='\/home\/x\/\.hermes'/)
 })
 
@@ -221,6 +222,8 @@ test('buildWindowsCleanupScript waits (bounded) for PID, runs uninstall, rmdir b
     hermesHome: 'C:\\Users\\x\\AppData\\Local\\hermes'
   })
   assert.match(script, /@echo off/)
+  assert.match(script, /set "EVELYN_HOME=C:\\Users\\x\\AppData\\Local\\hermes"/)
+  assert.match(script, /set "HERMES_HOME=C:\\Users\\x\\AppData\\Local\\hermes"/)
   assert.match(script, /set "PID=9988"/)
   // PYTHONPATH set so a system python can import hermes_cli from source.
   assert.match(script, /set "PYTHONPATH=C:\\hermes;%PYTHONPATH%"/)

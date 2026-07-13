@@ -1,26 +1,27 @@
 ---
 sidebar_position: 8
 title: "Context Files"
-description: "Project context files — .hermes.md, AGENTS.md, CLAUDE.md, global SOUL.md, and .cursorrules — automatically injected into every conversation"
+description: "Project context files — .evelyn.md, EVELYN.md, Hermes compatibility names, AGENTS.md, CLAUDE.md, global SOUL.md, and .cursorrules"
 ---
 
 # Context Files
 
-Hermes Agent automatically discovers and loads context files that shape how it behaves. Some are project-local and discovered from your working directory. `SOUL.md` is now global to the Hermes instance and is loaded from `HERMES_HOME` only.
+Evelyn automatically discovers and loads context files that shape how it behaves. Some are project-local and discovered from your working directory. `SOUL.md` is global and is loaded from the resolved data home. Fresh installs use `EVELYN_HOME` / `~/.evelyn`; existing `~/.hermes` roots and `HERMES_HOME` remain compatible fallbacks.
 
 ## Supported Context Files
 
 | File | Purpose | Discovery |
 |------|---------|-----------| 
-| **.hermes.md** / **HERMES.md** | Project instructions (highest priority) | Walks to git root |
+| **.evelyn.md** / **EVELYN.md** | Preferred Evelyn project instructions (highest priority) | Walks to git root |
+| **.hermes.md** / **HERMES.md** | Legacy Hermes-compatible project instructions | Walks to git root |
 | **AGENTS.md** | Project instructions, conventions, architecture | CWD at startup + subdirectories progressively |
 | **CLAUDE.md** | Claude Code context files (also detected) | CWD at startup + subdirectories progressively |
-| **SOUL.md** | Global personality and tone customization for this Hermes instance | `HERMES_HOME/SOUL.md` only |
+| **SOUL.md** | Global personality and tone customization | Resolved `EVELYN_HOME/SOUL.md` (`HERMES_HOME` compatible) |
 | **.cursorrules** | Cursor IDE coding conventions | CWD only |
 | **.cursor/rules/*.mdc** | Cursor IDE rule modules | CWD only |
 
 :::info Priority system
-Only **one** project context type is loaded per session (first match wins): `.hermes.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`. **SOUL.md** is always loaded independently as the agent identity (slot #1).
+Only **one** project context type is loaded per session (first match wins): `.evelyn.md` → `EVELYN.md` → `.hermes.md` → `HERMES.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`. **SOUL.md** is always loaded independently as the agent identity (slot #1).
 :::
 
 ## AGENTS.md

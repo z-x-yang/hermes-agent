@@ -7,8 +7,10 @@ configuration continue to work.
 
 from pathlib import Path
 import json
+import os
 import re
 import struct
+import subprocess
 import tomllib
 
 
@@ -137,6 +139,81 @@ def test_visual_identity_uses_discord_derived_evelyn_assets():
     assert "else EVELYN_PORTRAIT" in banner
     assert "_hero = EVELYN_PORTRAIT" in banner
     assert "⣴⣾⣿⣿⣇⠸⣿⣿" not in banner  # retired caduceus art
+
+
+def test_fresh_installs_prefer_evelyn_home_with_hermes_fallback():
+    install_sh = _text("scripts/install.sh")
+    install_ps1 = _text("scripts/install.ps1")
+    setup_sh = _text("setup-hermes.sh")
+    node_bootstrap = _text("scripts/lib/node-bootstrap.sh")
+    desktop_main = _text("apps/desktop/electron/main.cjs")
+    desktop_bootstrap = _text("apps/desktop/electron/bootstrap-runner.cjs")
+    bootstrap_runtime = _text("apps/bootstrap-installer/src-tauri/src/bootstrap.rs")
+    bootstrap_paths = _text("apps/bootstrap-installer/src-tauri/src/paths.rs")
+
+    assert "--evelyn-home" in install_sh
+    assert "--hermes-home" in install_sh
+    assert "$HOME/.evelyn" in install_sh
+    assert "$HOME/.hermes" in install_sh
+
+    assert "EVELYN_HOME" in install_ps1
+    assert "HERMES_HOME" in install_ps1
+    assert r"\evelyn" in install_ps1
+    assert r"\hermes" in install_ps1
+    assert "Test-Path $PreferredHome -PathType Container" in install_ps1
+    assert "Test-Path $LocalLegacyHome -PathType Container" in install_ps1
+    assert "Test-Path $DotLegacyHome -PathType Container" in install_ps1
+
+    for source in (desktop_main, bootstrap_paths):
+        assert "EVELYN_HOME" in source
+        assert "HERMES_HOME" in source
+        assert "evelyn" in source
+        assert "hermes" in source
+
+    # Desktop backend, updater handoffs, streamed update commands, and other
+    # official children must all receive one pinned root under both aliases.
+    assert desktop_main.count("EVELYN_HOME: HERMES_HOME") >= 4
+    assert desktop_bootstrap.count("EVELYN_HOME: hermesHome") >= 2
+    assert bootstrap_runtime.count("Some(hermes_home.as_str())") >= 2
+
+    for source in (setup_sh, node_bootstrap):
+        assert "EVELYN_HOME" in source
+        assert "HERMES_HOME" in source
+        assert "$HOME/.evelyn" in source
+        assert "$HOME/.hermes" in source
+
+
+def test_node_bootstrap_resolves_fresh_and_legacy_homes(tmp_path):
+    script = ROOT / "scripts/lib/node-bootstrap.sh"
+
+    def resolve(extra_env=None):
+        env = {**os.environ, "HOME": str(tmp_path)}
+        env.pop("EVELYN_HOME", None)
+        env.pop("HERMES_HOME", None)
+        env.update(extra_env or {})
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; printf "%s|%s" "$EVELYN_HOME" "$HERMES_HOME"',
+                "bash",
+                str(script),
+            ],
+            check=True,
+            capture_output=True,
+            env=env,
+            text=True,
+        )
+        return result.stdout
+
+    assert resolve() == f"{tmp_path / '.evelyn'}|{tmp_path / '.evelyn'}"
+    (tmp_path / ".hermes").mkdir()
+    assert resolve() == f"{tmp_path / '.hermes'}|{tmp_path / '.hermes'}"
+    (tmp_path / ".evelyn").mkdir()
+    assert resolve() == f"{tmp_path / '.evelyn'}|{tmp_path / '.evelyn'}"
+    assert resolve(
+        {"EVELYN_HOME": str(tmp_path / "explicit"), "HERMES_HOME": str(tmp_path / "legacy")}
+    ) == f"{tmp_path / 'explicit'}|{tmp_path / 'explicit'}"
 
 
 def test_secondary_user_interfaces_display_evelyn():

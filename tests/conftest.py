@@ -5,8 +5,8 @@ Hermetic-test invariants enforced here (see AGENTS.md for rationale):
 1. **No credential env vars.** All provider/credential-shaped env vars
    (ending in _API_KEY, _TOKEN, _SECRET, _PASSWORD, _CREDENTIALS, etc.)
    are unset before every test. Local developer keys cannot leak in.
-2. **Isolated HERMES_HOME.** HERMES_HOME points to a per-test tempdir so
-   code reading ``~/.hermes/*`` via ``get_hermes_home()`` can't see the
+2. **Isolated Evelyn/Hermes home.** Any inherited EVELYN_HOME is cleared and
+   HERMES_HOME points to a per-test tempdir so canonical resolution can't see the
    real one. (We do NOT also redirect HOME — that broke subprocesses in
    CI. Code using ``Path.home() / ".hermes"`` instead of the canonical
    ``get_hermes_home()`` is a bug to fix at the callsite.)
@@ -358,6 +358,7 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "cron").mkdir()
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
+    monkeypatch.delenv("EVELYN_HOME", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with

@@ -1,26 +1,27 @@
 ---
 sidebar_position: 8
 title: "上下文文件"
-description: "项目上下文文件 — .hermes.md、AGENTS.md、CLAUDE.md、全局 SOUL.md 以及 .cursorrules — 自动注入每次对话"
+description: "项目上下文文件 — .evelyn.md、EVELYN.md、Hermes 兼容名、AGENTS.md、CLAUDE.md、全局 SOUL.md 与 .cursorrules"
 ---
 
 # 上下文文件
 
-Hermes Agent 会自动发现并加载上下文文件，以塑造其行为方式。部分文件属于项目本地文件，从工作目录中发现。`SOUL.md` 现在对整个 Hermes 实例全局生效，仅从 `HERMES_HOME` 加载。
+Evelyn 会自动发现并加载上下文文件，以塑造其行为方式。部分文件属于项目本地文件，从工作目录中发现。`SOUL.md` 从 resolved data home 加载；全新安装使用 `EVELYN_HOME` / `~/.evelyn`，已有 `~/.hermes` 与 `HERMES_HOME` 继续作为兼容 fallback。
 
 ## 支持的上下文文件
 
 | 文件 | 用途 | 发现方式 |
 |------|---------|-----------| 
-| **.hermes.md** / **HERMES.md** | 项目指令（最高优先级） | 向上遍历至 git 根目录 |
+| **.evelyn.md** / **EVELYN.md** | Evelyn 首选项目指令（最高优先级） | 向上遍历到 git 根目录 |
+| **.hermes.md** / **HERMES.md** | Hermes 兼容项目指令 | 向上遍历到 git 根目录 |
 | **AGENTS.md** | 项目指令、规范、架构说明 | 启动时的 CWD 及子目录（渐进式） |
 | **CLAUDE.md** | Claude Code 上下文文件（同样支持检测） | 启动时的 CWD 及子目录（渐进式） |
-| **SOUL.md** | 当前 Hermes 实例的全局个性与语气定制 | 仅 `HERMES_HOME/SOUL.md` |
+| **SOUL.md** | 全局个性与语气定制 | resolved `EVELYN_HOME/SOUL.md`（兼容 `HERMES_HOME`） |
 | **.cursorrules** | Cursor IDE 编码规范 | 仅 CWD |
 | **.cursor/rules/*.mdc** | Cursor IDE 规则模块 | 仅 CWD |
 
 :::info 优先级系统
-每次会话仅加载**一种**项目上下文类型（先匹配先生效）：`.hermes.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`。**SOUL.md** 始终作为 agent 身份独立加载（插槽 #1）。
+每次会话仅加载**一种**项目上下文类型（先匹配先生效）：`.evelyn.md` → `EVELYN.md` → `.hermes.md` → `HERMES.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`。**SOUL.md** 始终作为 agent 身份独立加载（插槽 #1）。
 :::
 
 ## AGENTS.md

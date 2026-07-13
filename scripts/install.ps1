@@ -23,8 +23,20 @@ param(
     # exact ref.  Precedence: Commit > Tag > Branch.
     [string]$Commit = "",
     [string]$Tag = "",
-    [string]$HermesHome = $(if ($env:HERMES_HOME) { $env:HERMES_HOME } else { "$env:LOCALAPPDATA\hermes" }),
-    [string]$InstallDir = $(if ($env:HERMES_HOME) { "$env:HERMES_HOME\hermes-agent" } else { "$env:LOCALAPPDATA\hermes\hermes-agent" }),
+    [Alias("HermesHome")]
+    [string]$EvelynHome = $(
+        $LocalData = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { "$HOME\AppData\Local" }
+        $PreferredHome = "$LocalData\evelyn"
+        $LocalLegacyHome = "$LocalData\hermes"
+        $DotLegacyHome = "$HOME\.hermes"
+        if ($env:EVELYN_HOME) { $env:EVELYN_HOME }
+        elseif ($env:HERMES_HOME) { $env:HERMES_HOME }
+        elseif (Test-Path $PreferredHome -PathType Container) { $PreferredHome }
+        elseif (Test-Path $LocalLegacyHome -PathType Container) { $LocalLegacyHome }
+        elseif (Test-Path $DotLegacyHome -PathType Container) { $DotLegacyHome }
+        else { $PreferredHome }
+    ),
+    [string]$InstallDir = "",
 
     # --- Stage protocol (additive; default invocation behaves as before) ----
     # See the "Stage protocol" section near the bottom of the file for the
@@ -60,6 +72,15 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Keep the internal compatibility variable while exposing the Evelyn-first
+# parameter/env contract. Both names always resolve to the same root.
+$HermesHome = $EvelynHome
+if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+    $InstallDir = Join-Path $HermesHome "hermes-agent"
+}
+$env:EVELYN_HOME = $HermesHome
+$env:HERMES_HOME = $HermesHome
 
 # Suppress Invoke-WebRequest's per-chunk progress bar.  Windows PowerShell
 # 5.1's progress UI repaints synchronously on every received byte, which
@@ -2049,15 +2070,16 @@ function Set-PathVariable {
         Write-Info "PATH already configured"
     }
     
-    # Set HERMES_HOME so the Python code finds config/data in the right place.
-    # Only needed on Windows where we install to %LOCALAPPDATA%\hermes instead
-    # of the Unix default ~/.hermes
-    $currentHermesHome = [Environment]::GetEnvironmentVariable("HERMES_HOME", "User")
-    if (-not $currentHermesHome -or $currentHermesHome -ne $HermesHome) {
-        [Environment]::SetEnvironmentVariable("HERMES_HOME", $HermesHome, "User")
-        Write-Success "Set HERMES_HOME=$HermesHome"
+    # Persist both names to one root. EVELYN_HOME is the preferred product
+    # contract; HERMES_HOME remains for legacy scripts and upstream internals.
+    foreach ($homeVar in @("EVELYN_HOME", "HERMES_HOME")) {
+        $currentHome = [Environment]::GetEnvironmentVariable($homeVar, "User")
+        if (-not $currentHome -or $currentHome -ne $HermesHome) {
+            [Environment]::SetEnvironmentVariable($homeVar, $HermesHome, "User")
+        }
+        Set-Item -Path "Env:$homeVar" -Value $HermesHome
     }
-    $env:HERMES_HOME = $HermesHome
+    Write-Success "Set EVELYN_HOME=$HermesHome (HERMES_HOME compatibility retained)"
     
     # Update current session
     $env:Path = "$hermesBin;$env:Path"

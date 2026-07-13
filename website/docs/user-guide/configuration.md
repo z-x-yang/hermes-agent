@@ -1991,8 +1991,9 @@ Hermes uses two different context scopes:
 
 | File | Purpose | Scope |
 |------|---------|-------|
-| `SOUL.md` | **Primary agent identity** — defines who the agent is (slot #1 in the system prompt) | `~/.hermes/SOUL.md` or `$HERMES_HOME/SOUL.md` |
-| `.hermes.md` / `HERMES.md` | Project-specific instructions (highest priority) | Walks to git root |
+| `SOUL.md` | **Primary agent identity** — defines who the agent is (slot #1 in the system prompt) | Fresh `~/.evelyn/SOUL.md` / `$EVELYN_HOME/SOUL.md`; legacy `$HERMES_HOME` fallback |
+| `.evelyn.md` / `EVELYN.md` | Preferred project-specific instructions (highest priority) | Walks to git root |
+| `.hermes.md` / `HERMES.md` | Legacy compatibility project instructions | Walks to git root |
 | `AGENTS.md` | Project-specific instructions, coding conventions | Recursive directory walk |
 | `CLAUDE.md` | Claude Code context files (also detected) | Working directory only |
 | `.cursorrules` | Cursor IDE rules (also detected) | Working directory only |

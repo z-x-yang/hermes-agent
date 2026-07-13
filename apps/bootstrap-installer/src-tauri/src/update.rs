@@ -803,10 +803,16 @@ fn resolve_cli(install_root: &Path) -> Option<PathBuf> {
 
 fn update_child_env(install_root: &Path) -> Vec<(String, OsString)> {
     let hermes_home = crate::paths::hermes_home();
-    let mut envs = vec![(
-        "HERMES_HOME".to_string(),
-        hermes_home.as_os_str().to_os_string(),
-    )];
+    let mut envs = vec![
+        (
+            "EVELYN_HOME".to_string(),
+            hermes_home.as_os_str().to_os_string(),
+        ),
+        (
+            "HERMES_HOME".to_string(),
+            hermes_home.as_os_str().to_os_string(),
+        ),
+    ];
     if let Some(path) = path_with_prepended_entries(&[
         hermes_home.join("node").join("bin"),
         venv_bin_dir(install_root),

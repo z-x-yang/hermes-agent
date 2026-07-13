@@ -43,19 +43,44 @@ def get_hermes_home_override() -> str | None:
     return str(override)
 
 
-def _get_platform_default_hermes_home() -> Path:
-    """Return the platform-native default Hermes home path."""
+def _get_platform_home_candidates() -> tuple[Path, tuple[Path, ...]]:
+    """Return the preferred Evelyn root and ordered legacy candidates."""
     if sys.platform == "win32":
         local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
         base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
-        return base / "hermes"
-    return Path.home() / ".hermes"
+        return base / "evelyn", (base / "hermes", Path.home() / ".hermes")
+    return Path.home() / ".evelyn", (Path.home() / ".hermes",)
+
+
+def _get_platform_default_hermes_home() -> Path:
+    """Return the preferred native home, falling back to an existing legacy root.
+
+    Fresh Evelyn installs use the new product namespace. Existing Hermes users
+    keep using their one legacy root when no Evelyn root exists, avoiding a
+    silent config/session/credential split. If both exist, Evelyn wins.
+    """
+    evelyn_home, legacy_homes = _get_platform_home_candidates()
+    if evelyn_home.is_dir():
+        return evelyn_home
+    for legacy_home in legacy_homes:
+        if legacy_home.is_dir():
+            return legacy_home
+    return evelyn_home
+
+
+def _get_explicit_home_env() -> str:
+    """Return the preferred explicit home override with legacy env fallback."""
+    return (
+        os.environ.get("EVELYN_HOME", "").strip()
+        or os.environ.get("HERMES_HOME", "").strip()
+    )
 
 
 def get_hermes_home() -> Path:
     """Return the Hermes home directory (default: platform-native path).
 
-    Reads HERMES_HOME env var, falls back to the platform-native default.
+    Reads EVELYN_HOME first, then legacy HERMES_HOME, then the platform-native
+    Evelyn default with existing-Hermes fallback.
     This is the single source of truth — all other copies should import this.
 
     When ``HERMES_HOME`` is unset but an ``active_profile`` file indicates
@@ -72,7 +97,7 @@ def get_hermes_home() -> Path:
     if override:
         return Path(override)
 
-    val = os.environ.get("HERMES_HOME", "").strip()
+    val = _get_explicit_home_env()
     if val:
         return Path(val)
 
@@ -94,11 +119,11 @@ def get_hermes_home() -> Path:
             # configured, and (b) root-logger propagation would double-emit
             # on consoles where a StreamHandler is already attached.
             msg = (
-                f"[HERMES_HOME fallback] HERMES_HOME is unset but active "
+                f"[EVELYN_HOME fallback] EVELYN_HOME/HERMES_HOME are unset but active "
                 f"profile is {active!r}. Falling back to {fallback_home}, which "
                 f"is the DEFAULT profile — not {active!r}. Any data this "
                 f"process writes will land in the wrong profile. The "
-                f"subprocess spawner should pass HERMES_HOME explicitly "
+                f"subprocess spawner should pass the resolved home explicitly "
                 f"(see issue #18594)."
             )
             try:
@@ -113,8 +138,9 @@ def get_hermes_home() -> Path:
 def get_default_hermes_root() -> Path:
     """Return the root Hermes directory for profile-level operations.
 
-    In standard deployments this is the platform-native Hermes home
-    (``~/.hermes`` on POSIX, ``%LOCALAPPDATA%\\hermes`` on native Windows).
+    In fresh standard deployments this is the platform-native Evelyn home
+    (``~/.evelyn`` on POSIX, ``%LOCALAPPDATA%\\evelyn`` on native Windows).
+    Existing legacy roots remain the fallback when no Evelyn root exists.
 
     In Docker or custom deployments where ``HERMES_HOME`` points outside
     ``~/.hermes`` (e.g. ``/opt/data``), returns ``HERMES_HOME`` directly
@@ -128,7 +154,7 @@ def get_default_hermes_root() -> Path:
     Import-safe — no dependencies beyond stdlib.
     """
     native_home = _get_platform_default_hermes_home()
-    env_home = os.environ.get("HERMES_HOME", "")
+    env_home = _get_explicit_home_env()
     if not env_home:
         return native_home
     env_path = Path(env_home)
@@ -633,9 +659,10 @@ def display_hermes_home() -> str:
 
     Uses ``~/`` shorthand for readability::
 
-        default:  ``~/.hermes``
-        profile:  ``~/.hermes/profiles/coder``
-        custom:   ``/opt/hermes-custom``
+        fresh:   ``~/.evelyn``
+        legacy:  ``~/.hermes``
+        profile: ``~/.evelyn/profiles/coder``
+        custom:  ``/opt/evelyn-custom``
 
     Use this in **user-facing** print/log messages instead of hardcoding
     ``~/.hermes``.  For code that needs a real ``Path``, use

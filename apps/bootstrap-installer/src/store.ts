@@ -170,8 +170,8 @@ export async function initialize(): Promise<void> {
   const fake = fakeMode()
   if (fake) {
     unlisten = () => {}
-    $logPath.set('~/.hermes/logs/bootstrap-installer.log')
-    $hermesHome.set('~/.hermes')
+    $logPath.set('~/.evelyn/logs/bootstrap-installer.log')
+    $hermesHome.set('~/.evelyn')
     $mode.set(fake === 'update' ? 'update' : 'install')
     // Update auto-runs (it's a hand-off); install/failure wait for the welcome click.
     if (fake === 'update') void runFakeBoot('update')

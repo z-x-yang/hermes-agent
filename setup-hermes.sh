@@ -29,6 +29,21 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+if [ -n "${EVELYN_HOME:-}" ]; then
+    RESOLVED_EVELYN_HOME="$EVELYN_HOME"
+elif [ -n "${HERMES_HOME:-}" ]; then
+    RESOLVED_EVELYN_HOME="$HERMES_HOME"
+elif [ -d "$HOME/.evelyn" ]; then
+    RESOLVED_EVELYN_HOME="$HOME/.evelyn"
+elif [ -d "$HOME/.hermes" ]; then
+    RESOLVED_EVELYN_HOME="$HOME/.hermes"
+else
+    RESOLVED_EVELYN_HOME="$HOME/.evelyn"
+fi
+EVELYN_HOME="$RESOLVED_EVELYN_HOME"
+HERMES_HOME="$RESOLVED_EVELYN_HOME"
+export EVELYN_HOME HERMES_HOME
+
 # Prevent uv from discovering config files (uv.toml, pyproject.toml) from the
 # wrong user's home directory when running under sudo -u <user>.  See #21269.
 export UV_NO_CONFIG=1
@@ -423,14 +438,14 @@ else
 fi
 
 # ============================================================================
-# Seed bundled skills into ~/.hermes/skills/
+# Seed bundled skills into the resolved Evelyn home.
 # ============================================================================
 
-HERMES_SKILLS_DIR="${HERMES_HOME:-$HOME/.hermes}/skills"
+HERMES_SKILLS_DIR="$HERMES_HOME/skills"
 mkdir -p "$HERMES_SKILLS_DIR"
 
 echo ""
-echo "Syncing bundled skills to ~/.hermes/skills/ ..."
+echo "Syncing bundled skills to $HERMES_SKILLS_DIR ..."
 if "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/tools/skills_sync.py" 2>/dev/null; then
     echo -e "${GREEN}✓${NC} Skills synced"
 else

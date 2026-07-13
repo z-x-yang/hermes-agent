@@ -479,7 +479,7 @@ Hermes injects project-level instructions into the system prompt by reading cont
 
 | File (in priority order) | Discovery | Use when |
 |---|---|---|
-| `.hermes.md` / `HERMES.md` | Walks parents up to the git root, stops at git root | You want hierarchical project rules (root + per-package overrides) |
+| `.evelyn.md` / `EVELYN.md` (preferred); `.hermes.md` / `HERMES.md` (compatibility) | Walks parents up to the git root, stops at git root | You want hierarchical project rules (root + per-package overrides) |
 | `AGENTS.md` / `agents.md` | **Cwd only** — subdirectory and parent copies are ignored | You want portable agent instructions that work the same in Hermes, Claude Code, Codex, etc. |
 | `CLAUDE.md` / `claude.md` | Cwd only | Same as AGENTS.md, Claude-flavored |
 | `.cursorrules` / `.cursor/rules/*.mdc` | Cwd only | Migrating from Cursor |

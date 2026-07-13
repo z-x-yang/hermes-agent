@@ -778,6 +778,34 @@ class TestBuildContextFilesPrompt:
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "type hints" in result
 
+    def test_loads_evelyn_md_dotfile(self, tmp_path):
+        (tmp_path / ".evelyn.md").write_text("Evelyn dotfile rules.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Evelyn dotfile rules" in result
+
+    def test_loads_evelyn_md_uppercase(self, tmp_path):
+        (tmp_path / "EVELYN.md").write_text("Evelyn uppercase rules.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Evelyn uppercase rules" in result
+
+    def test_evelyn_names_precede_hermes_compatibility_names(self, tmp_path):
+        (tmp_path / ".evelyn.md").write_text("Preferred Evelyn rules.")
+        (tmp_path / "EVELYN.md").write_text("Upper Evelyn rules.")
+        (tmp_path / ".hermes.md").write_text("Legacy dotfile rules.")
+        (tmp_path / "HERMES.md").write_text("Legacy uppercase rules.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Preferred Evelyn rules" in result
+        assert "Upper Evelyn rules" not in result
+        assert "Legacy dotfile rules" not in result
+        assert "Legacy uppercase rules" not in result
+
+    def test_evelyn_uppercase_precedes_hermes_dotfile(self, tmp_path):
+        (tmp_path / "EVELYN.md").write_text("Evelyn wins.")
+        (tmp_path / ".hermes.md").write_text("Hermes loses.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Evelyn wins" in result
+        assert "Hermes loses" not in result
+
     def test_hermes_md_lowercase_takes_priority(self, tmp_path):
         (tmp_path / ".hermes.md").write_text("From dotfile.")
         (tmp_path / "HERMES.md").write_text("From uppercase.")
@@ -897,6 +925,19 @@ class TestBuildContextFilesPrompt:
 
 
 class TestFindHermesMd:
+    def test_prefers_evelyn_dotfile_over_all_compatibility_names(self, tmp_path):
+        for name in ("EVELYN.md", ".hermes.md", "HERMES.md"):
+            (tmp_path / name).write_text(name)
+        preferred = tmp_path / ".evelyn.md"
+        preferred.write_text("preferred")
+        assert _find_hermes_md(tmp_path) == preferred
+
+    def test_finds_evelyn_uppercase_before_hermes_names(self, tmp_path):
+        preferred = tmp_path / "EVELYN.md"
+        preferred.write_text("preferred")
+        (tmp_path / ".hermes.md").write_text("legacy")
+        assert _find_hermes_md(tmp_path) == preferred
+
     def test_finds_in_cwd(self, tmp_path):
         (tmp_path / ".hermes.md").write_text("rules")
         assert _find_hermes_md(tmp_path) == tmp_path / ".hermes.md"

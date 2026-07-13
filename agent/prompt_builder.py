@@ -75,11 +75,11 @@ def _find_git_root(start: Path) -> Optional[Path]:
     return None
 
 
-_HERMES_MD_NAMES = (".hermes.md", "HERMES.md")
+_HERMES_MD_NAMES = (".evelyn.md", "EVELYN.md", ".hermes.md", "HERMES.md")
 
 
 def _find_hermes_md(cwd: Path) -> Optional[Path]:
-    """Discover the nearest ``.hermes.md`` or ``HERMES.md``.
+    """Discover the nearest Evelyn project file or a Hermes compatibility file.
 
     Search order: *cwd* first, then each parent directory up to (and
     including) the git repository root.  Returns the first match, or
@@ -1825,7 +1825,7 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
 
 
 def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
-    """.hermes.md / HERMES.md — walk to git root."""
+    """Evelyn/Hermes project context — walk to git root."""
     hermes_md_path = _find_hermes_md(cwd_path)
     if not hermes_md_path:
         return ""

@@ -20,12 +20,25 @@
 # Env inputs (set before sourcing to override defaults):
 #   HERMES_NODE_MIN_VERSION   (default: 20)   — accepted on PATH
 #   HERMES_NODE_TARGET_MAJOR  (default: 22)   — installed when we install
-#   HERMES_HOME               (default: $HOME/.hermes)
+#   EVELYN_HOME              (fresh default: $HOME/.evelyn)
+#   HERMES_HOME               legacy override/fallback
 # ============================================================================
 
 HERMES_NODE_MIN_VERSION="${HERMES_NODE_MIN_VERSION:-20}"
 HERMES_NODE_TARGET_MAJOR="${HERMES_NODE_TARGET_MAJOR:-22}"
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+if [ -n "${EVELYN_HOME:-}" ]; then
+    HERMES_HOME="$EVELYN_HOME"
+elif [ -n "${HERMES_HOME:-}" ]; then
+    :
+elif [ -d "$HOME/.evelyn" ]; then
+    HERMES_HOME="$HOME/.evelyn"
+elif [ -d "$HOME/.hermes" ]; then
+    HERMES_HOME="$HOME/.hermes"
+else
+    HERMES_HOME="$HOME/.evelyn"
+fi
+EVELYN_HOME="$HERMES_HOME"
+export EVELYN_HOME HERMES_HOME
 HERMES_NODE_AVAILABLE=false
 
 # ---------------------------------------------------------------------------

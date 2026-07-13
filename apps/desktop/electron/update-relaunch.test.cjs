@@ -154,9 +154,10 @@ test('collectRelaunchArgs drops Electron internals, keeps user/launcher args', (
   assert.deepEqual(collectRelaunchArgs(undefined), [])
 })
 
-test('collectRelaunchEnv preserves HERMES_HOME + HERMES_DESKTOP_* + sandbox opt-out only', () => {
+test('collectRelaunchEnv pins both home aliases to the resolved root and preserves desktop context only', () => {
   const env = {
-    HERMES_HOME: '/home/u/.hermes',
+    EVELYN_HOME: '/stale/evelyn',
+    HERMES_HOME: '/stale/hermes',
     HERMES_DESKTOP_REMOTE_URL: 'http://box:9119',
     HERMES_DESKTOP_REMOTE_TOKEN: 'secret',
     HERMES_DESKTOP_HERMES_ROOT: '/home/u/dev/hermes',
@@ -165,7 +166,8 @@ test('collectRelaunchEnv preserves HERMES_HOME + HERMES_DESKTOP_* + sandbox opt-
     HOME: '/home/u', // not preserved
     UNRELATED: 'x'
   }
-  assert.deepEqual(collectRelaunchEnv(env), {
+  assert.deepEqual(collectRelaunchEnv(env, '/home/u/.hermes'), {
+    EVELYN_HOME: '/home/u/.hermes',
     HERMES_HOME: '/home/u/.hermes',
     HERMES_DESKTOP_REMOTE_URL: 'http://box:9119',
     HERMES_DESKTOP_REMOTE_TOKEN: 'secret',
