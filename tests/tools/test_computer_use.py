@@ -1449,6 +1449,103 @@ class TestCuaDriverSessionReconnect:
         assert bridge.calls[1][0] == ("call", "list_apps", {})
         assert len(bridge.calls) == 2
 
+    def test_call_tool_revives_ended_driver_session_once(self):
+        """A live MCP transport must revive an ended cua-driver action session."""
+        ended = {
+            "data": (
+                "session 'hermes-deadbeef0000' has ended; tool call 'click' was rejected. "
+                "Call start_session with this id to revive it before issuing further "
+                "actions, or use a new session id."
+            ),
+            "images": [],
+            "image_mime_types": [],
+            "structuredContent": None,
+            "isError": True,
+        }
+        revived = {
+            "data": {"active": True, "revived": True, "session": "hermes-deadbeef0000"},
+            "images": [],
+            "image_mime_types": [],
+            "structuredContent": None,
+            "isError": False,
+        }
+        clicked = {
+            "data": {"ok": True, "action": "click"},
+            "images": [],
+            "image_mime_types": [],
+            "structuredContent": None,
+            "isError": False,
+        }
+
+        class FakeBridge:
+            def __init__(self):
+                self.calls = []
+                self.effects = [ended, revived, clicked]
+
+            def run(self, value, timeout=None):
+                self.calls.append((value, timeout))
+                return self.effects.pop(0)
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+        args = {"session": "hermes-deadbeef0000", "pid": 42, "x": 10, "y": 20}
+
+        assert session.call_tool("click", args) == clicked
+        assert [call[0] for call in bridge.calls] == [
+            ("call", "click", args),
+            ("call", "start_session", {"session": "hermes-deadbeef0000"}),
+            ("call", "click", args),
+        ]
+
+    def test_action_session_revive_keeps_one_transport_reconnect_budget(self):
+        """The revive path shares the call's single MCP reconnect budget."""
+        from anyio import ClosedResourceError
+
+        ended = {
+            "data": (
+                "session 'hermes-deadbeef0000' has ended; tool call 'click' was rejected. "
+                "Call start_session with this id to revive it before issuing further "
+                "actions, or use a new session id."
+            ),
+            "images": [], "image_mime_types": [],
+            "structuredContent": None, "isError": True,
+        }
+        revived = {
+            "data": {"active": True, "revived": True, "session": "hermes-deadbeef0000"},
+            "images": [], "image_mime_types": [],
+            "structuredContent": None, "isError": False,
+        }
+        clicked = {
+            "data": {"ok": True, "action": "click"},
+            "images": [], "image_mime_types": [],
+            "structuredContent": None, "isError": False,
+        }
+
+        class FakeBridge:
+            def __init__(self):
+                self.calls = []
+                self.effects = [ended, ClosedResourceError(), revived, clicked]
+
+            def run(self, value, timeout=None):
+                self.calls.append((value, timeout))
+                effect = self.effects.pop(0)
+                if isinstance(effect, Exception):
+                    raise effect
+                return effect
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+        args = {"session": "hermes-deadbeef0000", "pid": 42, "x": 10, "y": 20}
+
+        assert session.call_tool("click", args) == clicked
+        assert session._reconnect_log == ["stop", "start"]
+        assert [call[0] for call in bridge.calls] == [
+            ("call", "click", args),
+            ("call", "start_session", {"session": "hermes-deadbeef0000"}),
+            ("call", "start_session", {"session": "hermes-deadbeef0000"}),
+            ("call", "click", args),
+        ]
+
     def test_call_tool_does_not_retry_on_unrelated_error(self):
         """Non-transport errors must propagate without a reconnect attempt."""
         class FakeBridge:
@@ -1501,6 +1598,72 @@ class TestCaptureAppFilterNoMatch:
         assert backend._active_pid is None
         assert backend._active_window_id is None
 
+    def test_app_filter_searches_off_space_windows(self):
+        windows = [
+            {"app_name": "Google Chrome", "pid": 22462, "window_id": 119584,
+             "is_on_screen": False, "title": "ScholarOne Manuscripts", "z_index": 0},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+        session: Any = backend._session
+        session.call_tool.side_effect = [
+            {"data": "", "images": [], "isError": False,
+             "structuredContent": {"windows": windows}},
+            {"data": "✅ Google Chrome — 0 elements\n", "images": [], "isError": False,
+             "structuredContent": None},
+        ]
+
+        backend.capture(mode="ax", app="Google Chrome")
+
+        first_tool, first_args = session.call_tool.call_args_list[0].args
+        assert first_tool == "list_windows"
+        assert first_args["on_screen_only"] is False
+        assert backend._active_pid == 22462
+        assert backend._active_window_id == 119584
+
+    def test_app_filter_prefers_titled_content_window_over_helper(self):
+        windows = [
+            {"app_name": "Google Chrome", "pid": 22462, "window_id": 129915,
+             "is_on_screen": False, "title": "", "z_index": 0,
+             "bounds": {"width": 2236, "height": 178}},
+            {"app_name": "Google Chrome", "pid": 22462, "window_id": 119584,
+             "is_on_screen": False, "title": "ScholarOne Manuscripts", "z_index": 10,
+             "bounds": {"width": 2560, "height": 1410}},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+        session: Any = backend._session
+        session.call_tool.side_effect = [
+            {"data": "", "images": [], "isError": False,
+             "structuredContent": {"windows": windows}},
+            {"data": "✅ Google Chrome — 0 elements\n", "images": [], "isError": False,
+             "structuredContent": None},
+        ]
+
+        backend.capture(mode="ax", app="Google Chrome")
+
+        assert backend._active_window_id == 119584
+
+    def test_app_filter_prefers_large_content_over_titled_onscreen_helper(self):
+        windows = [
+            {"app_name": "Google Chrome", "pid": 22462, "window_id": 129915,
+             "is_on_screen": True, "title": "Updater", "z_index": 0,
+             "bounds": {"width": 240, "height": 120}},
+            {"app_name": "Google Chrome", "pid": 22462, "window_id": 119584,
+             "is_on_screen": False, "title": "Authenticated account", "z_index": 10,
+             "bounds": {"width": 2560, "height": 1410}},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+        session: Any = backend._session
+        session.call_tool.side_effect = [
+            {"data": "", "images": [], "isError": False,
+             "structuredContent": {"windows": windows}},
+            {"data": "✅ Google Chrome — 0 elements\n", "images": [], "isError": False,
+             "structuredContent": None},
+        ]
+
+        backend.capture(mode="ax", app="Google Chrome")
+
+        assert backend._active_window_id == 119584
+
     def test_app_filter_match_still_works(self):
         windows = [
             {"app_name": "Fuwari", "pid": 100, "window_id": 1,
@@ -1521,6 +1684,25 @@ class TestCaptureAppFilterNoMatch:
 
         assert backend._active_pid == 200
         assert backend._active_window_id == 2
+
+    def test_screen_sentinel_keeps_on_screen_window_enumeration(self):
+        windows = [
+            {"app_name": "WindowServer", "pid": 1, "window_id": 10,
+             "is_on_screen": True, "title": "Desktop", "z_index": 0},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+        session: Any = backend._session
+        session.call_tool.side_effect = [
+            {"data": "", "images": [], "isError": False,
+             "structuredContent": {"windows": windows}},
+            {"data": "✅ Desktop — 0 elements\n", "images": [], "isError": False,
+             "structuredContent": None},
+        ]
+
+        backend.capture(mode="ax", app="screen")
+
+        _, args = session.call_tool.call_args_list[0].args
+        assert args["on_screen_only"] is True
 
     def test_no_app_filter_still_picks_frontmost(self):
         """When no app= is given, capture continues to pick the frontmost
@@ -1564,6 +1746,39 @@ class TestFocusAppFilterNoMatch:
         assert "Calculator" in res.message
         # _active_pid must remain unset so a subsequent click doesn't hit Fuwari.
         assert backend._active_pid is None
+
+    def test_focus_app_searches_off_space_windows(self):
+        windows = [
+            {"app_name": "Google Chrome", "pid": 22462, "window_id": 119584,
+             "is_on_screen": False, "title": "ScholarOne Manuscripts", "z_index": 0},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+        session: Any = backend._session
+
+        res = backend.focus_app("Google Chrome", raise_window=False)
+
+        tool_name, args = session.call_tool.call_args.args
+        assert tool_name == "list_windows"
+        assert args["on_screen_only"] is False
+        assert res.ok is True
+        assert backend._active_pid == 22462
+        assert backend._active_window_id == 119584
+
+    def test_focus_app_prefers_titled_content_window_over_helper(self):
+        windows = [
+            {"app_name": "Google Chrome", "pid": 22462, "window_id": 129915,
+             "is_on_screen": False, "title": "", "z_index": 0,
+             "bounds": {"width": 2236, "height": 178}},
+            {"app_name": "Google Chrome", "pid": 22462, "window_id": 119584,
+             "is_on_screen": False, "title": "ScholarOne Manuscripts", "z_index": 10,
+             "bounds": {"width": 2560, "height": 1410}},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+
+        res = backend.focus_app("Google Chrome", raise_window=False)
+
+        assert res.ok is True
+        assert backend._active_window_id == 119584
 
     def test_focus_app_match_still_works(self):
         windows = [

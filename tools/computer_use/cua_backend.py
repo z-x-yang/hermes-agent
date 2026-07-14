@@ -315,6 +315,33 @@ def cua_driver_install_hint() -> str:
     )
 
 
+def _window_area(window: Dict[str, Any]) -> int:
+    bounds = window.get("bounds") or {}
+    if not isinstance(bounds, dict):
+        return 0
+    try:
+        width = int(bounds.get("width", 0) or 0)
+        height = int(bounds.get("height", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(width, 0) * max(height, 0)
+
+
+def _best_window_for_app(windows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Prefer real content windows over helper/menu windows for one app."""
+    if not windows:
+        return None
+    return max(
+        windows,
+        key=lambda window: (
+            _window_area(window),
+            1 if str(window.get("title") or "").strip() else 0,
+            1 if not window.get("off_screen") else 0,
+            -int(window.get("z_index", 0) or 0),
+        ),
+    )
+
+
 def _parse_elements_from_tree(markdown: str) -> List[UIElement]:
     """Parse UIElement list from get_window_state AX tree markdown.
 
@@ -785,6 +812,20 @@ class _CuaDriverSession:
             or isinstance(exc, (BrokenPipeError, EOFError))
         )
 
+    @staticmethod
+    def _ended_action_session_id(
+        result: Dict[str, Any], name: str, args: Dict[str, Any]
+    ) -> Optional[str]:
+        """Return the exact logical session id when cua-driver says it ended."""
+        if name in {"start_session", "end_session"} or result.get("isError") is not True:
+            return None
+        session_id = args.get("session")
+        data = result.get("data")
+        if not isinstance(session_id, str) or not session_id or not isinstance(data, str):
+            return None
+        expected = f"session '{session_id}' has ended; tool call '{name}' was rejected."
+        return session_id if data.startswith(expected) else None
+
     def _restart_session_locked(self) -> None:
         """Recreate the MCP session after the daemon/stdin transport was closed.
         Caller must hold self._lock (the reconnect-once retry path holds it)."""
@@ -802,18 +843,51 @@ class _CuaDriverSession:
 
     def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
         self._require_started()
-        try:
-            return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
-        except Exception as e:
-            if not self._is_closed_session_error(e):
-                raise
-            # Daemon restart closes the cached stdio channel. Reconnect once and
-            # retry exactly one more time — never loop, to avoid hammering a
-            # genuinely dead daemon.
-            logger.warning("cua-driver MCP session closed during %s; reconnecting once", name)
-            with self._lock:
-                self._restart_session_locked()
-            return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+        transport_reconnected = False
+
+        def _run_with_transport_retry(
+            tool_name: str, tool_args: Dict[str, Any]
+        ) -> Dict[str, Any]:
+            nonlocal transport_reconnected
+            try:
+                return self._bridge.run(
+                    self._call_tool_async(tool_name, tool_args), timeout=timeout
+                )
+            except Exception as e:
+                if transport_reconnected or not self._is_closed_session_error(e):
+                    raise
+                # Share one reconnect budget across the initial call, logical
+                # session revival, and the one logical retry. Never loop.
+                transport_reconnected = True
+                logger.warning(
+                    "cua-driver MCP session closed during %s; reconnecting once",
+                    tool_name,
+                )
+                with self._lock:
+                    self._restart_session_locked()
+                return self._bridge.run(
+                    self._call_tool_async(tool_name, tool_args), timeout=timeout
+                )
+
+        result = _run_with_transport_retry(name, args)
+        ended_session_id = self._ended_action_session_id(result, name, args)
+        if ended_session_id is None:
+            return result
+
+        # The MCP transport is still healthy, but cua-driver's logical action
+        # session has ended. Revive that exact id once, then retry the rejected
+        # call once. start_session is idempotent, so concurrent revival is safe.
+        logger.warning(
+            "cua-driver action session %s ended during %s; reviving once",
+            ended_session_id,
+            name,
+        )
+        revived = _run_with_transport_retry(
+            "start_session", {"session": ended_session_id}
+        )
+        if revived.get("isError") is True:
+            return result
+        return _run_with_transport_retry(name, args)
 
 
 def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
@@ -1010,12 +1084,16 @@ class CuaDriverBackend(ComputerUseBackend):
 
     # ── Capture ────────────────────────────────────────────────────
     def capture(self, mode: str = "som", app: Optional[str] = None) -> CaptureResult:
-        """Capture the frontmost on-screen window (optionally filtered by app name).
+        """Capture the frontmost window, or a named app window across Spaces.
 
         Maps hermes `capture(mode, app)` → cua-driver `list_windows` +
         `get_window_state` (ax/som) or `screenshot` (vision).
         """
-        # Step 1: enumerate on-screen windows to find target pid/window_id.
+        # With an explicit app target, search all Spaces without raising or
+        # switching them. Without app= (or for the screen/desktop sentinel),
+        # preserve the frontmost on-screen default.
+        app_key = app.strip().lower() if app else ""
+        explicit_app_target = bool(app_key and app_key not in _SCREEN_CAPTURE_SENTINELS)
         # Surface 3 of NousResearch/hermes-agent#47072: read the canonical
         # `structuredContent.windows` array directly. Pre-fix the wrapper
         # also kept a text-line regex (`_WINDOW_LINE_RE`) as a fallback for
@@ -1025,7 +1103,7 @@ class CuaDriverBackend(ComputerUseBackend):
         # structured shape as the only contract.
         lw_out = self._session.call_tool(
             "list_windows",
-            {"on_screen_only": True, "session": self._session_id},
+            {"on_screen_only": not explicit_app_target, "session": self._session_id},
         )
         raw_windows = (lw_out.get("structuredContent") or {}).get("windows") or []
         windows = [
@@ -1036,6 +1114,7 @@ class CuaDriverBackend(ComputerUseBackend):
                 "off_screen": not w.get("is_on_screen", True),
                 "title": w.get("title", ""),
                 "z_index": w.get("z_index", 0),
+                "bounds": w.get("bounds") or {},
             }
             for w in raw_windows
         ]
@@ -1052,7 +1131,7 @@ class CuaDriverBackend(ComputerUseBackend):
         # returned by list_windows is the localized name (e.g. "計算機"), so
         # `app="Calculator"` legitimately matches no windows on a non-English
         # system and the caller needs to retry with the localized name.
-        if app and app.strip().lower() in _SCREEN_CAPTURE_SENTINELS:
+        if app_key in _SCREEN_CAPTURE_SENTINELS:
             # Whole-screen / desktop request. cua-driver has no virtual-desktop
             # capture tool, so resolve to the OS shell/desktop window (the
             # desktop backdrop or the taskbar/menu-bar), which list_windows
@@ -1096,7 +1175,7 @@ class CuaDriverBackend(ComputerUseBackend):
                     mode=mode, width=0, height=0, png_b64=None,
                     elements=[], app="",
                     window_title=(
-                        f"<no on-screen window matched app={app!r}; "
+                        f"<no window matched app={app!r} across macOS Spaces; "
                         f"call list_apps to see available app names "
                         f"(macOS reports localized names, e.g. '計算機' "
                         f"instead of 'Calculator')>"
@@ -1105,8 +1184,13 @@ class CuaDriverBackend(ComputerUseBackend):
                 )
             windows = filtered
 
-        # Pick first on-screen window (sorted by z_index / z-order above).
-        target = next((w for w in windows if not w["off_screen"]), windows[0])
+        # Explicit app targeting must skip tiny/untitled helper windows. The
+        # untargeted path keeps the existing frontmost on-screen behavior.
+        if explicit_app_target:
+            target = _best_window_for_app(windows)
+            assert target is not None  # windows was proven non-empty above
+        else:
+            target = next((w for w in windows if not w["off_screen"]), windows[0])
         self._active_pid = target["pid"]
         self._active_window_id = target["window_id"]
         app_name = target["app_name"]
@@ -1421,7 +1505,7 @@ class CuaDriverBackend(ComputerUseBackend):
         cua-driver background-automation never needs to bring a window to the
         front: capture(app=...) already selects the right window via
         list_windows. We implement focus_app as a pure window-selector —
-        enumerate on-screen windows, find the best match for *app*, and store
+        enumerate windows across Spaces, find the best match for *app*, and store
         its pid/window_id so that subsequent click/type calls hit the right
         process.
 
@@ -1430,19 +1514,21 @@ class CuaDriverBackend(ComputerUseBackend):
         """
         lw_out = self._session.call_tool(
             "list_windows",
-            {"on_screen_only": True, "session": self._session_id},
+            {"on_screen_only": False, "session": self._session_id},
         )
         raw_windows = (lw_out.get("structuredContent") or {}).get("windows") or []
         windows = [
             {
-                "app_name": w.get("app_name", ""),
+                "app_name": w.get("app_name") or w.get("app") or "",
                 "pid": int(w["pid"]),
-                "window_id": int(w["window_id"]),
+                "window_id": int(w.get("window_id") or w.get("id") or 0),
                 "z_index": w.get("z_index", 0),
+                "off_screen": not w.get("is_on_screen", True),
+                "title": w.get("title", ""),
+                "bounds": w.get("bounds") or {},
             }
             for w in raw_windows
         ]
-        windows.sort(key=lambda w: w["z_index"])
 
         app_lower = app.lower()
         matched = [w for w in windows if app_lower in w["app_name"].lower()]
@@ -1450,7 +1536,7 @@ class CuaDriverBackend(ComputerUseBackend):
         # matches nothing — that hides the real failure (often a localized
         # macOS app name mismatch, e.g. caller passed "Calculator" but
         # list_windows returns "計算機").
-        target = matched[0] if matched else None
+        target = _best_window_for_app(matched)
         if target:
             self._active_pid = target["pid"]
             self._active_window_id = target["window_id"]
@@ -1461,7 +1547,7 @@ class CuaDriverBackend(ComputerUseBackend):
                         f"window {self._active_window_id}) without raising window.",
             )
         return ActionResult(ok=False, action="focus_app",
-                            message=f"No on-screen window found for app '{app}'.")
+                            message=f"No window found for app '{app}' across macOS Spaces.")
 
     # ── App lifecycle ────────────────────────────────────────────────
     #
