@@ -845,6 +845,7 @@ export const zh: Translations = {
       applying: '应用中...',
       defaultsLabel: '默认值',
       reasoning: '推理',
+      reasoningDefault: '提供商默认值',
       reasoningOff: '关闭',
       defaultsFailed: '保存模型默认值失败',
       auxiliaryTitle: '辅助模型',

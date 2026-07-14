@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -18,6 +19,8 @@ const getRecommendedDefaultModel = vi.fn()
 const setEnvVar = vi.fn()
 const getHermesConfigRecord = vi.fn()
 const saveHermesConfig = vi.fn()
+const getMoaModels = vi.fn()
+const saveMoaModels = vi.fn()
 const startManualProviderOAuth = vi.fn()
 
 vi.mock('@/hermes', () => ({
@@ -28,7 +31,10 @@ vi.mock('@/hermes', () => ({
   getRecommendedDefaultModel: (slug: string) => getRecommendedDefaultModel(slug),
   setEnvVar: (key: string, value: string) => setEnvVar(key, value),
   getHermesConfigRecord: () => getHermesConfigRecord(),
-  saveHermesConfig: (config: unknown) => saveHermesConfig(config)
+  saveHermesConfig: (config: unknown) => saveHermesConfig(config),
+  getMoaModels: () => getMoaModels(),
+  saveMoaModels: (config: unknown) => saveMoaModels(config),
+  setApiRequestProfile: vi.fn()
 }))
 
 vi.mock('@/store/onboarding', () => ({
@@ -66,6 +72,8 @@ beforeEach(() => {
   setEnvVar.mockResolvedValue({ ok: true })
   getHermesConfigRecord.mockResolvedValue({ agent: { reasoning_effort: 'medium', service_tier: 'normal' } })
   saveHermesConfig.mockResolvedValue({ ok: true })
+  getMoaModels.mockResolvedValue(null)
+  saveMoaModels.mockResolvedValue({ ok: true })
 })
 
 afterEach(() => {
@@ -75,8 +83,13 @@ afterEach(() => {
 
 async function renderModelSettings() {
   const { ModelSettings } = await import('./model-settings')
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
-  return render(<ModelSettings />)
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <ModelSettings />
+    </QueryClientProvider>
+  )
 }
 
 describe('ModelSettings', () => {
@@ -91,11 +104,9 @@ describe('ModelSettings', () => {
     const triggers = await screen.findAllByRole('combobox')
     fireEvent.click(triggers[0])
 
-    // "Nous" shows in both the trigger and the open list; the unconfigured
-    // provider + its setup hint are the unique signal of the full universe.
+    // The unconfigured provider's presence is the full-universe signal.
     expect((await screen.findAllByText('Nous')).length).toBeGreaterThan(0)
     expect(await screen.findByText(/DeepSeek/)).toBeTruthy()
-    expect(await screen.findByText(/set up/)).toBeTruthy()
   })
 
   it('activates an unconfigured api_key provider inline by saving its key', async () => {
@@ -173,6 +184,71 @@ describe('ModelSettings', () => {
         scope: 'auxiliary',
         task: 'vision'
       })
+    )
+  })
+
+  it('configures reasoning strength for an auxiliary model', async () => {
+    getAuxiliaryModels.mockResolvedValueOnce({
+      main: { provider: 'nous', model: 'hermes-4' },
+      tasks: [
+        {
+          task: 'vision',
+          provider: 'openai-codex',
+          model: 'gpt-5.6-sol',
+          base_url: '',
+          reasoning_effort: 'medium'
+        }
+      ]
+    })
+
+    await renderModelSettings()
+    await screen.findByText('Vision')
+    fireEvent.click(screen.getAllByRole('button', { name: 'Change' })[0])
+
+    fireEvent.click(screen.getByRole('combobox', { name: 'Vision Reasoning' }))
+    fireEvent.click(await screen.findByRole('option', { name: 'High' }))
+    fireEvent.click(screen.getAllByRole('button', { name: 'Apply' }).at(-1)!)
+
+    await waitFor(() =>
+      expect(setModelAssignment).toHaveBeenCalledWith(
+        expect.objectContaining({
+          scope: 'auxiliary',
+          task: 'vision',
+          provider: 'openai-codex',
+          model: 'gpt-5.6-sol',
+          reasoning_effort: 'high'
+        })
+      )
+    )
+  })
+
+  it('migrates the displayed auxiliary reasoning value on apply', async () => {
+    getAuxiliaryModels.mockResolvedValueOnce({
+      main: { provider: 'nous', model: 'hermes-4' },
+      tasks: [
+        {
+          task: 'vision',
+          provider: 'openai-codex',
+          model: 'gpt-5.6-sol',
+          base_url: '',
+          reasoning_effort: 'high'
+        }
+      ]
+    })
+
+    await renderModelSettings()
+    await screen.findByText('Vision')
+    fireEvent.click(screen.getAllByRole('button', { name: 'Change' })[0])
+    fireEvent.click(screen.getAllByRole('button', { name: 'Apply' }).at(-1)!)
+
+    await waitFor(() =>
+      expect(setModelAssignment).toHaveBeenCalledWith(
+        expect.objectContaining({
+          scope: 'auxiliary',
+          task: 'vision',
+          reasoning_effort: 'high'
+        })
+      )
     )
   })
 

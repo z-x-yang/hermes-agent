@@ -656,6 +656,7 @@ export const en: Translations = {
       applying: 'Applying...',
       defaultsLabel: 'Defaults',
       reasoning: 'Reasoning',
+      reasoningDefault: 'Provider default',
       reasoningOff: 'Off',
       defaultsFailed: 'Failed to save model defaults',
       auxiliaryTitle: 'Auxiliary models',

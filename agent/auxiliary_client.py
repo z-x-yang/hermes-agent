@@ -104,10 +104,12 @@ from agent.credential_pool import load_pool
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from agent.process_bootstrap import build_keepalive_http_client
 from hermes_cli.config import get_hermes_home
-from hermes_constants import OPENROUTER_BASE_URL
+from hermes_constants import OPENROUTER_BASE_URL, parse_reasoning_effort
 from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
+
+_AUX_REASONING_CONFIG_KEY = "_hermes_aux_reasoning_config"
 
 
 # ── resolve_provider_client fall-through dedup ───────────────────────────
@@ -1239,6 +1241,21 @@ class _AnthropicCompletionsAdapter:
             max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
         temperature = kwargs.get("temperature")
 
+        reasoning_config = None
+        raw_effort = kwargs.get("reasoning_effort")
+        if raw_effort is not None:
+            reasoning_config = parse_reasoning_effort(raw_effort)
+        extra_body = kwargs.get("extra_body")
+        if reasoning_config is None and isinstance(extra_body, dict):
+            raw_reasoning = extra_body.get("reasoning")
+            if isinstance(raw_reasoning, dict):
+                reasoning_config = dict(raw_reasoning)
+            raw_thinking = extra_body.get("thinking")
+            if reasoning_config is None and isinstance(raw_thinking, dict):
+                thinking_type = str(raw_thinking.get("type") or "").strip().lower()
+                if thinking_type in {"enabled", "disabled"}:
+                    reasoning_config = {"enabled": thinking_type == "enabled"}
+
         normalized_tool_choice = None
         if isinstance(tool_choice, str):
             normalized_tool_choice = tool_choice
@@ -1254,7 +1271,7 @@ class _AnthropicCompletionsAdapter:
             messages=messages,
             tools=tools,
             max_tokens=max_tokens,
-            reasoning_config=None,
+            reasoning_config=reasoning_config,
             tool_choice=normalized_tool_choice,
             is_oauth=self._is_oauth,
         )
@@ -3478,8 +3495,11 @@ def _retry_same_provider_sync(
 
     retry_api_key_hint = _client_api_key_hint(retry_client)
     retry_base = str(getattr(retry_client, "base_url", "") or "")
+    request_provider = _provider_for_call_kwargs(
+        resolved_provider, retry_client, retry_base or resolved_base_url or ""
+    )
     retry_kwargs = _build_call_kwargs(
-        resolved_provider,
+        request_provider,
         retry_model or final_model,
         messages,
         temperature=temperature,
@@ -3489,7 +3509,7 @@ def _retry_same_provider_sync(
         extra_body=effective_extra_body,
         base_url=retry_base or resolved_base_url,
     )
-    if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
+    if _is_anthropic_compat_endpoint(request_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     try:
         return _validate_llm_response(
@@ -3540,8 +3560,11 @@ async def _retry_same_provider_async(
 
     retry_api_key_hint = _client_api_key_hint(retry_client)
     retry_base = str(getattr(retry_client, "base_url", "") or "")
+    request_provider = _provider_for_call_kwargs(
+        resolved_provider, retry_client, retry_base or resolved_base_url or ""
+    )
     retry_kwargs = _build_call_kwargs(
-        resolved_provider,
+        request_provider,
         retry_model or final_model,
         messages,
         temperature=temperature,
@@ -3551,7 +3574,7 @@ async def _retry_same_provider_async(
         extra_body=effective_extra_body,
         base_url=retry_base or resolved_base_url,
     )
-    if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
+    if _is_anthropic_compat_endpoint(request_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     try:
         return _validate_llm_response(
@@ -5944,6 +5967,38 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
     return {}
 
 
+def _get_task_reasoning_config(task: str) -> Dict[str, Any] | None:
+    """Read the provider-neutral per-task reasoning setting."""
+    task_config = _get_auxiliary_task_config(task)
+    raw = task_config.get("reasoning_effort")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    parsed = parse_reasoning_effort(raw)
+    if parsed is None:
+        raise ValueError(
+            f"Invalid auxiliary.{task}.reasoning_effort: {raw!r}. "
+            "Use none, minimal, low, medium, high, xhigh, or max."
+        )
+    return parsed
+
+
+def _apply_task_reasoning_config(
+    task: str,
+    task_extra_body: Dict[str, Any],
+    explicit_extra_body: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Attach canonical reasoning for provider translation without leaking it."""
+    merged = dict(task_extra_body)
+    merged.update(explicit_extra_body or {})
+    if isinstance(explicit_extra_body, dict) and "reasoning" in explicit_extra_body:
+        return merged
+    reasoning = _get_task_reasoning_config(task)
+    if reasoning is not None:
+        merged.pop("reasoning", None)
+        merged[_AUX_REASONING_CONFIG_KEY] = reasoning
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Anthropic-compatible endpoint detection + image block conversion
 # ---------------------------------------------------------------------------
@@ -6049,6 +6104,21 @@ def _convert_openai_images_to_anthropic(messages: list) -> list:
     return converted
 
 
+def _provider_for_call_kwargs(provider: str, client: Any, base_url: str) -> str:
+    """Resolve ``auto`` to the provider that owns the selected client."""
+    normalized = _normalize_aux_provider(provider)
+    if normalized != "auto":
+        return normalized
+    if isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)):
+        return "openai-codex"
+    try:
+        from agent.model_metadata import _infer_provider_from_url
+
+        inferred = _infer_provider_from_url(base_url)
+    except Exception:
+        inferred = None
+    return _normalize_aux_provider(inferred) if inferred else normalized
+
 
 def _build_call_kwargs(
     provider: str,
@@ -6142,10 +6212,46 @@ def _build_call_kwargs(
             _deduped.append(_t)
         kwargs["tools"] = _deduped
 
-    # Provider-specific extra_body
-    merged_extra = dict(extra_body or {})
+    # Provider-specific extra_body and canonical reasoning translation.
+    merged_extra: Dict[str, Any] = dict(extra_body or {})
+    reasoning_config = merged_extra.pop(_AUX_REASONING_CONFIG_KEY, None)
+    if isinstance(reasoning_config, dict):
+        from providers import get_provider_profile
+        from providers.base import ProviderProfile
+
+        profile = get_provider_profile(_normalize_aux_provider(provider))
+        if profile is None:
+            translated_extra = {"reasoning": dict(reasoning_config)}
+            top_level = {}
+        else:
+            profile_body = profile.build_extra_body(
+                reasoning_config=dict(reasoning_config),
+                model=model,
+                base_url=base_url,
+            )
+            profile_extra, top_level = profile.build_api_kwargs_extras(
+                reasoning_config=dict(reasoning_config),
+                supports_reasoning=True,
+                model=model,
+                base_url=base_url,
+            )
+            uses_generic_reasoning = (
+                type(profile).build_extra_body is ProviderProfile.build_extra_body
+                and type(profile).build_api_kwargs_extras
+                is ProviderProfile.build_api_kwargs_extras
+            )
+            translated_extra = dict(profile_body)
+            translated_extra.update(profile_extra)
+            if uses_generic_reasoning:
+                translated_extra["reasoning"] = dict(reasoning_config)
+        translated_extra.update(merged_extra)
+        merged_extra = translated_extra
+        kwargs.update(top_level)
     if provider == "nous":
-        merged_extra.setdefault("tags", []).extend(_nous_portal_tags())
+        tags = merged_extra.setdefault("tags", [])
+        for tag in _nous_portal_tags():
+            if tag not in tags:
+                tags.append(tag)
     if merged_extra:
         kwargs["extra_body"] = merged_extra
 
@@ -6328,8 +6434,11 @@ def call_llm(
         task, provider, model, base_url, api_key)
     if api_mode:
         resolved_api_mode = api_mode
-    effective_extra_body = _get_task_extra_body(task)
-    effective_extra_body.update(extra_body or {})
+    effective_extra_body = _apply_task_reasoning_config(
+        task,
+        _get_task_extra_body(task),
+        extra_body,
+    )
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -6416,15 +6525,18 @@ def call_llm(
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
+    request_provider = _provider_for_call_kwargs(
+        resolved_provider, client, _base_info or resolved_base_url or ""
+    )
     kwargs = _build_call_kwargs(
-        resolved_provider, final_model, messages,
+        request_provider, final_model or "", messages,
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         base_url=_base_info or resolved_base_url)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")
-    if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
+    if _is_anthropic_compat_endpoint(request_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     # Streaming path: return the raw SDK Stream iterator directly. This is used by
@@ -7007,8 +7119,11 @@ async def async_call_llm(
     """
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
-    effective_extra_body = _get_task_extra_body(task)
-    effective_extra_body.update(extra_body or {})
+    effective_extra_body = _apply_task_reasoning_config(
+        task,
+        _get_task_extra_body(task),
+        extra_body,
+    )
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -7083,14 +7198,17 @@ async def async_call_llm(
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     _client_base = str(getattr(client, "base_url", "") or "")
+    request_provider = _provider_for_call_kwargs(
+        resolved_provider, client, _client_base or resolved_base_url or ""
+    )
     kwargs = _build_call_kwargs(
-        resolved_provider, final_model, messages,
+        request_provider, final_model or "", messages,
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         base_url=_client_base or resolved_base_url)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
-    if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
+    if _is_anthropic_compat_endpoint(request_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     try:

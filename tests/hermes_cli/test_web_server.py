@@ -1620,6 +1620,101 @@ class TestWebServerEndpoints:
         assert data["provider"] == "openrouter"
         assert data["model"] == "anthropic/claude-sonnet-4.6"
 
+    def test_auxiliary_models_expose_legacy_reasoning_effort(self):
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        slot = cfg["auxiliary"]["compression"]
+        slot["extra_body"] = {
+            "provider": {"sort": "throughput"},
+            "reasoning": {"enabled": True, "effort": "xhigh"},
+        }
+        save_config(cfg)
+
+        resp = self.client.get("/api/model/auxiliary")
+        assert resp.status_code == 200
+        compression = next(row for row in resp.json()["tasks"] if row["task"] == "compression")
+        assert compression["reasoning_effort"] == "xhigh"
+
+    def test_model_set_persists_canonical_auxiliary_reasoning(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.model_cost_guard.expensive_model_warning",
+            lambda *_args, **_kwargs: None,
+        )
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        cfg["auxiliary"]["compression"]["extra_body"] = {
+            "provider": {"sort": "throughput"},
+            "reasoning": {"enabled": True, "effort": "low"},
+        }
+        save_config(cfg)
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "task": "compression",
+                "reasoning_effort": "high",
+            },
+        )
+        assert resp.status_code == 200
+
+        slot = load_config()["auxiliary"]["compression"]
+        assert slot["reasoning_effort"] == "high"
+        assert slot["extra_body"]["provider"] == {"sort": "throughput"}
+        assert "reasoning" not in slot["extra_body"]
+
+    def test_model_set_clears_auxiliary_reasoning_to_provider_default(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.model_cost_guard.expensive_model_warning",
+            lambda *_args, **_kwargs: None,
+        )
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        slot = cfg["auxiliary"]["compression"]
+        slot["reasoning_effort"] = "xhigh"
+        slot["extra_body"] = {
+            "provider": {"sort": "throughput"},
+            "reasoning": {"enabled": True, "effort": "low"},
+        }
+        save_config(cfg)
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "task": "compression",
+                "reasoning_effort": "default",
+            },
+        )
+        assert resp.status_code == 200
+
+        slot = load_config()["auxiliary"]["compression"]
+        assert "reasoning_effort" not in slot
+        assert slot["extra_body"] == {"provider": {"sort": "throughput"}}
+
+    def test_model_set_rejects_invalid_auxiliary_reasoning(self):
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "task": "compression",
+                "reasoning_effort": "ultra-mega",
+                "confirm_expensive_model": True,
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "reasoning_effort" in resp.json()["detail"]
+
     def test_ops_import_passes_force_flag(self, tmp_path, monkeypatch):
         """force=True must append --force so the spawned non-interactive
         `hermes import` doesn't auto-abort at the overwrite prompt."""

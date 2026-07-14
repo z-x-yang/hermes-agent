@@ -182,7 +182,13 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   const setConfig = setHermesConfigCache
   const [applying, setApplying] = useState(false)
   const [editingAuxTask, setEditingAuxTask] = useState<null | string>(null)
-  const [auxDraft, setAuxDraft] = useState<{ model: string; provider: string }>({ model: '', provider: '' })
+
+  const [auxDraft, setAuxDraft] = useState<{
+    model: string
+    provider: string
+    reasoningEffort: string
+  }>({ model: '', provider: '', reasoningEffort: 'default' })
+
   // Aux slots reported stale by the backend immediately after a main-model
   // switch (provider differs from the new main). Cleared on next switch/reset.
   const [switchStaleAux, setSwitchStaleAux] = useState<StaleAuxAssignment[]>([])
@@ -278,6 +284,13 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     () => providers.find(provider => provider.slug === auxDraft.provider)?.models ?? [],
     [auxDraft.provider, providers]
   )
+
+  const auxDraftCapabilities = useMemo(
+    () => providers.find(provider => provider.slug === auxDraft.provider)?.capabilities?.[auxDraft.model],
+    [auxDraft.model, auxDraft.provider, providers]
+  )
+
+  const auxDraftReasoningSupported = auxDraftCapabilities?.reasoning ?? true
 
   const modelsForProvider = useCallback(
     (provider: string) => providers.find(row => row.slug === provider)?.models ?? [],
@@ -535,7 +548,15 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
       setError('')
 
       try {
-        await setModelAssignment({ model: auxDraft.model, provider: auxDraft.provider, scope: 'auxiliary', task })
+        const reasoningEffort = auxDraftReasoningSupported ? auxDraft.reasoningEffort : 'default'
+
+        await setModelAssignment({
+          model: auxDraft.model,
+          provider: auxDraft.provider,
+          scope: 'auxiliary',
+          task,
+          reasoning_effort: reasoningEffort
+        })
         setEditingAuxTask(null)
         await refresh()
       } catch (err) {
@@ -544,7 +565,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
         setApplying(false)
       }
     },
-    [auxDraft, refresh]
+    [auxDraft, auxDraftReasoningSupported, refresh]
   )
 
   const beginAuxiliaryEdit = useCallback(
@@ -555,7 +576,12 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
         current?.provider && current.provider !== 'auto' ? current.provider : (mainModel?.provider ?? '')
 
       const initialModel = current?.model || mainModel?.model || ''
-      setAuxDraft({ provider: initialProvider, model: initialModel })
+      const initialReasoningEffort = String(current?.reasoning_effort || 'default').toLowerCase()
+      setAuxDraft({
+        provider: initialProvider,
+        model: initialModel,
+        reasoningEffort: initialReasoningEffort
+      })
       setEditingAuxTask(task)
     },
     [auxiliary, mainModel]
@@ -745,6 +771,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
             const current = auxiliary?.tasks.find(entry => entry.task === meta.key)
             const isAuto = !current || !current.provider || current.provider === 'auto'
             const isEditing = editingAuxTask === meta.key
+            const currentReasoning = String(current?.reasoning_effort || 'default').toLowerCase()
 
             return (
               <ListRow
@@ -803,6 +830,30 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                           ))}
                         </SelectContent>
                       </Select>
+                      {auxDraftReasoningSupported && (
+                        <Select
+                          onValueChange={value => setAuxDraft(prev => ({ ...prev, reasoningEffort: value }))}
+                          value={auxDraft.reasoningEffort}
+                        >
+                          <SelectTrigger
+                            aria-label={`${copy.label} ${m.reasoning}`}
+                            className={cn('min-w-36', CONTROL_TEXT)}
+                          >
+                            <SelectValue placeholder={m.reasoning} />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {withActive(['default', ...REASONING_EFFORT_VALUES], auxDraft.reasoningEffort).map(value => (
+                              <SelectItem key={value} value={value}>
+                                {value === 'default'
+                                  ? m.reasoningDefault
+                                  : value === 'none'
+                                    ? m.reasoningOff
+                                    : (t.shell.modelOptions[value as keyof typeof t.shell.modelOptions] ?? value)}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      )}
                       <Button
                         disabled={!auxDraft.provider || !auxDraft.model || applying}
                         onClick={() => void applyAuxiliaryDraft(meta.key)}
@@ -819,6 +870,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                 description={
                   <span className="font-mono text-[0.68rem]">
                     {isAuto ? m.autoUseMain : `${current.provider} · ${current.model || m.providerDefault}`}
+                    {currentReasoning === 'default' ? '' : ` · ${m.reasoning.toLowerCase()} ${currentReasoning}`}
                   </span>
                 }
                 key={meta.key}

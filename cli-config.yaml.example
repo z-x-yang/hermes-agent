@@ -496,10 +496,14 @@ prompt_caching:
 # Other providers pick a sensible default automatically.
 #
 # auxiliary:
+#   # Every LLM slot accepts provider-neutral reasoning_effort:
+#   # none|minimal|low|medium|high|xhigh|max. Omit it to use the provider
+#   # default; Evelyn translates the value to each provider's wire format.
 #   # Image analysis: vision_analyze tool + browser screenshots
 #   vision:
 #     provider: "auto"
 #     model: ""              # e.g. "google/gemini-2.5-flash", "openai/gpt-4o"
+#     reasoning_effort: "medium"
 #     timeout: 30            # LLM API call timeout (seconds)
 #     download_timeout: 30   # Image HTTP download timeout (seconds)
 #                            # Increase for slow connections or self-hosted image servers

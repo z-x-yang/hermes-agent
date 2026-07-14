@@ -299,7 +299,7 @@ def decompose_task(
 
     try:
         from agent.auxiliary_client import (  # type: ignore
-            get_auxiliary_extra_body,
+            call_llm,
             get_text_auxiliary_client,
         )
     except Exception as exc:
@@ -324,8 +324,8 @@ def decompose_task(
     )
 
     try:
-        resp = client.chat.completions.create(
-            model=model,
+        resp = call_llm(
+            task="kanban_decomposer",
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
@@ -333,7 +333,6 @@ def decompose_task(
             temperature=0.3,
             max_tokens=4000,
             timeout=timeout or 180,
-            extra_body=get_auxiliary_extra_body() or None,
         )
     except Exception as exc:
         logger.info(

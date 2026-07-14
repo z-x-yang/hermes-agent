@@ -940,6 +940,7 @@ class ModelAssignment(BaseModel):
     # ``hermes model`` custom flow collects. Honored only on the main slot for
     # custom/local providers.
     api_key: str = ""
+    reasoning_effort: Optional[str] = None
     confirm_expensive_model: bool = False
     profile: Optional[str] = None
 
@@ -4196,6 +4197,41 @@ _AUX_TASK_SLOTS: Tuple[str, ...] = (
 )
 
 
+def _auxiliary_reasoning_effort_for_api(slot_cfg: object) -> str:
+    """Return one normalized Desktop value from canonical or legacy config."""
+    from hermes_constants import parse_auxiliary_reasoning_config
+
+    parsed = parse_auxiliary_reasoning_config(slot_cfg)
+    if not parsed:
+        return "default"
+    if parsed.get("enabled") is False:
+        return "none"
+    effort = str(parsed.get("effort") or "").strip().lower()
+    return effort or "medium"
+
+
+def _set_auxiliary_reasoning_effort(slot_cfg: dict, raw_effort: str) -> None:
+    """Persist the provider-neutral setting and remove conflicting legacy state."""
+    from hermes_constants import parse_reasoning_effort
+
+    normalized = str(raw_effort or "").strip().lower()
+    if normalized in {"", "default", "auto", "inherit"}:
+        slot_cfg.pop("reasoning_effort", None)
+    else:
+        parsed = parse_reasoning_effort(normalized)
+        if parsed is None:
+            raise ValueError(
+                "reasoning_effort must be default, none, minimal, low, medium, high, xhigh, or max"
+            )
+        slot_cfg["reasoning_effort"] = (
+            "none" if parsed.get("enabled") is False else str(parsed["effort"])
+        )
+
+    extra_body = slot_cfg.get("extra_body")
+    if isinstance(extra_body, dict):
+        extra_body.pop("reasoning", None)
+
+
 @app.get("/api/model/options")
 def get_model_options(profile: Optional[str] = None, refresh: bool = False):
     """Return authenticated providers + their curated model lists.
@@ -4345,6 +4381,7 @@ def get_auxiliary_models(profile: Optional[str] = None):
                 "provider": str(slot_cfg.get("provider", "auto") or "auto"),
                 "model": str(slot_cfg.get("model", "") or ""),
                 "base_url": str(slot_cfg.get("base_url", "") or ""),
+                "reasoning_effort": _auxiliary_reasoning_effort_for_api(slot_cfg),
             })
 
         model_cfg = cfg.get("model", {})
@@ -4438,6 +4475,7 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
     task = (body.task or "").strip().lower()
     base_url = (body.base_url or "").strip()
     api_key = (body.api_key or "").strip()
+    reasoning_effort = body.reasoning_effort
 
     if scope not in {"main", "auxiliary"}:
         raise HTTPException(status_code=400, detail="scope must be 'main' or 'auxiliary'")
@@ -4474,19 +4512,27 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
         def _apply_assignment():
             with _profile_scope(body.profile or profile):
                 return _apply_model_assignment_sync(
-                    scope, provider, model, task, base_url, api_key
+                    scope, provider, model, task, base_url, api_key, reasoning_effort
                 )
 
         return await asyncio.to_thread(_apply_assignment)
     except HTTPException:
         raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception:
         _log.exception("POST /api/model/set failed")
         raise HTTPException(status_code=500, detail="Failed to save model assignment")
 
 
 def _apply_model_assignment_sync(
-    scope: str, provider: str, model: str, task: str, base_url: str, api_key: str = ""
+    scope: str,
+    provider: str,
+    model: str,
+    task: str,
+    base_url: str,
+    api_key: str = "",
+    reasoning_effort: Optional[str] = None,
 ):
     """Synchronous body of POST /api/model/set.
 
@@ -4630,6 +4676,8 @@ def _apply_model_assignment_sync(
         new_provider = provider.strip().lower()
         slot_cfg["provider"] = provider
         slot_cfg["model"] = model
+        if reasoning_effort is not None:
+            _set_auxiliary_reasoning_effort(slot_cfg, reasoning_effort)
         if new_provider != prev_provider and new_provider != "custom":
             slot_cfg.pop("base_url", None)
             clear_model_endpoint_credentials(slot_cfg)

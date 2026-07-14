@@ -211,7 +211,7 @@ def describe_profile(
 
     try:
         from agent.auxiliary_client import (  # type: ignore
-            get_auxiliary_extra_body,
+            call_llm,
             get_text_auxiliary_client,
         )
     except Exception as exc:
@@ -237,8 +237,8 @@ def describe_profile(
     )
 
     try:
-        resp = client.chat.completions.create(
-            model=aux_model,
+        resp = call_llm(
+            task="profile_describer",
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
@@ -246,7 +246,6 @@ def describe_profile(
             temperature=0.3,
             max_tokens=400,
             timeout=timeout or 60,
-            extra_body=get_auxiliary_extra_body() or None,
         )
     except Exception as exc:
         logger.info("describe: API call failed for %s (%s)", canon, exc)

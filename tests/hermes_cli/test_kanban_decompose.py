@@ -42,16 +42,10 @@ def _mock_client_returning(content: str):
 
 def _patch_aux_client(content: str, *, model: str = "test-model"):
     client = _mock_client_returning(content)
-    return patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(client, model),
-    )
-
-
-def _patch_extra_body():
-    return patch(
-        "agent.auxiliary_client.get_auxiliary_extra_body",
-        return_value={},
+    return patch.multiple(
+        "agent.auxiliary_client",
+        get_text_auxiliary_client=MagicMock(return_value=(client, model)),
+        call_llm=client.chat.completions.create,
     )
 
 
@@ -91,12 +85,17 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     for p in patches:
         p.start()
     try:
-        with _patch_aux_client(llm_payload), _patch_extra_body():
+        with _patch_aux_client(llm_payload), patch(
+            "agent.auxiliary_client.call_llm",
+            return_value=_fake_aux_response(llm_payload),
+        ) as request:
             outcome = decomp.decompose_task(tid, author="me")
     finally:
         for p in patches:
             p.stop()
 
+    request.assert_called_once()
+    assert request.call_args.kwargs["task"] == "kanban_decomposer"
     assert outcome.ok, outcome.reason
     assert outcome.fanout is True
     assert outcome.child_ids and len(outcome.child_ids) == 2
@@ -127,7 +126,7 @@ def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):
     for p in patches:
         p.start()
     try:
-        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+        with _patch_aux_client(llm_payload), patch(
             "hermes_cli.kanban_decompose._load_config",
             return_value={"kanban": {"default_assignee": "fallback"}},
         ):
@@ -169,7 +168,7 @@ def test_decompose_fanout_false_preserves_existing_assignee(kanban_home):
     for p in patches:
         p.start()
     try:
-        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+        with _patch_aux_client(llm_payload), patch(
             "hermes_cli.kanban_decompose._load_config",
             return_value={"kanban": {"default_assignee": "fallback"}},
         ):
@@ -202,7 +201,7 @@ def test_decompose_fanout_false_uses_valid_llm_assignee(kanban_home):
     for p in patches:
         p.start()
     try:
-        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+        with _patch_aux_client(llm_payload), patch(
             "hermes_cli.kanban_decompose._load_config",
             return_value={"kanban": {"default_assignee": "fallback"}},
         ):
@@ -234,7 +233,7 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     for p in patches:
         p.start()
     try:
-        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+        with _patch_aux_client(llm_payload), patch(
             "hermes_cli.kanban_decompose._load_config",
             return_value={"kanban": {"default_assignee": "fallback"}},
         ):
@@ -269,7 +268,7 @@ def test_decompose_unknown_assignee_falls_back_to_default(kanban_home):
     try:
         with patch.dict(
             "os.environ", {}, clear=False,
-        ), _patch_aux_client(llm_payload), _patch_extra_body(), \
+        ), _patch_aux_client(llm_payload), \
             patch(
                 "hermes_cli.kanban_decompose._load_config",
                 return_value={
@@ -300,7 +299,7 @@ def test_decompose_handles_malformed_llm_json(kanban_home):
     for p in patches:
         p.start()
     try:
-        with _patch_aux_client("not json at all, sorry"), _patch_extra_body():
+        with _patch_aux_client("not json at all, sorry"):
             outcome = decomp.decompose_task(tid, author="me")
     finally:
         for p in patches:

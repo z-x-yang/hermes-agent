@@ -48,14 +48,12 @@ def _mock_client_returning(content: str):
 
 
 def _patch_aux_client(content: str, *, model: str = "test-model"):
-    """Patch get_text_auxiliary_client at its source + at the module that
-    imported it lazily inside specify_task. Both patches are needed
-    because kanban_specify imports the function inside the function body.
-    """
+    """Patch the availability precheck and the unified task request."""
     client = _mock_client_returning(content)
-    return patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(client, model),
+    return patch.multiple(
+        "agent.auxiliary_client",
+        get_text_auxiliary_client=MagicMock(return_value=(client, model)),
+        call_llm=client.chat.completions.create,
     ), client
 
 
@@ -97,9 +95,14 @@ def test_specify_task_happy_path(kanban_home):
         "body": "**Goal**\nA concrete goal.",
     })
     p, _ = _patch_aux_client(content)
-    with p:
+    with p, patch(
+        "agent.auxiliary_client.call_llm",
+        return_value=_fake_aux_response(content),
+    ) as request:
         outcome = spec.specify_task(tid, author="ace")
 
+    request.assert_called_once()
+    assert request.call_args.kwargs["task"] == "triage_specifier"
     assert outcome.ok is True
     assert outcome.task_id == tid
     assert outcome.new_title == "Refined rough"
@@ -180,6 +183,9 @@ def test_specify_task_llm_api_error_keeps_task_in_triage(kanban_home):
     with patch(
         "agent.auxiliary_client.get_text_auxiliary_client",
         return_value=(client, "test-model"),
+    ), patch(
+        "agent.auxiliary_client.call_llm",
+        side_effect=RuntimeError("429 rate limited"),
     ):
         outcome = spec.specify_task(tid)
 

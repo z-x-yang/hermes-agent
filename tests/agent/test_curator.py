@@ -78,7 +78,7 @@ def test_resolve_review_runtime_includes_aux_reasoning_config():
         "auxiliary": {"curator": {
             "provider": "auto",
             "model": "",
-            "extra_body": {"reasoning": {"enabled": True, "effort": "high"}},
+            "reasoning_effort": "high",
         }},
     }
 

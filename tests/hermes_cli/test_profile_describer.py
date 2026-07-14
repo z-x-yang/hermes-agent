@@ -81,9 +81,10 @@ def _fake_aux_response(content: str):
 def _patch_aux_client(content: str):
     client = MagicMock()
     client.chat.completions.create = MagicMock(return_value=_fake_aux_response(content))
-    return patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(client, "test-model"),
+    return patch.multiple(
+        "agent.auxiliary_client",
+        get_text_auxiliary_client=MagicMock(return_value=(client, "test-model")),
+        call_llm=client.chat.completions.create,
     )
 
 
@@ -101,10 +102,13 @@ def test_describer_writes_description_with_auto_true(profile_env, monkeypatch):
 
     payload = jsonlib.dumps({"description": "writes Python codebases"})
     with _patch_aux_client(payload), patch(
-        "agent.auxiliary_client.get_auxiliary_extra_body", return_value={}
-    ):
+        "agent.auxiliary_client.call_llm",
+        return_value=_fake_aux_response(payload),
+    ) as request:
         outcome = describer.describe_profile("myprof")
 
+    request.assert_called_once()
+    assert request.call_args.kwargs["task"] == "profile_describer"
     assert outcome.ok, outcome.reason
     assert outcome.description == "writes Python codebases"
     meta = profiles_mod.read_profile_meta(profile_env)
@@ -136,9 +140,7 @@ def test_describer_overwrite_flag_replaces_user_authored(profile_env, monkeypatc
     monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: profile_env)
 
     payload = jsonlib.dumps({"description": "new auto-gen"})
-    with _patch_aux_client(payload), patch(
-        "agent.auxiliary_client.get_auxiliary_extra_body", return_value={}
-    ):
+    with _patch_aux_client(payload):
         outcome = describer.describe_profile("myprof", overwrite=True)
     assert outcome.ok, outcome.reason
     meta = profiles_mod.read_profile_meta(profile_env)
@@ -152,9 +154,7 @@ def test_describer_handles_malformed_llm_response(profile_env, monkeypatch):
     monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: profile_env)
 
     # Non-JSON: describer falls back to taking the first paragraph as the description.
-    with _patch_aux_client("Plain text description that sneaks in"), patch(
-        "agent.auxiliary_client.get_auxiliary_extra_body", return_value={}
-    ):
+    with _patch_aux_client("Plain text description that sneaks in"):
         outcome = describer.describe_profile("myprof")
     assert outcome.ok
     assert "Plain text description" in (outcome.description or "")

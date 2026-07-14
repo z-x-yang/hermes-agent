@@ -174,6 +174,140 @@ class TestResolveTaskProviderModel:
         assert api_mode is None
 
 
+class TestBuildCallKwargsReasoning:
+    def test_openai_codex_reasoning_uses_generic_extra_body_fallback(self):
+        marker = "_hermes_aux_reasoning_config"
+        kwargs = _build_call_kwargs(
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={marker: {"enabled": True, "effort": "high"}},
+            base_url="https://chatgpt.com/backend-api/codex",
+        )
+
+        assert kwargs["extra_body"]["reasoning"] == {
+            "enabled": True,
+            "effort": "high",
+        }
+        assert marker not in kwargs["extra_body"]
+
+    def test_gemini_reasoning_uses_native_thinking_config(self):
+        marker = "_hermes_aux_reasoning_config"
+        kwargs = _build_call_kwargs(
+            provider="gemini",
+            model="gemini-2.5-flash",
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={marker: {"enabled": True, "effort": "high"}},
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+        )
+
+        assert "thinking_config" in kwargs["extra_body"]
+        assert "reasoning" not in kwargs["extra_body"]
+        assert marker not in kwargs["extra_body"]
+
+    def test_vertex_reasoning_uses_nested_google_thinking_config(self):
+        marker = "_hermes_aux_reasoning_config"
+        kwargs = _build_call_kwargs(
+            provider="vertex",
+            model="gemini-2.5-flash",
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={marker: {"enabled": True, "effort": "high"}},
+            base_url="https://us-central1-aiplatform.googleapis.com/v1/openapi/",
+        )
+
+        assert "thinking_config" in kwargs["extra_body"]["extra_body"]["google"]
+        assert "reasoning" not in kwargs["extra_body"]
+        assert marker not in kwargs["extra_body"]
+
+    def test_openrouter_reasoning_uses_extra_body(self):
+        marker = "_hermes_aux_reasoning_config"
+        kwargs = _build_call_kwargs(
+            provider="openrouter",
+            model="openai/gpt-5.6-sol",
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={marker: {"enabled": True, "effort": "high"}},
+        )
+
+        assert kwargs["extra_body"]["reasoning"] == {"enabled": True, "effort": "high"}
+        assert marker not in kwargs["extra_body"]
+
+    def test_kimi_reasoning_uses_top_level_effort(self):
+        marker = "_hermes_aux_reasoning_config"
+        kwargs = _build_call_kwargs(
+            provider="kimi-coding",
+            model="kimi-k2.6",
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={marker: {"enabled": True, "effort": "high"}},
+        )
+
+        assert kwargs["reasoning_effort"] == "high"
+        assert marker not in kwargs.get("extra_body", {})
+        assert "reasoning" not in kwargs.get("extra_body", {})
+
+    def test_call_llm_applies_canonical_task_reasoning_to_the_wire(self):
+        client = MagicMock()
+        client.base_url = "https://api.kimi.com/coding/v1"
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("kimi-coding", "kimi-k2.6", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(client, "kimi-k2.6"),
+            ),
+            patch("agent.auxiliary_client._get_task_extra_body", return_value={}),
+            patch(
+                "agent.auxiliary_client._get_task_reasoning_config",
+                return_value={"enabled": True, "effort": "high"},
+            ),
+        ):
+            response = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert response.choices[0].message.content == "ok"
+        assert client.chat.completions.create.call_args.kwargs["reasoning_effort"] == "high"
+
+    def test_call_llm_auto_uses_the_actual_kimi_provider_for_reasoning(self):
+        client = MagicMock()
+        client.base_url = "https://api.kimi.com/coding/v1"
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("auto", "kimi-k2.6", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(client, "kimi-k2.6"),
+            ),
+            patch("agent.auxiliary_client._get_task_extra_body", return_value={}),
+            patch(
+                "agent.auxiliary_client._get_task_reasoning_config",
+                return_value={"enabled": True, "effort": "high"},
+            ),
+        ):
+            response = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert response.choices[0].message.content == "ok"
+        assert client.chat.completions.create.call_args.kwargs["reasoning_effort"] == "high"
+        assert "reasoning" not in client.chat.completions.create.call_args.kwargs.get(
+            "extra_body", {}
+        )
+
+
 class TestBuildCallKwargsMaxTokens:
     """_build_call_kwargs should not cap output by default (#34530).
 
@@ -1300,6 +1434,48 @@ class TestVisionClientFallback:
         expected_ceiling = _get_anthropic_max_output("claude-opus-4-8")
         assert expected_ceiling > 2000
         assert captured_kwargs["max_tokens"] == expected_ceiling
+
+    def test_anthropic_auxiliary_client_forwards_reasoning_effort(self):
+        from agent.auxiliary_client import AnthropicAuxiliaryClient
+
+        final_message = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="aux response")],
+            stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=3, output_tokens=4),
+        )
+        real_client = SimpleNamespace(messages=SimpleNamespace(create=MagicMock()))
+        client = AnthropicAuxiliaryClient(
+            real_client,
+            "kimi-k2.6",
+            "sk-kimi-test",
+            "https://api.kimi.com/coding/v1",
+        )
+
+        with (
+            patch(
+                "agent.anthropic_adapter.build_anthropic_kwargs",
+                return_value={
+                    "model": "kimi-k2.6",
+                    "messages": [{"role": "user", "content": "summarize"}],
+                    "max_tokens": 16,
+                },
+            ) as build_kwargs,
+            patch(
+                "agent.anthropic_adapter.create_anthropic_message",
+                return_value=final_message,
+            ),
+        ):
+            response = client.chat.completions.create(
+                messages=[{"role": "user", "content": "summarize"}],
+                max_tokens=16,
+                reasoning_effort="high",
+            )
+
+        assert response.choices[0].message.content == "aux response"
+        assert build_kwargs.call_args.kwargs["reasoning_config"] == {
+            "enabled": True,
+            "effort": "high",
+        }
 
 
 class TestAuxiliaryPoolAwareness:

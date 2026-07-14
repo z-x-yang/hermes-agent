@@ -566,6 +566,7 @@ export interface Translations {
       applying: string
       defaultsLabel: string
       reasoning: string
+      reasoningDefault: string
       reasoningOff: string
       defaultsFailed: string
       auxiliaryTitle: string

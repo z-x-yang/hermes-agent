@@ -848,14 +848,23 @@ def parse_reasoning_effort(effort) -> dict | None:
 
 
 def parse_auxiliary_reasoning_config(task_config: object) -> dict | None:
-    """Extract AIAgent reasoning_config from auxiliary.<task>.extra_body.reasoning.
+    """Extract canonical or legacy auxiliary reasoning into AIAgent shape.
 
-    Normal auxiliary calls send ``extra_body.reasoning`` directly. Forked
-    AIAgent-based auxiliary tasks need the same dial converted to the main
-    agent's ``reasoning_config`` shape before constructing the fork.
+    ``auxiliary.<task>.reasoning_effort`` is the provider-neutral product
+    setting. Legacy ``extra_body.reasoning`` remains readable for existing
+    configurations and direct provider-specific overrides.
     """
     if not isinstance(task_config, dict):
         return None
+
+    raw_canonical = task_config.get("reasoning_effort")
+    if raw_canonical is not None and str(raw_canonical).strip():
+        parsed = parse_reasoning_effort(raw_canonical)
+        if parsed is not None:
+            return parsed
+        effort = str(raw_canonical).strip().lower()
+        return {"enabled": True, "effort": effort}
+
     extra_body = task_config.get("extra_body")
     if not isinstance(extra_body, dict):
         return None

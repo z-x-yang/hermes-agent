@@ -842,6 +842,7 @@ export interface AuxiliaryTaskAssignment {
   base_url: string
   model: string
   provider: string
+  reasoning_effort?: string
   task: string
 }
 
@@ -887,6 +888,7 @@ export interface ModelAssignmentRequest {
   base_url?: string
   model: string
   provider: string
+  reasoning_effort?: string
   scope: 'main' | 'auxiliary'
   task?: string
 }
