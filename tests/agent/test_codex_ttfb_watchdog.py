@@ -351,49 +351,32 @@ def test_ttfb_disabled_via_env_zero(tmp_path, monkeypatch):
     assert "codex_ttfb_kill" not in closes
 
 
-def test_large_codex_request_waits_instead_of_ttfb_reconnect(tmp_path, monkeypatch):
-    """Large Codex inputs can legitimately take longer than the small-request
-    first-byte cutoff before the first SSE frame. Preserve the full input and
-    wait instead of killing/retrying at TTFB."""
+def test_ttfb_timeout_tiers_by_context_size():
+    """The no-byte TTFB cutoff scales with estimated context instead of being
+    disabled outright for large requests. Production round-trip latency for
+    >=100k-token calls is p50~12s / p99~79s (n=10k, 2026-07), and TTFB is
+    strictly smaller, so 180s never kills a live request while recovering a
+    zero-byte hang in 3 minutes instead of the 1200s wall-clock stale
+    timeout."""
+    from agent.chat_completion_helpers import openai_codex_ttfb_timeout
+
+    assert openai_codex_ttfb_timeout(5_000) == 120.0
+    assert openai_codex_ttfb_timeout(100_000) == 120.0
+    assert openai_codex_ttfb_timeout(100_001) == 180.0
+    assert openai_codex_ttfb_timeout(300_000) == 180.0
+
+
+def test_large_codex_request_zero_bytes_is_killed_at_ttfb(tmp_path, monkeypatch):
+    """Regression for the 2026-07-13 stuck-session incident: a large request
+    whose connection is accepted but never receives a single byte must be
+    killed at the TTFB cutoff, not left to wait out the 1200s wall-clock stale
+    timeout. The old HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS gate disabled the
+    watchdog for every production-sized request; an explicit
+    HERMES_CODEX_TTFB_TIMEOUT_SECONDS now applies to all request sizes."""
     from agent import chat_completion_helpers as h
 
     agent = _make_codex_agent(tmp_path, monkeypatch)
     monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1")
-
-    closes: list = []
-    dummy_client = SimpleNamespace()
-    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
-    monkeypatch.setattr(
-        agent, "_abort_request_openai_client", lambda c, reason=None: closes.append(reason)
-    )
-    monkeypatch.setattr(
-        agent, "_close_request_openai_client", lambda c, reason=None: closes.append(reason)
-    )
-
-    sentinel = SimpleNamespace(ok=True)
-
-    def fake_stream(api_kwargs, client=None, on_first_delta=None):
-        # No event marker for 2s: this would trip the 1s TTFB watchdog on a
-        # small request, but should be allowed for a large request.
-        time.sleep(2.0)
-        return sentinel
-
-    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
-
-    large_input = "x" * 44_000  # ~11k estimated tokens, above the 10k gate.
-    resp = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": large_input})
-    assert resp is sentinel
-    assert "codex_ttfb_kill" not in closes
-
-
-def test_large_codex_request_strict_ttfb_env_still_reconnects(tmp_path, monkeypatch):
-    """Operators can force the old early-reconnect behavior for large inputs
-    with HERMES_CODEX_TTFB_STRICT=1."""
-    from agent import chat_completion_helpers as h
-
-    agent = _make_codex_agent(tmp_path, monkeypatch)
-    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1")
-    monkeypatch.setenv("HERMES_CODEX_TTFB_STRICT", "1")
 
     closes: list = []
     dummy_client = SimpleNamespace()
@@ -415,11 +398,48 @@ def test_large_codex_request_strict_ttfb_env_still_reconnects(tmp_path, monkeypa
 
     monkeypatch.setattr(agent, "_run_codex_stream", fake_hang)
 
-    large_input = "x" * 44_000
+    large_input = "x" * 44_000  # ~11k estimated tokens, above the old 10k gate.
+    t0 = time.time()
     try:
         with pytest.raises(TimeoutError) as excinfo:
             h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": large_input})
-        assert "TTFB threshold: 1s" in str(excinfo.value)
+        elapsed = time.time() - t0
+        assert "TTFB" in str(excinfo.value)
         assert "codex_ttfb_kill" in closes
+        assert elapsed < 15, f"TTFB watchdog took {elapsed:.1f}s"
     finally:
         stop["flag"] = True
+
+
+def test_large_codex_request_slow_first_byte_not_killed_by_default(tmp_path, monkeypatch):
+    """With no env override, a large request whose first byte is merely slow
+    (~2s) is far under the tiered default cutoff and must not be killed."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.delenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("HERMES_CODEX_TTFB_MAX_SECONDS", raising=False)
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client", lambda c, reason=None: closes.append(reason)
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client", lambda c, reason=None: closes.append(reason)
+    )
+
+    sentinel = SimpleNamespace(ok=True)
+
+    def fake_slow_first_event(api_kwargs, client=None, on_first_delta=None):
+        time.sleep(2.0)
+        agent._codex_stream_last_event_ts = time.time()
+        return sentinel
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_slow_first_event)
+
+    large_input = "x" * 44_000
+    resp = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": large_input})
+    assert resp is sentinel
+    assert "codex_ttfb_kill" not in closes
