@@ -213,44 +213,33 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("MEMORY-CANARY", prompt)
         self.assertIn("USER-CANARY", prompt)
 
-    def test_cross_provider_or_fallback_strips_personal_always_on(self):
-        for override_provider, override_base_url, fallback_chain in (
-            ("anthropic", "https://api.anthropic.com", []),
-            (None, "https://alternate.example/v1", []),
-            (None, None, [{"provider": "anthropic", "model": "claude-sonnet"}]),
+    def test_general_purpose_inherits_personal_always_on_with_fallback(self):
+        parent = _make_mock_parent()
+        _seed_personal_context(parent)
+        parent._fallback_chain = [
+            {"provider": "anthropic", "model": "claude-sonnet"}
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool.load_soul_md", return_value="SOUL-CANARY"
         ):
-            parent = _make_mock_parent()
-            _seed_personal_context(parent)
-            parent._fallback_chain = fallback_chain
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                description="implement feature",
+                prompt="",
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                profile=get_subagent_profile("general-purpose"),
+            )
 
-            with self.subTest(
-                override_provider=override_provider, fallback_chain=fallback_chain
-            ), patch("run_agent.AIAgent") as MockAgent, patch(
-                "tools.delegate_tool.load_soul_md", return_value="SOUL-CANARY"
-            ):
-                MockAgent.return_value = MagicMock()
-                _build_child_agent(
-                    task_index=0,
-                    description="implement feature",
-                    prompt="",
-                    toolsets=None,
-                    model=None,
-                    max_iterations=10,
-                    parent_agent=parent,
-                    task_count=1,
-                    override_provider=override_provider,
-                    override_base_url=override_base_url,
-                    override_api_key=(
-                        "child-key" if override_provider or override_base_url else None
-                    ),
-                    profile=get_subagent_profile("general-purpose"),
-                )
-
-            prompt = MockAgent.call_args.kwargs["ephemeral_system_prompt"]
-            self.assertNotIn("SOUL-CANARY", prompt)
-            self.assertNotIn("MEMORY-CANARY", prompt)
-            self.assertNotIn("USER-CANARY", prompt)
-
+        prompt = MockAgent.call_args.kwargs["ephemeral_system_prompt"]
+        self.assertIn("SOUL-CANARY", prompt)
+        self.assertIn("MEMORY-CANARY", prompt)
+        self.assertIn("USER-CANARY", prompt)
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):

@@ -1331,39 +1331,6 @@ def _parent_personal_always_on(parent_agent) -> str:
     return context
 
 
-def _personal_context_stays_on_runtime(
-    parent_agent,
-    *,
-    provider: Optional[str],
-    base_url: Optional[str],
-    fallback_chain: Any,
-) -> bool:
-    """Allow personal context only while every provider route stays on the parent runtime."""
-    parent_provider = str(getattr(parent_agent, "provider", None) or "").strip()
-    parent_url = _normalized_runtime_url(
-        _inherit_parent_base_url(parent_agent, getattr(parent_agent, "base_url", None))
-    )
-    if not parent_provider:
-        return False
-    if str(provider or "").strip() != parent_provider:
-        return False
-    if _normalized_runtime_url(base_url) != parent_url:
-        return False
-
-    if fallback_chain and not isinstance(fallback_chain, list):
-        return False
-    entries = fallback_chain or []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            return False
-        if str(entry.get("provider") or "").strip() != parent_provider:
-            return False
-        fallback_url = _normalized_runtime_url(entry.get("base_url"))
-        if fallback_url and fallback_url != parent_url:
-            return False
-    return True
-
-
 def _build_child_agent(
     task_index: int,
     description: str,
@@ -1640,12 +1607,7 @@ def _build_child_agent(
     parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
 
     personal_context = ""
-    if profile.name == "general-purpose" and _personal_context_stays_on_runtime(
-        parent_agent,
-        provider=effective_provider,
-        base_url=effective_base_url,
-        fallback_chain=parent_fallback,
-    ):
+    if profile.name == "general-purpose":
         personal_context = _parent_personal_always_on(parent_agent)
         if personal_context:
             child_prompt = f"{child_prompt}\n\n{personal_context}"
