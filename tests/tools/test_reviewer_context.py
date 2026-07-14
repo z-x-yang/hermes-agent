@@ -20,6 +20,9 @@ def test_reviewer_system_prompt_loads_repo_rules_but_not_personal_context(tmp_pa
     )
     assert "independent code reviewer" in prompt
     assert "ordinary self-contained task prompt" in prompt
+    assert "Fixed review method" in prompt
+    assert "callers, callees" in prompt
+    assert "false-green" in prompt
     assert "PROJECT_CONTEXT_SENTINEL" in prompt
     assert "sealed-review-v1" not in prompt
     assert "report_review_findings" not in prompt

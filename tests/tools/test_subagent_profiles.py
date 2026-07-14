@@ -72,6 +72,21 @@ def test_reviewer_profile_uses_ordinary_prompt_without_special_grammar():
     assert not hasattr(profile, "invocation_guidance")
 
 
+def test_reviewer_profile_preloads_fixed_review_methodology():
+    instructions = get_subagent_profile("Reviewer").system_instructions.lower()
+
+    assert "fixed review method" in instructions
+    assert "intended behavior" in instructions
+    assert "callers, callees" in instructions
+    assert "error and cleanup paths" in instructions
+    assert "false-green" in instructions
+    assert "reuse" in instructions
+    assert "simplification" in instructions
+    assert "performance" in instructions
+    assert "reachable failure scenario" in instructions
+    assert "non-blocking cleanup" in instructions
+
+
 def test_reviewer_exposes_claude_like_review_tools_without_named_private_sources():
     profile = get_subagent_profile("Reviewer")
     assert profile.allowed_tool_names == frozenset(

@@ -1020,7 +1020,7 @@ Profiles and lifecycle:
 
 - `Explore` — read-only evidence search; one-shot.
 - `Plan` — read-only implementation planning; one-shot.
-- `Reviewer` — fresh-context independent code review from an ordinary self-contained prompt; one-shot, no delegation/retention, repository context, and ordinary final-response completion. Its findings are candidates that the controller must verify.
+- `Reviewer` — fresh-context independent code review from an ordinary self-contained prompt; one-shot, no delegation/retention, repository context, and ordinary final-response completion. Its profile system instructions preload a fixed runtime-owned review method for scope/intent, surrounding call and data/error/cleanup paths, runtime/test wiring and false-greens, and defect-relevant reuse/simplification/performance. It does not gain dynamic skill discovery. Its findings are candidates that the controller must verify.
 - `general-purpose` — multi-step execution with the exact surviving parent ceiling; retained only after explicit successful completion and resumable with `delegate_continue` in the same live parent session.
 - All profiles receive a lean runtime Core Contract plus explicit task data rather than complete active-profile SOUL/MEMORY/USER or parent history. GP and Reviewer additionally load real repository/workspace context; Reviewer does not inherit personal memory, session history, parent transcript/tool output, or named private-source tools.
 - Reviewer requires ordinary `read_file`, `search_files`, and `terminal`; readonly web is optional under the current parent authority. Raw terminal means no-write/private-source restrictions are profile instructions plus controller worktree verification, not a mechanical sandbox.
