@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -266,6 +267,64 @@ def openai_codex_ttfb_timeout(est_tokens: int) -> float:
     return 120.0
 
 
+def resolve_codex_ttfb(
+    est_tokens: int,
+    openai_codex_backend: bool,
+    env_raw: Optional[str],
+    cap_raw: Optional[str],
+) -> tuple[bool, float]:
+    """Resolve the no-byte TTFB (enabled, timeout_seconds) for a codex stream.
+
+    No override: the tiered default applies only to the subscription-backed
+    openai-codex backend; relayed Responses providers (gptcodex etc.) sit
+    behind proxies such as Cloudflare whose ~100s read timeout returns an
+    HTTP error long before a larger cutoff could matter, so they keep the
+    flat 120s. An explicit HERMES_CODEX_TTFB_TIMEOUT_SECONDS applies verbatim
+    to every request size (<= 0 disables); HERMES_CODEX_TTFB_MAX_SECONDS
+    caps overrides on the openai-codex backend. Non-finite values (NaN/inf)
+    would make every comparison in the watchdog loop false and silently
+    disarm it, so they are rejected here.
+    """
+
+    def _parse_finite(raw: Optional[str], name: str) -> Optional[float]:
+        if raw is None or not raw.strip():
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = None
+        if value is None or not math.isfinite(value):
+            logger.warning(
+                "Ignoring non-numeric or non-finite %s=%r; using defaults.",
+                name,
+                raw,
+            )
+            return None
+        return value
+
+    env_value = _parse_finite(env_raw, "HERMES_CODEX_TTFB_TIMEOUT_SECONDS")
+    if env_value is None:
+        if openai_codex_backend:
+            return True, openai_codex_ttfb_timeout(est_tokens)
+        return True, 120.0
+    if env_value <= 0:
+        return False, 0.0
+    timeout = env_value
+    if openai_codex_backend:
+        cap_value = _parse_finite(cap_raw, "HERMES_CODEX_TTFB_MAX_SECONDS")
+        cap = cap_value if cap_value is not None else 120.0
+        if cap > 0 and timeout > cap:
+            logger.info(
+                "Capping openai-codex no-byte TTFB timeout from %.0fs to %.0fs "
+                "(context=~%s tokens). Set HERMES_CODEX_TTFB_MAX_SECONDS to tune.",
+                timeout,
+                cap,
+                f"{est_tokens:,}",
+            )
+            timeout = cap
+    return True, timeout
+
+
 def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
     """Return a normalized OpenRouter provider.sort value or None."""
     if not isinstance(raw_sort, str):
@@ -476,25 +535,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # (0 disables the watchdog entirely); HERMES_CODEX_TTFB_MAX_SECONDS caps
     # such overrides on the openai-codex backend so a stale local env value
     # cannot stretch the reconnect window.
-    _ttfb_enabled = _codex_watchdog_enabled
-    _ttfb_env_raw = os.environ.get("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "").strip()
-    if _ttfb_env_raw:
-        _ttfb_timeout = _env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 120.0)
-        if _ttfb_timeout <= 0:
-            _ttfb_enabled = False
-        elif _openai_codex_backend:
-            _ttfb_cap = _env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 120.0)
-            if _ttfb_cap > 0 and _ttfb_timeout > _ttfb_cap:
-                logger.info(
-                    "Capping openai-codex no-byte TTFB timeout from %.0fs to %.0fs "
-                    "(context=~%s tokens). Set HERMES_CODEX_TTFB_MAX_SECONDS to tune.",
-                    _ttfb_timeout,
-                    _ttfb_cap,
-                    f"{_est_tokens_for_codex_watchdog:,}",
-                )
-                _ttfb_timeout = _ttfb_cap
-    else:
-        _ttfb_timeout = openai_codex_ttfb_timeout(_est_tokens_for_codex_watchdog)
+    _ttfb_resolved_enabled, _ttfb_timeout = resolve_codex_ttfb(
+        _est_tokens_for_codex_watchdog,
+        _openai_codex_backend,
+        os.environ.get("HERMES_CODEX_TTFB_TIMEOUT_SECONDS"),
+        os.environ.get("HERMES_CODEX_TTFB_MAX_SECONDS"),
+    )
+    _ttfb_enabled = _codex_watchdog_enabled and _ttfb_resolved_enabled
 
     _codex_idle_enabled = _codex_watchdog_enabled
     _codex_idle_timeout = _env_float(

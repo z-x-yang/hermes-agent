@@ -366,6 +366,43 @@ def test_ttfb_timeout_tiers_by_context_size():
     assert openai_codex_ttfb_timeout(300_000) == 180.0
 
 
+def test_resolve_codex_ttfb_control_flow():
+    """resolve_codex_ttfb is the single decision point interruptible_api_call
+    uses to arm the no-byte watchdog. Pin every branch:
+
+    - tiered defaults apply only to the subscription-backed openai-codex
+      backend; relayed Responses providers (gptcodex etc.) sit behind proxies
+      whose ~100s read timeout answers first, so they keep the flat 120s;
+    - an explicit env override applies verbatim to all request sizes, capped
+      (openai-codex only) by HERMES_CODEX_TTFB_MAX_SECONDS;
+    - <= 0 disables; non-finite values (NaN would make every watchdog-loop
+      comparison false and silently disarm it) fall back to defaults.
+    """
+    from agent.chat_completion_helpers import resolve_codex_ttfb
+
+    # No override: tiers for openai-codex, flat 120s for relays.
+    assert resolve_codex_ttfb(224_000, True, None, None) == (True, 180.0)
+    assert resolve_codex_ttfb(5_000, True, None, None) == (True, 120.0)
+    assert resolve_codex_ttfb(224_000, False, None, None) == (True, 120.0)
+    assert resolve_codex_ttfb(224_000, False, "", None) == (True, 120.0)
+
+    # Explicit override: verbatim for every size, capped on openai-codex only.
+    assert resolve_codex_ttfb(224_000, True, "60", None) == (True, 60.0)
+    assert resolve_codex_ttfb(224_000, True, "600", None) == (True, 120.0)
+    assert resolve_codex_ttfb(224_000, True, "600", "240") == (True, 240.0)
+    assert resolve_codex_ttfb(224_000, False, "600", None) == (True, 600.0)
+
+    # Zero/negative disable the watchdog.
+    assert resolve_codex_ttfb(224_000, True, "0", None) == (False, 0.0)
+    assert resolve_codex_ttfb(224_000, True, "-5", None) == (False, 0.0)
+
+    # Non-finite or garbage values must not silently disarm the watchdog.
+    assert resolve_codex_ttfb(224_000, True, "nan", None) == (True, 180.0)
+    assert resolve_codex_ttfb(224_000, True, "inf", None) == (True, 180.0)
+    assert resolve_codex_ttfb(224_000, True, "abc", None) == (True, 180.0)
+    assert resolve_codex_ttfb(224_000, True, "600", "nan") == (True, 120.0)
+
+
 def test_large_codex_request_zero_bytes_is_killed_at_ttfb(tmp_path, monkeypatch):
     """Regression for the 2026-07-13 stuck-session incident: a large request
     whose connection is accepted but never receives a single byte must be
