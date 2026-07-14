@@ -88,9 +88,9 @@ from agent.skill_utils import (
 logger = logging.getLogger(__name__)
 
 
-# All skills live in ~/.hermes/skills/ (seeded from bundled skills/ on install).
-# This is the single source of truth -- agent edits, hub installs, and bundled
-# skills all coexist here without polluting the git repo.
+# Profile-managed skills live in ~/.hermes/skills/ (seeded from bundled skills/
+# on install). Configured external and project roots are discoverable/readable,
+# but installs and autonomous lifecycle writes remain profile-local.
 HERMES_HOME = get_hermes_home()
 SKILLS_DIR = HERMES_HOME / "skills"
 
@@ -519,12 +519,11 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
     """
     # Try the module-level SKILLS_DIR first (respects monkeypatching in tests),
     # then every configured/project discovery root.
-    dirs_to_check = [SKILLS_DIR]
     try:
         from agent.skill_utils import get_all_skills_dirs
-        dirs_to_check.extend(get_all_skills_dirs()[1:])
+        dirs_to_check = get_all_skills_dirs(SKILLS_DIR)
     except Exception:
-        pass
+        dirs_to_check = [SKILLS_DIR]
     for skills_dir in dirs_to_check:
         try:
             rel_path = skill_path.relative_to(skills_dir)
@@ -640,9 +639,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     disabled = set() if skip_disabled else _get_disabled_skill_names()
 
     # Scan the same ordered roots used by prompt discovery and skill_view.
-    dirs_to_scan = [SKILLS_DIR]
-    dirs_to_scan.extend(get_all_skills_dirs()[1:])
-    dirs_to_scan = list(dict.fromkeys(path for path in dirs_to_scan if path.exists()))
+    dirs_to_scan = [path for path in get_all_skills_dirs(SKILLS_DIR) if path.exists()]
 
     for scan_dir in dirs_to_scan:
         for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
@@ -1149,9 +1146,7 @@ def skill_view(
                 )
 
         # Build the same ordered search roots used by prompt/list discovery.
-        all_dirs = [SKILLS_DIR]
-        all_dirs.extend(get_all_skills_dirs()[1:])
-        all_dirs = list(dict.fromkeys(path for path in all_dirs if path.exists()))
+        all_dirs = [path for path in get_all_skills_dirs(SKILLS_DIR) if path.exists()]
 
         if not all_dirs:
             return json.dumps(
@@ -1245,6 +1240,27 @@ def skill_view(
                     found_md
                 ):
                     _record(None, found_md)
+
+        if len(candidates) > 1:
+            loadable_candidates: List[Tuple[Optional[Path], Path]] = []
+            for candidate_dir, candidate_md in candidates:
+                try:
+                    candidate_content = candidate_md.read_text(encoding="utf-8")
+                    candidate_frontmatter, _ = _parse_frontmatter(candidate_content)
+                except Exception:
+                    continue
+                resolved_name = candidate_frontmatter.get(
+                    "name", candidate_md.parent.name
+                )
+                if unsupported_restrictive_skill_fields(candidate_frontmatter):
+                    continue
+                if not skill_matches_platform(candidate_frontmatter):
+                    continue
+                if _is_skill_disabled(resolved_name):
+                    continue
+                loadable_candidates.append((candidate_dir, candidate_md))
+            if loadable_candidates:
+                candidates = loadable_candidates
 
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]

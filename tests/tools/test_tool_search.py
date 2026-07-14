@@ -86,12 +86,10 @@ class TestConfigParsing:
         from tools.tool_search import ToolSearchConfig
 
         cfg = ToolSearchConfig.from_raw({
-            "threshold_tool_count": 12,
             "threshold_schema_tokens": 8_000,
             "always_visible_tools": ["ledger_*", "mcp_mail_search", "ledger_*", ""],
         })
 
-        assert cfg.threshold_tool_count == 12
         assert cfg.threshold_schema_tokens == 8_000
         assert cfg.always_visible_tools == ("ledger_*", "mcp_mail_search")
 
@@ -99,7 +97,7 @@ class TestConfigParsing:
         from hermes_cli.config import DEFAULT_CONFIG
 
         raw = DEFAULT_CONFIG["tools"]["tool_search"]
-        assert raw["threshold_tool_count"] == 10
+        assert "threshold_tool_count" not in raw
         assert raw["threshold_schema_tokens"] == 10_000
         assert raw["always_visible_tools"] == []
 
@@ -170,7 +168,7 @@ class TestThresholdGate:
         cfg = ToolSearchConfig.from_raw({"enabled": "on"})
         assert should_activate(cfg, deferrable_tokens=100, context_length=200_000)
 
-    def test_auto_activates_at_deferred_tool_count_threshold(self):
+    def test_auto_ignores_legacy_deferred_tool_count_threshold(self):
         from tools.tool_search import ToolSearchConfig, should_activate
 
         cfg = ToolSearchConfig.from_raw({
@@ -180,11 +178,9 @@ class TestThresholdGate:
             "threshold_pct": 100,
         })
 
+        assert not hasattr(cfg, "threshold_tool_count")
         assert not should_activate(
-            cfg, deferrable_tokens=100, context_length=200_000, deferrable_count=9
-        )
-        assert should_activate(
-            cfg, deferrable_tokens=100, context_length=200_000, deferrable_count=10
+            cfg, deferrable_tokens=100, context_length=200_000
         )
 
     def test_auto_activates_at_absolute_schema_token_threshold(self):
@@ -192,7 +188,6 @@ class TestThresholdGate:
 
         cfg = ToolSearchConfig.from_raw({
             "enabled": "auto",
-            "threshold_tool_count": 0,
             "threshold_schema_tokens": 8_000,
             "threshold_pct": 100,
         })
@@ -209,7 +204,6 @@ class TestThresholdGate:
         cfg = ToolSearchConfig.from_raw({
             "enabled": "auto",
             "threshold_pct": 10,
-            "threshold_tool_count": 0,
             "threshold_schema_tokens": 0,
         })
         # 5% of 200K = below 10% threshold
@@ -220,7 +214,6 @@ class TestThresholdGate:
         cfg = ToolSearchConfig.from_raw({
             "enabled": "auto",
             "threshold_pct": 10,
-            "threshold_tool_count": 0,
             "threshold_schema_tokens": 0,
         })
         assert should_activate(cfg, deferrable_tokens=20_000, context_length=200_000)
@@ -231,7 +224,6 @@ class TestThresholdGate:
         from tools.tool_search import ToolSearchConfig, should_activate
         cfg = ToolSearchConfig.from_raw({
             "enabled": "auto",
-            "threshold_tool_count": 0,
             "threshold_schema_tokens": 0,
         })
         assert not should_activate(cfg, deferrable_tokens=10_000, context_length=0)
@@ -242,7 +234,6 @@ class TestThresholdGate:
 
         cfg = ToolSearchConfig.from_raw({
             "enabled": "auto",
-            "threshold_tool_count": 0,
             "threshold_schema_tokens": 0,
             "threshold_pct": 0,
         })
@@ -251,7 +242,6 @@ class TestThresholdGate:
             cfg,
             deferrable_tokens=100_000,
             context_length=200_000,
-            deferrable_count=1_000,
         )
 
     def test_token_estimate_proportional_to_schema_size(self):
@@ -381,8 +371,7 @@ class TestAssembly:
                 context_length=200_000,
                 config=ToolSearchConfig.from_raw({
                     "enabled": "auto",
-                    "threshold_tool_count": 1,
-                    "threshold_schema_tokens": 0,
+                    "threshold_schema_tokens": 1,
                     "threshold_pct": 100,
                     "always_visible_tools": [
                         "hybrid_pin_ledger_*",
@@ -400,7 +389,7 @@ class TestAssembly:
         assert set(pinned) <= visible_names
         assert not (set(deferred) & visible_names)
 
-    def test_auto_assembly_activates_from_deferred_tool_count(self):
+    def test_auto_assembly_does_not_activate_from_legacy_tool_count_alone(self):
         from tools.registry import registry
         from tools.tool_search import assemble_tool_defs, ToolSearchConfig
 
@@ -427,11 +416,9 @@ class TestAssembly:
             for name in names:
                 registry.deregister(name)
 
-        assert result.activated
+        assert not result.activated
         assert result.deferred_count == 10
-        assert {td["function"]["name"] for td in result.tool_defs} == {
-            "tool_search", "tool_describe", "tool_call"
-        }
+        assert {td["function"]["name"] for td in result.tool_defs} == set(names)
 
     def test_parent_tool_surfaces_resolve_once_before_assembly(self, monkeypatch):
         from types import SimpleNamespace
@@ -711,6 +698,98 @@ class TestBridgeDispatch:
                 registry.deregister(name)
 
         assert [td["function"]["name"] for td in bridged] == [deferred]
+
+    def test_agent_local_dynamic_pin_stays_direct_only(self, monkeypatch):
+        import model_tools
+        from agent.tool_executor import _agent_bridge_deferrable_tool_defs
+        from tools import tool_search as tool_search_module
+        from tools.registry import registry
+
+        deferred = "agent_bridge_registry_deferred"
+        local = "honcho_recall"
+        cfg = tool_search_module.ToolSearchConfig.from_raw(
+            {"always_visible_tools": [local]}
+        )
+
+        class MemoryManager:
+            @staticmethod
+            def get_all_tool_schemas():
+                return [_td(local, "agent-local direct tool")["function"]]
+
+        agent = type(
+            "Agent",
+            (),
+            {
+                "enabled_toolsets": None,
+                "disabled_toolsets": None,
+                "_memory_manager": MemoryManager(),
+                "context_compressor": None,
+                "_context_engine_tool_names": set(),
+            },
+        )()
+        try:
+            registry.register(
+                name=deferred,
+                toolset="agent-bridge-test",
+                schema=_td(deferred)["function"],
+                handler=lambda args: args,
+            )
+            monkeypatch.setattr(
+                model_tools,
+                "get_tool_definitions",
+                lambda **_kwargs: [_td(deferred, "registry deferred")],
+            )
+            monkeypatch.setattr(tool_search_module, "load_config", lambda: cfg)
+
+            bridged = _agent_bridge_deferrable_tool_defs(agent)
+        finally:
+            registry.deregister(deferred)
+
+        assert [td["function"]["name"] for td in bridged] == [deferred]
+
+    def test_agent_executor_scope_cache_tracks_pin_config(self, monkeypatch):
+        import model_tools
+        from agent.tool_executor import _tool_search_scoped_names
+        from tools import tool_search as tool_search_module
+        from tools.registry import registry
+
+        name = "agent_scope_pin_refresh"
+        defs = [_td(name, "scope refresh")]
+        current_config = {
+            "value": tool_search_module.ToolSearchConfig.from_raw({})
+        }
+        agent = type(
+            "Agent",
+            (),
+            {
+                "enabled_toolsets": None,
+                "disabled_toolsets": None,
+                "_subagent_tool_policy": None,
+            },
+        )()
+        try:
+            registry.register(
+                name=name,
+                toolset="agent-bridge-test",
+                schema=defs[0]["function"],
+                handler=lambda args: args,
+            )
+            monkeypatch.setattr(
+                model_tools, "get_tool_definitions", lambda **_kwargs: defs
+            )
+            monkeypatch.setattr(
+                tool_search_module,
+                "load_config",
+                lambda: current_config["value"],
+            )
+
+            assert _tool_search_scoped_names(agent) == frozenset({name})
+            current_config["value"] = tool_search_module.ToolSearchConfig.from_raw(
+                {"always_visible_tools": [name]}
+            )
+            assert _tool_search_scoped_names(agent) == frozenset()
+        finally:
+            registry.deregister(name)
 
     def test_tool_search_requires_query(self):
         from tools.tool_search import dispatch_tool_search

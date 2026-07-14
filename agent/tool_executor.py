@@ -256,6 +256,10 @@ def _tool_search_scoped_names(agent) -> frozenset:
 
     enabled = getattr(agent, "enabled_toolsets", None)
     disabled = getattr(agent, "disabled_toolsets", None)
+    try:
+        tool_search_config = _ts.load_config()
+    except Exception:
+        return frozenset()
     policy = getattr(agent, "_subagent_tool_policy", None)
     policy_cache_key = None
     if policy is not None:
@@ -271,6 +275,7 @@ def _tool_search_scoped_names(agent) -> frozenset:
         getattr(_registry, "_generation", 0),
         frozenset(enabled) if enabled is not None else None,
         frozenset(disabled) if disabled is not None else None,
+        tool_search_config.always_visible_tools,
         policy_cache_key,
     )
     cached = getattr(agent, "_tool_search_scope_cache", None)
@@ -286,7 +291,9 @@ def _tool_search_scoped_names(agent) -> frozenset:
         from agent.subagent_tool_policy import filter_tool_definitions_for_policy
 
         scoped_defs = filter_tool_definitions_for_policy(agent, list(scoped_defs))
-        names = _ts.scoped_deferrable_names(scoped_defs)
+        names = _ts.scoped_deferrable_names(
+            scoped_defs, config=tool_search_config
+        )
     except Exception:
         names = frozenset()
     try:
@@ -300,14 +307,13 @@ def _wrap_tool_schema(schema: dict) -> dict:
     return {"type": "function", "function": schema}
 
 
-def _agent_local_bridge_tool_defs(agent) -> list[dict]:
-    """Return agent-local dynamic tools that are not in the global registry.
+def _agent_local_bridge_tool_defs(agent, config=None) -> list[dict]:
+    """Return searchable, unpinned agent-local tools absent from the registry."""
+    from tools import tool_search as _ts
 
-    Memory-provider and context-engine tools are attached to an AIAgent after
-    ``model_tools.get_tool_definitions()`` runs, so the global Tool Search
-    bridge cannot reconstruct them from the registry. Include them explicitly
-    for agent-owned bridge calls.
-    """
+    if config is None:
+        config = _ts.load_config()
+    pinned_patterns = config.always_visible_tools
     defs: list[dict] = []
     seen: set[str] = set()
 
@@ -320,7 +326,11 @@ def _agent_local_bridge_tool_defs(agent) -> list[dict]:
         if schema is None:
             return
         name = schema.get("name")
-        if not name or name in seen:
+        if (
+            not name
+            or name in seen
+            or _ts.matches_tool_pattern(name, pinned_patterns)
+        ):
             return
         defs.append(_wrap_tool_schema(schema))
         seen.add(name)
@@ -337,7 +347,9 @@ def _agent_local_bridge_tool_defs(agent) -> list[dict]:
 
     try:
         compressor = getattr(agent, "context_compressor", None)
-        routed_engine_names = set(getattr(agent, "_context_engine_tool_names", set()) or set())
+        routed_engine_names = set(
+            getattr(agent, "_context_engine_tool_names", set()) or set()
+        )
         if (
             compressor is not None
             and routed_engine_names
@@ -351,10 +363,15 @@ def _agent_local_bridge_tool_defs(agent) -> list[dict]:
                         schema = normalize_tool_schema(raw_schema)
                     except Exception:
                         schema = None
-                    if schema is not None and schema.get("name") in routed_engine_names:
+                    if (
+                        schema is not None
+                        and schema.get("name") in routed_engine_names
+                    ):
                         add_schema(schema)
     except Exception:
-        logger.debug("Failed to collect agent-local context engine tools", exc_info=True)
+        logger.debug(
+            "Failed to collect agent-local context engine tools", exc_info=True
+        )
 
     return defs
 
@@ -382,6 +399,7 @@ def _is_agent_tool_search_bridge_name(function_name: str) -> bool:
 
 def _agent_bridge_deferrable_tool_defs(agent) -> list[dict]:
     """Catalog the tools reachable via the agent-owned Tool Search bridge."""
+    cfg = None
     try:
         import model_tools
         from tools import tool_search as _ts
@@ -402,7 +420,9 @@ def _agent_bridge_deferrable_tool_defs(agent) -> list[dict]:
 
     combined: list[dict] = []
     seen: set[str] = set()
-    for td in list(registry_deferrable) + _agent_local_bridge_tool_defs(agent):
+    for td in list(registry_deferrable) + _agent_local_bridge_tool_defs(
+        agent, config=cfg
+    ):
         name = (td.get("function") or {}).get("name", "")
         if not name or name in seen:
             continue

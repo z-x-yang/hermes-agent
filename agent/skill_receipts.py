@@ -1,4 +1,4 @@
-"""Deterministic receipts for skill content loaded before context compaction."""
+"""Deterministic, bounded receipts for skills loaded around context compaction."""
 
 from __future__ import annotations
 
@@ -6,11 +6,12 @@ import hashlib
 import json
 from typing import Any
 
-RECEIPT_START = "[LOADED SKILL RECEIPT v1]"
+LEGACY_RECEIPT_START = "[LOADED SKILL RECEIPT v1]"
+RECEIPT_START = "[LOADED SKILL RECEIPT v2]"
 RECEIPT_END = "[/LOADED SKILL RECEIPT]"
 RELOAD_INSTRUCTION = (
-    "Reload each listed skill/reference with exact skill_view before relying on it "
-    "after compaction."
+    "Reload only the listed skills/references still needed by the current task "
+    "before relying on them after compaction."
 )
 
 
@@ -59,56 +60,82 @@ def _message_text(content: Any) -> str:
     )
 
 
-def _previous_receipt_entries(
-    messages: list[dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
+def _visible_references(raw: dict[str, Any], version: int) -> list[str]:
+    if version == 1:
+        return sorted({
+            str(item.get("path") or "").strip()
+            for item in raw.get("loaded_files") or []
+            if isinstance(item, dict) and str(item.get("path") or "").strip()
+        })
+    return sorted({
+        str(path).strip()
+        for path in raw.get("references") or []
+        if str(path).strip()
+    })
+
+
+def _receipt_entries_from_text(text: str) -> dict[str, dict[str, Any]]:
     entries: dict[str, dict[str, Any]] = {}
-    for message in messages:
+    for marker, expected_version in (
+        (RECEIPT_START, 2),
+        (LEGACY_RECEIPT_START, 1),
+    ):
+        start = text.find(marker)
+        if start < 0:
+            continue
+        payload_start = start + len(marker)
+        end = text.find(RECEIPT_END, payload_start)
+        if end < 0:
+            continue
+        payload = _json_object(text[payload_start:end].strip())
+        if payload.get("version") != expected_version:
+            continue
+        for raw in payload.get("skills") or []:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip()
+            if name:
+                entries[name] = {
+                    "name": name,
+                    "references": _visible_references(raw, expected_version),
+                }
+        break
+    return entries
+
+
+def _latest_previous_receipt(
+    messages: list[dict[str, Any]],
+) -> tuple[int | None, dict[str, dict[str, Any]]]:
+    """Return the latest trusted compaction boundary and its visible receipt."""
+    latest_index: int | None = None
+    latest_entries: dict[str, dict[str, Any]] = {}
+    for index, message in enumerate(messages):
         if message.get("_compressed_summary") is not True:
             continue
         text = _message_text(message.get("content"))
         if not text.lstrip().startswith("[CONTEXT COMPACTION]"):
             continue
-        search_start = 0
-        while True:
-            start = text.find(RECEIPT_START, search_start)
-            if start < 0:
-                break
-            payload_start = start + len(RECEIPT_START)
-            end = text.find(RECEIPT_END, payload_start)
-            if end < 0:
-                break
-            payload = _json_object(text[payload_start:end].strip())
-            if payload.get("version") == 1:
-                for raw in payload.get("skills") or []:
-                    if not isinstance(raw, dict):
-                        continue
-                    name = str(raw.get("name") or "").strip()
-                    if not name:
-                        continue
-                    files = {
-                        str(item.get("path") or ""): str(item.get("content_sha256") or "")
-                        for item in raw.get("loaded_files") or []
-                        if isinstance(item, dict) and item.get("path")
-                    }
-                    entries[name] = {
-                        "name": name,
-                        "source": str(raw.get("source") or ""),
-                        "content_sha256": raw.get("content_sha256"),
-                        "loaded_files": files,
-                    }
-            search_start = end + len(RECEIPT_END)
-    return entries
+        latest_index = index
+        latest_entries = _receipt_entries_from_text(text)
+    return latest_index, latest_entries
 
 
-def build_loaded_skill_receipt_block(
+def build_loaded_skill_receipt(
     messages: list[dict[str, Any]],
-) -> str | None:
-    """Return a compact reload receipt for successful skill-view tool results."""
-    call_arguments = _skill_call_arguments(messages)
-    skills = _previous_receipt_entries(messages)
+) -> tuple[str | None, dict[str, Any]]:
+    """Build a model-minimal receipt plus a machine-only provenance audit.
 
-    for message in messages:
+    A receipt is a one-compaction lease: only successful skill loads after the
+    latest trusted compaction boundary are renewed into the next receipt. Skills
+    not reloaded during that interval leave the receipt but remain discoverable
+    through the normal skill index.
+    """
+    previous_index, previous = _latest_previous_receipt(messages)
+    current_messages = messages[(previous_index + 1) if previous_index is not None else 0 :]
+    call_arguments = _skill_call_arguments(current_messages)
+    skills: dict[str, dict[str, Any]] = {}
+
+    for message in current_messages:
         if message.get("role") != "tool":
             continue
         call_id = str(message.get("tool_call_id") or "")
@@ -144,29 +171,37 @@ def build_loaded_skill_receipt_block(
         else:
             entry["content_sha256"] = content_hash
 
-    if not skills:
-        return None
-
-    normalized = []
+    normalized_audit = []
+    visible_skills = []
     for name in sorted(skills):
         entry = skills[name]
-        normalized.append(
-            {
-                "name": name,
-                "source": entry["source"],
-                "content_sha256": entry["content_sha256"],
-                "loaded_files": [
-                    {"path": path, "content_sha256": digest}
-                    for path, digest in sorted(entry["loaded_files"].items())
-                ],
-            }
-        )
-    payload = {
-        "version": 1,
-        "reload_required": True,
-        "skills": normalized,
+        loaded_files = [
+            {"path": path, "content_sha256": digest}
+            for path, digest in sorted(entry["loaded_files"].items())
+        ]
+        normalized_audit.append({
+            "name": name,
+            "source": entry["source"],
+            "content_sha256": entry["content_sha256"],
+            "loaded_files": loaded_files,
+        })
+        visible_entry: dict[str, Any] = {"name": name}
+        if loaded_files:
+            visible_entry["references"] = [item["path"] for item in loaded_files]
+        visible_skills.append(visible_entry)
+
+    audit = {
+        "version": 2,
+        "previous_skill_count": len(previous),
+        "active_skill_count": len(skills),
+        "expired_skill_count": len(set(previous) - set(skills)),
+        "skills": normalized_audit,
     }
-    return (
+    if not visible_skills:
+        return None, audit
+
+    payload = {"version": 2, "skills": visible_skills}
+    block = (
         RECEIPT_START
         + "\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -175,3 +210,4 @@ def build_loaded_skill_receipt_block(
         + "\n"
         + RELOAD_INSTRUCTION
     )
+    return block, audit

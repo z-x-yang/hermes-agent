@@ -576,9 +576,18 @@ def get_project_skills_dirs(cwd: Path | str | None = None) -> List[Path]:
     return result
 
 
-def get_all_skills_dirs() -> List[Path]:
-    """Return profile, configured-external, then project skill directories."""
-    dirs = [get_skills_dir()]
+def get_all_skills_dirs(profile_dir: Path | str | None = None) -> List[Path]:
+    """Return profile, configured-external, then project skill directories.
+
+    ``profile_dir`` lets caller-owned surfaces preserve an injected/test profile
+    root without reimplementing the external/project composition rule.
+    """
+    profile_root = (
+        get_skills_dir()
+        if profile_dir is None
+        else Path(profile_dir).expanduser()
+    )
+    dirs = [profile_root]
     dirs.extend(get_external_skills_dirs())
     dirs.extend(get_project_skills_dirs())
     return list(dict.fromkeys(dirs))

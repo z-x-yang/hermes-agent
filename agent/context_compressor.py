@@ -35,7 +35,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
-from agent.skill_receipts import build_loaded_skill_receipt_block
+from agent.skill_receipts import build_loaded_skill_receipt
 from utils import base_url_host_matches
 
 logger = logging.getLogger(__name__)
@@ -1495,6 +1495,7 @@ class ContextCompressor(ContextEngine):
         self._summary_failure_cooldown_error = None
         self._summary_skipped_for_cooldown = False
         self._last_summary_source_audit = {}
+        self._last_skill_receipt_audit = {}
         self._last_emergency_hygiene_audit = {}
         self._last_retained_tail_metadata_bounded_count = 0
         self._compression_audit_session_id = None
@@ -2014,6 +2015,7 @@ class ContextCompressor(ContextEngine):
         # lifts is noise.
         self._summary_skipped_for_cooldown: bool = False
         self._last_summary_source_audit: dict[str, Any] = {}
+        self._last_skill_receipt_audit: dict[str, Any] = {}
         self._last_summary_fail_closed_reason: str | None = None
         self._compression_audit_session_id: Optional[str] = None
         self._last_compression_audit_record: dict[str, Any] | None = None
@@ -3453,6 +3455,7 @@ class ContextCompressor(ContextEngine):
                 len(_user_ground_truth) if _user_ground_truth is not None else None
             ),
             "summary_source": dict(self._last_summary_source_audit or {}),
+            "skill_receipt": dict(self._last_skill_receipt_audit or {}),
             "summary_call": dict(self._last_summary_call_audit or {}),
             "cheap_tool_result_cleanup": cheap_cleanup_audit,
             "emergency_hygiene": dict(getattr(self, "_last_emergency_hygiene_audit", {}) or {}),
@@ -5908,6 +5911,7 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
         self._last_summary_fallback_used = False
         self._last_summary_error = None
         self._last_summary_source_audit = {}
+        self._last_skill_receipt_audit = {}
         self._last_summary_call_audit = {}
         self._last_summary_sample = None
         self._last_summary_fail_closed_reason = None
@@ -6455,7 +6459,9 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
         # generated checkpoint from live tail content. The marker is deliberately
         # neutral: active continuation is carried by Current Work / Pending Tasks
         # and later user messages still take precedence on conflict.
-        skill_receipt = build_loaded_skill_receipt_block(original_messages)
+        skill_receipt, self._last_skill_receipt_audit = build_loaded_skill_receipt(
+            original_messages
+        )
         if skill_receipt:
             summary = f"{summary.rstrip()}\n\n{skill_receipt}"
         summary_was_merged_into_tail = _merge_summary_into_tail

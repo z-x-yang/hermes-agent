@@ -9,8 +9,8 @@ for the full rationale):
 
 * Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
   Always-load means always-load. No exceptions.
-* The auto gate runs every assembly and activates when any positive deferred
-  count, absolute schema-token, or context-percentage threshold is met.
+* The auto gate runs every assembly and activates when either a positive
+  absolute schema-token or context-percentage threshold is met.
   Configured exact/glob pins remain directly visible and are excluded from
   every bridge surface.
 * The catalog is stateless across turns and tools-array assemblies. It is
@@ -68,7 +68,6 @@ class ToolSearchConfig:
 
     enabled: str  # "auto" | "on" | "off"
     threshold_pct: float  # 0..100 — only used when enabled == "auto"
-    threshold_tool_count: int  # positive auto trigger; 0 disables count trigger
     threshold_schema_tokens: int  # positive auto trigger; 0 disables absolute trigger
     always_visible_tools: Tuple[str, ...]  # exact names or shell-style globs
     search_default_limit: int
@@ -85,26 +84,11 @@ class ToolSearchConfig:
         break the agent.
         """
         if raw is True:
-            return cls(
-                enabled="auto", threshold_pct=10.0,
-                threshold_tool_count=10, threshold_schema_tokens=10_000,
-                always_visible_tools=(), search_default_limit=5,
-                max_search_limit=20,
-            )
-        if raw is False:
-            return cls(
-                enabled="off", threshold_pct=10.0,
-                threshold_tool_count=10, threshold_schema_tokens=10_000,
-                always_visible_tools=(), search_default_limit=5,
-                max_search_limit=20,
-            )
-        if not isinstance(raw, dict):
-            return cls(
-                enabled="auto", threshold_pct=10.0,
-                threshold_tool_count=10, threshold_schema_tokens=10_000,
-                always_visible_tools=(), search_default_limit=5,
-                max_search_limit=20,
-            )
+            raw = {}
+        elif raw is False:
+            raw = {"enabled": "off"}
+        elif not isinstance(raw, dict):
+            raw = {}
 
         enabled_raw = str(raw.get("enabled", "auto")).strip().lower()
         if enabled_raw in ("true", "1", "yes"):
@@ -118,9 +102,6 @@ class ToolSearchConfig:
 
         threshold_pct = _safe_float(raw.get("threshold_pct"), 10.0)
         threshold_pct = max(0.0, min(100.0, threshold_pct))
-        threshold_tool_count = max(
-            0, min(10_000, _safe_int(raw.get("threshold_tool_count"), 10))
-        )
         threshold_schema_tokens = max(
             0, min(10_000_000, _safe_int(raw.get("threshold_schema_tokens"), 10_000))
         )
@@ -133,7 +114,6 @@ class ToolSearchConfig:
         return cls(
             enabled=enabled,
             threshold_pct=threshold_pct,
-            threshold_tool_count=threshold_tool_count,
             threshold_schema_tokens=threshold_schema_tokens,
             always_visible_tools=always_visible_tools,
             search_default_limit=search_default_limit,
@@ -223,7 +203,7 @@ def is_deferrable_tool_name(name: str) -> bool:
         return False
 
 
-def _matches_tool_pattern(name: str, patterns: Iterable[str]) -> bool:
+def matches_tool_pattern(name: str, patterns: Iterable[str]) -> bool:
     return any(fnmatchcase(name, pattern) for pattern in patterns)
 
 
@@ -246,7 +226,7 @@ def classify_tools(
             # Should never happen — bridge tools are added after classification —
             # but be defensive.
             continue
-        if is_deferrable_tool_name(name) and not _matches_tool_pattern(
+        if is_deferrable_tool_name(name) and not matches_tool_pattern(
             name, always_visible_tools
         ):
             deferrable.append(td)
@@ -281,14 +261,13 @@ def should_activate(
     config: ToolSearchConfig,
     deferrable_tokens: int,
     context_length: Optional[int],
-    deferrable_count: int = 0,
 ) -> bool:
     """Decide whether tool search should activate for the current assembly.
 
     ``"off"`` skips unconditionally. ``"on"`` activates unconditionally
     (as long as there is at least one deferrable tool — there's no point
-    swapping a no-op). ``"auto"`` activates when any configured positive
-    count, absolute-schema-token, or context-percentage threshold is met.
+    swapping a no-op). ``"auto"`` activates when either configured positive
+    absolute-schema-token or context-percentage threshold is met.
     """
     if config.enabled == "off":
         return False
@@ -297,11 +276,6 @@ def should_activate(
     if config.enabled == "on":
         return True
     # auto
-    if (
-        config.threshold_tool_count > 0
-        and deferrable_count >= config.threshold_tool_count
-    ):
-        return True
     if (
         config.threshold_schema_tokens > 0
         and deferrable_tokens >= config.threshold_schema_tokens
@@ -622,12 +596,7 @@ def assemble_tool_defs(
         return AssemblyResult(tool_defs=incoming, activated=False)
 
     deferrable_tokens = estimate_tokens_from_schemas(deferrable)
-    if not should_activate(
-        config,
-        deferrable_tokens,
-        context_length,
-        deferrable_count=len(deferrable),
-    ):
+    if not should_activate(config, deferrable_tokens, context_length):
         return AssemblyResult(
             tool_defs=incoming,
             activated=False,
@@ -714,7 +683,7 @@ def dispatch_tool_describe(args: Dict[str, Any],
         return json.dumps({"error": "name is required"}, ensure_ascii=False)
     if (
         not is_deferrable_tool_name(name)
-        or _matches_tool_pattern(name, config.always_visible_tools)
+        or matches_tool_pattern(name, config.always_visible_tools)
     ):
         return json.dumps({
             "error": (

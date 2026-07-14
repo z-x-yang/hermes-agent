@@ -2700,15 +2700,14 @@ DEFAULT_CONFIG = {
     # openclaw-tool-search-report PDF in this PR for the rationale.
     "tools": {
         "tool_search": {
-            # "auto" (default) — activate when any positive count, absolute
-            #   schema-token, or context-percentage threshold is met.
+            # "auto" (default) — activate when either a positive absolute
+            # schema-token or context-percentage threshold is met.
             # "on"  — always activate when there is at least one deferrable
             #   tool. Use when you have many MCP servers and want maximum
             #   token reduction unconditionally.
             # "off" — disable entirely. Tools-array assembly is a pass-through.
             "enabled": "auto",
             # Auto-mode OR gates. Set an individual threshold to 0 to disable it.
-            "threshold_tool_count": 10,
             "threshold_schema_tokens": 10_000,
             "threshold_pct": 10,
             # Exact tool names or shell-style globs that remain directly visible

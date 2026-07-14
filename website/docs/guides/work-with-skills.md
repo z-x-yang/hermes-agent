@@ -80,9 +80,11 @@ Skills use a token-efficient loading pattern. The agent doesn't load everything 
 2. **`skill_view(name)`** — full SKILL.md content for one skill. Loaded when the agent decides it needs that skill.
 3. **`skill_view(name, file_path)`** — a specific reference file within the skill. Only loaded if needed.
 
-After a context compression, a deterministic receipt preserves which exact
-skill and reference versions were loaded and requires the agent to reload them
-before relying on their instructions again.
+After context compression, a bounded receipt preserves only the skill names and
+reference paths loaded since the previous compression boundary. Reload an entry
+only when the current task still needs it; entries not reloaded before the next
+compression expire from the receipt. Provenance hashes remain in runtime audit
+metadata rather than consuming model context.
 
 This means full skill bodies don't cost tokens until they're actually used.
 

@@ -84,7 +84,6 @@ This decision is re-evaluated every time the tools array is built, so:
 tools:
   tool_search:
     enabled: auto
-    threshold_tool_count: 10
     threshold_schema_tokens: 10000
     threshold_pct: 10
     always_visible_tools:
@@ -96,8 +95,7 @@ tools:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `auto` | `auto` activates when any positive threshold is met; `on` always activates if there's at least one deferrable tool; `off` disables entirely. |
-| `threshold_tool_count` | `10` | Deferred-tool count at which `auto` activates. Set `0` to disable this gate. |
+| `enabled` | `auto` | `auto` activates when either positive threshold is met; `on` always activates if there's at least one deferrable tool; `off` disables entirely. |
 | `threshold_schema_tokens` | `10000` | Estimated deferred-schema token count at which `auto` activates. Set `0` to disable this gate. |
 | `threshold_pct` | `10` | Percentage of active context at which `auto` activates. Set `0` only if another gate should decide. |
 | `always_visible_tools` | `[]` | Exact names or shell-style globs kept directly visible and excluded from search/describe/call bridge scope. |

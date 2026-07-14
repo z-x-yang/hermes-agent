@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
+_skill_commands_roots: tuple[str, ...] = ()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -148,11 +149,10 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         identifier_path = Path(raw_identifier).expanduser()
         if identifier_path.is_absolute():
             normalized = None
-            trusted_roots = [SKILLS_DIR]
             try:
-                trusted_roots.extend(get_all_skills_dirs()[1:])
+                trusted_roots = get_all_skills_dirs(SKILLS_DIR)
             except Exception:
-                pass
+                trusted_roots = [SKILLS_DIR]
 
             # Prefer the lexical path under a trusted skill root before
             # resolving symlinks.  Slash-command discovery can legitimately
@@ -345,29 +345,33 @@ def _build_skill_message(
     return "\n".join(parts)
 
 
+def _current_skill_command_roots() -> list[Path]:
+    from tools.skills_tool import SKILLS_DIR
+    from agent.skill_utils import get_all_skills_dirs
+
+    return [path for path in get_all_skills_dirs(SKILLS_DIR) if path.exists()]
+
+
 def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     """Scan every visible skill root and return unambiguous slash commands."""
-    global _skill_commands, _skill_commands_platform
+    global _skill_commands, _skill_commands_platform, _skill_commands_roots
     _skill_commands_platform = _resolve_skill_commands_platform()
     _skill_commands = {}
     try:
         from tools.skills_tool import (
-            SKILLS_DIR,
             _get_disabled_skill_names,
             _parse_frontmatter,
             skill_matches_environment,
             skill_matches_platform,
         )
         from agent.skill_utils import (
-            get_all_skills_dirs,
             iter_skill_index_files,
             unsupported_restrictive_skill_fields,
         )
 
         disabled = _get_disabled_skill_names()
-        dirs_to_scan = [SKILLS_DIR]
-        dirs_to_scan.extend(get_all_skills_dirs()[1:])
-        dirs_to_scan = list(dict.fromkeys(path for path in dirs_to_scan if path.exists()))
+        dirs_to_scan = _current_skill_command_roots()
+        _skill_commands_roots = tuple(str(path.resolve()) for path in dirs_to_scan)
         candidates: Dict[str, list[Dict[str, Any]]] = {}
 
         for scan_dir in dirs_to_scan:
@@ -418,15 +422,18 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
 
 
 def get_skill_commands() -> Dict[str, Dict[str, Any]]:
-    """Return the current skill commands mapping (scan first if empty).
-
-    Rescans when the active platform scope changes (e.g. a gateway
-    process serving Telegram and Discord concurrently) so each platform
-    sees its own ``skills.platform_disabled`` view (#14536).
-    """
+    """Return commands for the current platform and runtime project roots."""
+    current_platform = _resolve_skill_commands_platform()
+    try:
+        current_roots = tuple(
+            str(path.resolve()) for path in _current_skill_command_roots()
+        )
+    except Exception:
+        current_roots = ()
     if (
         not _skill_commands
-        or _skill_commands_platform != _resolve_skill_commands_platform()
+        or _skill_commands_platform != current_platform
+        or _skill_commands_roots != current_roots
     ):
         scan_skill_commands()
     return _skill_commands
@@ -435,9 +442,8 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
 def reload_skills() -> Dict[str, Any]:
     """Re-scan the skills directory and return a diff of what changed.
 
-    Rescans ``~/.hermes/skills/`` and any ``skills.external_dirs`` so the
-    slash-command map (``agent.skill_commands._skill_commands``) reflects
-    skills added or removed on disk.
+    Rescans profile, configured external, and current project skill roots so the
+    slash-command map reflects skills added or removed on disk.
 
     This does NOT invalidate the skills system-prompt cache. Skills are
     called by name via ``/skill-name``, ``skills_list``, or ``skill_view``

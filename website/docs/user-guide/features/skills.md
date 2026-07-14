@@ -124,11 +124,13 @@ The startup prompt contains the compact name/description index, not every
 skill name discoverable and demotes lower-priority descriptions to names-only.
 It does not hide the overflow behind a second catalog search.
 
-After context compression, the summary carries a deterministic receipt for
-every loaded skill and reference (qualified name, source, and content hash).
-The receipt tells the agent to reload those exact files before relying on them;
-it is carried across repeated compressions and cannot be created by ordinary
-user, tool, or web content.
+After context compression, the summary carries a bounded receipt containing only
+skills and reference paths loaded since the previous compression boundary. The
+agent reloads an entry only if the current task still needs it; entries that are
+not reloaded expire at the next compression instead of accumulating forever.
+Source paths and content hashes stay in the runtime compression audit rather than
+the model-visible prompt. Ordinary user, tool, or web content cannot create a
+trusted receipt.
 
 ## SKILL.md Format
 

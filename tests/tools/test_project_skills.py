@@ -183,3 +183,96 @@ paths: [src/**]
         "paths",
     ]
     assert "/restricted-owner" not in commands
+
+
+def test_ineligible_duplicate_does_not_block_visible_skill_view(tmp_path, monkeypatch):
+    from agent import prompt_builder, skill_commands, skill_utils
+    from tools import skills_tool
+
+    home = tmp_path / "home"
+    local_skill = home / "skills" / "local-owner"
+    local_skill.mkdir(parents=True)
+    (home / "config.yaml").write_text("skills: {}\n", encoding="utf-8")
+    (local_skill / "SKILL.md").write_text(
+        "---\nname: shared-owner\ndescription: Valid profile owner.\n---\n",
+        encoding="utf-8",
+    )
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    restricted = repo / ".claude" / "skills" / "restricted-owner"
+    restricted.mkdir(parents=True)
+    (restricted / "SKILL.md").write_text(
+        """---
+name: shared-owner
+description: Must remain hidden.
+allowed-tools: [terminal]
+---
+""",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("EVELYN_HOME", str(home))
+    monkeypatch.setenv("TERMINAL_CWD", str(repo))
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", home / "skills")
+    monkeypatch.setattr(skills_tool, "HERMES_HOME", home)
+    skill_utils._external_dirs_cache_clear()
+    prompt_builder.clear_skills_system_prompt_cache()
+
+    prompt = prompt_builder.build_skills_system_prompt()
+    listed = json.loads(skills_tool.skills_list_readonly())
+    viewed = json.loads(skills_tool.skill_view_readonly("shared-owner"))
+    commands = skill_commands.scan_skill_commands()
+
+    assert "shared-owner: Valid profile owner." in prompt
+    assert [skill["name"] for skill in listed["skills"]] == ["shared-owner"]
+    assert viewed["success"] is True
+    assert viewed["skill_dir"] == str(local_skill)
+    assert commands["/shared-owner"]["skill_dir"] == str(local_skill)
+
+
+def test_slash_command_cache_is_scoped_to_runtime_project_cwd(tmp_path, monkeypatch):
+    from agent import runtime_cwd, skill_commands, skill_utils
+    from tools import skills_tool
+
+    home = tmp_path / "home"
+    (home / "skills").mkdir(parents=True)
+    (home / "config.yaml").write_text("skills: {}\n", encoding="utf-8")
+
+    repos = []
+    for suffix in ("a", "b"):
+        repo = tmp_path / f"repo-{suffix}"
+        (repo / ".git").mkdir(parents=True)
+        skill = repo / ".evelyn" / "skills" / f"project-{suffix}"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            f"---\nname: project-{suffix}\ndescription: Project {suffix}.\n---\n",
+            encoding="utf-8",
+        )
+        repos.append(repo)
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("EVELYN_HOME", str(home))
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", home / "skills")
+    monkeypatch.setattr(skills_tool, "HERMES_HOME", home)
+    skill_utils._external_dirs_cache_clear()
+    monkeypatch.setattr(skill_commands, "_skill_commands", {})
+    monkeypatch.setattr(skill_commands, "_skill_commands_platform", None)
+
+    token_a = runtime_cwd.set_session_cwd(str(repos[0]))
+    try:
+        commands_a = skill_commands.get_skill_commands()
+    finally:
+        token_a.var.reset(token_a)
+
+    token_b = runtime_cwd.set_session_cwd(str(repos[1]))
+    try:
+        commands_b = skill_commands.get_skill_commands()
+    finally:
+        token_b.var.reset(token_b)
+
+    assert "/project-a" in commands_a
+    assert "/project-b" not in commands_a
+    assert "/project-b" in commands_b
+    assert "/project-a" not in commands_b
