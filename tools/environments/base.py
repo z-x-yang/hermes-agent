@@ -384,16 +384,15 @@ class BaseEnvironment(ABC):
         # source() either sees the old complete snapshot or the new complete
         # one — never a partial/truncated file.
         #
-        # The temp name MUST be unique per concurrent writer.  ``$$`` is the
-        # bash PID, but in ``&``-launched subshells (how concurrent terminal
-        # calls run) ``$$`` stays the *parent* shell's PID — so two concurrent
-        # writers would pick the SAME temp name, clobber each other's temp
-        # mid-write, and mv would then publish a torn file (the corruption is
-        # only narrowed, not closed).  ``$BASHPID`` is the actual subshell PID
-        # and is genuinely unique per writer, which closes the race.  The
-        # static path is shlex-quoted (Windows/Git-Bash drive letters, spaces)
-        # with ``$BASHPID`` left outside the quotes so it still expands.
-        _snap_tmp = shlex.quote(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # Generate the unique writer token in Python, not the shell. macOS
+        # ships Bash 3.2 where BASHPID is undefined; expanding it after a user
+        # command enables ``set -u`` aborts the control footer, and without
+        # nounset all writers collapse onto the same ``.tmp.`` path. A UUID
+        # literal stays unique across concurrent writers on every backend and
+        # remains safe when the full path needs shell quoting.
+        _snap_tmp = shlex.quote(
+            self._snapshot_path + f".tmp.{uuid.uuid4().hex}"
+        )
         bootstrap = (
             f"export -p > {_snap_tmp}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
@@ -472,13 +471,12 @@ class BaseEnvironment(ABC):
         _quoted_snap = shlex.quote(self._snapshot_path)
         _quoted_cwd_file = shlex.quote(self._cwd_file)
         # Use atomic file replacement for env snapshot updates (issue #38249).
-        # Assemble into a per-writer-unique temp file, then mv to atomically
-        # replace the snapshot so concurrent source() calls never read a
-        # truncated/half-written file.  ``$BASHPID`` (not ``$$``) is the actual
-        # subshell PID — unique per concurrent ``&``-launched writer — so two
-        # writers never share a temp name and clobber each other before the mv.
-        # Static path shlex-quoted (Windows/spaces); ``$BASHPID`` left to expand.
-        _snap_tmp = shlex.quote(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # A Python-generated UUID gives every concurrent wrapper a unique
+        # literal temp path without relying on shell-version-specific variables
+        # or inheriting user shell options such as ``set -u``.
+        _snap_tmp = shlex.quote(
+            self._snapshot_path + f".tmp.{uuid.uuid4().hex}"
+        )
 
         parts = []
 

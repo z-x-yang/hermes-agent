@@ -114,34 +114,34 @@ class TestAtomicSnapshotWrite:
         assert f"export -p > {snap} " not in wrapped
         assert f"export -p > '{snap}'" not in wrapped
 
-    def test_temp_path_uses_bashpid_not_dollardollar(self):
-        """The temp name MUST use ``$BASHPID`` (the real subshell PID), not
-        ``$$``.  In ``&``-launched concurrent subshells ``$$`` stays the parent
-        shell's PID, so two writers would pick the same temp name, clobber each
-        other mid-write, and mv would publish a torn file — the corruption is
-        only narrowed, not closed.  This is the bug shared by every prior PR in
-        the #38249 cluster."""
+    def test_temp_path_is_unique_without_shell_pid_variables(self):
+        """Each wrapper gets a unique literal temp path from Python.
+
+        macOS ships Bash 3.2, where ``BASHPID`` is undefined.  An unguarded
+        ``$BASHPID`` breaks the control footer after a command enables
+        ``set -u`` and also collapses concurrent writers onto one ``.tmp.``
+        path when nounset is off.
+        """
         env = _TestableEnv()
         env._snapshot_ready = True
-        wrapped = env._wrap_command("echo hi", "/tmp")
-        assert "$BASHPID" in wrapped
-        # The bare $$ temp form must be gone.
-        assert ".tmp.$$" not in wrapped
+        first = env._wrap_command("echo first", "/tmp")
+        second = env._wrap_command("echo second", "/tmp")
+        assert "$BASHPID" not in first
+        assert ".tmp.$$" not in first
+        first_temp = first.split("export -p > ", 1)[1].split(" && mv -f", 1)[0]
+        second_temp = second.split("export -p > ", 1)[1].split(" && mv -f", 1)[0]
+        assert ".tmp." in first_temp
+        assert first_temp != second_temp
 
-    def test_temp_path_static_part_is_quoted_bashpid_outside(self):
-        """The static path portion must be shlex-quoted (Windows/Git-Bash
-        ``C:/Users/...`` or spaces) while ``$BASHPID`` stays OUTSIDE the quotes
-        so it still expands."""
+    def test_unique_temp_path_with_spaces_is_fully_quoted(self):
         env = _TestableEnv()
         env._snapshot_ready = True
         env._snapshot_path = "/tmp/has space/hermes-snap-x.sh"
         wrapped = env._wrap_command("echo hi", "/tmp")
-        # The static path (with its space) is shlex-quoted as a single word, with
-        # $BASHPID appended OUTSIDE the quotes so it still expands at runtime.
-        assert "'/tmp/has space/hermes-snap-x.sh.tmp.'$BASHPID" in wrapped
-        # The space must never appear bare/unquoted in the temp token (that would
-        # word-split into two args and break the redirect/mv).
-        assert " space/hermes-snap-x.sh.tmp.$BASHPID" not in wrapped
+        temp_token = wrapped.split("export -p > ", 1)[1].split(" && mv -f", 1)[0]
+        assert temp_token.startswith("'/tmp/has space/hermes-snap-x.sh.tmp.")
+        assert temp_token.endswith("'")
+        assert "$" not in temp_token
 
     def test_wrap_command_mv_chained_on_export_success(self):
         """A failed/partial ``export -p`` must NOT mv a torn temp over a good
@@ -153,10 +153,10 @@ class TestAtomicSnapshotWrite:
         assert "export -p > " in wrapped and "&& mv -f " in wrapped
         assert "rm -f " in wrapped  # temp cleanup on failure
 
-    def test_init_session_bootstrap_also_atomic_and_bashpid(self):
+    def test_init_session_bootstrap_also_uses_unique_literal_temp(self):
         """The init_session bootstrap (first snapshot write) is the same shared
-        file a concurrent command could source — it must be atomic and use
-        ``$BASHPID`` too."""
+        file a concurrent command could source, so it needs its own unique
+        literal temp path too."""
         env = _TestableEnv()
         captured = {}
 
@@ -171,8 +171,26 @@ class TestAtomicSnapshotWrite:
             pass
         boot = captured.get("cmd", "")
         assert ".tmp." in boot and "mv -f " in boot, boot
-        assert "$BASHPID" in boot
+        assert "$BASHPID" not in boot
         assert ".tmp.$$" not in boot
+
+    def test_wrapper_preserves_success_after_command_enables_nounset(self, tmp_path):
+        env = _TestableEnv(cwd=str(tmp_path))
+        env._snapshot_ready = True
+        env._snapshot_path = str(tmp_path / "snapshot.sh")
+        (tmp_path / "snapshot.sh").write_text("export HERMES_TEST=1\n")
+
+        wrapped = env._wrap_command(
+            "set -euo pipefail\nprintf 'STRICT_SUCCESS\\n'", str(tmp_path)
+        )
+
+        import subprocess
+        result = subprocess.run(
+            ["/bin/bash", "-c", wrapped], capture_output=True, text=True
+        )
+        assert result.returncode == 0, result.stderr
+        assert "STRICT_SUCCESS" in result.stdout
+        assert env._cwd_marker in result.stdout
 
 
 class TestAtomicSnapshotConcurrencyBehavioral:
@@ -199,15 +217,18 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         import shlex
         snap = str(tmp_path / "hermes-snap-x.sh")
         _q = shlex.quote
-        _snap_tmp = _q(snap + ".tmp.") + "$BASHPID"
-        # One writer iteration = the exact atomic sequence _wrap_command emits.
-        writer = (
-            "for i in $(seq 1 80); do "
-            "export BIG_$i=$(head -c 600 /dev/zero | tr '\\0' x); "
-            f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_q(snap)}; }} "
-            f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true; "
-            "done"
-        )
+        # Each real _wrap_command call receives a distinct Python-generated
+        # literal path. Model four concurrent calls with four unique paths.
+        writers = []
+        for writer_id in range(4):
+            temp = _q(f"{snap}.tmp.writer-{writer_id}")
+            writers.append(
+                "for i in $(seq 1 80); do "
+                "export BIG_$i=$(head -c 600 /dev/zero | tr '\\0' x); "
+                f"{{ export -p > {temp} && mv -f {temp} {_q(snap)}; }} "
+                f"2>/dev/null || rm -f {temp} 2>/dev/null || true; "
+                "done"
+            )
         # Reader: repeatedly source the snapshot and check PATH never absorbs
         # an `export `/`declare -x` fragment (the corruption signature).
         reader = (
@@ -219,7 +240,7 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         )
         self._run(f"export -p > {_q(snap)}")  # seed a valid snapshot
         # 4 concurrent writers + 4 readers, repeated.
-        w = " & ".join([writer] * 4)
+        w = " & ".join(writers)
         r = " & ".join([reader] * 4)
         procs = [self._run(f"{w} & {r} & wait") for _ in range(3)]
         corrupt = any("CORRUPT" in p.stdout for p in procs)
