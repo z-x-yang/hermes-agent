@@ -415,6 +415,25 @@ class TestBuildSkillsSystemPrompt:
         assert "Debug Python scripts" in result
         assert "available_skills" in result
 
+    def test_skill_routing_uses_description_match_not_partial_relevance(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "If the task at hand is one a listed skill covers" in result
+        assert "check whether any available skill matches the user's task" in result
+        assert "## Skills (mandatory)" not in result
+        assert "even partially relevant" not in result
+        assert "always better to have context you don't need" not in result
+        assert "Only proceed without loading a skill" not in result
+
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"
