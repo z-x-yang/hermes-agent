@@ -262,6 +262,7 @@ def test_visual_identity_uses_discord_derived_evelyn_assets():
 
     for relative_path in (
         "apps/desktop/assets/icon.png",
+        "apps/desktop/public/apple-touch-icon.png",
         "apps/bootstrap-installer/src-tauri/icons/32x32.png",
         "apps/bootstrap-installer/src-tauri/icons/128x128.png",
         "apps/bootstrap-installer/src-tauri/icons/128x128@2x.png",
