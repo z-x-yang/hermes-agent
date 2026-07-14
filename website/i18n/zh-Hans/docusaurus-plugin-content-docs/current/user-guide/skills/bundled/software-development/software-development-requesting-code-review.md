@@ -16,7 +16,7 @@ description: "对高风险软件改动，在本地验证后运行一次全新上
 |---|---|
 | 来源 | 内置（默认安装） |
 | 路径 | `skills/software-development/requesting-code-review` |
-| 版本 | `3.0.0` |
+| 版本 | `3.3.0` |
 | 作者 | Hermes Agent |
 | 许可证 | MIT |
 | 平台 | linux, macos, windows |
@@ -50,6 +50,20 @@ Parent/controller 拥有这次改动的 review call 和全局 review budget。
 - Implementer subagent 只做 tests 和 self-review；不得自行调用 Codex、Claude Code 或 reviewer agent。
 - 如果一个 child 的 assigned task 本身就是 independent review，它自己完成 review，不再套娃启动另一个 reviewer。
 - 修复 finding 不会自动产生新的 review pass。
+
+## Review 收敛与上下文接续
+
+最小 review topology 是一个 controller 加一个 one-shot Reviewer。Controller 拥有 scope、continuity、finding 裁决、修复、确定性验证和下一次 review 的授权；Reviewer 只检查一个冻结 package 并返回候选 blocker，不编辑、不保留会话，也不管理 review loop。Implementer 可以是独立 agent，但不是额外的 review-governance 角色。
+
+改动稳定且本地验证通过后，默认只运行 **一次 substantive independent-review pass**。Reviewer、Codex、Claude Code、不同 session/commit，以及 `final`、`targeted`、`closure` 等标签，都按同一个 change 全局累计。Pass 1 后，controller 必须先裁决全部 findings，把所有 confirmed blockers 合并成一次有界 repair；不得每修一个 finding 就重新 review。
+
+只有 confirmed pass-1 blockers 实质重塑 architecture、trust/privacy boundary、concurrency/locking、durable state/crash recovery、不可逆 side-effect ordering 或 public compatibility contract，且 controller-owned tests 与 source inspection 不能安全关闭风险时，才允许 Pass 2。Pass 2 是 targeted closure review，不是再次 broad sweep。
+
+使用 artifact continuity，而不是 conversation continuation：启动一个新的 fresh Reviewer，给它最小 closure packet，包含冻结 contract/threat model、Pass-1 finding IDs 与 controller dispositions、精确 repair diff/range、新鲜确定性证据和窄范围 closure question。禁止 `delegate_continue` 旧 Reviewer、重放完整 transcript，或发起失忆式 whole-change re-review。
+
+Pass 2 后不再自动 review。Controller 修复并验证任何 confirmed residual finding；若 Critical/Important uncertainty 仍存在，任务标为 blocked 并升级。额外 substantive pass 必须由用户或 domain owner 显式例外授权，并说明它会增加什么真正新的证据或专业能力。新 commit、agent、session、route 或 review 标签都不会重置收敛状态。
+
+Setup/auth/transport failure 或没有 usable verdict 的运行不计 substantive pass，但同一 pass 最多只允许一次修正后的 retry，随后把 route 报为 blocked。
 
 ## 工作流
 
@@ -133,7 +147,7 @@ delegate_task(
 
 ### 6. 用确定性证据关闭任务
 
-修复后重新运行 covering tests 与完整高信号验证。第二次 reviewer 不是默认动作；只有明确授权，或 blocker fix 实质改变风险且 controller verification 无法安全关闭时才允许。
+修复后重新运行 covering tests 与完整高信号验证。任何 Pass 2 都必须先满足 **Review 收敛与上下文接续** 的条件；普通修复、补测试、调整 assertion、重命名和格式修改由 controller evidence 关闭，不再启动 Reviewer。
 
 提交前，用相对 `HEAD` 的精确 tracked task delta 同时核对 staged 与 unstaged 改动，然后只 stage intended task files：
 
@@ -163,6 +177,7 @@ git diff HEAD --check -- <changed-files...>
 - 默认在每个 implementation task 后启动 reviewer；
 - 未复现就相信 reviewer finding；
 - 进入 reviewer-fixer-reviewer 无限循环；
+- 把每个修复、新 commit 或 `final`/`closure` 标签当成新的 review budget；
 - 让 procedural read-only reviewer 修改 checkout；
 - 把无关文件混入 review range 或 staging。
 

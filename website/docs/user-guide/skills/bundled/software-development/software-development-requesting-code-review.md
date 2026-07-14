@@ -16,7 +16,7 @@ Use when a completed software change has material shared/core, auth/security, co
 |---|---|
 | Source | Bundled (installed by default) |
 | Path | `skills/software-development/requesting-code-review` |
-| Version | `3.0.0` |
+| Version | `3.3.0` |
 | Author | Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos, windows |
@@ -48,6 +48,20 @@ Usually skip tiny docs/config edits, throwaway spikes, generated/mechanical chan
 The parent/controller owns the review call and the global review budget for the change. Implementation subagents perform self-review and tests only; they do not launch Codex, Claude Code, or reviewer agents on their own work.
 
 A child whose assigned task is the independent review performs that review itself and does not spawn another reviewer. A repair does not automatically authorize another review pass.
+
+## Review Convergence and Continuity
+
+The minimum review topology is one controller and one one-shot reviewer. The controller owns scope, continuity, finding adjudication, repairs, deterministic verification, and the decision to request another pass. The reviewer inspects one frozen package and returns candidate blockers; it does not edit, retain a conversation, or manage the review loop. An implementer may be separate, but it is not another review-governance role.
+
+Default to **one substantive independent-review pass** after the change is stable and locally verified. Count passes globally per change across Reviewer, Codex, Claude Code, sessions, commits, and labels such as `final`, `targeted`, or `closure`. After pass 1, adjudicate every finding and group all confirmed blockers into one bounded repair rather than reviewing each fix separately.
+
+A second pass is justified only when confirmed pass-1 blockers materially reshape architecture, trust/privacy boundaries, concurrency or locking, durable state/crash recovery, irreversible side-effect ordering, or a public compatibility contract **and** controller-owned tests and source inspection cannot safely close the resulting risk. Pass 2 is a targeted closure review, not another broad sweep.
+
+Use artifact continuity, not conversation continuation: start a new fresh Reviewer and give it a minimal closure packet containing the frozen contract/threat model, pass-1 finding IDs and controller dispositions, the exact repair diff/range, fresh deterministic evidence, and the narrow closure question. Do not `delegate_continue` the prior reviewer, replay its full transcript, or launch a blind whole-change re-review.
+
+After pass 2, no further review is automatic. The controller fixes and verifies any confirmed residual finding. If Critical/Important uncertainty remains, mark the change blocked and escalate it; an additional substantive review requires explicit exceptional authorization from the user or domain owner and must state what genuinely new evidence or expertise it adds. A new commit, agent, session, route, or review label does not reset convergence.
+
+Setup/auth/transport failures or runs with no usable verdict do not consume a substantive pass, but the same pass gets at most one corrected retry before the route is reported blocked.
 
 ## Workflow
 
@@ -131,7 +145,7 @@ Do not forward reviewer prose as truth. Do not let review pull later-phase work 
 
 ### 6. Close with deterministic evidence
 
-After fixes, re-run the covering tests and full high-signal verification. A second reviewer is not automatic; use one only when explicitly authorized or when a blocker fix materially changes risk and controller verification cannot close it safely.
+After fixes, re-run the covering tests and full high-signal verification. Follow **Review Convergence and Continuity** before any second pass; ordinary fixes, added tests, assertion changes, renames, and formatting close under controller evidence rather than another reviewer.
 
 Before commit, verify the exact tracked task delta against `HEAD` (both staged and unstaged), then stage only intended task files:
 
@@ -163,6 +177,7 @@ Style and speculative suggestions do not block unless they expose one of these r
 - trusting reviewer findings without reproduction;
 - starting a reviewer-fixer-reviewer spiral;
 - asking the reviewer to re-run the same broad suite instead of reading evidence;
+- treating each repaired finding, new commit, or `final`/`closure` label as a fresh review budget;
 - letting a procedural read-only reviewer mutate the checkout;
 - sweeping unrelated files into staging or the review range.
 
