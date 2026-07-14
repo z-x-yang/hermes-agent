@@ -16,7 +16,7 @@ description: "对高风险软件改动，在本地验证后运行一次全新上
 |---|---|
 | 来源 | 内置（默认安装） |
 | 路径 | `skills/software-development/requesting-code-review` |
-| 版本 | `3.3.0` |
+| 版本 | `3.4.0` |
 | 作者 | Hermes Agent |
 | 许可证 | MIT |
 | 平台 | linux, macos, windows |
@@ -101,7 +101,7 @@ Untracked files 不会出现在 Git diff 中。必须把每个 intended untracke
 
 ### 4. 运行一次全新上下文 reviewer
 
-在 built-in route 通过 live rollout gate 前，高风险/shared-core 改动优先使用 Codex。Built-in Hermes review 使用 canonical `Reviewer` profile 与普通自包含 prompt；由于 Reviewer 有 raw terminal，结束后必须验证 checkout 未被修改。
+默认使用 built-in `Reviewer` profile 完成独立审查，包括高风险/shared-core 改动。给它普通自包含 prompt，并仅在需要时通过 top-level 参数指定本机 `review_root`；由于 Reviewer 有 raw terminal，结束后必须验证 checkout 未被修改。只有用户/domain owner 明确要求，或风险结论确实需要更强的独立性边界时，才显式改用 Codex、Claude Code、不同 model/provider 或人类/domain reviewer。
 
 ```python
 delegate_task(

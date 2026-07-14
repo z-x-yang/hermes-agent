@@ -127,7 +127,7 @@ delegate_task(
 )
 ```
 
-For high-stakes/shared-core/auth/concurrency work, prefer Codex as the final reviewer. Reviewer findings are leads; the controller reproduces and classifies them before repair. A repair does not automatically authorize another review pass.
+For high-stakes/shared-core/auth/concurrency work, use the built-in `Reviewer` as the default final reviewer. Codex/Claude or another independence boundary is explicit opt-in under `requesting-code-review`. Reviewer findings are leads; the controller reproduces and classifies them before repair. A repair does not automatically authorize another review pass.
 
 ### 5. Close the branch
 
