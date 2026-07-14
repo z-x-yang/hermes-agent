@@ -67,6 +67,19 @@ def _stable_prompt(agent):
         return build_system_prompt_parts(agent)["stable"]
 
 
+class TestDeferredToolDiscoveryGuidance:
+    def test_injected_when_tool_search_is_visible(self):
+        stable = _stable_prompt(
+            _make_agent(valid_tool_names=["tool_search", "computer_use"])
+        )
+        assert "tool visibility is partial" in stable
+        assert "exactly matches the requested operation" in stable
+
+    def test_absent_without_tool_search(self):
+        stable = _stable_prompt(_make_agent(valid_tool_names=["computer_use"]))
+        assert "tool visibility is partial" not in stable
+
+
 def _init_code_repo(path):
     """A git repo that actually holds code — the coding posture requires a source
     file (or manifest), not a bare ``.git`` (a prose/notes repo stays general)."""

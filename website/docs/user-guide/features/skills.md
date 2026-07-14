@@ -8,7 +8,7 @@ description: "On-demand knowledge documents — progressive disclosure, agent-ma
 
 Skills are on-demand knowledge documents the agent can load when needed. They follow a **progressive disclosure** pattern to minimize token usage and are compatible with the [agentskills.io](https://agentskills.io/specification) open standard.
 
-All skills live in **`~/.hermes/skills/`** — the primary directory and source of truth. On fresh install, bundled skills are copied from the repo. Hub-installed and agent-created skills also go here. The agent can modify or delete any skill.
+Profile-owned skills live in **`~/.hermes/skills/`** — the primary source of truth. On fresh install, bundled skills are copied from the repo. Hub-installed and agent-created skills also go here.
 
 You can also point Hermes at **external skill directories** — additional folders scanned alongside the local one. See [External Skill Directories](#external-skill-directories) below.
 
@@ -118,6 +118,17 @@ Level 2: skill_view(name, path)  → Specific reference file       (varies)
 ```
 
 The agent only loads the full skill content when it actually needs it.
+
+The startup prompt contains the compact name/description index, not every
+`SKILL.md`. If the index exceeds its description budget, Hermes keeps every
+skill name discoverable and demotes lower-priority descriptions to names-only.
+It does not hide the overflow behind a second catalog search.
+
+After context compression, the summary carries a deterministic receipt for
+every loaded skill and reference (qualified name, source, and content hash).
+The receipt tells the agent to reload those exact files before relying on them;
+it is carried across repeated compressions and cannot be created by ordinary
+user, tool, or web content.
 
 ## SKILL.md Format
 
@@ -304,9 +315,30 @@ Paths support `~` expansion and `${VAR}` environment variable substitution.
 
 - **Create locally, update in place**: New agent-created skills are written to `~/.hermes/skills/`. Existing skills are modified where they are found, including skills under `external_dirs`, when the agent uses `skill_manage` actions such as `patch`, `edit`, `write_file`, `remove_file`, or `delete`.
 - **External dirs are not a write-protection boundary**: If an external skill directory is writable by the Hermes process, agent-managed skill updates can change files in that directory. Use filesystem permissions or a separate profile/toolset setup if shared external skills must stay read-only.
-- **Local precedence**: If the same skill name exists in both the local dir and an external dir, the local version wins.
+- **Collisions fail closed**: If the same frontmatter `name` appears in more than one visible root, the prompt, `skills_list`, `skill_view`, and slash-command registry all mark or omit it as ambiguous. Rename one source; Hermes never silently chooses a winner.
 - **Full integration**: External skills appear in the system prompt index, `skills_list`, `skill_view`, and as `/skill-name` slash commands — no different from local skills.
 - **Non-existent paths are silently skipped**: If a configured directory doesn't exist, Hermes ignores it without errors. Useful for optional shared directories that may not be present on every machine.
+
+## Project-Scoped Skill Directories
+
+Inside a Git worktree, Hermes also discovers skill roots from the repository
+root down to the active runtime working directory. At each level it checks, in
+order, `.evelyn/skills`, `.hermes/skills`, and `.claude/skills`. Without a Git
+root, only the runtime working directory is checked.
+
+Project skills participate in the same prompt, `skills_list`, `skill_view`,
+slash-command, compatibility, and collision rules as profile skills. They are
+owned by the project rather than the active profile, so autonomous profile
+curation treats them as read-only.
+
+### Imported metadata compatibility
+
+Hermes accepts imported skill content only when it can honor any restrictive
+frontmatter semantics. A skill is hidden from offer surfaces and `skill_view`
+rejects it when it declares an unsupported restriction that would otherwise
+expand authority: invocation restrictions, non-empty `allowed-tools`,
+`disallowed-tools`, `hooks`, or `paths`, or `context: fork`. This is fail-closed;
+remove the field only if the skill is truly safe without that restriction.
 
 ### Example
 

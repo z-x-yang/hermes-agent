@@ -10,7 +10,7 @@ session, their JSON schemas can consume a substantial fraction of the
 context window on every turn — even when only a few of them are relevant
 to what the user actually asked for.
 
-**Tool Search** is Hermes' opt-in progressive-disclosure layer for that
+**Tool Search** is Hermes' progressive-disclosure layer for that
 problem. When activated, MCP and plugin tools are replaced in the
 model-visible tools array by three bridge tools, and the model loads each
 specific tool's schema on demand.
@@ -35,6 +35,13 @@ tool_describe(name)            — load the full schema for one tool
 tool_call(name, arguments)     — invoke a deferred tool
 ```
 
+If the exact deferred tool name is already known, the model can start with
+`tool_describe(name)` without running a keyword search first. Because the
+visible set is partial, a broader visible integration is not a substitute for
+an exact operation that may be deferred. When a request names an app or service
+and no already-visible dedicated tool matches, Tool Search is a mandatory
+discovery gate before browser, computer, or terminal.
+
 A typical interaction looks like:
 
 ```
@@ -55,17 +62,19 @@ see the underlying tool, not the bridge.
 
 ## When does it activate?
 
-By default Tool Search runs in `auto` mode: it activates only when the
-deferrable tool schemas would consume at least 10% of the active model's
-context window. Below that, the tools-array assembly is a pure
-pass-through and you pay no overhead.
+By default Tool Search runs in `auto` mode. It activates when any positive
+threshold is met: 10 deferred tools, 10,000 deferred-schema tokens, or 10%
+of the active model's context window. Set an individual threshold to `0` to
+disable that gate. Below all enabled gates, the tools-array assembly is a
+pure pass-through and you pay no bridge overhead.
 
 This decision is re-evaluated every time the tools array is built, so:
 
-- A session with just a few MCP tools and a long context model never
-  activates Tool Search.
-- A session with many MCP servers attached (15+ tools typically) starts
-  activating it.
+- A session with fewer than 10 small MCP/plugin tools and a long context model
+  never activates Tool Search.
+- A session with many MCP servers attached starts activating it.
+- Exact names or shell-style globs in `always_visible_tools` remain directly
+  callable while the eligible long tail is deferred.
 - Removing MCP servers mid-session correctly returns to direct exposure
   on the next assembly.
 
@@ -74,16 +83,24 @@ This decision is re-evaluated every time the tools array is built, so:
 ```yaml
 tools:
   tool_search:
-    enabled: auto       # auto (default), on, or off
-    threshold_pct: 10   # percentage of context — only used in auto mode
+    enabled: auto
+    threshold_tool_count: 10
+    threshold_schema_tokens: 10000
+    threshold_pct: 10
+    always_visible_tools:
+      - "ledger_*"
+      - "mcp_mail_search"
     search_default_limit: 5
     max_search_limit: 20
 ```
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `auto` | `auto` activates above threshold; `on` always activates if there's at least one deferrable tool; `off` disables entirely. |
-| `threshold_pct` | `10` | Percentage of context length at which `auto` mode kicks in. Range 0–100. |
+| `enabled` | `auto` | `auto` activates when any positive threshold is met; `on` always activates if there's at least one deferrable tool; `off` disables entirely. |
+| `threshold_tool_count` | `10` | Deferred-tool count at which `auto` activates. Set `0` to disable this gate. |
+| `threshold_schema_tokens` | `10000` | Estimated deferred-schema token count at which `auto` activates. Set `0` to disable this gate. |
+| `threshold_pct` | `10` | Percentage of active context at which `auto` activates. Set `0` only if another gate should decide. |
+| `always_visible_tools` | `[]` | Exact names or shell-style globs kept directly visible and excluded from search/describe/call bridge scope. |
 | `search_default_limit` | `5` | Hits returned when the model calls `tool_search` without a `limit`. |
 | `max_search_limit` | `20` | Hard upper bound the model can request via `limit`. Range 1–50. |
 
@@ -97,8 +114,9 @@ tools:
 ## When NOT to use it
 
 Tool Search trades a fixed per-turn token cost (the three bridge tool
-schemas, ~300 tokens) and at least one extra round trip (search →
-describe → call) for the savings on the deferred schemas. It's a clear
+schemas, ~300 tokens) and extra round trips (describe → call when the exact
+name is known; otherwise search → describe → call) for the savings on the
+deferred schemas. It's a clear
 win when you have many tools and use few per turn; it's overhead when
 you have few tools total.
 
@@ -110,9 +128,9 @@ unconditionally, expect a slight per-turn cost on small toolsets.
 These come from the prompt-cache integrity invariant — they are inherent
 to any progressive-disclosure design, not specific to this implementation:
 
-- **One extra round trip on cold tools.** The first time the model needs
-  a deferred tool, it spends one or two extra model calls to find and
-  load the schema. The token savings on the static side are real, but a
+- **Extra round trips on cold tools.** The first time the model needs
+  a deferred tool, it spends one or two extra model calls to load or find
+  the schema. The token savings on the static side are real, but a
   portion is paid back at runtime.
 - **No cache benefit on deferred schemas.** A loaded `tool_describe`
   result enters the conversation history (so it does get cached on
@@ -146,6 +164,9 @@ to any progressive-disclosure design, not specific to this implementation:
   discover or call a tool outside that subset — the deferred catalog is
   the deferrable slice of the session's own enabled/disabled toolsets,
   not the whole process registry.
+- **Configured pins are direct-only.** `always_visible_tools` entries are
+  removed from the deferred catalog and cannot be described or invoked through
+  the bridge, avoiding duplicate direct/bridge paths.
 - **No JS sandbox.** Hermes uses the simpler "structured tools" mode
   (search / describe / call as plain functions). The JS-sandbox "code
   mode" some other implementations offer is a large surface area; we

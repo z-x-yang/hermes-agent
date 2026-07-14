@@ -118,8 +118,8 @@ class TestExternalSkillsInFindAll:
         names = [s["name"] for s in skills]
         assert "my-external-skill" in names
 
-    def test_local_takes_precedence(self, hermes_home, external_skills_dir):
-        """If the same skill name exists locally and externally, local wins."""
+    def test_local_external_collision_fails_closed(self, hermes_home, external_skills_dir):
+        """Duplicate frontmatter names are ambiguous; no root silently wins."""
         local_skills = hermes_home / "skills"
         local_skill = local_skills / "my-external-skill"
         local_skill.mkdir(parents=True)
@@ -137,7 +137,14 @@ class TestExternalSkillsInFindAll:
             skills = _find_all_skills()
         matching = [s for s in skills if s["name"] == "my-external-skill"]
         assert len(matching) == 1
-        assert matching[0]["description"] == "Local version"
+        assert matching[0]["ambiguous"] is True
+        assert matching[0]["category"] == "collisions"
+        assert sorted(matching[0]["matches"]) == sorted(
+            [
+                str(local_skill / "SKILL.md"),
+                str(external_skills_dir / "my-external-skill" / "SKILL.md"),
+            ]
+        )
 
 
 class TestExternalSkillView:

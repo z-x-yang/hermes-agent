@@ -82,6 +82,7 @@ from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
     is_skill_support_path as _is_skill_support_path,
+    unsupported_restrictive_skill_fields,
 )
 
 logger = logging.getLogger(__name__)
@@ -201,6 +202,21 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
     """
     from agent.skill_utils import skill_matches_environment as _impl
     return _impl(frontmatter)
+
+
+def _restrictive_skill_rejection(name: str, fields: List[str]) -> str:
+    return json.dumps(
+        {
+            "success": False,
+            "error": (
+                f"Skill '{name}' declares unsupported restrictive behavior; "
+                "loading it without enforcement could expand authority."
+            ),
+            "compatibility": "rejected",
+            "unsupported_restrictive_fields": fields,
+        },
+        ensure_ascii=False,
+    )
 
 
 def _normalize_prerequisite_values(value: Any) -> List[str]:
@@ -502,11 +518,11 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
     Also works for external skill dirs configured via skills.external_dirs.
     """
     # Try the module-level SKILLS_DIR first (respects monkeypatching in tests),
-    # then fall back to external dirs from config.
+    # then every configured/project discovery root.
     dirs_to_check = [SKILLS_DIR]
     try:
-        from agent.skill_utils import get_external_skills_dirs
-        dirs_to_check.extend(get_external_skills_dirs())
+        from agent.skill_utils import get_all_skills_dirs
+        dirs_to_check.extend(get_all_skills_dirs()[1:])
     except Exception:
         pass
     for skills_dir in dirs_to_check:
@@ -612,19 +628,21 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     Returns:
         List of skill metadata dicts (name, description, category).
     """
-    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+    from agent.skill_utils import (
+        get_all_skills_dirs,
+        iter_skill_index_files,
+        unsupported_restrictive_skill_fields,
+    )
 
-    skills = []
-    seen_names: set = set()
+    candidates_by_name: Dict[str, List[Dict[str, Any]]] = {}
 
     # Load disabled set once (not per-skill)
     disabled = set() if skip_disabled else _get_disabled_skill_names()
 
-    # Scan local dir first, then external dirs (local takes precedence)
-    dirs_to_scan = []
-    if SKILLS_DIR.exists():
-        dirs_to_scan.append(SKILLS_DIR)
-    dirs_to_scan.extend(get_external_skills_dirs())
+    # Scan the same ordered roots used by prompt discovery and skill_view.
+    dirs_to_scan = [SKILLS_DIR]
+    dirs_to_scan.extend(get_all_skills_dirs()[1:])
+    dirs_to_scan = list(dict.fromkeys(path for path in dirs_to_scan if path.exists()))
 
     for scan_dir in dirs_to_scan:
         for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
@@ -637,6 +655,8 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 content = skill_md.read_text(encoding="utf-8")[:4000]
                 frontmatter, body = _parse_frontmatter(content)
 
+                if unsupported_restrictive_skill_fields(frontmatter):
+                    continue
                 if not skill_matches_platform(frontmatter):
                     continue
 
@@ -644,8 +664,6 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     continue
 
                 name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
-                if name in seen_names:
-                    continue
                 if name in disabled:
                     continue
 
@@ -662,11 +680,11 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
                 category = _get_category_from_path(skill_md)
 
-                seen_names.add(name)
-                skills.append({
+                candidates_by_name.setdefault(name, []).append({
                     "name": name,
                     "description": description,
                     "category": category,
+                    "_source": str(skill_md),
                 })
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -678,6 +696,21 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 )
                 continue
 
+    skills: List[Dict[str, Any]] = []
+    for name in sorted(candidates_by_name):
+        candidates = candidates_by_name[name]
+        if len(candidates) == 1:
+            entry = dict(candidates[0])
+            entry.pop("_source", None)
+            skills.append(entry)
+            continue
+        skills.append({
+            "name": name,
+            "description": "Ambiguous skill name; rename one source before loading.",
+            "category": "collisions",
+            "ambiguous": True,
+            "matches": sorted(str(entry["_source"]) for entry in candidates),
+        })
     return skills
 
 
@@ -704,35 +737,31 @@ def _skills_list_impl(
         JSON string with minimal skill info: name, description, category
     """
     try:
-        if not SKILLS_DIR.exists():
-            if create_missing_directory:
-                SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-                message = (
-                    f"No skills found. Skills directory created at "
-                    f"{display_hermes_home()}/skills/"
-                )
+        profile_skills_dir_missing = not SKILLS_DIR.exists()
+        if profile_skills_dir_missing and create_missing_directory:
+            SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Find all skills, including external and project roots even when the
+        # profile-owned directory is absent.
+        all_skills = _find_all_skills()
+
+        if not all_skills:
+            if profile_skills_dir_missing:
+                if create_missing_directory:
+                    message = (
+                        f"No skills found. Skills directory created at "
+                        f"{display_hermes_home()}/skills/"
+                    )
+                else:
+                    message = "No skills found; read-only listing did not create a directory."
             else:
-                message = "No skills found; read-only listing did not create a directory."
+                message = "No skills found in skills/ directory."
             return json.dumps(
                 {
                     "success": True,
                     "skills": [],
                     "categories": [],
                     "message": message,
-                },
-                ensure_ascii=False,
-            )
-
-        # Find all skills
-        all_skills = _find_all_skills()
-
-        if not all_skills:
-            return json.dumps(
-                {
-                    "success": True,
-                    "skills": [],
-                    "categories": [],
-                    "message": "No skills found in skills/ directory.",
                 },
                 ensure_ascii=False,
             )
@@ -850,6 +879,9 @@ def _serve_plugin_skill(
     except Exception:
         pass
 
+    unsupported_fields = unsupported_restrictive_skill_fields(parsed_frontmatter)
+    if unsupported_fields:
+        return _restrictive_skill_rejection(f"{namespace}:{bare}", unsupported_fields)
     if not skill_matches_platform(parsed_frontmatter):
         return json.dumps(
             {
@@ -1100,7 +1132,7 @@ def skill_view(
             if bare:
                 local_category_name = f"{namespace}/{bare}"
 
-        from agent.skill_utils import get_external_skills_dirs
+        from agent.skill_utils import get_all_skills_dirs
 
         # The categorized fall-through form (namespace/bare) joins onto each
         # search dir too; re-validate it since `bare` is not namespace-checked.
@@ -1116,11 +1148,10 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
-        # Build list of all skill directories to search
-        all_dirs = []
-        if SKILLS_DIR.exists():
-            all_dirs.append(SKILLS_DIR)
-        all_dirs.extend(get_external_skills_dirs())
+        # Build the same ordered search roots used by prompt/list discovery.
+        all_dirs = [SKILLS_DIR]
+        all_dirs.extend(get_all_skills_dirs()[1:])
+        all_dirs = list(dict.fromkeys(path for path in all_dirs if path.exists()))
 
         if not all_dirs:
             return json.dumps(
@@ -1301,6 +1332,9 @@ def skill_view(
         except Exception:
             parsed_frontmatter = {}
 
+        unsupported_fields = unsupported_restrictive_skill_fields(parsed_frontmatter)
+        if unsupported_fields:
+            return _restrictive_skill_rejection(name, unsupported_fields)
         if not skill_matches_platform(parsed_frontmatter):
             return json.dumps(
                 {
@@ -1408,6 +1442,7 @@ def skill_view(
                     {
                         "success": True,
                         "name": name,
+                        "skill_dir": str(skill_dir),
                         "file": file_path,
                         "content": f"[Binary file: {target_file.name}, size: {target_file.stat().st_size} bytes]",
                         "is_binary": True,
@@ -1431,6 +1466,7 @@ def skill_view(
                 {
                     "success": True,
                     "name": name,
+                    "skill_dir": str(skill_dir),
                     "file": file_path,
                     "content": content,
                     "file_type": target_file.suffix,
@@ -1777,6 +1813,13 @@ SKILL_VIEW_SCHEMA = {
     },
 }
 
+from tools.tool_effects import (  # noqa: E402 — registration-time policy metadata
+    ResultRetention,
+    ToolEffect,
+    builtin_policy_descriptor,
+)
+
+
 registry.register(
     name="skills_list",
     toolset="skills",
@@ -1819,6 +1862,14 @@ registry.register(
     handler=_skill_view_with_bump,
     check_fn=check_skills_requirements,
     emoji="📚",
+    descriptor=builtin_policy_descriptor(
+        name="skill_view",
+        schema=SKILL_VIEW_SCHEMA,
+        handler=_skill_view_with_bump,
+        effects={ToolEffect.UNKNOWN},
+        requires_confirmation=False,
+        retention=ResultRetention.NO_SPILL,
+    ),
 )
 
 
@@ -1832,12 +1883,6 @@ def _skill_view_readonly_handler(args, **kw):
         file_path=args.get("file_path"),
     )
 
-
-from tools.tool_effects import (  # noqa: E402 — descriptors depend on raw registration
-    ResultRetention,
-    ToolEffect,
-    builtin_policy_descriptor,
-)
 
 SKILLS_LIST_READONLY_SCHEMA = json.loads(json.dumps(SKILLS_LIST_SCHEMA))
 SKILLS_LIST_READONLY_SCHEMA["name"] = "skills_list_readonly"

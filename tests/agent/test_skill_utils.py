@@ -6,6 +6,7 @@ from agent.skill_utils import (
     extract_skill_conditions,
     get_disabled_skill_names,
     get_external_skills_dirs,
+    get_project_skills_dirs,
     is_excluded_skill_path,
     is_external_skill_path,
     is_skill_support_path,
@@ -189,6 +190,43 @@ def test_is_external_skill_path_matches_configured_external_dir(tmp_path, monkey
 
     assert is_external_skill_path(external / "team-skill" / "SKILL.md") is True
     assert is_external_skill_path(local_skills / "local-skill" / "SKILL.md") is False
+
+
+def test_project_skill_dirs_follow_git_root_to_nested_cwd(tmp_path):
+    repo = tmp_path / "repo"
+    nested = repo / "packages" / "worker"
+    (repo / ".git").mkdir(parents=True)
+    nested.mkdir(parents=True)
+
+    expected = [
+        repo / ".evelyn" / "skills",
+        repo / ".claude" / "skills",
+        repo / "packages" / ".hermes" / "skills",
+        nested / ".evelyn" / "skills",
+    ]
+    for path in expected:
+        path.mkdir(parents=True)
+
+    assert get_project_skills_dirs(nested) == [path.resolve() for path in expected]
+
+
+def test_project_skill_path_is_external_to_profile_maintenance(tmp_path, monkeypatch):
+    from agent import skill_utils
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text("skills: {}\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    project_root = repo / ".evelyn" / "skills"
+    project_root.mkdir(parents=True)
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("EVELYN_HOME", str(home))
+    monkeypatch.setenv("TERMINAL_CWD", str(repo))
+    skill_utils._external_dirs_cache_clear()
+
+    assert is_external_skill_path(project_root / "owner" / "SKILL.md") is True
 
 
 def test_iter_skill_index_files_prunes_skill_support_dirs(tmp_path):

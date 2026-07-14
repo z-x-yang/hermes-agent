@@ -25,6 +25,7 @@ from agent.skill_utils import (
     parse_frontmatter,
     skill_matches_environment,
     skill_matches_platform,
+    unsupported_restrictive_skill_fields,
 )
 from utils import atomic_json_write
 
@@ -1257,7 +1258,7 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-_SKILLS_SNAPSHOT_VERSION = 1
+_SKILLS_SNAPSHOT_VERSION = 2
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1352,6 +1353,7 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
+        "unsupported_restrictive_fields": unsupported_restrictive_skill_fields(frontmatter),
     }
 
 
@@ -1377,6 +1379,9 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
         # non-kanban users, s6-only skills outside the container). Explicit
         # loads (skill_view / --skills) bypass this — see skill_matches_environment.
         if not skill_matches_environment(frontmatter):
+            return False, frontmatter, ""
+
+        if unsupported_restrictive_skill_fields(frontmatter):
             return False, frontmatter, ""
 
         return True, frontmatter, extract_skill_description(frontmatter)
@@ -1491,6 +1496,8 @@ def build_skills_system_prompt(
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
+            if entry.get("unsupported_restrictive_fields"):
+                continue
             if not _skill_should_show(
                 entry.get("conditions") or {},
                 available_tools,
@@ -1548,13 +1555,15 @@ def build_skills_system_prompt(
         )
 
     # ── External skill directories ─────────────────────────────────────
-    # Scan external dirs directly (no snapshot caching — they're read-only
-    # and typically small).  Local skills already in skills_by_category take
-    # precedence: we track seen names and skip duplicates from external dirs.
-    seen_skill_names: set[str] = set()
+    # Scan configured/project dirs directly. Any visible duplicate is a
+    # fail-closed collision: the prompt must not advertise one source while
+    # skill_view refuses the same bare name as ambiguous.
+    name_counts: dict[str, int] = {}
     for cat_skills in skills_by_category.values():
         for name, _desc in cat_skills:
-            seen_skill_names.add(name)
+            name_counts[name] = name_counts.get(name, 0) + 1
+    seen_skill_names = set(name_counts)
+    colliding_names = {name for name, count in name_counts.items() if count > 1}
 
     for ext_dir in external_dirs:
         if not ext_dir.exists():
@@ -1568,6 +1577,7 @@ def build_skills_system_prompt(
                 skill_name = entry["skill_name"]
                 frontmatter_name = entry["frontmatter_name"]
                 if frontmatter_name in seen_skill_names:
+                    colliding_names.add(frontmatter_name)
                     continue
                 if frontmatter_name in disabled or skill_name in disabled:
                     continue
@@ -1597,6 +1607,25 @@ def build_skills_system_prompt(
                 category_descriptions.setdefault(cat, str(cat_desc).strip().strip("'\""))
             except Exception as e:
                 logger.debug("Could not read external skill description %s: %s", desc_file, e)
+
+    if colliding_names:
+        for category in list(skills_by_category):
+            remaining = [
+                (name, desc)
+                for name, desc in skills_by_category[category]
+                if name not in colliding_names
+            ]
+            if remaining:
+                skills_by_category[category] = remaining
+            else:
+                del skills_by_category[category]
+        skills_by_category.setdefault("collisions", []).extend(
+            (
+                name,
+                "[ambiguous; rename one source before loading]",
+            )
+            for name in sorted(colliding_names)
+        )
 
     # Posture-driven category demotion (e.g. non-coding skills while pairing
     # on code). Demoted categories stay in the index as a single names-only

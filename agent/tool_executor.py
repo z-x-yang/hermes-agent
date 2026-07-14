@@ -392,7 +392,11 @@ def _agent_bridge_deferrable_tool_defs(agent) -> list[dict]:
             quiet_mode=True,
             skip_tool_search_assembly=True,
         ) or []
-        _, registry_deferrable = _ts.classify_tools(scoped_defs)
+        cfg = _ts.load_config()
+        _, registry_deferrable = _ts.classify_tools(
+            scoped_defs,
+            always_visible_tools=cfg.always_visible_tools,
+        )
     except Exception:
         registry_deferrable = []
 

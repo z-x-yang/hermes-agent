@@ -71,6 +71,12 @@ _SKILL_READ_TOOL_NAMES = frozenset(
     }
 )
 
+_DEFERRED_TOOL_DISCOVERY_GUIDANCE = (
+    "When tool_search is available, tool visibility is partial. If no visible tool "
+    "exactly matches the requested operation, search before substituting a broader "
+    "integration, browser, computer, or terminal action."
+)
+
 
 def _has_skill_read_tools(valid_tool_names: Any) -> bool:
     """Return whether the active surface can discover and read skills."""
@@ -263,6 +269,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if "computer_use" in agent.valid_tool_names:
         from agent.prompt_builder import computer_use_guidance
         stable_parts.append(computer_use_guidance())
+
+    if "tool_search" in agent.valid_tool_names:
+        stable_parts.append(_DEFERRED_TOOL_DISCOVERY_GUIDANCE)
 
     nous_subscription_prompt = _r.build_nous_subscription_prompt(agent.valid_tool_names)
     if nous_subscription_prompt:

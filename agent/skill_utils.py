@@ -496,15 +496,92 @@ def get_external_skills_dirs() -> List[Path]:
     return result
 
 
-def get_all_skills_dirs() -> List[Path]:
-    """Return all skill directories: local ``~/.hermes/skills/`` first, then external.
+def unsupported_restrictive_skill_fields(frontmatter: Dict[str, Any]) -> List[str]:
+    """Return unsupported fields whose omission could expand skill authority.
 
-    The local dir is always first (and always included even if it doesn't exist
-    yet — callers handle that).  External dirs follow in config order.
+    These fields narrow who may invoke a skill, which paths/tools it may use,
+    or which isolation/hooks must be active. Until Hermes enforces each
+    behavior, imported skills declaring them must fail closed.
     """
+    unsupported: Set[str] = set()
+
+    def enabled(value: Any) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() not in {"", "false", "0", "no", "off", "none", "null"}
+        return bool(value)
+
+    for key in ("disable-model-invocation", "disable-user-invocation"):
+        if enabled(frontmatter.get(key)):
+            unsupported.add(key)
+    for key in ("model-invocable", "user-invocable"):
+        if key in frontmatter and not enabled(frontmatter.get(key)):
+            unsupported.add(key)
+    for key in ("allowed-tools", "disallowed-tools", "hooks", "paths"):
+        if enabled(frontmatter.get(key)):
+            unsupported.add(key)
+    if str(frontmatter.get("context") or "").strip().lower() == "fork":
+        unsupported.add("context")
+
+    return sorted(unsupported)
+
+
+def get_project_skills_dirs(cwd: Path | str | None = None) -> List[Path]:
+    """Return project skill roots from the git root through the runtime cwd.
+
+    At each level, Evelyn-native ``.evelyn/skills`` wins display order,
+    followed by the Hermes compatibility path and Claude project skills.
+    Collision resolution remains fail-closed at the skill catalog/load layer.
+    """
+    if cwd is None:
+        from agent.runtime_cwd import resolve_agent_cwd
+
+        start = resolve_agent_cwd()
+    else:
+        start = Path(cwd).expanduser()
+    try:
+        start = start.resolve()
+    except (OSError, RuntimeError):
+        start = start.absolute()
+    if not start.is_dir():
+        return []
+
+    project_root = start
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            project_root = candidate
+            break
+
+    if start == project_root:
+        lineage = [project_root]
+    else:
+        relative = start.relative_to(project_root)
+        lineage = [project_root]
+        current = project_root
+        for part in relative.parts:
+            current = current / part
+            lineage.append(current)
+
+    result: List[Path] = []
+    seen: Set[Path] = set()
+    for base in lineage:
+        for relative in (
+            Path(".evelyn/skills"),
+            Path(".hermes/skills"),
+            Path(".claude/skills"),
+        ):
+            candidate = (base / relative).resolve()
+            if candidate.is_dir() and candidate not in seen:
+                seen.add(candidate)
+                result.append(candidate)
+    return result
+
+
+def get_all_skills_dirs() -> List[Path]:
+    """Return profile, configured-external, then project skill directories."""
     dirs = [get_skills_dir()]
     dirs.extend(get_external_skills_dirs())
-    return dirs
+    dirs.extend(get_project_skills_dirs())
+    return list(dict.fromkeys(dirs))
 
 
 def _resolve_for_skill_ownership(path) -> Path:
@@ -516,16 +593,15 @@ def _resolve_for_skill_ownership(path) -> Path:
 
 
 def is_external_skill_path(path) -> bool:
-    """Return True when ``path`` lives under a configured external skills dir.
+    """Return True when ``path`` lives outside the profile-owned skills dir.
 
-    ``skills.external_dirs`` are externally owned: Hermes can discover and view
-    their skills, and foreground user-directed tool calls may still edit them,
-    but autonomous lifecycle maintenance must treat them as read-only. This
-    helper centralizes the ownership boundary so curator/reporting/tool paths do
-    not each need to re-interpret the config.
+    Configured external and project-scoped skill roots are discoverable and
+    viewable, but autonomous profile lifecycle maintenance must treat them as
+    read-only because their ownership lives outside the active profile.
     """
     candidate = _resolve_for_skill_ownership(path)
-    for root in get_external_skills_dirs():
+    roots = [*get_external_skills_dirs(), *get_project_skills_dirs()]
+    for root in roots:
         resolved_root = _resolve_for_skill_ownership(root)
         try:
             candidate.relative_to(resolved_root)

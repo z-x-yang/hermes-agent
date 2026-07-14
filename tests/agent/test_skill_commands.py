@@ -451,6 +451,21 @@ class TestBuildPreloadedSkillsPrompt:
         assert loaded == ["present-skill"]
         assert missing == ["missing-skill"]
 
+    def test_restrictive_import_cannot_bypass_view_gate(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "restricted-skill",
+                frontmatter_extra="disallowed-tools: [terminal]\ncontext: fork\n",
+            )
+            prompt, loaded, missing = build_preloaded_skills_prompt(
+                ["restricted-skill"]
+            )
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == ["restricted-skill"]
+
 
 class TestBuildSkillInvocationMessage:
     def test_loads_skill_by_stored_path_when_frontmatter_name_differs(self, tmp_path):

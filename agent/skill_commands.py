@@ -143,14 +143,14 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
 
     try:
         from tools.skills_tool import SKILLS_DIR, skill_view
-        from agent.skill_utils import get_external_skills_dirs
+        from agent.skill_utils import get_all_skills_dirs
 
         identifier_path = Path(raw_identifier).expanduser()
         if identifier_path.is_absolute():
             normalized = None
             trusted_roots = [SKILLS_DIR]
             try:
-                trusted_roots.extend(get_external_skills_dirs())
+                trusted_roots.extend(get_all_skills_dirs()[1:])
             except Exception:
                 pass
 
@@ -346,70 +346,72 @@ def _build_skill_message(
 
 
 def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
-    """Scan ~/.hermes/skills/ and return a mapping of /command -> skill info.
-
-    Returns:
-        Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
-    """
+    """Scan every visible skill root and return unambiguous slash commands."""
     global _skill_commands, _skill_commands_platform
     _skill_commands_platform = _resolve_skill_commands_platform()
     _skill_commands = {}
     try:
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
-        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
-        disabled = _get_disabled_skill_names()
-        seen_names: set = set()
+        from tools.skills_tool import (
+            SKILLS_DIR,
+            _get_disabled_skill_names,
+            _parse_frontmatter,
+            skill_matches_environment,
+            skill_matches_platform,
+        )
+        from agent.skill_utils import (
+            get_all_skills_dirs,
+            iter_skill_index_files,
+            unsupported_restrictive_skill_fields,
+        )
 
-        # Scan local dir first, then external dirs
-        dirs_to_scan = []
-        if SKILLS_DIR.exists():
-            dirs_to_scan.append(SKILLS_DIR)
-        dirs_to_scan.extend(get_external_skills_dirs())
+        disabled = _get_disabled_skill_names()
+        dirs_to_scan = [SKILLS_DIR]
+        dirs_to_scan.extend(get_all_skills_dirs()[1:])
+        dirs_to_scan = list(dict.fromkeys(path for path in dirs_to_scan if path.exists()))
+        candidates: Dict[str, list[Dict[str, Any]]] = {}
 
         for scan_dir in dirs_to_scan:
             for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
-                if any(part in {'.git', '.github', '.hub', '.archive'} for part in skill_md.parts):
+                if any(part in {".git", ".github", ".hub", ".archive"} for part in skill_md.parts):
                     continue
                 try:
-                    content = skill_md.read_text(encoding='utf-8')
+                    content = skill_md.read_text(encoding="utf-8")
                     frontmatter, body = _parse_frontmatter(content)
-                    # Skip skills incompatible with the current OS platform
+                    if unsupported_restrictive_skill_fields(frontmatter):
+                        continue
                     if not skill_matches_platform(frontmatter):
                         continue
-                    # Skip skills not relevant to the current runtime env
-                    # (kanban/docker/s6). Offer-time only; explicit load bypasses.
                     if not skill_matches_environment(frontmatter):
                         continue
-                    name = frontmatter.get('name', skill_md.parent.name)
-                    if name in seen_names:
-                        continue
-                    # Respect user's disabled skills config
+                    name = frontmatter.get("name", skill_md.parent.name)
                     if name in disabled:
                         continue
-                    description = frontmatter.get('description', '')
+                    description = frontmatter.get("description", "")
                     if not description:
-                        for line in body.strip().split('\n'):
+                        for line in body.strip().split("\n"):
                             line = line.strip()
-                            if line and not line.startswith('#'):
+                            if line and not line.startswith("#"):
                                 description = line[:80]
                                 break
-                    seen_names.add(name)
-                    # Normalize to hyphen-separated slug, stripping
-                    # non-alnum chars (e.g. +, /) to avoid invalid
-                    # Telegram command names downstream.
-                    cmd_name = name.lower().replace(' ', '-').replace('_', '-')
-                    cmd_name = _SKILL_INVALID_CHARS.sub('', cmd_name)
-                    cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
+                    cmd_name = name.lower().replace(" ", "-").replace("_", "-")
+                    cmd_name = _SKILL_INVALID_CHARS.sub("", cmd_name)
+                    cmd_name = _SKILL_MULTI_HYPHEN.sub("-", cmd_name).strip("-")
                     if not cmd_name:
                         continue
-                    _skill_commands[f"/{cmd_name}"] = {
+                    candidates.setdefault(f"/{cmd_name}", []).append({
                         "name": name,
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
                         "skill_dir": str(skill_md.parent),
-                    }
+                    })
                 except Exception:
                     continue
+
+        _skill_commands = {
+            command: entries[0]
+            for command, entries in candidates.items()
+            if len(entries) == 1
+        }
     except Exception:
         pass
     return _skill_commands

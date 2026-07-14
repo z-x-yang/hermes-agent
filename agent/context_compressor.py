@@ -35,6 +35,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
+from agent.skill_receipts import build_loaded_skill_receipt_block
 from utils import base_url_host_matches
 
 logger = logging.getLogger(__name__)
@@ -6454,6 +6455,9 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
         # generated checkpoint from live tail content. The marker is deliberately
         # neutral: active continuation is carried by Current Work / Pending Tasks
         # and later user messages still take precedence on conflict.
+        skill_receipt = build_loaded_skill_receipt_block(original_messages)
+        if skill_receipt:
+            summary = f"{summary.rstrip()}\n\n{skill_receipt}"
         summary_was_merged_into_tail = _merge_summary_into_tail
         if not _merge_summary_into_tail:
             summary = summary + "\n\n" + _SUMMARY_END_MARKER

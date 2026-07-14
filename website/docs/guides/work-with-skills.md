@@ -76,11 +76,15 @@ You can also trigger skills through natural conversation — ask Hermes to use a
 
 Skills use a token-efficient loading pattern. The agent doesn't load everything at once:
 
-1. **`skills_list()`** — compact list of all skills (~3k tokens). Loaded at session start.
+1. **Startup index** — compact names and descriptions in the system prompt; if the budget is tight, names remain while some descriptions become names-only.
 2. **`skill_view(name)`** — full SKILL.md content for one skill. Loaded when the agent decides it needs that skill.
 3. **`skill_view(name, file_path)`** — a specific reference file within the skill. Only loaded if needed.
 
-This means skills don't cost tokens until they're actually used.
+After a context compression, a deterministic receipt preserves which exact
+skill and reference versions were loaded and requires the agent to reload them
+before relying on their instructions again.
+
+This means full skill bodies don't cost tokens until they're actually used.
 
 ---
 
