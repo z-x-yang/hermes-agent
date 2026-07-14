@@ -1,12 +1,9 @@
-"""Shared request-governance and middleware path for one provider attempt."""
+"""Shared middleware and backend path for one provider attempt."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Callable
-
-from agent.subagent_governance import GovernancePreflightError
-
 
 @dataclass(frozen=True)
 class PreparedProviderAttempt:
@@ -24,7 +21,7 @@ def prepare_provider_attempt(
     api_request_id: str,
     api_call_count: int,
 ) -> PreparedProviderAttempt:
-    """Apply request middleware, failing closed for governed children."""
+    """Apply request middleware with the ordinary no-middleware fallback."""
     try:
         from hermes_cli.middleware import apply_llm_request_middleware
 
@@ -47,11 +44,6 @@ def prepare_provider_attempt(
             middleware_trace=tuple(middleware_result.trace),
         )
     except Exception:
-        governance = getattr(agent, "_governance_diagnostics", None)
-        if isinstance(governance, dict) and governance.get("fingerprint"):
-            raise GovernancePreflightError(
-                "governance_transport_unverifiable"
-            ) from None
         return PreparedProviderAttempt(
             payload=dict(api_kwargs),
             original_payload=dict(api_kwargs),
@@ -71,13 +63,11 @@ def execute_provider_attempt(
     pre_api_observer: Callable[[dict[str, Any], tuple[Any, ...]], None] | None = None,
     final_payload_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ):
-    """Run execution middleware, then fit-check/observe its final payload."""
-    from agent.subagent_governance import assert_governance_request_fits
+    """Run execution middleware, then observe and execute its final payload."""
 
-    def _governed_terminal(final_payload: dict[str, Any]):
+    def _terminal(final_payload: dict[str, Any]):
         if final_payload_transform is not None:
             final_payload = final_payload_transform(final_payload)
-        assert_governance_request_fits(agent, final_payload)
         if pre_api_observer is not None:
             pre_api_observer(final_payload, prepared.middleware_trace)
         return perform_backend(final_payload)
@@ -86,7 +76,7 @@ def execute_provider_attempt(
 
     return run_llm_execution_middleware(
         prepared.payload,
-        _governed_terminal,
+        _terminal,
         original_request=prepared.original_payload,
         task_id=task_id,
         turn_id=turn_id,

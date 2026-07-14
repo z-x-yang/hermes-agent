@@ -12,6 +12,10 @@ class SubagentProfile:
     allowed_tool_names: Optional[FrozenSet[str]]
     default_wait_timeout_seconds: int
     default_run_timeout_seconds: int
+    default_run_in_background: bool
+    retain_on_success: bool
+    context_policy: str
+    allow_delegation: bool
 
 
 @dataclass(frozen=True)
@@ -55,6 +59,17 @@ _READ_ONLY_TOOLS = frozenset(
     }
 ) | NOTION_PROMPT_READ_TOOL_NAMES | APPLE_MAIL_READ_TOOL_NAMES
 
+REVIEWER_TOOL_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        "review_read_file",
+        "review_search_files",
+        "review_git",
+        "web_search_readonly",
+        "web_extract_readonly",
+        "report_review_findings",
+    }
+)
+
 _DATA_SOURCE_READ_INSTRUCTIONS = (
     "For public web research, use web_search_readonly and web_extract_readonly. "
     "For Notion, call mcp_notion_ai_notion_ai_ask only with mode=readonly and explicitly tell "
@@ -79,6 +94,14 @@ GENERAL_FINAL = (
     "the task prompt. The parent will verify claimed changes and side effects."
 )
 
+REVIEWER_FINAL = (
+    "You are an independent reviewer of a code change made in another context. "
+    "Use only the frozen review capsule and the sealed review tools. Reconstruct "
+    "the requirement and runtime path independently, report only newly introduced "
+    "evidence-backed P0/P1/P2 candidate blockers, and never edit files. Complete "
+    "the review through report_review_findings; free text is not a completed review."
+)
+
 _PROFILES = {
     "Explore": SubagentProfile(
         name="Explore",
@@ -96,6 +119,10 @@ _PROFILES = {
         allowed_tool_names=_READ_ONLY_TOOLS,
         default_wait_timeout_seconds=900,
         default_run_timeout_seconds=1800,
+        default_run_in_background=True,
+        retain_on_success=False,
+        context_policy="lean",
+        allow_delegation=False,
     ),
     "Plan": SubagentProfile(
         name="Plan",
@@ -113,6 +140,26 @@ _PROFILES = {
         allowed_tool_names=_READ_ONLY_TOOLS,
         default_wait_timeout_seconds=1800,
         default_run_timeout_seconds=3600,
+        default_run_in_background=True,
+        retain_on_success=False,
+        context_policy="project_summary",
+        allow_delegation=False,
+    ),
+    "Reviewer": SubagentProfile(
+        name="Reviewer",
+        description=(
+            "Fresh-context independent code reviewer. Reviews a frozen contract "
+            "and scoped code target, returns evidence-backed candidate blockers, "
+            "and never edits."
+        ),
+        system_instructions=REVIEWER_FINAL,
+        allowed_tool_names=REVIEWER_TOOL_NAMES,
+        default_wait_timeout_seconds=1800,
+        default_run_timeout_seconds=3600,
+        default_run_in_background=False,
+        retain_on_success=False,
+        context_policy="reviewer_lean",
+        allow_delegation=False,
     ),
     "general-purpose": SubagentProfile(
         name="general-purpose",
@@ -133,6 +180,10 @@ _PROFILES = {
         allowed_tool_names=None,
         default_wait_timeout_seconds=1800,
         default_run_timeout_seconds=7200,
+        default_run_in_background=True,
+        retain_on_success=True,
+        context_policy="project_context",
+        allow_delegation=True,
     ),
 }
 

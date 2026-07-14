@@ -193,6 +193,17 @@ TOOLSETS = {
         "tools": ["read_file", "write_file", "patch", "search_files"],
         "includes": []
     },
+
+    "review": {
+        "description": "Sealed Reviewer-only root-scoped read, git inspection, and structured completion tools",
+        "tools": [
+            "review_read_file",
+            "review_search_files",
+            "review_git",
+            "report_review_findings",
+        ],
+        "includes": []
+    },
     
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",

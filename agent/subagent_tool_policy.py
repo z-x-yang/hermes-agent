@@ -121,7 +121,7 @@ def build_child_tool_policy(
 ) -> ToolNamePolicy:
     """Build an intersection-only exact policy-identity ceiling."""
     allowed_effects = None
-    if profile_name in {"Explore", "Plan"}:
+    if profile_name in {"Explore", "Plan", "Reviewer"}:
         allowed_effects = frozenset({ToolEffect.READ_LOCAL, ToolEffect.READ_REMOTE})
 
     parent_snapshot = getattr(parent, "_parent_tool_authority_snapshot", None)

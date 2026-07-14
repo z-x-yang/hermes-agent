@@ -1270,15 +1270,45 @@ registry.register(
 
 
 def _web_search_readonly_handler(args, **kw):
-    return web_search_readonly(args.get("query", ""), limit=args.get("limit", 5))
+    task_id = kw.get("task_id")
+    record_reviewer_web_result = None
+    try:
+        from tools.review_tools import (
+            assert_reviewer_web_allowed,
+            record_reviewer_web_result,
+        )
+
+        review_context = assert_reviewer_web_allowed(task_id)
+    except ImportError:
+        review_context = None
+    result = web_search_readonly(args.get("query", ""), limit=args.get("limit", 5))
+    if review_context is not None and record_reviewer_web_result is not None:
+        urls = re.findall(r"https?://[^\"'<>\s]+", str(result))
+        record_reviewer_web_result(task_id, urls=urls)
+    return result
 
 
 async def _web_extract_readonly_handler(args, **kw):
+    task_id = kw.get("task_id")
+    record_reviewer_web_result = None
+    try:
+        from tools.review_tools import (
+            assert_reviewer_web_allowed,
+            record_reviewer_web_result,
+        )
+
+        review_context = assert_reviewer_web_allowed(task_id)
+    except ImportError:
+        review_context = None
     urls = args.get("urls", [])
-    return await web_extract_readonly(
-        urls[:5] if isinstance(urls, list) else [],
+    bounded_urls = urls[:5] if isinstance(urls, list) else []
+    result = await web_extract_readonly(
+        bounded_urls,
         char_limit=args.get("char_limit", DEFAULT_EXTRACT_CHAR_LIMIT),
     )
+    if review_context is not None and record_reviewer_web_result is not None:
+        record_reviewer_web_result(task_id, urls=bounded_urls)
+    return result
 
 
 from tools.tool_effects import (  # noqa: E402 — descriptors depend on raw registration

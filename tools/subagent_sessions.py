@@ -33,7 +33,6 @@ class RetainedSubagentSession:
     profile_id: str
     canonical_profile_home: str
     original_policy_identities: frozenset[str]
-    original_governance_fingerprint: str
     transport_identity: str = ""
     effective_allowed_tool_names: frozenset[str] = frozenset()
     claim_generation: int = 0
@@ -142,10 +141,7 @@ def retain_subagent_session(
         raise RuntimeError(
             "Retained subagent session has no original exact authority; refusing retention."
         )
-    if not record.original_governance_fingerprint:
-        raise RuntimeError(
-            "Retained subagent session has no governance fingerprint; refusing retention."
-        )
+
     copied = _copy_record(record)
     record_bytes = _serialized_history_bytes(copied.conversation_history)
     byte_budget = max(1, int(max_total_bytes or 1))

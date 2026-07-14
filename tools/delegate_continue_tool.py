@@ -7,7 +7,6 @@ import time
 import uuid
 from typing import Any, Optional
 
-from agent.subagent_governance import load_governance_snapshot
 from tools.registry import registry
 from tools.tool_effects import build_authority_snapshot
 from tools.subagent_sessions import (
@@ -130,14 +129,17 @@ def _build_continuation_child(
         resolve_subagent_type,
     )
 
-    governance_snapshot = load_governance_snapshot()
-    if governance_snapshot.profile_id != record.profile_id:
+    from hermes_cli.profiles import get_active_profile_name
+    from hermes_constants import get_hermes_home
+
+    current_profile_id = get_active_profile_name()
+    if current_profile_id != record.profile_id:
         raise ValueError("Retained subagent profile changed; refusing continuation.")
     try:
         retained_profile_home = Path(record.canonical_profile_home).expanduser().resolve(
             strict=True
         )
-        current_profile_home = Path(governance_snapshot.profile_home).resolve(strict=True)
+        current_profile_home = get_hermes_home().expanduser().resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         raise ValueError(
             "Retained subagent canonical profile home is invalid; refusing continuation."
@@ -150,6 +152,8 @@ def _build_continuation_child(
     cfg = _load_config()
     subagent_type = resolve_subagent_type(record.subagent_type)
     profile = get_subagent_profile(subagent_type)
+    if not profile.retain_on_success:
+        raise ValueError(f"{subagent_type} is a one-shot profile and cannot continue.")
     resolved_profile = resolve_profile_config(subagent_type, cfg)
 
     parent_provider = str(getattr(parent_agent, "provider", "") or "")
@@ -247,7 +251,6 @@ def _build_continuation_child(
         profile=profile,
         workspace_path_override=record.workspace_path,
         register_with_parent=register_with_parent,
-        governance_snapshot=governance_snapshot,
     )
 
     prior_file_writes = tuple(

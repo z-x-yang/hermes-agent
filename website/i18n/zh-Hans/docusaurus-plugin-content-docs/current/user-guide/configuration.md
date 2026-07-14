@@ -1618,7 +1618,7 @@ checkpoints:
 
 ## 委托
 
-在 `delegation` 下配置 provider routing、并发、运行时派生 nesting、profile timeout 与 GP 自动保留。模型调用只使用 `description`、`prompt`、可选 `subagent_type` 和可选 `run_in_background`；下面的 operator controls 不向模型暴露。
+在 `delegation` 下配置 provider routing、并发、运行时派生 nesting、profile timeout 与 GP 自动保留。模型调用使用 `description`、`prompt`、可选 `subagent_type`、可选 `run_in_background`，以及仅限顶层单个 Reviewer 的可选 `review_root`。`review_root` 必须是本机 absolute Git worktree 精确根目录；不支持 remote/cluster root。下面的 operator controls 不向模型暴露。
 
 ```yaml
 delegation:
@@ -1649,6 +1649,9 @@ delegation:
     Plan:
       foreground_wait_timeout_seconds: 1800
       child_run_timeout_seconds: 3600
+    Reviewer:
+      foreground_wait_timeout_seconds: 1800
+      child_run_timeout_seconds: 3600
     general-purpose:
       foreground_wait_timeout_seconds: 1800
       child_run_timeout_seconds: 7200
@@ -1659,19 +1662,19 @@ delegation:
 
 ### 调度与超时
 
-`run_in_background` 是唯一 caller scheduling control：顶层省略时后台，顶层 `False` 前台等待；嵌套省略或 `False` 前台，嵌套 `True` 在 child 执行前拒绝；一个 Batch 共用一个顶层选择。
+`run_in_background` 是唯一 caller scheduling control：顶层省略时采用所选 profile 默认值（`Reviewer` 前台，其余后台），顶层 `False` 前台等待；嵌套省略或 `False` 前台，嵌套 `True` 在 child 执行前拒绝；一个 Batch 共用一个顶层选择。
 
 `foreground_wait_timeout_seconds` 控制 parent 等待时间。超时后同一个 future 转到后台，并只投递一次 completion。`child_run_timeout_seconds` 限制每个 child run，无论从前台还是后台启动；`agents.<type>` 覆盖 global fallback，`max_foreground_wait_timeout_seconds` 是全局 wait ceiling。显式 `child_timeout_seconds` 仍是独立 hard cap。
 
 ### Profile 上下文与生命周期
 
-`Explore` 和 `Plan` 是一次性只读 profile：获得完整 governance，但跳过项目上下文和 workspace snapshot。`general-purpose` 获得完整 governance、项目上下文与 workspace/git snapshot；成功的 GP 仅在 parent session ID 非空且容量允许时自动保留。
+`Explore`、`Plan` 和 `Reviewer` 都是一次性 profile。每个 child 只获得短的 runtime-owned Core Contract 与显式 task data，不再注入 active profile 完整 `SOUL.md`/`MEMORY.md`/`USER.md`。`general-purpose` 额外获得真实 project context 与 workspace/git snapshot；成功的 GP 仅在 parent session ID 非空且容量允许时自动保留。Reviewer 获得固定版本 review bundle 与严格 frozen capsule，只暴露六个 sealed review tools，并继续使用 operator 配置的 `delegation.max_iterations`。
 
 `delegate_continue` 只接受 `agent_id`、`prompt` 和可选 `run_in_background`。process-local store 受 `retained_subagent_ttl_seconds`、`max_retained_subagents` 和 `max_retained_subagent_bytes` 限制，Gateway/process 重启后丢失。过大的初始记录 fail closed；claimed continuation 不会被 prune；过大的成功 update 会保留 result，但删除并 invalidate retained handle。
 
 ### Provider 与 model routing
 
-默认继承 parent provider/model。共享 `delegation.provider`/`model` 可覆盖默认值；`delegation.agents.<type>.provider`/`model` 可覆盖单个 profile。直接 `base_url` 优先于 provider；endpoint credential 不匹配时 fail closed，不会转发无关 provider key。provider fallback 的每次 attempt 都继续经过完整 governance 与 final payload-fit 检查。
+默认继承 parent provider/model。共享 `delegation.provider`/`model` 可覆盖默认值；`delegation.agents.<type>.provider`/`model` 可覆盖单个 profile。直接 `base_url` 优先于 provider；endpoint credential 不匹配时 fail closed，不会转发无关 provider key。main 与 child 共用同一套 provider-visible estimate、tool-output cleanup、context compression 与 provider context-error recovery；不再有 child-only raw-byte governance fit gate 或 governance-triggered provider fallback。
 
 Retained record 不保存 credentials 或自定义 endpoint secret；continuation 从当前 trusted config 重新解析。
 
@@ -1679,7 +1682,7 @@ Retained record 不保存 credentials 或自定义 endpoint secret；continuatio
 
 `max_global_concurrent_children` 限制整个 Hermes 进程中的活跃 child runner（默认 `20`，下限 `1`）。`max_concurrent_children` 限制一个 root session 拥有的活跃 runner（包括嵌套后代与 continuation），同时也限制单个 Batch width（默认 `5`，下限 `1`）。两层容量通过一次原子 reservation 同时检查；超宽或容量不足的 Batch 会在任何 child 启动前整批拒绝。一个 accepted Batch 仍只返回一个 handle，并只发出一次 consolidated completion，但每个 child 各占一个 runner slot。
 
-`max_spawn_depth=2` 允许一层有界的 `general-purpose` orchestrator（`parent → child → grandchild`）。只有 current parent 实际暴露 `delegate_task` 的 GP child 才可能获得 nesting，并且必须 `orchestrator_enabled=true` 且仍有剩余 depth。`Explore` 和 `Plan` 永远不能委派。每增加一层都可能成倍增加成本和并发，请谨慎调整。
+`max_spawn_depth=2` 允许一层有界的 `general-purpose` orchestrator（`parent → child → grandchild`）。只有 current parent 实际暴露 `delegate_task` 的 GP child 才可能获得 nesting，并且必须 `orchestrator_enabled=true` 且仍有剩余 depth。`Explore`、`Plan` 和 `Reviewer` 永远不能委派。每增加一层都可能成倍增加成本和并发，请谨慎调整。
 
 ## 澄清
 

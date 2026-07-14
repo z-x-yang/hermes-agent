@@ -12,10 +12,11 @@ from tools.subagent_profiles import (
 )
 
 
-def test_only_claude_aligned_builtin_types_are_exposed():
+def test_four_canonical_builtin_types_are_exposed():
     assert SUPPORTED_SUBAGENT_TYPES == (
         "Explore",
         "Plan",
+        "Reviewer",
         "general-purpose",
     )
 
@@ -52,17 +53,50 @@ def test_profiles_use_claude_like_type_specific_final_guidance():
     assert "exact return requirements in the task prompt" in gp
 
 
-def test_profile_metadata_has_no_redundant_capability_booleans_or_context_capsule():
-    profile = get_subagent_profile("general-purpose")
-    for removed in (
-        "result_contract",
-        "context_policy",
-        "can_write_files",
-        "can_external_side_effects",
-        "can_delegate",
-        "default_scheduling",
+def test_reviewer_profile_owns_one_shot_context_and_lifecycle_metadata():
+    profile = get_subagent_profile("Reviewer")
+    assert profile.default_run_in_background is False
+    assert profile.retain_on_success is False
+    assert profile.context_policy == "reviewer_lean"
+    assert profile.allow_delegation is False
+    assert "fresh-context" in profile.description.lower()
+    assert "independent" in profile.description.lower()
+    assert "never edits" in profile.description.lower()
+
+
+def test_reviewer_exposes_only_sealed_review_tools():
+    profile = get_subagent_profile("Reviewer")
+    assert profile.allowed_tool_names is not None
+    assert profile.allowed_tool_names == frozenset(
+        {
+            "review_read_file",
+            "review_search_files",
+            "review_git",
+            "web_search_readonly",
+            "web_extract_readonly",
+            "report_review_findings",
+        }
+    )
+    for forbidden in (
+        "terminal",
+        "process",
+        "execute_code",
+        "read_file",
+        "search_files",
+        "write_file",
+        "patch",
+        "delegate_task",
+        "delegate_continue",
+        "tool_search",
+        "tool_call",
+        "browser_navigate",
+        "session_search",
+        "memory",
+        "fact_store",
+        "mcp_notion_ai_notion_ai_ask",
+        "mcp_apple_mail_get_message",
     ):
-        assert not hasattr(profile, removed)
+        assert forbidden not in profile.allowed_tool_names
 
 
 def test_read_only_profiles_remain_hard_no_external_side_effect():
@@ -291,6 +325,7 @@ def test_delegation_docs_match_simplified_contract():
         "run_in_background",
         "Explore",
         "Plan",
+        "Reviewer",
         "general-purpose",
     )
     stale_claims = (
@@ -312,7 +347,8 @@ def test_delegation_docs_match_simplified_contract():
         "one-shot",
         "automatically retained",
         "project context",
-        "complete governance",
+        "lean",
+        "report_review_findings",
         "runtime-derived",
         "including work dispatched directly to background",
     )
@@ -322,7 +358,8 @@ def test_delegation_docs_match_simplified_contract():
         "一次性",
         "自动保留",
         "项目上下文",
-        "完整 governance",
+        "lean",
+        "report_review_findings",
         "运行时派生",
         "包括直接在后台启动的工作",
     )
@@ -330,6 +367,8 @@ def test_delegation_docs_match_simplified_contract():
     zh_text = feature_docs[1].read_text(encoding="utf-8")
     assert all(claim in en_text for claim in semantic_claims)
     assert all(claim in zh_text for claim in zh_semantic_claims)
+    assert "review_root" in en_text and "remote/cluster roots fail closed" in en_text
+    assert "review_root" in zh_text and "remote/cluster root 都 fail closed" in zh_text
 
     pattern_docs = docs[2:4]
     for path in pattern_docs:
@@ -353,10 +392,13 @@ def test_bundled_evelyn_skill_uses_current_delegation_contract():
         "tasks",
         "subagent_type",
         "run_in_background",
+        "review_root",
         "delegate_continue",
         "Explore",
         "Plan",
+        "Reviewer",
         "general-purpose",
+        "report_review_findings",
         "runtime-derived",
     ):
         assert required in delegation

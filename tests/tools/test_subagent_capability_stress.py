@@ -184,7 +184,6 @@ def test_two_hundred_retained_session_cycles_stay_bounded_and_do_not_leak_fds(
                 profile_id="stress-profile",
                 canonical_profile_home=str(profile_home.resolve()),
                 original_policy_identities=frozenset({identity}),
-                original_governance_fingerprint="a" * 64,
                 effective_allowed_tool_names=frozenset({name}),
             ),
             max_records=8,

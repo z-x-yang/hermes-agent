@@ -1,7 +1,7 @@
 ---
 sidebar_position: 13
 title: "委派与并行工作"
-description: "Explore、Plan、general-purpose、Batch 与 retained follow-up 的实用模式"
+description: "Explore、Plan、Reviewer、general-purpose、Batch 与 retained follow-up 的实用模式"
 ---
 
 # 委派与并行工作
@@ -14,9 +14,10 @@ Hermes 通过 `delegate_task(description=..., prompt=...)` 委派隔离任务。
 |---|---|---|
 | 定位代码、追踪调用链、收集文件/行证据 | `Explore` | 只读，一次性 |
 | 调研变更并识别关键实现文件 | `Plan` | 只读，一次性 |
+| 独立检查一个 frozen code target 并返回 candidate blocker | `Reviewer` | sealed evidence/tools，结构化结果，一次性 |
 | 编辑、测试、terminal/process 或获准外部动作 | `general-purpose` | 成功后自动保留 |
 
-`general-purpose` 只能获得通过 current parent 精确工具权限和运行时 policy 检查的工具，不是 unrestricted worker，也不是“无外部副作用”的 sandbox。`Explore` 和 `Plan` 保留完整 governance，但跳过项目上下文；general-purpose 额外加载 repo project context 与 workspace/git snapshot。
+`general-purpose` 只能获得通过 current parent 精确工具权限和运行时 policy 检查的工具，不是 unrestricted worker，也不是“无外部副作用”的 sandbox。child 获得 lean Core Contract，而不是完整个人 governance。Explore/Plan 跳过自动项目上下文；Reviewer 只获得固定 review bundle、严格 frozen capsule 与六个 sealed review tools；general-purpose 额外加载 repo project context 与 workspace/git snapshot。
 
 ## 模式：行动前先调查
 
@@ -56,7 +57,7 @@ pytest tests/auth/test_tokens.py -q。返回改动文件和真实输出。""",
 )
 ```
 
-顶层省略 `run_in_background` 时默认后台执行。不要轮询；完成后只向 owning conversation 回流一次结果。
+顶层省略 `run_in_background` 时除 Reviewer 默认前台外，其余 profile 默认后台。不要轮询后台 worker；完成后只向 owning conversation 回流一次结果。
 
 ## 模式：并行独立任务
 

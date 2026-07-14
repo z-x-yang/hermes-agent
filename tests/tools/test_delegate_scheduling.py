@@ -105,6 +105,12 @@ def _install_fake_delegate_runtime(monkeypatch, run_child):
 
 def test_top_level_omission_defaults_background():
     assert _resolve_run_in_background(None, is_subagent=False) is True
+    assert (
+        _resolve_run_in_background(
+            None, is_subagent=False, subagent_type="Reviewer"
+        )
+        is False
+    )
 
 
 def test_top_level_explicit_background_boolean_is_respected():
@@ -439,13 +445,15 @@ def test_run_agent_model_dispatch_forwards_static_background_boolean():
             {
                 "description": "inspect code",
                 "prompt": "inspect the implementation",
-                "subagent_type": "Explore",
+                "subagent_type": "Reviewer",
+                "review_root": "/tmp/review-repo",
                 "run_in_background": False,
             },
         )
 
     assert captured["description"] == "inspect code"
     assert captured["prompt"] == "inspect the implementation"
+    assert captured["review_root"] == "/tmp/review-repo"
     assert captured["run_in_background"] is False
     assert "scheduling" not in captured
     assert "_dispatch_origin" not in captured

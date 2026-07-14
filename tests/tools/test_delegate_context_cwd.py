@@ -238,38 +238,3 @@ def test_delegate_task_background_runner_preserves_contextvar_cwd(tmp_path, monk
         assert captured["entry"]["results"][0]["summary"] == str(ctx_cwd)
     finally:
         clear_session_vars(tokens)
-
-
-def test_delegate_batch_reuses_one_snapshot_then_new_call_reloads(monkeypatch):
-    from tools import delegate_tool as dt
-
-    snapshots = [object(), object()]
-    load_count = 0
-    built_snapshots = []
-
-    def fake_load_governance_snapshot():
-        nonlocal load_count
-        snapshot = snapshots[load_count]
-        load_count += 1
-        return snapshot
-
-    parent = _install_delegate_task_stubs(monkeypatch, dt, summary_fn=lambda: "ok")
-    original_fake_builder = dt._build_child_agent
-
-    def capture_builder(*args, **kwargs):
-        built_snapshots.append(kwargs["governance_snapshot"])
-        return original_fake_builder(*args, **kwargs)
-
-    monkeypatch.setattr(dt, "load_governance_snapshot", fake_load_governance_snapshot)
-    monkeypatch.setattr(dt, "_build_child_agent", capture_builder)
-
-    dt.delegate_task(
-        tasks=[{"description": "a", "prompt": "a"}, {"description": "b", "prompt": "b"}],
-        run_in_background=False,
-        parent_agent=parent,
-    )
-    dt.delegate_task(description="later", prompt="later", run_in_background=False, parent_agent=parent)
-
-    assert load_count == 2
-    assert built_snapshots[:2] == [snapshots[0], snapshots[0]]
-    assert built_snapshots[2] is snapshots[1]

@@ -86,12 +86,13 @@ class TestDelegateRequirements(unittest.TestCase):
                 "prompt",
                 "tasks",
                 "subagent_type",
+                "review_root",
                 "run_in_background",
             },
         )
         self.assertEqual(
             props["subagent_type"]["enum"],
-            ["Explore", "Plan", "general-purpose"],
+            ["Explore", "Plan", "Reviewer", "general-purpose"],
         )
         item = props["tasks"]["items"]
         item_props = item["properties"]
@@ -993,6 +994,40 @@ class TestDelegateObservability(unittest.TestCase):
 
             result = json.loads(delegate_task(description="Test max iter", prompt="Test max iter", parent_agent=parent, run_in_background=False))
             self.assertEqual(result["results"][0]["exit_reason"], "max_iterations")
+
+    @patch("run_agent.AIAgent")
+    def test_context_failure_before_limit_is_not_mislabeled_max_iterations(self, MockAgent):
+        parent = _make_mock_parent(depth=0)
+        child = MagicMock()
+        child.run_conversation.return_value = {
+            "final_response": "",
+            "completed": False,
+            "failed": True,
+            "error": "Context length exceeded after compression",
+            "messages": [],
+            "api_calls": 31,
+        }
+        child.session_prompt_tokens = 0
+        child.session_completion_tokens = 0
+        child.session_estimated_cost_usd = 0.0
+        child.session_reasoning_tokens = 0
+        child.tool_progress_callback = None
+        MockAgent.return_value = child
+
+        result = json.loads(
+            delegate_task(
+                description="context regression",
+                prompt="x",
+                run_in_background=False,
+                parent_agent=parent,
+            )
+        )
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["api_calls"], 31)
+        self.assertEqual(entry["exit_reason"], "context_error")
+        self.assertNotEqual(entry["exit_reason"], "max_iterations")
 
     def test_empty_sentinel_marks_status_failed(self):
         """Regression: a child that returns the literal '(empty)' sentinel
@@ -2468,6 +2503,123 @@ class TestDispatchDelegateTask(unittest.TestCase):
             )
         )
         self.assertIn("unsupported fields: role", unsupported["error"])
+
+    def test_review_root_requires_single_reviewer_invocation(self):
+        parent = _make_mock_parent(depth=0)
+
+        wrong_profile = json.loads(
+            delegate_task(
+                description="inspect",
+                prompt="inspect",
+                subagent_type="Explore",
+                review_root="/tmp/repo",
+                parent_agent=parent,
+                run_in_background=False,
+            )
+        )
+        self.assertIn("single Reviewer invocation", wrong_profile["error"])
+
+        batch = json.loads(
+            delegate_task(
+                tasks=[
+                    {
+                        "description": "review",
+                        "prompt": "review",
+                        "subagent_type": "Reviewer",
+                    }
+                ],
+                review_root="/tmp/repo",
+                parent_agent=parent,
+                run_in_background=False,
+            )
+        )
+        self.assertIn("single Reviewer invocation", batch["error"])
+
+    def test_review_root_resolves_only_an_exact_local_git_root(self):
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        import tools.delegate_tool as delegate_module
+
+        with self.subTest("relative path"):
+            with self.assertRaisesRegex(ValueError, "absolute"):
+                delegate_module._resolve_local_review_root("relative/repo")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            repo = temp_root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            self.assertEqual(
+                delegate_module._resolve_local_review_root(str(repo)),
+                str(repo.resolve()),
+            )
+
+            subdir = repo / "src"
+            subdir.mkdir()
+            with self.assertRaisesRegex(ValueError, "Git worktree root"):
+                delegate_module._resolve_local_review_root(str(subdir))
+
+            non_repo = temp_root / "not-a-repo"
+            non_repo.mkdir()
+            with self.assertRaisesRegex(ValueError, "Git worktree root"):
+                delegate_module._resolve_local_review_root(str(non_repo))
+
+    def test_review_root_reaches_reviewer_builder_and_runner(self):
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        parent = _make_mock_parent(depth=0)
+        credentials = {
+            "model": "review-model",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "test-key",
+            "api_mode": "chat_completions",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir) / "review-repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            with (
+                patch(
+                    "tools.delegate_tool._load_config",
+                    return_value={"max_iterations": 150},
+                ),
+                patch(
+                    "tools.delegate_tool._resolve_delegation_credentials",
+                    return_value=credentials,
+                ),
+                patch("tools.delegate_tool._build_child_agent") as mock_build,
+                patch("tools.delegate_tool._run_single_child") as mock_run,
+            ):
+                mock_build.return_value = MagicMock()
+                mock_run.return_value = {
+                    "task_index": 0,
+                    "status": "completed",
+                    "summary": "done",
+                    "api_calls": 1,
+                    "duration_seconds": 0.1,
+                }
+
+                delegate_task(
+                    description="review code",
+                    prompt="review capsule",
+                    subagent_type="Reviewer",
+                    review_root=str(repo),
+                    parent_agent=parent,
+                    run_in_background=False,
+                )
+
+            self.assertEqual(
+                mock_build.call_args.kwargs["workspace_path_override"],
+                str(repo.resolve()),
+            )
+            self.assertEqual(
+                mock_run.call_args.kwargs["workspace_path"],
+                str(repo.resolve()),
+            )
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     def test_subagent_profile_model_provider_override_reaches_child_builder(self, mock_creds):

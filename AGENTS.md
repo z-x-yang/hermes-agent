@@ -1009,18 +1009,20 @@ Enable/disable per platform via `hermes tools` (the curses UI) or the
 
 ## Delegation (`delegate_task`)
 
-`tools/delegate_tool.py` spawns a subagent with an isolated context and one of three canonical profiles. At top level, omitted `run_in_background` defaults to background execution; nested omission runs foreground. Explicit `run_in_background=false` blocks the parent until the consolidated result returns. Background results re-enter the conversation through the async-delegation completion queue.
+`tools/delegate_tool.py` spawns a subagent with an isolated context and one of four canonical profiles. At top level, omitted `run_in_background` uses the selected profile default (`Reviewer` foreground; others background); nested omission runs foreground. Explicit `run_in_background=false` blocks the parent until the consolidated result returns. Background results re-enter the conversation through the async-delegation completion queue.
 
 Two shapes:
 
-- **Single:** pass `description`, `prompt`, optional `subagent_type`, and optional `run_in_background`.
+- **Single:** pass `description`, `prompt`, optional `subagent_type`, optional `run_in_background`, and—only for a top-level single `Reviewer`—optional `review_root` pointing to an exact local Git worktree root.
 - **Batch (parallel):** pass `tasks: [{description, prompt, subagent_type?}, ...]`. One call returns one batch handle/background unit and one consolidated completion. Live child runners are capped atomically at 5 per root session (also the Batch-width cap) and 20 process-wide by default.
 
 Profiles and lifecycle:
 
 - `Explore` — read-only evidence search; one-shot.
 - `Plan` — read-only implementation planning; one-shot.
+- `Reviewer` — fresh-context sealed review of one strict frozen capsule; one-shot, no edits/delegation/retention, six exact review tools, and validated `report_review_findings` completion. Its findings are candidates that the controller must verify.
 - `general-purpose` — multi-step execution with the exact surviving parent ceiling; retained only after explicit successful completion and resumable with `delegate_continue` in the same live parent session.
+- All profiles receive a lean runtime Core Contract plus explicit task data rather than complete active-profile SOUL/MEMORY/USER or parent history. GP additionally loads real project/workspace context; Reviewer gets only its fixed versioned review bundle, minimal workspace identity, and frozen capsule.
 - Nested delegation is runtime-derived from profile, depth, the runtime kill switch, and exact current-parent authority. The caller cannot select a privilege role.
 
 Key config knobs (under `delegation:` in `config.yaml`): `max_global_concurrent_children`, `max_concurrent_children`, `max_spawn_depth`, `child_timeout_seconds`, the legacy-named `orchestrator_enabled` runtime nesting kill switch, `subagent_auto_approve`, `max_retained_subagent_bytes`, `max_iterations`, and per-profile `child_run_timeout_seconds` / `foreground_wait_timeout_seconds` overrides.

@@ -5681,6 +5681,7 @@ class AIAgent:
             prompt=function_args.get("prompt"),
             tasks=function_args.get("tasks"),
             subagent_type=function_args.get("subagent_type"),
+            review_root=function_args.get("review_root"),
             run_in_background=function_args.get("run_in_background"),
             parent_agent=self,
         )

@@ -1605,26 +1605,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 provider=agent.provider,
                 api_mode=agent.api_mode,
             )
-            if isinstance(
-                getattr(agent, "_governance_diagnostics", None), dict
-            ) and agent._governance_diagnostics.get("fingerprint"):
-                from agent.model_metadata import get_verified_model_context_length
 
-                _fb_verified_limit = get_verified_model_context_length(
-                    agent.model,
-                    base_url=agent.base_url,
-                    api_key=_fb_ctx_api_key,
-                    provider=agent.provider,
-                    config_context_length=_fb_config_context_length,
-                    custom_providers=getattr(agent, "_custom_providers", None),
-                )
-                agent._governance_context_limit_proof = {
-                    "model": agent.model,
-                    "provider": agent.provider,
-                    "base_url": agent.base_url,
-                    "api_mode": agent.api_mode,
-                    "limit": _fb_verified_limit,
-                }
 
         # Keep the prompt's self-identity in sync with the model actually
         # answering, so "what model are you?" doesn't report the primary.
@@ -1993,21 +1974,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
     except Exception as e:
-        from agent.subagent_governance import GovernancePreflightError
-
-        if isinstance(e, GovernancePreflightError):
-            if agent._try_activate_fallback():
-                if (
-                    messages
-                    and messages[-1].get("role") == "user"
-                    and messages[-1].get("content") == summary_request
-                ):
-                    messages.pop()
-                return handle_max_iterations(agent, messages, api_call_count)
-            final_response = e.code
-        else:
-            logger.warning(f"Failed to get summary response: {e}")
-            final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
+        logger.warning(f"Failed to get summary response: {e}")
+        final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
 
     return final_response
 

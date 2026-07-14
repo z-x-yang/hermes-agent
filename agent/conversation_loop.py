@@ -2305,40 +2305,6 @@ def run_conversation(
                 if agent.thinking_callback:
                     agent.thinking_callback("")
 
-                from agent.subagent_governance import GovernancePreflightError
-
-                if isinstance(api_error, GovernancePreflightError):
-                    # The outer loop charges one logical call before entering this
-                    # provider chain.  Keep that charge while another fallback can
-                    # still be attempted.  Refund exactly once only when the chain
-                    # terminates without any provider backend invocation.
-                    if agent._try_activate_fallback():
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt
-                        )
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        continue
-
-                    if not provider_backend_invoked_this_iteration:
-                        api_call_count = max(0, api_call_count - 1)
-                        agent._api_call_count = api_call_count
-                        try:
-                            agent.iteration_budget.refund()
-                        except Exception:
-                            pass
-                    agent._cleanup_task_resources(effective_task_id)
-                    agent._persist_session(messages, conversation_history)
-                    return {
-                        "final_response": api_error.code,
-                        "messages": messages,
-                        "api_calls": api_call_count,
-                        "completed": False,
-                        "failed": True,
-                        "error": api_error.code,
-                    }
-
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
                 #   1. Lone surrogates (U+D800..U+DFFF) from clipboard paste

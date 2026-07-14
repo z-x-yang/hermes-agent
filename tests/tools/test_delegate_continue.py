@@ -105,7 +105,12 @@ def test_retained_session_has_no_role_field():
 
 @pytest.mark.parametrize(
     ("profile", "expected"),
-    [("Explore", False), ("Plan", False), ("general-purpose", True)],
+    [
+        ("Explore", False),
+        ("Plan", False),
+        ("Reviewer", False),
+        ("general-purpose", True),
+    ],
 )
 def test_retention_is_fixed_by_profile(profile, expected):
     from tools import delegate_tool as dt
@@ -115,10 +120,10 @@ def test_retention_is_fixed_by_profile(profile, expected):
 
 def _record(**overrides):
     now = time.time()
-    from agent.subagent_governance import load_governance_snapshot
+    from hermes_cli.profiles import get_active_profile_name
+    from hermes_constants import get_hermes_home
     import model_tools  # noqa: F401
 
-    governance = load_governance_snapshot()
     effective_names = frozenset(
         {
             "terminal",
@@ -147,10 +152,9 @@ def _record(**overrides):
         "created_at": now,
         "expires_at": now + 60,
         "effective_allowed_tool_names": effective_names,
-        "profile_id": governance.profile_id,
-        "canonical_profile_home": str(governance.profile_home.resolve()),
+        "profile_id": get_active_profile_name(),
+        "canonical_profile_home": str(get_hermes_home().expanduser().resolve()),
         "original_policy_identities": original_identities,
-        "original_governance_fingerprint": governance.fingerprint,
     }
     data.update(overrides)
     return RetainedSubagentSession(**data)
@@ -496,16 +500,16 @@ def test_non_boolean_or_false_continuation_does_not_commit_history(
 
         def run_conversation(self, **_kwargs):
             return {
-                "final_response": "governance_transport_unverifiable",
+                "final_response": "provider failed",
                 "completed": completed_value,
-                "error": "governance_transport_unverifiable",
+                "error": "provider failed",
                 "api_calls": 0,
                 "messages": [
                     *original_history,
                     {"role": "user", "content": "continue"},
                     {
                         "role": "assistant",
-                        "content": "governance_transport_unverifiable",
+                        "content": "provider failed",
                     },
                 ],
             }
@@ -525,7 +529,7 @@ def test_non_boolean_or_false_continuation_does_not_commit_history(
     )
 
     assert entry["status"] == "failed"
-    assert entry["summary"] == "governance_transport_unverifiable"
+    assert entry["summary"] == "provider failed"
     assert (
         get_retained_subagent_session("agent-1").conversation_history
         == original_history
@@ -694,74 +698,17 @@ def test_delegate_continue_reuses_history_and_updates_retained_record(monkeypatc
     assert updated.conversation_history[-1] == {"role": "assistant", "content": "continued"}
 
 
-def test_continuation_reloads_modified_current_active_governance(monkeypatch, tmp_path):
-    import agent.subagent_governance as governance
-    import tools.delegate_continue_tool as continue_tool
-    from tools.delegate_tool import _build_child_system_prompt
-
-    memories = tmp_path / "memories"
-    memories.mkdir()
-    (tmp_path / "SOUL.md").write_text("SOUL-V1\n", encoding="utf-8")
-    (memories / "MEMORY.md").write_text("MEMORY-CANARY\n", encoding="utf-8")
-    (memories / "USER.md").write_text("USER-CANARY\n", encoding="utf-8")
-    monkeypatch.setattr(governance, "get_hermes_home", lambda: tmp_path)
-    monkeypatch.setattr(governance, "get_active_profile_name", lambda: "active-test")
-
-    prompts = []
-    fingerprints = []
-
-    def fake_build_child_agent(*_args, **kwargs):
-        snapshot = kwargs["governance_snapshot"]
-        fingerprints.append(snapshot.fingerprint)
-        prompts.append(
-            _build_child_system_prompt(
-                profile=kwargs["profile"],
-                allow_delegation=False,
-                workspace_path=kwargs["workspace_path_override"],
-                child_depth=1,
-                max_spawn_depth=1,
-                governance_snapshot=snapshot,
-            )
-        )
-        return _attach_policy(
-            SimpleNamespace(valid_tool_names={"read_file"}),
-            {"read_file"},
-            kwargs["profile"].name,
-        )
-
-    monkeypatch.setattr("tools.delegate_tool._build_child_agent", fake_build_child_agent)
-    record = _record(
-        subagent_type="Explore",
-        workspace_path=str(tmp_path),
-        effective_allowed_tool_names=frozenset({"read_file"}),
-        profile_id="active-test",
-        canonical_profile_home=str(tmp_path.resolve()),
-    )
-    parent = _parent()
-
-    continue_tool._build_continuation_child(record, prompt="first", parent_agent=parent)
-    (tmp_path / "SOUL.md").write_text("SOUL-V2-MODIFIED\n", encoding="utf-8")
-    continue_tool._build_continuation_child(record, prompt="second", parent_agent=parent)
-
-    assert "SOUL-V1\n" in prompts[0]
-    assert "SOUL-V2-MODIFIED\n" in prompts[1]
-    assert "SOUL-V1\n" not in prompts[1]
-    assert fingerprints[0] != fingerprints[1]
-
-
 def test_continuation_rejects_profile_or_canonical_home_drift_before_child_build(
     monkeypatch,
 ):
     import tools.delegate_continue_tool as continue_tool
 
     record = _record(profile_id="retained-profile")
-    latest = SimpleNamespace(
-        profile_id="different-profile",
-        profile_home=record.canonical_profile_home,
-        fingerprint="b" * 64,
-    )
     backend_calls = []
-    monkeypatch.setattr(continue_tool, "load_governance_snapshot", lambda: latest)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name",
+        lambda: "different-profile",
+    )
     monkeypatch.setattr(
         "tools.delegate_tool._build_child_agent",
         lambda *_args, **_kwargs: backend_calls.append(True),
@@ -781,7 +728,6 @@ def test_continuation_intersects_original_and_current_exact_policy_identities(
 ):
     import tools.delegate_continue_tool as continue_tool
 
-    current = continue_tool.load_governance_snapshot()
     kept = "policy:" + "1" * 64
     original_only = "policy:" + "2" * 64
     replacement = "policy:" + "3" * 64
@@ -798,7 +744,6 @@ def test_continuation_intersects_original_and_current_exact_policy_identities(
         ),
         profile_name="general-purpose",
     )
-    monkeypatch.setattr(continue_tool, "load_governance_snapshot", lambda: current)
     monkeypatch.setattr("tools.delegate_tool._build_child_agent", lambda *_a, **_k: child)
 
     rebuilt = continue_tool._build_continuation_child(
@@ -1993,52 +1938,22 @@ def test_build_continuation_child_warns_after_prior_file_writes(monkeypatch):
     assert "/tmp/repo/changed.py" in built.ephemeral_system_prompt
 
 
-def test_build_continuation_child_preserves_explore_capability_ceiling(monkeypatch):
+def test_build_continuation_child_rejects_one_shot_profiles_before_agent_build(monkeypatch):
     from tools.delegate_continue_tool import _build_continuation_child
-    from toolsets import TOOLSETS
 
-    created = []
-
-    class FakeAgent:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.session_id = "child-session"
-            self.model = kwargs["model"]
-            self.provider = kwargs["provider"]
-            self.base_url = kwargs["base_url"]
-            self.api_mode = kwargs["api_mode"]
-            self._session_init_model_config = {}
-            names = []
-            for toolset in kwargs.get("enabled_toolsets") or []:
-                names.extend(TOOLSETS.get(toolset, {}).get("tools", []))
-            self.valid_tool_names = set(names)
-            self.tools = [
-                {"type": "function", "function": {"name": name, "parameters": {}}}
-                for name in sorted(self.valid_tool_names)
-            ]
-            _set_authority(self, self.valid_tool_names)
-            created.append(self)
-
-    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
-
-    record = _record(subagent_type="Explore")
-    child = _build_continuation_child(
-        record,
-        prompt="same investigation",
-        parent_agent=_parent(enabled_toolsets=["terminal", "file", "web", "delegation"]),
+    built = []
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_agent",
+        lambda **_kwargs: built.append(True),
     )
-
-    assert child is created[0]
-    assert getattr(child, "_subagent_tool_policy", None) is not None
-    assert "read_file" in child.valid_tool_names
-    assert "search_files" in child.valid_tool_names
-    assert "write_file" not in child.valid_tool_names
-    assert "patch" not in child.valid_tool_names
-    assert "terminal" not in child.valid_tool_names
-    assert "delegate_continue" not in child.valid_tool_names
-    assert not hasattr(child, "_delegate_role")
-    assert child._subagent_profile.name == "Explore"
-    assert "/tmp" in child.kwargs["ephemeral_system_prompt"]
+    for profile_name in ("Explore", "Plan", "Reviewer"):
+        with pytest.raises(ValueError, match="one-shot profile"):
+            _build_continuation_child(
+                _record(subagent_type=profile_name),
+                prompt="continue",
+                parent_agent=_parent(),
+            )
+    assert built == []
 
 
 def test_build_continuation_child_preserves_original_effective_tool_ceiling(monkeypatch):
@@ -2415,14 +2330,12 @@ def test_run_single_child_retains_completed_general_purpose_session(monkeypatch)
         "writes_since",
         lambda *_args, **_kwargs: {"sa-test": ["/tmp/repo/changed.py"]},
     )
-    governance = dt.load_governance_snapshot()
+    from hermes_cli.profiles import get_active_profile_name
+    from hermes_constants import get_hermes_home
+
+    profile_id = get_active_profile_name()
+    profile_home = get_hermes_home().expanduser().resolve()
     child = _attach_policy(FakeChild(), {"read_file"}, "general-purpose")
-    child._governance_diagnostics = {
-        "profile_id": governance.profile_id,
-        "profile_home": str(governance.profile_home),
-        "fingerprint": governance.fingerprint,
-        "total_bytes": governance.total_bytes,
-    }
 
     entry = dt._run_single_child(
         task_index=0,
@@ -2446,12 +2359,12 @@ def test_run_single_child_retains_completed_general_purpose_session(monkeypatch)
     assert record.subagent_type == "general-purpose"
     assert record.workspace_path == "/tmp/repo"
     assert record.effective_allowed_tool_names == frozenset({"read_file"})
-    assert record.profile_id == governance.profile_id
-    assert record.canonical_profile_home == str(governance.profile_home.resolve())
+    assert record.profile_id == profile_id
+    assert record.canonical_profile_home == str(profile_home)
     assert record.original_policy_identities == (
         child._subagent_tool_policy.authority_snapshot.policy_identities
     )
-    assert record.original_governance_fingerprint == governance.fingerprint
+    assert not hasattr(record, "original_governance_fingerprint")
     assert record.provider == "openrouter"
     assert record.transport_identity == _transport_identity(
         provider="openrouter",
@@ -2480,18 +2393,17 @@ def test_run_single_child_rejects_non_boolean_or_false_completion(
         session_reasoning_tokens = 0
         tool_progress_callback = None
         valid_tool_names = {"read_file"}
-        _governance_diagnostics = None
 
         def run_conversation(self, **kwargs):
             return {
-                "final_response": "governance_transport_unverifiable",
+                "final_response": "provider failed",
                 "completed": completed_value,
                 "api_calls": 0,
                 "messages": [
                     {"role": "user", "content": kwargs["user_message"]},
                     {
                         "role": "assistant",
-                        "content": "governance_transport_unverifiable",
+                        "content": "provider failed",
                     },
                 ],
             }
@@ -2506,14 +2418,7 @@ def test_run_single_child_rejects_non_boolean_or_false_completion(
     monkeypatch.setattr(
         "tools.subagent_sessions.retain_subagent_session", retain
     )
-    governance = dt.load_governance_snapshot()
     child = _attach_policy(FailedChild(), {"read_file"}, "general-purpose")
-    child._governance_diagnostics = {
-        "profile_id": governance.profile_id,
-        "profile_home": str(governance.profile_home),
-        "fingerprint": governance.fingerprint,
-        "total_bytes": governance.total_bytes,
-    }
 
     entry = dt._run_single_child(
         task_index=0,
@@ -2527,7 +2432,7 @@ def test_run_single_child_rejects_non_boolean_or_false_completion(
     )
 
     assert entry["status"] == "failed"
-    assert entry["summary"] == "governance_transport_unverifiable"
+    assert entry["summary"] == "provider failed"
     assert "retention_status" not in entry
     assert "agent_id" not in entry
     assert "retained_until" not in entry
@@ -2538,16 +2443,9 @@ def test_run_single_child_surfaces_retention_failure(monkeypatch):
     import tools.delegate_tool as dt
     import tools.subagent_sessions as sessions
 
-    governance = dt.load_governance_snapshot()
     child = _attach_policy(
         _CompletedRetainableChild(), {"read_file"}, "general-purpose"
     )
-    child._governance_diagnostics = {
-        "profile_id": governance.profile_id,
-        "profile_home": str(governance.profile_home),
-        "fingerprint": governance.fingerprint,
-        "total_bytes": governance.total_bytes,
-    }
     monkeypatch.setattr(
         sessions,
         "retain_subagent_session",
@@ -2601,14 +2499,7 @@ def test_initial_retained_history_projects_handle_only_tool_results(monkeypatch)
                 ],
             }
 
-    governance = dt.load_governance_snapshot()
     child = _attach_policy(SensitiveChild(), {"read_file"}, "general-purpose")
-    child._governance_diagnostics = {
-        "profile_id": governance.profile_id,
-        "profile_home": str(governance.profile_home),
-        "fingerprint": governance.fingerprint,
-        "total_bytes": governance.total_bytes,
-    }
     dt._run_single_child(
         task_index=0,
         description="read notion",

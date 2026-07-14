@@ -1906,7 +1906,7 @@ checkpoints:
 
 ## Delegation
 
-Configure provider routing, concurrency, runtime-derived nesting, profile timeouts, and automatic GP retention under `delegation`. Model-facing calls use `description`, `prompt`, optional `subagent_type`, and optional `run_in_background`; operator controls below are not exposed to the model.
+Configure provider routing, concurrency, runtime-derived nesting, profile timeouts, and automatic GP retention under `delegation`. Model-facing calls use `description`, `prompt`, optional `subagent_type`, optional `run_in_background`, and optional `review_root` only for a top-level single Reviewer. `review_root` must be an exact absolute local Git worktree root; remote/cluster roots are unsupported. Operator controls below are not exposed to the model.
 
 ```yaml
 delegation:
@@ -1938,6 +1938,9 @@ delegation:
     Plan:
       foreground_wait_timeout_seconds: 1800
       child_run_timeout_seconds: 3600
+    Reviewer:
+      foreground_wait_timeout_seconds: 1800
+      child_run_timeout_seconds: 3600
     general-purpose:
       foreground_wait_timeout_seconds: 1800
       child_run_timeout_seconds: 7200
@@ -1950,7 +1953,7 @@ delegation:
 
 `run_in_background` is the only caller scheduling control:
 
-- top-level omission → background;
+- top-level omission → selected profile default (`Reviewer` foreground; others background);
 - top-level `False` → foreground wait;
 - nested omission or `False` → foreground;
 - nested `True` → reject before child execution;
@@ -1960,13 +1963,13 @@ delegation:
 
 ### Profile context and lifecycle
 
-`Explore` and `Plan` are one-shot read-only profiles. They receive complete governance but skip project context/workspace snapshots. `general-purpose` receives complete governance plus project context and a workspace/git snapshot; successful GP work is automatically retained only when the parent session ID is nonempty and capacity is available.
+`Explore`, `Plan`, and `Reviewer` are one-shot profiles. Every child receives a short runtime-owned Core Contract plus explicit task data; complete active-profile `SOUL.md`/`MEMORY.md`/`USER.md` is not injected. `general-purpose` additionally receives real project context and a workspace/git snapshot, and successful GP work is automatically retained only when the parent session ID is nonempty and capacity is available. Reviewer receives a fixed versioned review bundle and strict frozen capsule, exposes six sealed review tools, and uses the ordinary operator-configured `delegation.max_iterations`.
 
 `delegate_continue` accepts `agent_id`, `prompt`, and optional `run_in_background`. The process-local store is bounded by `retained_subagent_ttl_seconds`, `max_retained_subagents`, and `max_retained_subagent_bytes`, and is lost on Gateway/process restart. Oversized initial records fail closed; claimed continuations are never evicted; an oversized successful update preserves the result but drops/invalidate the retained handle.
 
 ### Provider and model routing
 
-By default, subagents inherit the parent provider/model. Shared `delegation.provider`/`model` overrides that default; `delegation.agents.<type>.provider`/`model` overrides one profile. A configured direct `base_url` takes precedence over `provider`; endpoint-scoped credential rules fail closed rather than forwarding an unrelated provider key. Provider fallback still runs each attempt through complete governance and final payload-fit checks.
+By default, subagents inherit the parent provider/model. Shared `delegation.provider`/`model` overrides that default; `delegation.agents.<type>.provider`/`model` overrides one profile. A configured direct `base_url` takes precedence over `provider`; endpoint-scoped credential rules fail closed rather than forwarding an unrelated provider key. Main and child agents use the same provider-visible estimation, tool-output cleanup, context compression, and provider context-error recovery. There is no child-only raw-byte governance fit gate or governance-triggered provider fallback.
 
 Retained records do not store credentials or custom endpoint secrets. Continuation resolves credentials again from current trusted configuration.
 
@@ -1974,7 +1977,7 @@ Retained records do not store credentials or custom endpoint secrets. Continuati
 
 `max_global_concurrent_children` caps live child runners across the entire Hermes process (default `20`, floor `1`). `max_concurrent_children` caps live runners owned by one root session, including nested descendants and continuations, and also caps one Batch width (default `5`, floor `1`). Reservations are atomic across both ceilings: oversized or saturated batches reject before any child starts. One accepted Batch returns one handle and emits one consolidated completion even though each child consumes one runner slot.
 
-`max_spawn_depth=2` permits one bounded `general-purpose` orchestrator layer (`parent → child → grandchild`). Only a GP child whose current parent actually exposes `delegate_task` may receive nesting, and only while `orchestrator_enabled` is true and another depth remains. `Explore` and `Plan` never delegate. Each extra level can multiply cost and concurrency, so raise depth deliberately.
+`max_spawn_depth=2` permits one bounded `general-purpose` orchestrator layer (`parent → child → grandchild`). Only a GP child whose current parent actually exposes `delegate_task` may receive nesting, and only while `orchestrator_enabled` is true and another depth remains. `Explore`, `Plan`, and `Reviewer` never delegate. Each extra level can multiply cost and concurrency, so raise depth deliberately.
 
 ## Clarify
 

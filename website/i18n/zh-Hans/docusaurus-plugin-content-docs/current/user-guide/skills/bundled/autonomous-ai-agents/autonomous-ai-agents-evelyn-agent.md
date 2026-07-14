@@ -631,13 +631,13 @@ terminal(command="tmux new-session -d -s resumed 'hermes --resume 20260225_14305
 
 ### 委派（`delegate_task` / `delegate_continue`）
 
-Hermes 只暴露 `Explore`、`Plan` 和 `general-purpose`；省略时解析为 `general-purpose`。单任务使用 `description` + 自包含 `prompt`；顶层省略 `run_in_background` 时后台执行，嵌套省略时前台执行，嵌套 true 会 fail closed。
+Hermes 只暴露 `Explore`、`Plan`、`Reviewer` 和 `general-purpose`；省略时解析为 `general-purpose`。单任务使用 `description` + 自包含 `prompt`；顶层省略时采用所选 profile 默认值（Reviewer 前台、其余后台），嵌套省略时前台执行，嵌套 true 会 fail closed。
 
-- **单任务：** `delegate_task(description=..., prompt=..., subagent_type=...)`。
+- **单任务：** `delegate_task(description=..., prompt=..., subagent_type=..., review_root=...)`；可选 `review_root` 仅限顶层单个 Reviewer，且必须是本机 absolute Git worktree 精确根目录；不支持 remote/cluster root。
 - **Batch：** item 只有 `description`、`prompt` 和可选 `subagent_type`；一个 Batch 只有一个 handle 和一次 consolidated completion。
-- **生命周期：** Explore/Plan 是一次性任务；成功的 general-purpose 在 parent session 与容量可用时自动保留。
+- **生命周期：** Explore/Plan/Reviewer 是一次性任务；成功的 general-purpose 在 parent session 与容量可用时自动保留。
 - **续聊：** 同一 retained GP 工作使用 `delegate_continue(agent_id, prompt, run_in_background=...)`。
-- **上下文：** 每个 profile 都收到完整 governance；GP 额外加载项目上下文/workspace snapshot，Explore/Plan 跳过项目上下文。
+- **上下文：** child 获得 lean Core Contract 与显式 task data，不注入完整个人 governance 或 parent history。GP 额外加载 project context/workspace snapshot。Reviewer 只获得固定 bundle、严格 frozen capsule、六个 sealed review tools 与 validated structured completion。
 - **嵌套：** 由 GP 类型、current parent 精确工具权限、depth 和 kill switch 运行时派生，不由 caller role 决定。
 - **不持久：** process/Gateway restart 会丢失后台工作和 retained session；持久任务用 cron 或 managed process。
 

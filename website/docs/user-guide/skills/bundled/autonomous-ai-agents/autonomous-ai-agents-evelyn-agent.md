@@ -723,10 +723,11 @@ here; full developer notes live in `AGENTS.md`, user-facing docs under
 
 Spawn a subagent with an isolated context and its canonical profile ceiling.
 
-- **Single:** `delegate_task(description=..., prompt=..., subagent_type=..., run_in_background=...)`.
+- **Single:** `delegate_task(description=..., prompt=..., subagent_type=..., review_root=..., run_in_background=...)`; `review_root` is optional and valid only for a top-level single Reviewer, must be an exact absolute local Git worktree root, and never supports remote/cluster paths.
 - **Batch:** `delegate_task(tasks=[{description, prompt, subagent_type?}, ...], run_in_background=...)` runs children in parallel. Defaults cap live runners at 5 per root session (also the Batch-width cap) and 20 process-wide, then return one consolidated completion.
-- **Profiles:** `Explore` and `Plan` are read-only one-shot agents; `general-purpose` handles multi-step execution and is automatically retained only after explicit successful completion.
-- **Scheduling:** top-level omission defaults to background; a nested omission runs foreground. `run_in_background=true` forces background where the runtime permits it. Background results re-enter the parent conversation on completion.
+- **Profiles:** `Explore` and `Plan` are read-only one-shot agents; `Reviewer` is a sealed, fresh-context, structured one-shot code reviewer; `general-purpose` handles multi-step execution and is automatically retained only after explicit successful completion. Omission still resolves to `general-purpose`.
+- **Context:** children receive a runtime Core Contract plus explicit task data, not complete `SOUL.md`/`MEMORY.md`/`USER.md` or parent history. GP additionally loads project context. Reviewer receives only its fixed review bundle, minimal workspace identity, and strict frozen capsule; its exact tools are root-scoped review read/search, structured Git, gated readonly web, and `report_review_findings` structured completion.
+- **Scheduling:** top-level omission uses the selected profile default (`Reviewer` foreground; others background); a nested omission runs foreground. An explicit `run_in_background` boolean wins where runtime permits it. Background results re-enter the parent conversation on completion.
 - **Continuation:** resume a retained successful general-purpose child with `delegate_continue(agent_id=..., prompt=..., run_in_background=...)` in the same live parent session.
 - **Nesting:** authority is runtime-derived from depth, profile policy, configuration, and the exact current-parent tool ceiling. Callers cannot select delegation privilege roles.
 - **Not durable.** Background children and retained continuations are process-local. If work must outlive the process, use `cronjob` or `terminal(background=True, notify_on_complete=True)`.

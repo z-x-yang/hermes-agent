@@ -1,7 +1,7 @@
 ---
 sidebar_position: 13
 title: "Delegation & Parallel Work"
-description: "Practical patterns for Explore, Plan, general-purpose, Batch, and retained follow-ups"
+description: "Practical patterns for Explore, Plan, Reviewer, general-purpose, Batch, and retained follow-ups"
 ---
 
 # Delegation & Parallel Work
@@ -14,9 +14,10 @@ Hermes delegates isolated work through `delegate_task(description=..., prompt=..
 |---|---|---|
 | Locate code, trace a call path, gather file/line evidence | `Explore` | read-only, one-shot |
 | Research a change and identify critical implementation files | `Plan` | read-only, one-shot |
+| Independently inspect one frozen code target and return candidate blockers | `Reviewer` | sealed evidence/tools, structured result, one-shot |
 | Edit, test, use terminal/process, or perform permitted external actions | `general-purpose` | automatically retained after success |
 
-`general-purpose` receives only the exact current-parent tool authority that survives runtime policy checks. It is not an unrestricted worker and not a no-side-effect sandbox. `Explore` and `Plan` retain complete governance but skip project context; general-purpose additionally loads repository project context and a workspace/git snapshot.
+`general-purpose` receives only the exact current-parent tool authority that survives runtime policy checks. It is not an unrestricted worker and not a no-side-effect sandbox. Children receive a lean Core Contract rather than complete personal governance. Explore/Plan skip automatic project context; Reviewer gets only a fixed review bundle plus strict frozen capsule and six sealed review tools; general-purpose additionally loads repository project context and a workspace/git snapshot.
 
 ## Pattern: focused exploration before acting
 
@@ -56,7 +57,7 @@ pytest tests/auth/test_tokens.py -q. Return changed files and real output.""",
 )
 ```
 
-Top-level omission defaults `run_in_background` to true. Do not poll the worker; one completion re-enters the owning conversation.
+Top-level omission defaults `run_in_background` to true except for Reviewer, whose default is foreground. Do not poll a background worker; one completion re-enters the owning conversation.
 
 ## Pattern: parallel independent work
 
