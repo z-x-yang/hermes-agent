@@ -1620,6 +1620,52 @@ class TestCaptureAppFilterNoMatch:
         assert backend._active_pid == 22462
         assert backend._active_window_id == 119584
 
+    def test_capture_surfaces_driver_screenshot_error(self):
+        windows = [
+            {"app_name": "Google Chrome", "pid": 22462, "window_id": 119584,
+             "is_on_screen": False, "title": "ScholarOne Manuscripts", "z_index": 0},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+        session: Any = backend._session
+        session.call_tool.side_effect = [
+            {"data": "", "images": [], "isError": False,
+             "structuredContent": {"windows": windows}},
+            {"data": "✅ Google Chrome — 1 element\n", "images": [], "isError": False,
+             "structuredContent": {
+                 "elements": [],
+                 "degraded": True,
+                 "screenshot_error": "screencapture exited with status 1",
+             }},
+        ]
+
+        cap = backend.capture(mode="som", app="Google Chrome")
+
+        assert cap.screenshot_error == "screencapture exited with status 1"
+
+    def test_ax_capture_skips_pixels_and_ignores_screenshot_error(self):
+        windows = [
+            {"app_name": "Google Chrome", "pid": 22462, "window_id": 119584,
+             "is_on_screen": False, "title": "ScholarOne Manuscripts", "z_index": 0},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+        session: Any = backend._session
+        session.call_tool.side_effect = [
+            {"data": "", "images": [], "isError": False,
+             "structuredContent": {"windows": windows}},
+            {"data": "✅ Google Chrome — 1 element\n", "images": [], "isError": False,
+             "structuredContent": {
+                 "elements": [],
+                 "degraded": True,
+                 "screenshot_error": "must not leak into AX mode",
+             }},
+        ]
+
+        cap = backend.capture(mode="ax", app="Google Chrome")
+
+        _, args = session.call_tool.call_args_list[1].args
+        assert args["include_screenshot"] is False
+        assert cap.screenshot_error is None
+
     def test_app_filter_prefers_titled_content_window_over_helper(self):
         windows = [
             {"app_name": "Google Chrome", "pid": 22462, "window_id": 129915,
@@ -2087,6 +2133,25 @@ class TestImageMimeTypePropagation:
             assert url.startswith("data:image/png;base64,"), (
                 f"sniff fallback should default to PNG; got {url[:32]}"
             )
+
+    def test_capture_response_exposes_screenshot_failure_error(self):
+        from tools.computer_use.backend import CaptureResult
+        from tools.computer_use.tool import _capture_response
+
+        cap = CaptureResult(
+            mode="som",
+            width=0,
+            height=0,
+            png_b64=None,
+            elements=[],
+            screenshot_error="capture denied",
+        )
+
+        payload = json.loads(_capture_response(cap))
+
+        assert payload["degraded"] is True
+        assert payload["screenshot_error"] == "capture denied"
+        assert payload["retry"] is True
 
 
 class TestMcpInvocationResolution:

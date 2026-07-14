@@ -1205,6 +1205,7 @@ class CuaDriverBackend(ComputerUseBackend):
         elements: List[UIElement] = []
         width = height = 0
         window_title = ""
+        screenshot_error: Optional[str] = None
 
         if mode == "vision":
             # Plain screenshot, no AX walk. cua-driver dropped the standalone
@@ -1252,6 +1253,10 @@ class CuaDriverBackend(ComputerUseBackend):
                     },
                 )
                 png_b64, image_mime_type = _image_from_tool_result(gws_out)
+                screenshot_error = (
+                    (gws_out.get("structuredContent") or {}).get("screenshot_error")
+                    or None
+                )
                 # Still grab the window title — it's cheap and useful in the
                 # vision response — but deliberately leave `elements` empty so
                 # vision stays free of AX-tree noise.
@@ -1268,6 +1273,7 @@ class CuaDriverBackend(ComputerUseBackend):
                     "pid": self._active_pid,
                     "window_id": self._active_window_id,
                     "session": self._session_id,
+                    "include_screenshot": mode != "ax",
                 },
             )
             text = gws_out["data"] if isinstance(gws_out["data"], str) else ""
@@ -1302,6 +1308,11 @@ class CuaDriverBackend(ComputerUseBackend):
             # structuredContent (screenshot_png_b64) depending on the driver
             # build — _image_from_tool_result handles both.
             png_b64, image_mime_type = _image_from_tool_result(gws_out)
+            if mode != "ax":
+                screenshot_error = (
+                    (gws_out.get("structuredContent") or {}).get("screenshot_error")
+                    or None
+                )
 
             # Extract window title from the AX tree first AXWindow line.
             wt = re.search(r'AXWindow\s+"([^"]+)"', tree)
@@ -1330,6 +1341,7 @@ class CuaDriverBackend(ComputerUseBackend):
             window_title=window_title,
             png_bytes_len=png_bytes_len,
             image_mime_type=image_mime_type,
+            screenshot_error=screenshot_error,
         )
 
     # ── Pointer ────────────────────────────────────────────────────

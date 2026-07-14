@@ -563,6 +563,11 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
     ]
     if element_index:
         summary_lines.extend(element_index)
+    if cap.screenshot_error:
+        summary_lines.append(
+            "  (screenshot failed: " + cap.screenshot_error
+            + "; AX data may still be usable. Retry before any pixel action.)"
+        )
     # Multimodal and AX paths both reference `summary`; build it once up-front
     # so the aux-vision routing branch (which fires before either path is
     # selected) has a valid value to hand to _route_capture_through_aux_vision.
@@ -617,6 +622,12 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
             }
             if truncated_elements:
                 payload["truncated_elements"] = truncated_elements
+            if cap.screenshot_error:
+                payload.update({
+                    "degraded": True,
+                    "screenshot_error": cap.screenshot_error,
+                    "retry": True,
+                })
             return json.dumps(payload)
 
         # Prefer the explicit MIME type cua-driver attaches to its image
@@ -662,6 +673,12 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
     }
     if truncated_elements:
         payload["truncated_elements"] = truncated_elements
+    if cap.screenshot_error:
+        payload.update({
+            "degraded": True,
+            "screenshot_error": cap.screenshot_error,
+            "retry": True,
+        })
     return json.dumps(payload)
 
 

@@ -65,6 +65,9 @@ class CaptureResult:
     # When None, downstream consumers fall back to base64-prefix
     # sniffing for back-compat with older drivers.
     image_mime_type: Optional[str] = None
+    # Driver-reported screenshot failure. AX elements may still be usable,
+    # but callers must not treat a missing image as a successful pixel capture.
+    screenshot_error: Optional[str] = None
 
 
 @dataclass
