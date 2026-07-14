@@ -128,6 +128,19 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("one batch handle", description)
         self.assertIn("one consolidated completion", description)
 
+    def test_brief_contract_matches_task_type_and_keeps_parent_ownership(self):
+        description = DELEGATE_TASK_SCHEMA["description"]
+        self.assertIn("Brief a lookup with the exact locator or command", description)
+        self.assertIn(
+            "Brief an investigation with the question, known facts, evidence boundary, "
+            "and stop condition—not prescribed steps",
+            description,
+        )
+        self.assertIn(
+            "The parent owns synthesis, decisions, and any follow-on authorization",
+            description,
+        )
+
     def test_reviewer_uses_profile_description_and_ordinary_prompt_schema(self):
         profile = get_subagent_profile("Reviewer")
         properties = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
