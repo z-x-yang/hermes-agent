@@ -233,6 +233,17 @@ def test_desktop_builds_as_evelyn_with_hermes_compatibility_ids():
     assert build["nsis"]["uninstallDisplayName"] == "Evelyn"
 
 
+def test_desktop_package_version_matches_python_release_version():
+    with (ROOT / "pyproject.toml").open("rb") as handle:
+        python_version = tomllib.load(handle)["project"]["version"]
+
+    desktop_version = _json("apps/desktop/package.json")["version"]
+    lock_version = _json("package-lock.json")["packages"]["apps/desktop"]["version"]
+
+    assert desktop_version == python_version
+    assert lock_version == python_version
+
+
 def test_desktop_runtime_and_installer_display_evelyn():
     assert "const APP_NAME = 'Evelyn'" in _text("apps/desktop/electron/main.cjs")
     assert "<title>Evelyn</title>" in _text("apps/desktop/index.html")

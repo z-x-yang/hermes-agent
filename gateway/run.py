@@ -14635,6 +14635,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_id = None
         session_key = None
         metadata = None
+        platform = None
+        platform_str = None
         for path in (claimed_path, pending_path):
             if path.exists():
                 try:
@@ -14664,7 +14666,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pass
 
         if not adapter or not chat_id:
-            logger.warning("Update watcher: cannot resolve adapter/chat_id, falling back to completion-only")
+            platform_config = None
+            config = getattr(self, "config", None)
+            if config is not None and platform is not None:
+                platform_config = config.platforms.get(platform)
+            target_platform_disabled = (
+                adapter is None
+                and chat_id is not None
+                and platform_config is not None
+                and not platform_config.enabled
+            )
+            if target_platform_disabled:
+                logger.info(
+                    "Update watcher: %s target platform is disabled; "
+                    "waiting for terminal cleanup without notification",
+                    platform_str,
+                )
+            else:
+                logger.warning(
+                    "Update watcher: cannot resolve adapter/chat_id, "
+                    "falling back to completion-only"
+                )
             # Fall back to completion-only: wait for the exit code and send the
             # final notification. _send_update_notification re-resolves the
             # adapter on every call, so when the target platform is still
@@ -14676,8 +14698,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if exit_code_path.exists() and await self._send_update_notification():
                     return
                 await asyncio.sleep(poll_interval)
-            if (pending_path.exists() or claimed_path.exists()) and not exit_code_path.exists():
-                exit_code_path.write_text("124")
+            if pending_path.exists() or claimed_path.exists():
+                if not exit_code_path.exists():
+                    exit_code_path.write_text("124")
                 await self._send_update_notification()
             return
 
@@ -14895,6 +14918,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Resolve adapter
             platform = Platform(platform_str)
             adapter = self.adapters.get(platform)
+            platform_config = None
+            config = getattr(self, "config", None)
+            if config is not None:
+                platform_config = config.platforms.get(platform)
+
+            if (
+                not adapter
+                and chat_id
+                and platform_config is not None
+                and not platform_config.enabled
+            ):
+                logger.info(
+                    "Update notification skipped: %s target platform is disabled",
+                    platform_str,
+                )
+                return True
 
             if not adapter and chat_id:
                 # The update finished, but the target platform has not

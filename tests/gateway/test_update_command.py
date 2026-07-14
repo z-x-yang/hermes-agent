@@ -28,6 +28,14 @@ def _make_event(text="/update", platform=Platform.TELEGRAM,
     return MessageEvent(text=text, source=source)
 
 
+@pytest.fixture(autouse=True)
+def isolate_update_artifact_root(monkeypatch, tmp_path):
+    """Keep update lifecycle artifacts out of the live profile."""
+    hermes_home = tmp_path / "module-update-home"
+    hermes_home.mkdir()
+    monkeypatch.setattr("gateway.run._hermes_home", hermes_home)
+
+
 def _make_runner():
     """Create a bare GatewayRunner without calling __init__."""
     from gateway.run import GatewayRunner

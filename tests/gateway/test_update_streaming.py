@@ -15,7 +15,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
@@ -482,6 +482,74 @@ class TestWatchUpdateProgress:
         # ...and the markers are cleaned up after successful delivery.
         assert not pending_path.exists()
         assert not (hermes_home / ".update_exit_code").exists()
+
+    @pytest.mark.asyncio
+    async def test_disabled_target_platform_cleans_terminal_update_markers(self, tmp_path):
+        """A disabled target is a definitive skip, not a reconnect candidate."""
+        runner = _make_runner()
+        runner.config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=False)}
+        )
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "67890",
+            "user_id": "12345",
+        }))
+        exit_code_path = hermes_home / ".update_exit_code"
+        exit_code_path.write_text("124")
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await asyncio.wait_for(
+                runner._watch_update_progress(
+                    poll_interval=0.01,
+                    stream_interval=0.02,
+                    timeout=5.0,
+                ),
+                timeout=0.5,
+            )
+
+        assert not pending_path.exists()
+        assert not exit_code_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_disabled_target_cleans_terminal_marker_written_at_deadline(self, tmp_path):
+        """A terminal marker written during the final sleep must still be consumed."""
+        runner = _make_runner()
+        runner.config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=False)}
+        )
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "67890",
+            "user_id": "12345",
+        }))
+        exit_code_path = hermes_home / ".update_exit_code"
+
+        fake_loop = MagicMock()
+        fake_loop.time.side_effect = [0.0, 0.0, 1.0]
+
+        async def finish_during_final_sleep(_delay):
+            exit_code_path.write_text("0")
+
+        with patch("gateway.run._hermes_home", hermes_home), \
+             patch("gateway.run.asyncio.get_running_loop", return_value=fake_loop), \
+             patch("gateway.run.asyncio.sleep", side_effect=finish_during_final_sleep):
+            await runner._watch_update_progress(
+                poll_interval=0.01,
+                stream_interval=0.02,
+                timeout=0.5,
+            )
+
+        assert not pending_path.exists()
+        assert not exit_code_path.exists()
 
     @pytest.mark.asyncio
     async def test_prompt_forwarded_only_once(self, tmp_path):
