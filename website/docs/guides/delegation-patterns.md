@@ -17,7 +17,7 @@ Hermes delegates isolated work through `delegate_task(description=..., prompt=..
 | Independently inspect a scoped code change and return candidate blockers | `Reviewer` | repo context, ordinary prompt/final, one-shot |
 | Edit, test, use terminal/process, or perform permitted external actions | `general-purpose` | automatically retained after success |
 
-`general-purpose` receives only the exact current-parent tool authority that survives runtime policy checks. It is not an unrestricted worker and not a no-side-effect sandbox. Children receive a lean Core Contract rather than complete personal governance. Explore/Plan skip automatic project context; Reviewer and general-purpose load repository project context and a workspace/git snapshot. Reviewer uses ordinary read/search/terminal plus authority-gated readonly web, but no named private-source, write, process, browser, or delegation tools. Because raw terminal is present, its no-edit/private-source rule is a profile instruction verified by the controller, not a mechanical sandbox.
+`general-purpose` receives only the exact current-parent tool authority that survives runtime policy checks. It is not an unrestricted worker and not a no-side-effect sandbox. On the same provider/endpoint it inherits the parent's SOUL/MEMORY/USER context; cross-provider/endpoint routes and fallbacks strip that personal context. Explore/Plan remain lean and skip automatic project context; Reviewer remains personal-context isolated. Reviewer and general-purpose load repository project context and a workspace/git snapshot. Reviewer uses ordinary read/search/terminal plus authority-gated readonly web, but no named private-source, write, process, browser, or delegation tools. Because it has raw terminal, its no-edit/private-source rule is an instruction plus controller verification, not a mechanical sandbox.
 
 ## Pattern: focused exploration before acting
 
@@ -38,8 +38,8 @@ and unresolved call edges. Do not modify anything.""",
 delegate_task(
     description="plan token rotation",
     prompt="""Repository: /home/user/webapp.
-Identify critical files, existing tests, migration risks, security constraints,
-and open questions. End with ### Critical Files for Implementation.""",
+Return research inputs for the parent: critical files, existing tests, migration
+risks, security constraints, and open questions. Do not choose the final plan.""",
     subagent_type="Plan",
     run_in_background=False,
 )

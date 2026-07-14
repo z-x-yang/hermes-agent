@@ -15,9 +15,9 @@ Hermes uses `delegate_task` to run isolated child agents. The model-facing contr
 | Type | Use it for | Lifecycle and context |
 |---|---|---|
 | `Explore` | Read-only code/file/source investigation | one-shot; lean Core Contract + task capsule; skips personal and project context |
-| `Plan` | Read-only implementation research and planning | one-shot; Core Contract + controller-selected task/project summary; skips personal governance |
+| `Plan` | Read-only research inputs for parent-owned implementation planning | one-shot; lean Core Contract + task data; skips personal/project context and does not author the final plan |
 | `Reviewer` | Fresh-context independent review of a scoped code change | one-shot; foreground by default; repository context + ordinary self-contained prompt; ordinary final response |
-| `general-purpose` | Multi-step execution, edits, tests, and permitted external actions | automatically retained after successful completion; Core Contract plus project context and workspace snapshot |
+| `general-purpose` | Multi-step execution, edits, tests, and permitted external actions | automatically retained after successful completion; Core Contract plus project context/workspace snapshot and, only on the same provider/endpoint, the parent SOUL/MEMORY/USER context |
 
 Like Claude Code, each canonical profile owns the routing `description` that tells the parent when to select it. `Reviewer` uses the same ordinary `prompt` field as every other profile; it has no hidden JSON grammar or profile-specific completion tool. Its profile system instructions preload a fixed runtime-owned review method: establish scope and intended behavior, inspect callers/callees plus data/error/cleanup paths, trace runtime wiring and false-green tests, and consider reuse, simplification, and performance only when they expose a concrete defect. This is profile text, not dynamic skill discovery or automatic inheritance of another product's bundled review command. `review_root` remains a top-level Hermes adaptation that binds one local worktree when the current workspace is not the intended target.
 

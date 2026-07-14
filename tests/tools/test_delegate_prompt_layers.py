@@ -68,7 +68,7 @@ def test_generic_delegation_keeps_a_static_fallback_contract():
     assert SUBAGENT_CORE_CONTRACT in system_prompt
 
 
-def test_personal_governance_is_not_loaded_into_any_child_prompt(tmp_path):
+def test_static_profile_prompts_do_not_load_personal_governance(tmp_path):
     (tmp_path / "SOUL.md").write_text("SOUL-CANARY", encoding="utf-8")
     memories = tmp_path / "memories"
     memories.mkdir()

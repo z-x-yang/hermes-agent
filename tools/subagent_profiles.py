@@ -83,9 +83,10 @@ EXPLORE_FINAL = (
 )
 
 PLAN_FINAL = (
-    "Return an actionable implementation plan without making changes. End with "
-    "`### Critical Files for Implementation` and list 3-5 files that are central "
-    "to the plan, each with a one-line reason."
+    "Return concise implementation-plan inputs for the parent: relevant architecture, "
+    "observed behavior, constraints, dependencies, risks, open questions, and critical "
+    "files with symbols or line evidence. Do not choose or present the final plan; the "
+    "parent owns that decision."
 )
 
 GENERAL_FINAL = (
@@ -159,7 +160,7 @@ _PROFILES = {
         default_run_timeout_seconds=3600,
         default_run_in_background=True,
         retain_on_success=False,
-        context_policy="project_summary",
+        context_policy="lean",
         allow_delegation=False,
     ),
     "Reviewer": SubagentProfile(

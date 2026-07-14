@@ -17,7 +17,7 @@ Hermes 通过 `delegate_task(description=..., prompt=...)` 委派隔离任务。
 | 独立检查 scoped code change 并返回 candidate blocker | `Reviewer` | repo context、普通 prompt/final、一次性 |
 | 编辑、测试、terminal/process 或获准外部动作 | `general-purpose` | 成功后自动保留 |
 
-`general-purpose` 只能获得通过 current parent 精确工具权限和运行时 policy 检查的工具，不是 unrestricted worker，也不是“无外部副作用”的 sandbox。child 获得 lean Core Contract，而不是完整个人 governance。Explore/Plan 跳过自动项目上下文；Reviewer 和 general-purpose 加载 repo project context 与 workspace/git snapshot。Reviewer 使用普通 read/search/terminal 与按 parent authority 提供的 readonly web，不暴露 named private-source、write、process、browser 或 delegation tools。由于存在 raw terminal，no-edit/private-source 是 profile instruction 并由 controller 检查，不是机械 sandbox。
+`general-purpose` 只能获得通过 current parent 精确工具权限和运行时 policy 检查的工具，不是 unrestricted worker，也不是“无外部副作用”的 sandbox。同 provider/endpoint 时，它继承 parent 的 SOUL/MEMORY/USER context；跨 provider/endpoint route 或 fallback 会剥离这份 personal context。Explore/Plan 保持 lean 并跳过自动项目上下文；Reviewer 保持 personal-context 隔离。Reviewer 和 general-purpose 加载 repo project context 与 workspace/git snapshot。Reviewer 使用普通 read/search/terminal 与按 parent authority 提供的 readonly web，不暴露 named private-source、write、process、browser 或 delegation tools。由于存在 raw terminal，no-edit/private-source 是 profile instruction 并由 controller 检查，不是机械 sandbox。
 
 ## 模式：行动前先调查
 
@@ -38,8 +38,8 @@ delegate_task(
 delegate_task(
     description="plan token rotation",
     prompt="""Repository: /home/user/webapp.
-识别 critical files、现有 tests、migration risk、security constraint 和
-open questions。以 ### Critical Files for Implementation 结尾。""",
+为 parent 返回调研输入：critical files、现有 tests、migration risk、security
+constraint 和 open questions；不要选择最终 plan。""",
     subagent_type="Plan",
     run_in_background=False,
 )

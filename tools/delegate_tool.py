@@ -36,7 +36,7 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 
 from agent.coding_context import build_coding_workspace_block
-from agent.prompt_builder import build_context_files_prompt
+from agent.prompt_builder import build_context_files_prompt, load_soul_md
 from toolsets import TOOLSETS
 from tools.subagent_profiles import (
     DEFAULT_SUBAGENT_TYPE,
@@ -1298,6 +1298,72 @@ def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> 
     return fallback_base_url or None
 
 
+def _parent_personal_always_on(parent_agent) -> str:
+    """Return the parent's SOUL plus frozen MEMORY/USER for a GP child."""
+    inherited = getattr(parent_agent, "_delegate_personal_context_snapshot", None)
+    if isinstance(inherited, str) and inherited.strip():
+        return inherited
+
+    parts: List[str] = []
+    soul = load_soul_md()
+    if isinstance(soul, str) and soul.strip():
+        parts.append(soul.strip())
+
+    store = getattr(parent_agent, "_memory_store", None)
+    if store is not None:
+        for enabled_attr, target in (
+            ("_memory_enabled", "memory"),
+            ("_user_profile_enabled", "user"),
+        ):
+            if not bool(getattr(parent_agent, enabled_attr, False)):
+                continue
+            block = store.format_for_system_prompt(target)
+            if isinstance(block, str) and block.strip():
+                parts.append(block.strip())
+
+    if not parts:
+        return ""
+    context = (
+        "# Personal always-on context inherited from the parent profile\n\n"
+        + "\n\n".join(parts)
+    )
+    setattr(parent_agent, "_delegate_personal_context_snapshot", context)
+    return context
+
+
+def _personal_context_stays_on_runtime(
+    parent_agent,
+    *,
+    provider: Optional[str],
+    base_url: Optional[str],
+    fallback_chain: Any,
+) -> bool:
+    """Allow personal context only while every provider route stays on the parent runtime."""
+    parent_provider = str(getattr(parent_agent, "provider", None) or "").strip()
+    parent_url = _normalized_runtime_url(
+        _inherit_parent_base_url(parent_agent, getattr(parent_agent, "base_url", None))
+    )
+    if not parent_provider:
+        return False
+    if str(provider or "").strip() != parent_provider:
+        return False
+    if _normalized_runtime_url(base_url) != parent_url:
+        return False
+
+    if fallback_chain and not isinstance(fallback_chain, list):
+        return False
+    entries = fallback_chain or []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return False
+        if str(entry.get("provider") or "").strip() != parent_provider:
+            return False
+        fallback_url = _normalized_runtime_url(entry.get("base_url"))
+        if fallback_url and fallback_url != parent_url:
+            return False
+    return True
+
+
 def _build_child_agent(
     task_index: int,
     description: str,
@@ -1573,6 +1639,17 @@ def _build_child_agent(
     # fallback_model parameter (which handles both list and dict forms).
     parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
 
+    personal_context = ""
+    if profile.name == "general-purpose" and _personal_context_stays_on_runtime(
+        parent_agent,
+        provider=effective_provider,
+        base_url=effective_base_url,
+        fallback_chain=parent_fallback,
+    ):
+        personal_context = _parent_personal_always_on(parent_agent)
+        if personal_context:
+            child_prompt = f"{child_prompt}\n\n{personal_context}"
+
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
     # constraints).  BUT: when `delegation.provider` is set the user is
@@ -1626,6 +1703,9 @@ def _build_child_agent(
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
     )
+    if personal_context:
+        setattr(child, "_delegate_personal_context_snapshot", personal_context)
+
     from agent.subagent_tool_policy import (
         apply_tool_policy_to_agent,
         build_child_tool_policy,

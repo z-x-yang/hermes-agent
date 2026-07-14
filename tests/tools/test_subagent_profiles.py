@@ -48,8 +48,8 @@ def test_profiles_use_claude_like_type_specific_final_guidance():
     assert "mcp_notion_ai_notion_ai_ask" in explore
     assert "call notion_ai_ask" not in explore
     assert "absolute file paths" in explore
-    assert "### Critical Files for Implementation" in plan
-    assert "3-5" in plan
+    assert "implementation-plan inputs" in plan
+    assert "parent owns that decision" in plan
     assert "exact return requirements in the task prompt" in gp
 
 
@@ -85,6 +85,17 @@ def test_reviewer_profile_preloads_fixed_review_methodology():
     assert "performance" in instructions
     assert "reachable failure scenario" in instructions
     assert "non-blocking cleanup" in instructions
+
+
+def test_plan_returns_research_inputs_and_leaves_final_plan_to_parent():
+    profile = get_subagent_profile("Plan")
+    instructions = profile.system_instructions.lower()
+
+    assert profile.context_policy == "lean"
+    assert "implementation-plan inputs" in instructions
+    assert "parent" in instructions
+    assert "actionable implementation plan" not in instructions
+    assert "critical files for implementation" not in instructions
 
 
 def test_reviewer_exposes_claude_like_review_tools_without_named_private_sources():
