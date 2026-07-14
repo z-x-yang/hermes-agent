@@ -14,10 +14,10 @@ Hermes delegates isolated work through `delegate_task(description=..., prompt=..
 |---|---|---|
 | Locate code, trace a call path, gather file/line evidence | `Explore` | read-only, one-shot |
 | Research a change and identify critical implementation files | `Plan` | read-only, one-shot |
-| Independently inspect one frozen code target and return candidate blockers | `Reviewer` | sealed evidence/tools, structured result, one-shot |
+| Independently inspect a scoped code change and return candidate blockers | `Reviewer` | repo context, ordinary prompt/final, one-shot |
 | Edit, test, use terminal/process, or perform permitted external actions | `general-purpose` | automatically retained after success |
 
-`general-purpose` receives only the exact current-parent tool authority that survives runtime policy checks. It is not an unrestricted worker and not a no-side-effect sandbox. Children receive a lean Core Contract rather than complete personal governance. Explore/Plan skip automatic project context; Reviewer gets only a fixed review bundle plus strict frozen capsule and six sealed review tools; general-purpose additionally loads repository project context and a workspace/git snapshot.
+`general-purpose` receives only the exact current-parent tool authority that survives runtime policy checks. It is not an unrestricted worker and not a no-side-effect sandbox. Children receive a lean Core Contract rather than complete personal governance. Explore/Plan skip automatic project context; Reviewer and general-purpose load repository project context and a workspace/git snapshot. Reviewer uses ordinary read/search/terminal plus authority-gated readonly web, but no named private-source, write, process, browser, or delegation tools. Because raw terminal is present, its no-edit/private-source rule is a profile instruction verified by the controller, not a mechanical sandbox.
 
 ## Pattern: focused exploration before acting
 

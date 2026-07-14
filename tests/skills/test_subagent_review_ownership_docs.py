@@ -47,7 +47,7 @@ def _text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def test_reviewer_examples_use_review_capable_profile():
+def test_reviewer_examples_use_canonical_reviewer_profile():
     for path in (
         REQUESTING_REVIEW,
         REQUESTING_REVIEW_DOC,
@@ -56,6 +56,7 @@ def test_reviewer_examples_use_review_capable_profile():
         SUBAGENT_DRIVEN_DOC,
     ):
         text = _text(path)
+        assert 'subagent_type="Reviewer"' in text, path
         assert 'subagent_type="Explore"' not in text, path
 
 

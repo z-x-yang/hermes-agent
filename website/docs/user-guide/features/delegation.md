@@ -16,16 +16,16 @@ Hermes uses `delegate_task` to run isolated child agents. The model-facing contr
 |---|---|---|
 | `Explore` | Read-only code/file/source investigation | one-shot; lean Core Contract + task capsule; skips personal and project context |
 | `Plan` | Read-only implementation research and planning | one-shot; Core Contract + controller-selected task/project summary; skips personal governance |
-| `Reviewer` | Fresh-context independent review of one frozen code target | one-shot; foreground by default; sealed review bundle + strict review capsule; validated structured result |
+| `Reviewer` | Fresh-context independent review of a scoped code change | one-shot; foreground by default; repository context + ordinary self-contained prompt; ordinary final response |
 | `general-purpose` | Multi-step execution, edits, tests, and permitted external actions | automatically retained after successful completion; Core Contract plus project context and workspace snapshot |
 
-Like Claude Code, each canonical profile owns the routing `description` that tells the parent when to select it. A profile with a special call shape may also own parent-facing invocation guidance; the runtime appends that guidance to the model-visible `subagent_type` schema. `Reviewer` uses this path for its strict capsule and `review_root` rules, while backend validation remains the enforcement boundary.
+Like Claude Code, each canonical profile owns the routing `description` that tells the parent when to select it. `Reviewer` uses the same ordinary `prompt` field as every other profile; it has no hidden JSON grammar or profile-specific completion tool. `review_root` remains a top-level Hermes adaptation that binds one local worktree when the current workspace is not the intended target.
 
-Omitting `subagent_type` resolves to `general-purpose`. Children do not inherit the parent transcript, parent tool results, or the active profile's complete `SOUL.md`, `MEMORY.md`, or `USER.md`. Runtime capability policy remains trusted; private or project facts enter only through an explicit task capsule, except that `general-purpose` loads the real workspace project context.
+Omitting `subagent_type` resolves to `general-purpose`. Children do not inherit the parent transcript, parent tool results, or the active profile's complete `SOUL.md`, `MEMORY.md`, or `USER.md`. `general-purpose` and `Reviewer` load repository rules and a workspace snapshot from their bound root; this normative project context is separate from personal memory or implementation-session rationale.
 
-`Explore` and `Plan` use a runtime-enforced read-oriented tool ceiling. They can use permitted repository/file readers, no-spill web/skill readers, Notion AI with `mode=readonly`, and selected Apple Mail read tools, but no raw terminal or file writes. `Reviewer` exposes only root-scoped review read/search, structured read-only Git, policy-gated readonly web, and `report_review_findings`; it has no Notion, Mail, session/memory, MCP, browser, raw shell, write, or delegation tools. `general-purpose` receives only tools that survive the exact current-parent tool authority and normal tool safety contracts; it is not a no-side-effect sandbox.
+`Explore` and `Plan` use a runtime-enforced read-oriented tool ceiling. They can use permitted repository/file readers, no-spill web/skill readers, Notion AI with `mode=readonly`, and selected Apple Mail read tools, but no raw terminal or file writes. `Reviewer` requires `read_file`, `search_files`, and `terminal`; readonly/no-spill web tools are added only when the parent currently has that authority. It has no named Notion, Mail, session/memory, MCP, browser, write/patch, process/execute-code, or delegation tools. Raw terminal is deliberately Claude-like, so Reviewer is **not** a mechanical no-write or no-external-side-effect sandbox: its system contract forbids edits, installs, Git mutation, publishing, and private-source access, and the controller must verify the worktree afterward. `general-purpose` likewise receives only tools that survive exact current-parent authority and normal tool safety contracts.
 
-`Explore`, `Plan`, and `general-purpose` use prompt-defined return contracts. `Reviewer` is the exception: free text does not complete a review. It must submit validated findings, correctness, confidence, short file/line locations, evidence, and traced sources through `report_review_findings`. Reviewer findings are candidate blockers; the parent/controller must reproduce or falsify each one.
+All profiles use prompt-defined return contracts and ordinary final responses. Reviewer should report only newly introduced, evidence-backed Critical or Important candidate blockers with file/line evidence and concrete failure paths; a concise no-findings final is valid. The parent/controller must reproduce or falsify every candidate before treating it as true.
 
 ## Single task
 
@@ -44,31 +44,26 @@ A single task requires both `description` and `prompt`:
 - `prompt` is the self-contained task, including paths, constraints, evidence requirements, and expected deliverable.
 - `run_in_background` defaults to the selected profile: `Reviewer` is foreground by default; other top-level profiles default to background. An explicit boolean always wins.
 
-### Sealed Reviewer capsule
+### Reviewer
 
-`Reviewer` requires `prompt` to be one strict JSON object, not prose:
+Give Reviewer an ordinary self-contained task, just as you would a Claude Code custom agent:
 
 ```python
-capsule = json.dumps({
-    "original_ask_or_approved_contract": "Fix the auth race without changing the public API.",
-    "acceptance_criteria_and_invariants": ["No token may be refreshed twice concurrently."],
-    "relevant_repo_rules": ["Python 3.11; pytest is the canonical test runner."],
-    "review_target": {"mode": "commit", "commit": "HEAD", "paths": ["src/auth", "tests/auth"]},
-    "verification_evidence": [{"command": "pytest tests/auth -q", "result": "18 passed", "status": "pass"}],
-    "known_baseline_failures": [],
-    "external_reference_scope": "none",
-})
 delegate_task(
     description="independent auth review",
-    prompt=capsule,
+    prompt="""Review the committed auth-race fix at HEAD.
+Inspect src/auth and tests/auth against this contract: no token may refresh
+twice concurrently and the public API must not change. Fresh verification:
+`pytest tests/auth -q` returned `18 passed`.
+
+Report only newly introduced Critical or Important candidate blockers with
+file:line evidence and a concrete failure path. Do not edit the checkout.""",
     subagent_type="Reviewer",
     review_root="/absolute/path/to/local/worktree",  # optional
 )
 ```
 
-`review_root` is a controller-bound tool argument, not part of the child capsule. It is valid only for a top-level single Reviewer and must resolve exactly to an existing absolute local Git worktree root; relative paths, repo subdirectories, Batch/nested use, non-Reviewer use, and remote/cluster roots fail closed. Omit it to review the current workspace.
-
-Target modes are `uncommitted`, `base` (requires `base`), and `commit` (requires `commit`). Scoped target drift during the review invalidates the result. `external_reference_scope="none"` rejects web calls before backend invocation; `authoritative_docs_only` permits only the readonly/no-spill web aliases.
+`review_root` is a controller-bound tool argument, not prompt syntax. It is valid only for a top-level single Reviewer and must resolve exactly to an existing absolute local Git worktree root; relative paths, repo subdirectories, Batch/nested use, non-Reviewer use, and remote/cluster roots fail closed. Omit it to review the current workspace. The runtime binds the child workspace and loads that root's repository guidance; the prompt names the diff/range/files to inspect in ordinary prose.
 
 ## Batch API: intentional Hermes divergence
 
@@ -131,7 +126,7 @@ pytest tests/api/. Return changed files and real test output.""",
 )
 ```
 
-`general-purpose` loads real repository rules (`.hermes.md`, `AGENTS.md`, `CLAUDE.md`, or `.cursorrules` under the normal discovery contract) and a workspace/git snapshot. `Explore`, `Plan`, and `Reviewer` deliberately skip automatic project context and all complete personal-governance injection. Reviewer receives only its fixed versioned bundle, minimal workspace identity, and frozen capsule.
+`general-purpose` and `Reviewer` load real repository rules (`.hermes.md`, `AGENTS.md`, `CLAUDE.md`, or `.cursorrules` under the normal discovery contract) and a workspace/git snapshot. `Explore` and `Plan` skip automatic project context. Every profile skips complete personal-governance injection; Reviewer also receives no parent transcript, parent tool output, Notion Project Memory, session history, or personal memory.
 
 ## Retained sessions and `delegate_continue`
 

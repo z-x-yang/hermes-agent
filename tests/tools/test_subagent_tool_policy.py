@@ -177,10 +177,9 @@ def test_profiled_child_filters_visible_and_runtime_tool_names():
     assert child._skip_mcp_refresh is False
 
 
-def test_reviewer_child_resolves_exact_sealed_tool_closure(tmp_path, monkeypatch):
+def test_reviewer_child_resolves_claude_like_tool_closure(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-web-key")
     import model_tools  # noqa: F401
-    import tools.review_tools  # noqa: F401
 
     for web_name in (
         "web_search",
@@ -203,41 +202,27 @@ def test_reviewer_child_resolves_exact_sealed_tool_closure(tmp_path, monkeypatch
     _set_authority(parent, parent.valid_tool_names)
 
     reviewer_names = {
-        "review_read_file",
-        "review_search_files",
-        "review_git",
-        "web_search_readonly",
-        "web_extract_readonly",
-        "report_review_findings",
-    }
-    child = _child_agent()
-    child.valid_tool_names = set(reviewer_names) | {
         "read_file",
         "search_files",
         "terminal",
+        "web_search_readonly",
+        "web_extract_readonly",
+    }
+    child = _child_agent()
+    child.valid_tool_names = set(reviewer_names) | {
         "write_file",
+        "patch",
+        "process",
         "delegate_task",
     }
     child.tools = [_tool(name) for name in sorted(child.valid_tool_names)]
     _set_authority(child, child.valid_tool_names)
 
-    capsule = json.dumps(
-        {
-            "original_ask_or_approved_contract": "Review the target.",
-            "acceptance_criteria_and_invariants": ["Never edit files."],
-            "relevant_repo_rules": [],
-            "review_target": {"mode": "uncommitted", "paths": ["tools"]},
-            "verification_evidence": [{"command": "pytest -q", "result": "1 passed", "status": "pass"}],
-            "known_baseline_failures": [],
-            "external_reference_scope": "none",
-        }
-    )
-    (tmp_path / "tools").mkdir()
     with patch("run_agent.AIAgent", return_value=child):
         built = _build_child_agent(
             task_index=0,
             description="Independent review",
-            prompt=capsule,
+            prompt="Review the changed LAB builder files and report blockers.",
             toolsets=None,
             model=None,
             max_iterations=150,
@@ -250,7 +235,7 @@ def test_reviewer_child_resolves_exact_sealed_tool_closure(tmp_path, monkeypatch
     assert built.valid_tool_names == reviewer_names
     assert {tool["function"]["name"] for tool in built.tools} == reviewer_names
     assert built._subagent_tool_policy.allowed_names == frozenset(reviewer_names)
-    assert built._review_context.root == tmp_path.resolve()
+    assert "_review_context" not in built.__dict__
     assert built._delegate_max_iterations == 150
 
 

@@ -1020,9 +1020,10 @@ Profiles and lifecycle:
 
 - `Explore` — read-only evidence search; one-shot.
 - `Plan` — read-only implementation planning; one-shot.
-- `Reviewer` — fresh-context sealed review of one strict frozen capsule; one-shot, no edits/delegation/retention, six exact review tools, and validated `report_review_findings` completion. Its findings are candidates that the controller must verify.
+- `Reviewer` — fresh-context independent code review from an ordinary self-contained prompt; one-shot, no delegation/retention, repository context, and ordinary final-response completion. Its findings are candidates that the controller must verify.
 - `general-purpose` — multi-step execution with the exact surviving parent ceiling; retained only after explicit successful completion and resumable with `delegate_continue` in the same live parent session.
-- All profiles receive a lean runtime Core Contract plus explicit task data rather than complete active-profile SOUL/MEMORY/USER or parent history. GP additionally loads real project/workspace context; Reviewer gets only its fixed versioned review bundle, minimal workspace identity, and frozen capsule.
+- All profiles receive a lean runtime Core Contract plus explicit task data rather than complete active-profile SOUL/MEMORY/USER or parent history. GP and Reviewer additionally load real repository/workspace context; Reviewer does not inherit personal memory, session history, parent transcript/tool output, or named private-source tools.
+- Reviewer requires ordinary `read_file`, `search_files`, and `terminal`; readonly web is optional under the current parent authority. Raw terminal means no-write/private-source restrictions are profile instructions plus controller worktree verification, not a mechanical sandbox.
 - Nested delegation is runtime-derived from profile, depth, the runtime kill switch, and exact current-parent authority. The caller cannot select a privilege role.
 
 Key config knobs (under `delegation:` in `config.yaml`): `max_global_concurrent_children`, `max_concurrent_children`, `max_spawn_depth`, `child_timeout_seconds`, the legacy-named `orchestrator_enabled` runtime nesting kill switch, `subagent_auto_approve`, `max_retained_subagent_bytes`, `max_iterations`, and per-profile `child_run_timeout_seconds` / `foreground_wait_timeout_seconds` overrides.

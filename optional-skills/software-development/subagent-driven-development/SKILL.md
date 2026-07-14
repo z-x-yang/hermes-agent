@@ -102,11 +102,12 @@ After all tasks are complete and controller-verified, use `requesting-code-revie
 ```python
 delegate_task(
     description="Review integrated change",
-    subagent_type="general-purpose",
+    subagent_type="Reviewer",
+    review_root="/absolute/path/to/local/worktree",  # optional
     run_in_background=False,
     prompt="""
     You are the assigned independent reviewer for the integrated software change.
-    This checkout is read-only: do not edit, commit, or launch another reviewer.
+    Do not edit, commit, or launch another reviewer.
 
     APPROVED CONTRACT:
     [INSERT APPROVED CONTRACT]

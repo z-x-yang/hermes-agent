@@ -57,52 +57,36 @@ def test_reviewer_profile_owns_one_shot_context_and_lifecycle_metadata():
     profile = get_subagent_profile("Reviewer")
     assert profile.default_run_in_background is False
     assert profile.retain_on_success is False
-    assert profile.context_policy == "reviewer_lean"
+    assert profile.context_policy == "reviewer_project"
     assert profile.allow_delegation is False
     assert "fresh-context" in profile.description.lower()
     assert "independent" in profile.description.lower()
-    assert "never edits" in profile.description.lower()
+    assert "without editing" in profile.description.lower()
 
 
-def test_reviewer_profile_owns_parent_invocation_guidance():
-    guidance = get_subagent_profile("Reviewer").invocation_guidance
-
-    for field in (
-        "original_ask_or_approved_contract",
-        "acceptance_criteria_and_invariants",
-        "relevant_repo_rules",
-        "review_target",
-        "verification_evidence",
-        "known_baseline_failures",
-        "external_reference_scope",
-    ):
-        assert field in guidance
-    assert "uncommitted" in guidance
-    assert "authoritative_docs_only" in guidance
-    assert "review_root" in guidance
-    assert "top-level single" in guidance
-    assert "batch" in guidance.lower()
-
-
-def test_reviewer_exposes_only_sealed_review_tools():
+def test_reviewer_profile_uses_ordinary_prompt_without_special_grammar():
     profile = get_subagent_profile("Reviewer")
-    assert profile.allowed_tool_names is not None
+
+    assert "ordinary" in profile.description.lower()
+    assert "self-contained" in profile.description.lower()
+    assert not hasattr(profile, "invocation_guidance")
+
+
+def test_reviewer_exposes_claude_like_review_tools_without_named_private_sources():
+    profile = get_subagent_profile("Reviewer")
     assert profile.allowed_tool_names == frozenset(
         {
-            "review_read_file",
-            "review_search_files",
-            "review_git",
+            "read_file",
+            "search_files",
+            "terminal",
             "web_search_readonly",
             "web_extract_readonly",
-            "report_review_findings",
         }
     )
+    assert "not a no-side-effect sandbox" in profile.system_instructions
     for forbidden in (
-        "terminal",
         "process",
         "execute_code",
-        "read_file",
-        "search_files",
         "write_file",
         "patch",
         "delegate_task",
@@ -368,7 +352,8 @@ def test_delegation_docs_match_simplified_contract():
         "automatically retained",
         "project context",
         "lean",
-        "report_review_findings",
+        "ordinary final response",
+        "terminal",
         "runtime-derived",
         "including work dispatched directly to background",
     )
@@ -379,7 +364,8 @@ def test_delegation_docs_match_simplified_contract():
         "自动保留",
         "项目上下文",
         "lean",
-        "report_review_findings",
+        "普通 final response",
+        "terminal",
         "运行时派生",
         "包括直接在后台启动的工作",
     )
@@ -418,7 +404,8 @@ def test_bundled_evelyn_skill_uses_current_delegation_contract():
         "Plan",
         "Reviewer",
         "general-purpose",
-        "report_review_findings",
+        "ordinary final response",
+        "terminal",
         "runtime-derived",
     ):
         assert required in delegation

@@ -14,10 +14,10 @@ Hermes 通过 `delegate_task(description=..., prompt=...)` 委派隔离任务。
 |---|---|---|
 | 定位代码、追踪调用链、收集文件/行证据 | `Explore` | 只读，一次性 |
 | 调研变更并识别关键实现文件 | `Plan` | 只读，一次性 |
-| 独立检查一个 frozen code target 并返回 candidate blocker | `Reviewer` | sealed evidence/tools，结构化结果，一次性 |
+| 独立检查 scoped code change 并返回 candidate blocker | `Reviewer` | repo context、普通 prompt/final、一次性 |
 | 编辑、测试、terminal/process 或获准外部动作 | `general-purpose` | 成功后自动保留 |
 
-`general-purpose` 只能获得通过 current parent 精确工具权限和运行时 policy 检查的工具，不是 unrestricted worker，也不是“无外部副作用”的 sandbox。child 获得 lean Core Contract，而不是完整个人 governance。Explore/Plan 跳过自动项目上下文；Reviewer 只获得固定 review bundle、严格 frozen capsule 与六个 sealed review tools；general-purpose 额外加载 repo project context 与 workspace/git snapshot。
+`general-purpose` 只能获得通过 current parent 精确工具权限和运行时 policy 检查的工具，不是 unrestricted worker，也不是“无外部副作用”的 sandbox。child 获得 lean Core Contract，而不是完整个人 governance。Explore/Plan 跳过自动项目上下文；Reviewer 和 general-purpose 加载 repo project context 与 workspace/git snapshot。Reviewer 使用普通 read/search/terminal 与按 parent authority 提供的 readonly web，不暴露 named private-source、write、process、browser 或 delegation tools。由于存在 raw terminal，no-edit/private-source 是 profile instruction 并由 controller 检查，不是机械 sandbox。
 
 ## 模式：行动前先调查
 

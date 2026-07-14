@@ -16,7 +16,6 @@ class SubagentProfile:
     retain_on_success: bool
     context_policy: str
     allow_delegation: bool
-    invocation_guidance: str = ""
 
 
 @dataclass(frozen=True)
@@ -60,15 +59,14 @@ _READ_ONLY_TOOLS = frozenset(
     }
 ) | NOTION_PROMPT_READ_TOOL_NAMES | APPLE_MAIL_READ_TOOL_NAMES
 
-REVIEWER_TOOL_NAMES: Final[frozenset[str]] = frozenset(
-    {
-        "review_read_file",
-        "review_search_files",
-        "review_git",
-        "web_search_readonly",
-        "web_extract_readonly",
-        "report_review_findings",
-    }
+REVIEWER_REQUIRED_TOOL_NAMES: Final[frozenset[str]] = frozenset(
+    {"read_file", "search_files", "terminal"}
+)
+REVIEWER_OPTIONAL_TOOL_NAMES: Final[frozenset[str]] = frozenset(
+    {"web_search_readonly", "web_extract_readonly"}
+)
+REVIEWER_TOOL_NAMES: Final[frozenset[str]] = (
+    REVIEWER_REQUIRED_TOOL_NAMES | REVIEWER_OPTIONAL_TOOL_NAMES
 )
 
 _DATA_SOURCE_READ_INSTRUCTIONS = (
@@ -96,28 +94,16 @@ GENERAL_FINAL = (
 )
 
 REVIEWER_FINAL = (
-    "You are an independent reviewer of a code change made in another context. "
-    "Use only the frozen review capsule and the sealed review tools. Reconstruct "
-    "the requirement and runtime path independently, report only newly introduced "
-    "evidence-backed P0/P1/P2 candidate blockers, and never edit files. Complete "
-    "the review through report_review_findings; free text is not a completed review."
+    "You are an independent code reviewer working from a fresh context. Read the "
+    "ordinary self-contained task prompt, inspect the requested Git diff/files and "
+    "relevant surrounding code, and use repository rules from the bound workspace. "
+    "Report only newly introduced, evidence-backed Critical or Important candidate "
+    "blockers; never edit files or decide merge readiness. You may use terminal for "
+    "inspection and relevant checks, but it is not a no-side-effect sandbox: do not "
+    "write files, install packages, change Git state, publish, or access Notion, Mail, "
+    "session history, personal memory, or other private sources. The controller will "
+    "verify every candidate."
 )
-
-REVIEWER_INVOCATION_GUIDANCE = (
-    "Invocation: top-level single task only, never Batch. Set prompt to one strict JSON "
-    "object with exactly these fields: original_ask_or_approved_contract (non-empty "
-    "string); acceptance_criteria_and_invariants (non-empty string array); "
-    "relevant_repo_rules (string array); review_target (mode uncommitted with paths, "
-    "mode base with base and paths, or mode commit with commit and paths); "
-    "verification_evidence (non-empty array of exact command/result/status objects, "
-    "with non-empty command/result and status pass, fail, or baseline); "
-    "known_baseline_failures (string array); external_reference_scope (none or "
-    "authoritative_docs_only). Paths must be non-empty repo-relative scopes narrower "
-    "than the repo root. Optional top-level review_root selects an exact absolute "
-    "existing local Git worktree root; omit it for the current workspace and never put "
-    "review_root inside the prompt."
-)
-
 
 _PROFILES = {
     "Explore": SubagentProfile(
@@ -165,9 +151,9 @@ _PROFILES = {
     "Reviewer": SubagentProfile(
         name="Reviewer",
         description=(
-            "Fresh-context independent code reviewer. Reviews a frozen contract "
-            "and scoped code target, returns evidence-backed candidate blockers, "
-            "and never edits."
+            "Fresh-context independent code reviewer. Use with an ordinary "
+            "self-contained prompt to inspect a scoped change and return "
+            "evidence-backed candidate blockers without editing."
         ),
         system_instructions=REVIEWER_FINAL,
         allowed_tool_names=REVIEWER_TOOL_NAMES,
@@ -175,9 +161,8 @@ _PROFILES = {
         default_run_timeout_seconds=3600,
         default_run_in_background=False,
         retain_on_success=False,
-        context_policy="reviewer_lean",
+        context_policy="reviewer_project",
         allow_delegation=False,
-        invocation_guidance=REVIEWER_INVOCATION_GUIDANCE,
     ),
     "general-purpose": SubagentProfile(
         name="general-purpose",

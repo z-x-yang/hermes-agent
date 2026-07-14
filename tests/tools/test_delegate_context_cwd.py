@@ -6,6 +6,8 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 
 def test_delegate_worker_submission_preserves_contextvar_cwd(tmp_path):
     """delegate_task child workers must inherit the parent's session cwd ContextVar."""
@@ -25,13 +27,18 @@ def test_delegate_worker_submission_preserves_contextvar_cwd(tmp_path):
         clear_session_vars(tokens)
 
 
-def test_run_single_child_registers_and_clears_child_terminal_override(tmp_path):
+@pytest.mark.parametrize("reviewer_workspace", [False, True])
+def test_run_single_child_registers_and_clears_child_terminal_override(
+    tmp_path, reviewer_workspace
+):
     from gateway.session_context import clear_session_vars, set_session_vars
     from tools import delegate_tool as dt
     from tools.terminal_tool import _resolve_container_task_id, resolve_task_overrides
 
     ctx_cwd = tmp_path / "ctx"
+    review_cwd = tmp_path / "review-root"
     ctx_cwd.mkdir()
+    review_cwd.mkdir()
     observed: dict = {}
 
     class Child:
@@ -82,12 +89,19 @@ def test_run_single_child_registers_and_clears_child_terminal_override(tmp_path)
 
     tokens = set_session_vars(cwd=str(ctx_cwd))
     try:
-        result = dt._run_single_child(0, "goal", Child(), parent)
+        result = dt._run_single_child(
+            0,
+            "goal",
+            Child(),
+            parent,
+            subagent_type="Reviewer" if reviewer_workspace else "general-purpose",
+            workspace_path=str(review_cwd) if reviewer_workspace else None,
+        )
         assert result["status"] == "completed"
         assert observed["task_id"] == "sa-test"
         assert observed["container_task_id"] == "sa-test"
         assert observed["overrides"] == {
-            "cwd": str(ctx_cwd),
+            "cwd": str(review_cwd if reviewer_workspace else ctx_cwd),
             "_force_task_isolation": True,
         }
         assert resolve_task_overrides("sa-test") == {}

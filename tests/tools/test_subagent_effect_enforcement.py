@@ -125,6 +125,29 @@ def test_nested_child_intersects_parent_current_allowed_names(
     assert policy.allowed_names == frozenset({"task6_read_probe"})
 
 
+def test_reviewer_policy_allows_terminal_execute_effect():
+    import tools.terminal_tool  # noqa: F401
+    from agent.subagent_tool_policy import build_child_tool_policy
+
+    identity = registry.resolved_policy_identity("terminal")
+    assert identity is not None
+    snapshot = build_authority_snapshot(
+        {identity}, registry_generation=registry._generation
+    )
+    parent = SimpleNamespace(_parent_tool_authority_snapshot=snapshot)
+    child = SimpleNamespace(_parent_tool_authority_snapshot=snapshot)
+
+    policy = build_child_tool_policy(
+        child=child,
+        parent=parent,
+        profile_name="Reviewer",
+        profile_allowed_names=frozenset({"terminal"}),
+    )
+
+    assert policy.allowed_names == frozenset({"terminal"})
+    assert policy.allowed_effects is None
+
+
 def test_read_call_authorizes_and_unknown_effect_denies_backend(registered_effect_tools):
     from agent.subagent_tool_policy import (
         ToolAuthorizationError,

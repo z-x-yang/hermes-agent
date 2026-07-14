@@ -87,17 +87,18 @@ Untracked files 不会出现在 Git diff 中。必须把每个 intended untracke
 
 ### 4. 运行一次全新上下文 reviewer
 
-高风险/shared-core 改动优先使用 Codex。Hermes reviewer 使用具备 review 能力的 `general-purpose` profile，并通过 prompt 约束为 procedural read-only；结束后验证 checkout 未被修改。
+在 built-in route 通过 live rollout gate 前，高风险/shared-core 改动优先使用 Codex。Built-in Hermes review 使用 canonical `Reviewer` profile 与普通自包含 prompt；由于 Reviewer 有 raw terminal，结束后必须验证 checkout 未被修改。
 
 ```python
 delegate_task(
     description="Independent code review",
-    subagent_type="general-purpose",
+    subagent_type="Reviewer",
+    review_root="/absolute/path/to/local/worktree",  # 可选
     run_in_background=False,
     prompt="""
     You are the assigned fresh-context independent reviewer for this completed
-    software change. This checkout is read-only: do not edit files, the index,
-    HEAD, or branch, and do not launch another reviewer.
+    software change. Do not edit files, the index, HEAD, or branch, and do not
+    launch another reviewer.
 
     APPROVED CONTRACT:
     [INSERT CONTRACT]

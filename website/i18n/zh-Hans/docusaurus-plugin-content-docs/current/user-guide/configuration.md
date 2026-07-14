@@ -1668,7 +1668,7 @@ delegation:
 
 ### Profile 上下文与生命周期
 
-`Explore`、`Plan` 和 `Reviewer` 都是一次性 profile。每个 child 只获得短的 runtime-owned Core Contract 与显式 task data，不再注入 active profile 完整 `SOUL.md`/`MEMORY.md`/`USER.md`。`general-purpose` 额外获得真实 project context 与 workspace/git snapshot；成功的 GP 仅在 parent session ID 非空且容量允许时自动保留。Reviewer 获得固定版本 review bundle 与严格 frozen capsule，只暴露六个 sealed review tools，并继续使用 operator 配置的 `delegation.max_iterations`。
+`Explore`、`Plan` 和 `Reviewer` 都是一次性 profile。每个 child 只获得短的 runtime-owned Core Contract 与显式 task data，不再注入 active profile 完整 `SOUL.md`/`MEMORY.md`/`USER.md`。`general-purpose` 和 `Reviewer` 额外获得真实 repo context 与 workspace/git snapshot；成功的 GP 仅在 parent session ID 非空且容量允许时自动保留。Reviewer 接受普通自包含 prompt，以普通 final response 完成，暴露 read/search/terminal，并且只在 parent 当前拥有 web authority 时附加 readonly web。Raw terminal 意味着其 no-edit/private-source contract 不是机械 sandbox。
 
 `delegate_continue` 只接受 `agent_id`、`prompt` 和可选 `run_in_background`。process-local store 受 `retained_subagent_ttl_seconds`、`max_retained_subagents` 和 `max_retained_subagent_bytes` 限制，Gateway/process 重启后丢失。过大的初始记录 fail closed；claimed continuation 不会被 prune；过大的成功 update 会保留 result，但删除并 invalidate retained handle。
 

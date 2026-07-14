@@ -84,15 +84,16 @@ def test_personal_governance_is_not_loaded_into_any_child_prompt(tmp_path):
         assert "GOVERNANCE_SNAPSHOT_METADATA" not in system_prompt
 
 
-def test_general_purpose_loads_real_project_context_but_other_profiles_skip_it(tmp_path):
+def test_general_purpose_and_reviewer_load_real_project_context(tmp_path):
     (tmp_path / "AGENTS.md").write_text("PROJECT_SENTINEL", encoding="utf-8")
     gp = _system_prompt("general-purpose", str(tmp_path))
     explore = _system_prompt("Explore", str(tmp_path))
     plan = _system_prompt("Plan", str(tmp_path))
     reviewer = _system_prompt("Reviewer", str(tmp_path))
 
-    assert "PROJECT_SENTINEL" in gp
-    assert "Workspace (snapshot at session start" in gp
-    for lean_prompt in (explore, plan, reviewer):
+    for project_prompt in (gp, reviewer):
+        assert "PROJECT_SENTINEL" in project_prompt
+        assert "Workspace (snapshot at session start" in project_prompt
+    for lean_prompt in (explore, plan):
         assert "PROJECT_SENTINEL" not in lean_prompt
         assert "Workspace (snapshot at session start" not in lean_prompt
