@@ -117,6 +117,18 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("one batch handle", description)
         self.assertIn("one consolidated completion", description)
 
+    def test_reviewer_invocation_contract_is_profile_owned_and_model_visible(self):
+        profile = get_subagent_profile("Reviewer")
+        type_schema = DELEGATE_TASK_SCHEMA["parameters"]["properties"]["subagent_type"]
+        description = type_schema["description"]
+
+        self.assertTrue(profile.invocation_guidance)
+        self.assertIn(profile.description, description)
+        self.assertIn(profile.invocation_guidance, description)
+        self.assertIn("Reviewer:", description)
+        self.assertIn("review_root", description)
+        self.assertIn("strict JSON", description)
+
     def test_delegate_registry_entry_has_no_dynamic_schema_override(self):
         from tools.registry import registry
 

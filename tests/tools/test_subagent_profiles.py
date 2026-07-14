@@ -64,6 +64,26 @@ def test_reviewer_profile_owns_one_shot_context_and_lifecycle_metadata():
     assert "never edits" in profile.description.lower()
 
 
+def test_reviewer_profile_owns_parent_invocation_guidance():
+    guidance = get_subagent_profile("Reviewer").invocation_guidance
+
+    for field in (
+        "original_ask_or_approved_contract",
+        "acceptance_criteria_and_invariants",
+        "relevant_repo_rules",
+        "review_target",
+        "verification_evidence",
+        "known_baseline_failures",
+        "external_reference_scope",
+    ):
+        assert field in guidance
+    assert "uncommitted" in guidance
+    assert "authoritative_docs_only" in guidance
+    assert "review_root" in guidance
+    assert "top-level single" in guidance
+    assert "batch" in guidance.lower()
+
+
 def test_reviewer_exposes_only_sealed_review_tools():
     profile = get_subagent_profile("Reviewer")
     assert profile.allowed_tool_names is not None

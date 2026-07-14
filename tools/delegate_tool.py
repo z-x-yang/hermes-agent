@@ -4177,14 +4177,19 @@ def _load_config() -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _profile_schema_description(name: str) -> str:
+    profile = get_subagent_profile(name)
+    guidance = f" {profile.invocation_guidance}" if profile.invocation_guidance else ""
+    return f"{name}: {profile.description}{guidance}"
+
+
 _SUBAGENT_TYPE_SCHEMA = {
     "type": "string",
     "enum": list(SUPPORTED_SUBAGENT_TYPES),
     "description": (
         "Available profiles: "
         + " ".join(
-            f"{name}: {get_subagent_profile(name).description}"
-            for name in SUPPORTED_SUBAGENT_TYPES
+            _profile_schema_description(name) for name in SUPPORTED_SUBAGENT_TYPES
         )
         + " Omission resolves to general-purpose."
     ),

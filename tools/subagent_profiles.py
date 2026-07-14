@@ -16,6 +16,7 @@ class SubagentProfile:
     retain_on_success: bool
     context_policy: str
     allow_delegation: bool
+    invocation_guidance: str = ""
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,22 @@ REVIEWER_FINAL = (
     "the review through report_review_findings; free text is not a completed review."
 )
 
+REVIEWER_INVOCATION_GUIDANCE = (
+    "Invocation: top-level single task only, never Batch. Set prompt to one strict JSON "
+    "object with exactly these fields: original_ask_or_approved_contract (non-empty "
+    "string); acceptance_criteria_and_invariants (non-empty string array); "
+    "relevant_repo_rules (string array); review_target (mode uncommitted with paths, "
+    "mode base with base and paths, or mode commit with commit and paths); "
+    "verification_evidence (non-empty array of exact command/result/status objects, "
+    "with non-empty command/result and status pass, fail, or baseline); "
+    "known_baseline_failures (string array); external_reference_scope (none or "
+    "authoritative_docs_only). Paths must be non-empty repo-relative scopes narrower "
+    "than the repo root. Optional top-level review_root selects an exact absolute "
+    "existing local Git worktree root; omit it for the current workspace and never put "
+    "review_root inside the prompt."
+)
+
+
 _PROFILES = {
     "Explore": SubagentProfile(
         name="Explore",
@@ -160,6 +177,7 @@ _PROFILES = {
         retain_on_success=False,
         context_policy="reviewer_lean",
         allow_delegation=False,
+        invocation_guidance=REVIEWER_INVOCATION_GUIDANCE,
     ),
     "general-purpose": SubagentProfile(
         name="general-purpose",
