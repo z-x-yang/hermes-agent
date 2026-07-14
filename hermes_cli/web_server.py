@@ -616,6 +616,14 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "Context window override (0 = auto-detect from model metadata)",
         "category": "general",
     },
+    "compression.internal_context_length": {
+        "type": "number",
+        "description": (
+            "Evelyn's independent working context window in tokens; "
+            "the active model/provider limit remains the runtime ceiling"
+        ),
+        "category": "compression",
+    },
     "terminal.backend": {
         "type": "select",
         "description": "Terminal execution backend",

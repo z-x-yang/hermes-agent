@@ -389,11 +389,12 @@ tool_loop_guardrails:
 # =============================================================================
 # Context Compression (Auto-shrinks long conversations)
 # =============================================================================
-# When conversation approaches Hermes' compression window, middle turns are
-# automatically summarized to free up space while preserving important context.
-# The compression window defaults to the provider/runtime context, but can be
-# set independently with compression.internal_context_length for large-runtime
-# models where Hermes should still roll memory on a smaller internal budget.
+# When conversation approaches Evelyn's independent compression window, middle
+# turns are automatically summarized to free up space while preserving important
+# context. The compression window defaults to 272K tokens and is capped by the
+# active model/provider runtime context. Change
+# compression.internal_context_length to use a different rolling-memory budget
+# without rewriting the provider's advertised request limit.
 #
 # HOW IT WORKS:
 # 1. Tracks actual token usage from API responses (not estimates)
@@ -404,8 +405,8 @@ tool_loop_guardrails:
 # 6. Inserts summary as a user message, continues conversation seamlessly
 #
 # Post-compression tail budget is target_ratio × compression window:
-#   272K internal window, ratio 0.073529 → 20K tokens of recent tail preserved
-#   1M runtime model can still use a 272K internal window for rolling memory
+#   272K default internal window, ratio 0.20 → about 54K recent-tail tokens
+#   1M runtime model still uses the 272K internal window for rolling memory
 #
 compression:
   # Enable automatic context compression (default: true)
@@ -416,14 +417,14 @@ compression:
   # Lower values = more aggressive compression, higher values = compress later
   threshold: 0.50
 
-  # Optional internal Hermes compression/status/budget window. Leave unset to
-  # follow the provider/runtime context_length. Set when the provider supports a
-  # very large request window but Hermes should still compress and display usage
-  # against a smaller rolling-memory budget.
-  # internal_context_length: 272000
+  # Evelyn's independent rolling-memory window (default: 272000 tokens).
+  # The effective window is capped by the active model/provider runtime limit.
+  # Change this without changing model.context_length when you want a different
+  # compression/status budget.
+  internal_context_length: 272000
   
   # Fraction of the compression window to preserve as recent tail (default: 0.20 = 20%)
-  # e.g. 272K internal window × 0.073529 ≈ 20K recent-tail tokens.
+  # e.g. 272K internal window × 0.20 ≈ 54K recent-tail tokens.
   # Summary output is separately capped at 12K tokens (Gemini output limit).
   # Range: 0.01 - 0.80
   target_ratio: 0.20

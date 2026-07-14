@@ -1340,12 +1340,12 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "threshold": 0.50,            # compress when context usage exceeds this ratio
         "target_ratio": 0.20,         # fraction of internal_context_length to preserve as recent tail
-        "internal_context_length": None,  # Optional Hermes rolling-memory window.
-                                      # When set (e.g. 272000), compression
-                                      # threshold/tail/status percentages use
-                                      # this value while model.context_length
-                                      # remains the provider runtime window for
-                                      # actual requests and append-cached preflight.
+        "internal_context_length": 272_000,  # Evelyn rolling-memory window.
+                                       # Compression threshold/tail/status
+                                       # percentages use this value while
+                                       # model.context_length remains the provider
+                                       # runtime window for actual requests and
+                                       # append-cached preflight.
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "persistent_overload_threshold": 5,  # consecutive origin-overload errors
                                       # (502/503/524/529) before auto-compress

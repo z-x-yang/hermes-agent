@@ -275,7 +275,6 @@ export const ENUM_OPTIONS: Record<string, string[]> = {
 
 export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
   model: 'Default Model',
-  modelContextLength: 'Context Window',
   fallbackProviders: 'Fallback Models',
   toolsets: 'Enabled Toolsets',
   timezone: 'Timezone',
@@ -411,7 +410,8 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
     enabled: 'Auto-Compression',
     threshold: 'Compression Threshold',
     targetRatio: 'Compression Target',
-    protectLastN: 'Protected Recent Messages'
+    protectLastN: 'Protected Recent Messages',
+    internalContextLength: 'Context Window'
   },
   delegation: {
     model: 'Subagent Model',
@@ -428,7 +428,6 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
 
 export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
   model: 'Used for new chats unless you pick a different model in the composer.',
-  modelContextLength: "Leave at 0 to use the selected model's detected context window.",
   fallbackProviders: 'Backup provider:model entries to try if the default model fails.',
   display: {
     personality: 'Default assistant style for new sessions.',
@@ -470,7 +469,9 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
     engine: 'Strategy for managing long conversations near the context limit.'
   },
   compression: {
-    enabled: 'Summarize older context when conversations get large.'
+    enabled: 'Summarize older context when conversations get large.',
+    internalContextLength:
+      "Evelyn's independent working context window in tokens; the active model/provider limit remains the runtime ceiling."
   },
   voice: {
     autoTts: 'Automatically speak assistant responses.'
@@ -502,7 +503,7 @@ export const SECTIONS: DesktopConfigSection[] = [
     id: 'model',
     label: 'Model',
     icon: Box,
-    keys: ['model_context_length', 'fallback_providers']
+    keys: ['compression.internal_context_length', 'fallback_providers']
   },
   {
     id: 'chat',

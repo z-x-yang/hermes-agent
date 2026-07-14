@@ -4534,6 +4534,14 @@ class TestModelContextLengthSchema:
         assert entry["type"] == "number"
         assert "category" in entry
 
+    def test_schema_internal_context_length_is_independent_numeric_window(self):
+        from hermes_cli.web_server import CONFIG_SCHEMA
+
+        entry = CONFIG_SCHEMA["compression.internal_context_length"]
+        assert entry["type"] == "number"
+        assert "independent" in entry["description"].lower()
+        assert "model" in entry["description"].lower()
+
 
 class TestModelInfoEndpoint:
     """Tests for GET /api/model/info endpoint."""
