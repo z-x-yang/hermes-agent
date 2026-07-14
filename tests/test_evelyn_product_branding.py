@@ -402,6 +402,16 @@ def test_secondary_user_interfaces_display_evelyn():
     assert "Gateway online — Evelyn is back and ready." in _text("gateway/run.py")
 
 
+def test_update_guidance_prefers_evelyn_cli():
+    from hermes_cli.config import recommended_update_command_for_method
+
+    assert recommended_update_command_for_method("git") == "evelyn update"
+    assert "run `evelyn update` manually" in _text("gateway/run.py")
+    assert "This will run 'evelyn update'" in _text("web/src/App.tsx")
+    assert "This will run 'evelyn update'" in _text("web/src/pages/SystemPage.tsx")
+    assert "This runs evelyn update" in _text("web/src/i18n/en.ts")
+
+
 def test_desktop_launchers_prefer_evelyn_and_accept_legacy_hermes_artifacts():
     migration_surfaces = [
         "apps/desktop/electron/main.cjs",

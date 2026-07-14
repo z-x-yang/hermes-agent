@@ -14974,7 +14974,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 elif exit_code == 0:
                     msg = "✅ Evelyn update finished successfully."
                 else:
-                    msg = "❌ Evelyn update failed. Check the gateway logs or run `hermes update` manually for details."
+                    msg = "❌ Evelyn update failed. Check the gateway logs or run `evelyn update` manually for details."
                 await adapter.send(
                     chat_id,
                     msg,

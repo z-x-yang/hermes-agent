@@ -518,7 +518,7 @@ def recommended_update_command_for_method(method: str) -> str:
         if shutil.which("uv"):
             return "uv pip install --upgrade hermes-agent"
         return "pip install --upgrade hermes-agent"
-    return "hermes update"
+    return "evelyn update"
 
 
 def recommended_update_command() -> str:

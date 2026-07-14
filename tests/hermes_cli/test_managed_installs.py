@@ -36,7 +36,7 @@ def test_recommended_update_command_defaults_to_hermes_update(monkeypatch):
     # detect_install_method().
     with patch("hermes_cli.config.get_managed_update_command", return_value=None), \
          patch("hermes_cli.config.detect_install_method", return_value="git"):
-        assert recommended_update_command() == "hermes update"
+        assert recommended_update_command() == "evelyn update"
 
 
 def test_cmd_update_blocks_managed_homebrew(monkeypatch, capsys):
