@@ -15,13 +15,11 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
+from agent.compression_summary_runtime import make_summary_runtime
 
 
 def _patch_bootstrap(monkeypatch):
-    monkeypatch.setattr(run_agent, "get_tool_definitions", lambda **kwargs: [{
-        "type": "function",
-        "function": {"name": "t", "description": "t", "parameters": {"type": "object", "properties": {}}},
-    }])
+    monkeypatch.setattr(run_agent, "get_tool_definitions", lambda **kwargs: [])
     monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda: {})
 
 
@@ -126,3 +124,41 @@ def test_codex_no_cache_fields(monkeypatch):
     agent = _make_agent(monkeypatch, "codex_responses", "openai-codex", resp)
     agent.run_conversation("hi")
     assert agent.context_compressor.last_prompt_tokens == 3000
+
+
+def test_successful_main_call_records_reusable_prefix_checkpoint(monkeypatch):
+    resp = lambda: SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace(
+            role="assistant", content="ok", tool_calls=None, reasoning_content=None,
+        ), finish_reason="stop")],
+        usage=SimpleNamespace(prompt_tokens=5000, completion_tokens=100, total_tokens=5100),
+        model="gpt-4o",
+    )
+    agent = _make_agent(monkeypatch, "chat_completions", "openrouter", resp)
+
+    agent.run_conversation("hi")
+
+    checkpoints = agent.context_compressor._reusable_prefix_checkpoints
+    assert len(checkpoints) == 1
+    assert checkpoints[0].source_message_count == 1
+    assert checkpoints[0].prefix_fingerprint
+
+
+def test_anthropic_main_checkpoint_matches_summary_runtime_prefix(monkeypatch):
+    agent = _make_agent(
+        monkeypatch,
+        "anthropic_messages",
+        "anthropic",
+        lambda: _anthropic_resp(500, 20),
+    )
+
+    agent.run_conversation("hi")
+
+    checkpoint = agent.context_compressor._reusable_prefix_checkpoints[0]
+    prefix = [{"role": "user", "content": "hi"}]
+    summary_fingerprint = make_summary_runtime(agent).fingerprint_prefix(prefix)
+    assert checkpoint.prefix_fingerprint == summary_fingerprint
+
+    agent.api_key = "rotated-credential"
+    rotated_fingerprint = make_summary_runtime(agent).fingerprint_prefix(prefix)
+    assert checkpoint.prefix_fingerprint != rotated_fingerprint

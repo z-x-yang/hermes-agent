@@ -11,8 +11,9 @@ class _TodoStore:
 
 
 class _Compressor:
-    def __init__(self, *, aborted: bool = False):
+    def __init__(self, *, aborted: bool = False, deferred: bool = False):
         self._last_compress_aborted = aborted
+        self._last_compress_deferred = deferred
         self._last_summary_error = "summary failed" if aborted else None
         self._last_aux_model_failure_model = None
         self._last_aux_model_failure_error = None
@@ -23,7 +24,7 @@ class _Compressor:
         self.awaiting_real_usage_after_compression = False
 
     def compress(self, messages, **_kwargs):
-        if self._last_compress_aborted:
+        if self._last_compress_aborted or self._last_compress_deferred:
             return messages
         return [{"role": "user", "content": "[CONTEXT COMPACTION] summary"}]
 
@@ -32,7 +33,7 @@ class _Agent(SimpleNamespace):
     pass
 
 
-def _agent(*, aborted: bool = False):
+def _agent(*, aborted: bool = False, deferred: bool = False):
     return _Agent(
         session_id="sess-1",
         model="test/model",
@@ -50,7 +51,7 @@ def _agent(*, aborted: bool = False):
         _runtime_context_status_audit_enabled=False,
         _pending_runtime_context_statuses=[],
         _queued_runtime_context_status_keys=set(),
-        context_compressor=_Compressor(aborted=aborted),
+        context_compressor=_Compressor(aborted=aborted, deferred=deferred),
         _emit_status=lambda *_a, **_k: None,
         _emit_warning=lambda *_a, **_k: None,
         _invalidate_system_prompt=lambda: None,
@@ -97,4 +98,24 @@ def test_aborted_compression_does_not_queue_post_runtime_context_status():
 
     assert compressed is messages
     assert new_system == "SYSTEM"
+    assert agent._pending_runtime_context_statuses == []
+
+
+def test_deferred_compression_does_not_rotate_or_queue_runtime_status():
+    warnings = []
+    agent = _agent(deferred=True)
+    agent._emit_warning = warnings.append
+    messages = [{"role": "user", "content": "hello"}]
+
+    compressed, new_system = compress_context(
+        agent,
+        messages,
+        None,
+        approx_tokens=1000,
+        trigger_reason="token_threshold",
+    )
+
+    assert compressed is messages
+    assert new_system == "SYSTEM"
+    assert warnings == []
     assert agent._pending_runtime_context_statuses == []

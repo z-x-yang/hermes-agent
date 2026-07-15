@@ -324,6 +324,15 @@ _COMPACTED_MEDIA_EMERGENCY_SERIALIZED_BYTES = 12 * 1024 * 1024
 
 
 @dataclass(frozen=True)
+class ReusablePrefixCheckpoint:
+    """One prior successful API request whose source prefix can be reused."""
+
+    source_message_count: int
+    prefix_fingerprint: str
+    recorded_at: float
+
+
+@dataclass(frozen=True)
 class AppendCachedSummaryConfig:
     """Config for cache-friendly append-mode compression summary calls."""
 
@@ -1513,6 +1522,8 @@ class ContextCompressor(ContextEngine):
         self._summary_failure_cooldown_until = 0.0  # transient errors must not block a fresh session
         self._last_summary_error = None
         self._last_compress_aborted = False
+        self._last_compress_deferred = False
+        self._reusable_prefix_checkpoints = []
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
@@ -1571,6 +1582,8 @@ class ContextCompressor(ContextEngine):
         self._ineffective_compression_count = 0
         self._summary_failure_cooldown_until = 0.0
         self._last_compress_aborted = False
+        self._last_compress_deferred = False
+        self._reusable_prefix_checkpoints = []
         self._context_probed = False
         self._context_probe_persistable = False
         self.last_real_prompt_tokens = 0
@@ -1594,6 +1607,58 @@ class ContextCompressor(ContextEngine):
     def bind_summary_runtime_factory(self, factory: Any) -> None:
         """Bind a request-local main-runtime bridge used by append_cached summaries."""
         self._summary_runtime_factory = factory
+
+    def record_reusable_prefix_checkpoint(
+        self,
+        *,
+        source_message_count: int,
+        prefix_fingerprint: str,
+    ) -> None:
+        """Remember one successful API-request endpoint."""
+        source_end = int(source_message_count or 0)
+        fingerprint = str(prefix_fingerprint or "")
+        if source_end <= 0 or not fingerprint:
+            return
+        self._reusable_prefix_checkpoints.append(ReusablePrefixCheckpoint(
+            source_message_count=source_end,
+            prefix_fingerprint=fingerprint,
+            recorded_at=time.monotonic(),
+        ))
+        self._reusable_prefix_checkpoints = self._reusable_prefix_checkpoints[-50:]
+
+    def _select_reusable_prefix_checkpoint(
+        self,
+        messages: List[Dict[str, Any]],
+        desired_end: int,
+    ) -> Any:
+        """Return the nearest unchanged successful endpoint before the cut."""
+        if self._summary_runtime_factory is None:
+            return None
+        try:
+            runtime = self._summary_runtime_factory()
+        except Exception:
+            logger.debug("Failed to build summary runtime for checkpoint selection", exc_info=True)
+            return None
+        fingerprint_prefix = getattr(runtime, "fingerprint_prefix", None)
+        if not callable(fingerprint_prefix):
+            return None
+
+        selected = None
+        for checkpoint in self._reusable_prefix_checkpoints:
+            source_end = checkpoint.source_message_count
+            if source_end <= 0 or source_end > desired_end:
+                continue
+            try:
+                current_fingerprint = str(fingerprint_prefix(messages[:source_end]) or "")
+            except Exception:
+                logger.debug("Failed to fingerprint summary prefix checkpoint", exc_info=True)
+                continue
+            if current_fingerprint == checkpoint.prefix_fingerprint and (
+                selected is None
+                or source_end > selected.source_message_count
+            ):
+                selected = checkpoint
+        return selected
 
     def estimate_provider_messages_tokens(self, messages: List[Dict[str, Any]]) -> int:
         """Estimate only provider-visible message payload for this compressor route."""
@@ -1933,6 +1998,9 @@ class ContextCompressor(ContextEngine):
         self._summary_runtime_factory: Any = None
         self._last_summary_call_audit: dict[str, Any] = {}
         self._last_summary_sample: dict[str, Any] | None = None
+        self._reusable_prefix_checkpoints: list[Any] = []
+        self._last_reusable_prefix_checkpoint_audit: dict[str, Any] = {}
+        self._last_compress_deferred = False
         self._reset_cheap_tool_cleanup_audit()
 
         self.context_length = get_model_context_length(
@@ -3461,6 +3529,9 @@ class ContextCompressor(ContextEngine):
             "summary_source": dict(self._last_summary_source_audit or {}),
             "skill_receipt": dict(self._last_skill_receipt_audit or {}),
             "summary_call": dict(self._last_summary_call_audit or {}),
+            "reusable_prefix_checkpoint": dict(
+                self._last_reusable_prefix_checkpoint_audit or {}
+            ),
             "cheap_tool_result_cleanup": cheap_cleanup_audit,
             "emergency_hygiene": dict(getattr(self, "_last_emergency_hygiene_audit", {}) or {}),
             "summary_dropped_count": int(self._last_summary_dropped_count or 0),
@@ -4711,6 +4782,29 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
             base_audit["fallback_reason"] = "summary_runtime_not_main"
             return None
 
+        checkpoint_audit = self._last_reusable_prefix_checkpoint_audit
+        if bool(checkpoint_audit.get("selected")):
+            fingerprint_prefix = getattr(runtime, "fingerprint_prefix", None)
+            if callable(fingerprint_prefix):
+                try:
+                    runtime_fingerprint = str(fingerprint_prefix(prefix_messages) or "")
+                except Exception:
+                    runtime_fingerprint = ""
+            else:
+                runtime_fingerprint = ""
+            checkpoint_matches_runtime = bool(runtime_fingerprint) and any(
+                checkpoint.source_message_count == compress_end
+                and checkpoint.prefix_fingerprint == runtime_fingerprint
+                for checkpoint in self._reusable_prefix_checkpoints
+            )
+            checkpoint_audit["runtime_revalidated"] = checkpoint_matches_runtime
+            if not checkpoint_matches_runtime:
+                self._last_compress_deferred = True
+                base_audit["fallback_reason"] = (
+                    "reusable_prefix_checkpoint_unavailable"
+                )
+                return None
+
         request_messages = prefix_messages + [{"role": "user", "content": instruction}]
         requested_output_tokens = int(summary_budget * 1.3)
         api_kwargs = runtime.build_kwargs(request_messages, requested_output_tokens)
@@ -4962,6 +5056,8 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
             )
             if summary is not None:
                 return summary
+            if self._last_compress_deferred:
+                return None
             append_failure_reason = str(
                 (self._last_summary_call_audit or {}).get("fallback_reason") or ""
             )
@@ -5921,6 +6017,7 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
         self._last_skill_receipt_audit = {}
         self._last_summary_call_audit = {}
         self._last_summary_sample = None
+        self._last_reusable_prefix_checkpoint_audit = {}
         self._last_summary_fail_closed_reason = None
         self._last_tail_boundary_audit = {}
         self._last_emergency_hygiene_audit = {}
@@ -5928,6 +6025,7 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
         self._last_aux_model_failure_model = None
         self._reset_cheap_tool_cleanup_audit()
         self._last_compress_aborted = False
+        self._last_compress_deferred = False
         # NOTE: do NOT reset _last_summary_auth_failure or
         # _last_summary_network_failure here.  These flags are set by
         # _generate_summary() on a terminal failure and are already cleared on
@@ -6017,6 +6115,53 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
         compress_start = self._protect_head_size(messages)
         compress_start = self._align_boundary_forward(messages, compress_start)
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+
+        # append_cached may only run when the selected source prefix is backed
+        # by a prior successful main-request checkpoint. Deferring keeps the
+        # transcript intact and lets a subsequent main request establish one.
+        if (
+            getattr(self, "summary_call_mode", "serialized_prompt") == "append_cached"
+            and not force
+            and trigger_reason == "token_threshold"
+        ):
+            checkpoint = self._select_reusable_prefix_checkpoint(messages, compress_end)
+            if checkpoint is not None:
+                compress_end = int(checkpoint.source_message_count)
+                self._last_reusable_prefix_checkpoint_audit = {
+                    "selected": True,
+                    "source_message_count": compress_end,
+                    "prefix_fingerprint": str(checkpoint.prefix_fingerprint)[:16],
+                }
+            else:
+                self._last_reusable_prefix_checkpoint_audit = {
+                    "selected": False,
+                    "reason": "reusable_prefix_checkpoint_unavailable",
+                    "candidate_count": len(self._reusable_prefix_checkpoints),
+                    "desired_source_message_count": compress_end,
+                }
+                self._last_compress_deferred = True
+                self._write_compression_audit_record(self._build_compression_audit_record(
+                    result="deferred",
+                    entrypoint=entrypoint,
+                    input_messages=n_messages,
+                    output_messages=n_messages,
+                    summary_start=compress_start,
+                    summary_end=compress_end,
+                    retained_tail_start=compress_end,
+                    abort_reason="reusable_prefix_checkpoint_unavailable",
+                    before_estimate=display_tokens,
+                    after_estimate=display_tokens,
+                    before_messages=original_messages,
+                    after_messages=original_messages,
+                    trigger_reason=trigger_reason,
+                    trigger_token_source=trigger_token_source,
+                    trigger_tokens=trigger_tokens,
+                    trigger_threshold_tokens=trigger_threshold_tokens,
+                    trigger_context_length=trigger_context_length,
+                    trigger_message_count=trigger_message_count,
+                    trigger_hard_message_limit=trigger_hard_message_limit,
+                ))
+                return messages
 
         tail_tool_compacted = 0
         tail_boundary_promoted = False
@@ -6274,6 +6419,36 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
                 summarize_start=summarize_start,
                 compress_end=compress_end,
             )
+
+        if self._last_compress_deferred:
+            defer_reason = str(
+                (self._last_summary_call_audit or {}).get("fallback_reason")
+                or "reusable_prefix_checkpoint_unavailable"
+            )
+            self._last_summary_dropped_count = 0
+            self._last_summary_fallback_used = False
+            self._write_compression_audit_record(self._build_compression_audit_record(
+                result="deferred",
+                entrypoint=entrypoint,
+                input_messages=n_messages,
+                output_messages=n_messages,
+                summary_start=summarize_start,
+                summary_end=compress_end,
+                retained_tail_start=compress_end,
+                pruned_count=pruned_count,
+                tail_compacted_count=tail_tool_compacted,
+                tail_boundary_promoted=tail_boundary_promoted,
+                abort_reason=defer_reason,
+                before_estimate=display_tokens,
+                after_estimate=display_tokens,
+                previous_summary_text=previous_summary_for_audit,
+                before_messages=original_messages,
+                after_messages=original_messages,
+                retained_tail_messages=original_messages[compress_end:],
+                retained_tail_raw_messages=original_messages[compress_end:],
+                **audit_trigger_kwargs,
+            ))
+            return original_messages
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):

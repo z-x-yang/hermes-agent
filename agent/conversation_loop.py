@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.chat_completion_helpers import prepare_provider_visible_messages
+from agent.compression_summary_runtime import fingerprint_cache_visible_prefix
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
@@ -1303,9 +1304,16 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                successful_request_kwargs = None
+                successful_request_source_message_count = 0
+
                 def _perform_api_call(next_api_kwargs):
                     nonlocal provider_backend_invoked_this_iteration
+                    nonlocal successful_request_kwargs
+                    nonlocal successful_request_source_message_count
                     provider_backend_invoked_this_iteration = True
+                    successful_request_kwargs = next_api_kwargs
+                    successful_request_source_message_count = len(messages)
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -2253,6 +2261,27 @@ def run_conversation(
                             f"({hit_pct:.0f}% hit, {written:,} written)"
                         )
                 
+                try:
+                    checkpoint_fingerprint = fingerprint_cache_visible_prefix(
+                        successful_request_kwargs or {},
+                        lineage=(
+                            str(agent.provider or ""),
+                            str(agent.model or ""),
+                            str(agent.api_mode or ""),
+                            str(agent.base_url or ""),
+                            str(agent.api_key or ""),
+                        ),
+                    )
+                    agent.context_compressor.record_reusable_prefix_checkpoint(
+                        source_message_count=successful_request_source_message_count,
+                        prefix_fingerprint=checkpoint_fingerprint,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to record reusable prefix checkpoint",
+                        exc_info=True,
+                    )
+
                 _retry.has_retried_429 = False  # Reset on success
                 # Note: don't clear the retry buffer here — an "API call
                 # success" only means we got bytes back, not that we got

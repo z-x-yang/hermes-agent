@@ -666,6 +666,18 @@ def compress_context(
         finally:
             _release_lock()
 
+    # Cache-checkpoint deferral is an intentional no-op, not a summary
+    # failure. Keep the current session/transcript untouched and silent; the
+    # next successful main request can establish a reusable prefix.
+    if getattr(agent.context_compressor, "_last_compress_deferred", False) is True:
+        try:
+            _existing_sp = getattr(agent, "_cached_system_prompt", None)
+            if not _existing_sp:
+                _existing_sp = agent._build_system_prompt(system_message)
+            return messages, _existing_sp
+        finally:
+            _release_lock()
+
     try:
         summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
         if summary_error:

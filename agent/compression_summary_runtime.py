@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from contextlib import contextmanager
 from typing import Any, Callable
@@ -20,10 +22,60 @@ class SummaryRuntime:
     summary_runtime_shape: str | None
     summary_runtime_toolset_source: str | None
     build_kwargs: Callable[[list[dict[str, Any]], int], dict[str, Any]]
+    fingerprint_prefix: Callable[[list[dict[str, Any]]], str]
     invoke: Callable[[dict[str, Any]], Any]
     estimate_request_tokens: Callable[[dict[str, Any]], int]
     activate_fallback: Callable[[BaseException], bool] | None = None
     fallback_attempt_budget: int = 0
+
+
+_NON_PREFIX_REQUEST_FIELDS = frozenset({
+    "include",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "max_tokens",
+    "metadata",
+    "n",
+    "parallel_tool_calls",
+    "response_format",
+    "service_tier",
+    "stop",
+    "stream",
+    "stream_options",
+    "temperature",
+    "timeout",
+    "tool_choice",
+    "top_k",
+    "top_p",
+    "user",
+})
+
+
+def fingerprint_cache_visible_prefix(
+    api_kwargs: dict[str, Any],
+    *,
+    lineage: tuple[str, ...] = (),
+) -> str:
+    """Hash one successful request's reusable prompt prefix and API lineage."""
+    prompt = {
+        key: value
+        for key, value in api_kwargs.items()
+        if key not in _NON_PREFIX_REQUEST_FIELDS
+    }
+    if not prompt:
+        return ""
+    projection = {
+        "lineage": [str(value or "").strip().rstrip("/") for value in lineage],
+        "prompt": prompt,
+    }
+    payload = json.dumps(
+        projection,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def make_summary_runtime(agent: Any) -> SummaryRuntime:
@@ -60,7 +112,26 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
                 provider_messages = [
                     {"role": "system", "content": system_prompt}
                 ] + provider_messages
-            return agent._build_api_kwargs(provider_messages)
+            if getattr(agent, "_use_prompt_caching", False):
+                from agent.prompt_caching import apply_anthropic_cache_control
+
+                provider_messages = apply_anthropic_cache_control(
+                    provider_messages,
+                    cache_ttl=getattr(agent, "_cache_ttl", "5m"),
+                    native_anthropic=bool(
+                        getattr(agent, "_use_native_cache_layout", False)
+                    ),
+                )
+            api_kwargs = agent._build_api_kwargs(provider_messages)
+            try:
+                transport = agent._get_transport()
+                api_kwargs = transport.preflight_kwargs(
+                    api_kwargs,
+                    allow_stream=False,
+                )
+            except (AttributeError, NotImplementedError):
+                pass
+            return api_kwargs
         finally:
             agent._ephemeral_max_output_tokens = old_ephemeral
 
@@ -83,6 +154,18 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
     def _invoke(api_kwargs: dict[str, Any]) -> Any:
         with _suppress_main_stream_callbacks():
             return interruptible_api_call(agent, api_kwargs)
+
+    def _fingerprint_prefix(messages: list[dict[str, Any]]) -> str:
+        return fingerprint_cache_visible_prefix(
+            _build_kwargs(messages, 1),
+            lineage=(
+                str(getattr(agent, "provider", "") or ""),
+                str(getattr(agent, "model", "") or ""),
+                str(getattr(agent, "api_mode", "") or ""),
+                str(getattr(agent, "base_url", "") or ""),
+                str(getattr(agent, "api_key", "") or ""),
+            ),
+        )
 
     def _activate_fallback(exc: BaseException) -> bool:
         activator = getattr(agent, "_try_activate_fallback", None)
@@ -121,6 +204,7 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
         summary_runtime_shape=getattr(agent, "_summary_runtime_shape", None),
         summary_runtime_toolset_source=getattr(agent, "_summary_runtime_toolset_source", None),
         build_kwargs=_build_kwargs,
+        fingerprint_prefix=_fingerprint_prefix,
         invoke=_invoke,
         estimate_request_tokens=estimate_request_context_tokens,
         activate_fallback=_activate_fallback,

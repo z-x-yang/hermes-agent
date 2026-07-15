@@ -15,6 +15,7 @@ from agent.compression_summary_runtime import (
     apply_summary_tool_choice_none,
     extract_summary_cache_stats,
     extract_summary_response_content,
+    fingerprint_cache_visible_prefix,
     make_summary_runtime,
 )
 from hermes_cli.config import DEFAULT_CONFIG
@@ -213,6 +214,94 @@ def test_append_cached_summary_uses_parent_session_cache_key():
     )
 
     assert summary_kwargs["prompt_cache_key"] == main_kwargs["prompt_cache_key"]
+
+
+def test_summary_runtime_exposes_stable_cache_prefix_fingerprint():
+    runtime = make_summary_runtime(ScopedCodexAgentForSummaryRuntime())
+    prefix = [{"role": "user", "content": "stable prefix"}]
+
+    first = runtime.fingerprint_prefix(prefix)
+    second = runtime.fingerprint_prefix([dict(prefix[0])])
+    changed = runtime.fingerprint_prefix([{"role": "user", "content": "changed prefix"}])
+
+    assert first == second
+    assert first != changed
+
+
+def test_summary_runtime_fingerprint_changes_after_credential_swap():
+    agent = ScopedCodexAgentForSummaryRuntime()
+    setattr(agent, "api_key", "credential-a")
+    runtime = make_summary_runtime(agent)
+    prefix = [{"role": "user", "content": "stable prefix"}]
+
+    first = runtime.fingerprint_prefix(prefix)
+    setattr(agent, "api_key", "credential-b")
+    second = runtime.fingerprint_prefix(prefix)
+
+    assert first != second
+
+
+def test_summary_runtime_build_kwargs_applies_transport_preflight():
+    agent = ScopedCodexAgentForSummaryRuntime()
+
+    class _MutatingTransport:
+        @staticmethod
+        def preflight_kwargs(api_kwargs, *, allow_stream):
+            assert allow_stream is False
+            return {
+                **api_kwargs,
+                "instructions": api_kwargs["instructions"] + "\nPREFLIGHT",
+            }
+
+    setattr(agent, "_get_transport", lambda: _MutatingTransport())
+
+    kwargs = make_summary_runtime(agent).build_kwargs(
+        [{"role": "user", "content": "summary source"}],
+        12345,
+    )
+
+    assert kwargs["instructions"].endswith("\nPREFLIGHT")
+
+
+def test_cache_prefix_fingerprint_supports_unknown_request_shape():
+    fingerprint = fingerprint_cache_visible_prefix({
+        "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+        "max_tokens": 100,
+        "stream": False,
+    })
+
+    assert fingerprint
+
+
+def test_cache_prefix_fingerprint_separates_credential_namespaces():
+    request = {"messages": [{"role": "user", "content": "same prefix"}]}
+
+    first = fingerprint_cache_visible_prefix(
+        request,
+        lineage=("provider", "model", "mode", "https://api.example", "secret-a"),
+    )
+    second = fingerprint_cache_visible_prefix(
+        request,
+        lineage=("provider", "model", "mode", "https://api.example", "secret-b"),
+    )
+
+    assert first != second
+    assert "secret-a" not in first
+    assert "secret-b" not in second
+
+
+def test_cache_prefix_fingerprint_includes_cache_scope_headers():
+    common = {"messages": [{"role": "user", "content": "same prefix"}]}
+    first = fingerprint_cache_visible_prefix({
+        **common,
+        "extra_headers": {"session_id": "cache-scope-a"},
+    })
+    second = fingerprint_cache_visible_prefix({
+        **common,
+        "extra_headers": {"session_id": "cache-scope-b"},
+    })
+
+    assert first != second
 
 
 def test_make_summary_runtime_forwards_ephemeral_output_tokens_to_codex_build_kwargs():
@@ -430,6 +519,10 @@ class CapturingRuntime:
     main_api_calls_in_process: int = 0
     captured_messages: list[dict[str, Any]] | None = None
     captured_kwargs: dict[str, Any] | None = None
+    fingerprint_value: str = "capturing-checkpoint"
+
+    def fingerprint_prefix(self, _messages: list[dict[str, Any]]) -> str:
+        return self.fingerprint_value
 
     def build_kwargs(self, messages: list[dict[str, Any]], max_tokens: int) -> dict[str, Any]:
         self.captured_messages = messages
@@ -880,6 +973,53 @@ def test_append_cached_transport_error_tries_provider_fallback_before_serialized
     assert fallback_runtime.captured_messages is not None
     assert compressor._last_summary_call_audit["mode"] == "append_cached"
     assert compressor._last_summary_call_audit["cache_key_runtime"]["provider"] == "openrouter"
+
+
+def test_auto_checkpoint_admission_does_not_leak_across_provider_fallback():
+    primary_runtime = FailingFallbackActivatingRuntime(
+        fingerprint_value="primary-checkpoint"
+    )
+    fallback_runtime = FallbackSummaryRuntime(
+        provider="openrouter",
+        model="fallback/model",
+        api_mode="chat_completions",
+        fingerprint_value="fallback-without-checkpoint",
+    )
+    runtimes = [primary_runtime, fallback_runtime]
+    with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+        compressor = ContextCompressor(
+            model="gpt-5.5",
+            quiet_mode=True,
+            summary_call_mode="append_cached",
+            append_cached_summary={"fallback_to_serialized_prompt": True},
+        )
+    compressor.record_reusable_prefix_checkpoint(
+        source_message_count=1,
+        prefix_fingerprint="primary-checkpoint",
+    )
+    compressor._last_reusable_prefix_checkpoint_audit = {"selected": True}
+    compressor.bind_summary_runtime_factory(lambda: runtimes.pop(0))
+
+    with patch(
+        "agent.context_compressor.call_llm",
+        side_effect=AssertionError("serialized prompt fallback should not run"),
+    ) as serialized_call:
+        summary = compressor._generate_summary(
+            [{"role": "user", "content": "old prefix"}],
+            source_messages=[{"role": "user", "content": "old prefix"}],
+            summarize_start=0,
+            compress_end=1,
+            focus_topic=None,
+        )
+
+    assert summary is None
+    assert serialized_call.call_count == 0
+    assert compressor._last_compress_deferred is True
+    assert primary_runtime.activate_calls
+    assert fallback_runtime.captured_messages is None
+    assert compressor._last_summary_call_audit["fallback_reason"] == (
+        "reusable_prefix_checkpoint_unavailable"
+    )
 
 
 def test_append_cached_provider_fallback_honors_full_configured_chain():
