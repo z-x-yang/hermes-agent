@@ -15,6 +15,7 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
+import agent.conversation_loop as conversation_loop_module
 from agent.compression_summary_runtime import make_summary_runtime
 
 
@@ -154,7 +155,7 @@ def test_anthropic_main_checkpoint_matches_summary_runtime_prefix(monkeypatch):
 
     agent.run_conversation("hi")
 
-    checkpoint = agent.context_compressor._reusable_prefix_checkpoints[0]
+    checkpoint = getattr(agent, "context_compressor")._reusable_prefix_checkpoints[0]
     prefix = [{"role": "user", "content": "hi"}]
     summary_fingerprint = make_summary_runtime(agent).fingerprint_prefix(prefix)
     assert checkpoint.prefix_fingerprint == summary_fingerprint
@@ -162,3 +163,63 @@ def test_anthropic_main_checkpoint_matches_summary_runtime_prefix(monkeypatch):
     agent.api_key = "rotated-credential"
     rotated_fingerprint = make_summary_runtime(agent).fingerprint_prefix(prefix)
     assert checkpoint.prefix_fingerprint != rotated_fingerprint
+
+
+def test_prefill_main_checkpoint_matches_summary_runtime_prefix(monkeypatch):
+    agent = _make_agent(
+        monkeypatch,
+        "anthropic_messages",
+        "anthropic",
+        lambda: _anthropic_resp(500, 20),
+    )
+    setattr(agent, "prefill_messages", [
+        {"role": "user", "content": "stable prefill user"},
+        {"role": "assistant", "content": "stable prefill assistant"},
+    ])
+
+    agent.run_conversation("hi")
+
+    checkpoint = getattr(agent, "context_compressor")._reusable_prefix_checkpoints[0]
+    summary_fingerprint = make_summary_runtime(agent).fingerprint_prefix(
+        [{"role": "user", "content": "hi"}]
+    )
+    assert checkpoint.prefix_fingerprint == summary_fingerprint
+
+
+def test_turn_local_user_injection_records_reconstructable_prefix_checkpoint(monkeypatch):
+    agent = _make_agent(
+        monkeypatch,
+        "anthropic_messages",
+        "anthropic",
+        lambda: _anthropic_resp(500, 20),
+    )
+    original_build_turn_context = conversation_loop_module.build_turn_context
+
+    def _build_turn_context_with_plugin(*args, **kwargs):
+        context = original_build_turn_context(*args, **kwargs)
+        context.plugin_user_context = "temporary current-turn plugin context"
+        return context
+
+    monkeypatch.setattr(
+        conversation_loop_module,
+        "build_turn_context",
+        _build_turn_context_with_plugin,
+    )
+    history = [
+        {"role": "user", "content": "previous question"},
+        {"role": "assistant", "content": "previous answer"},
+    ]
+
+    agent.run_conversation("current question", conversation_history=history)
+
+    expected_fingerprint = make_summary_runtime(agent).fingerprint_prefix(history)
+    matching = [
+        checkpoint
+        for checkpoint in getattr(
+            agent,
+            "context_compressor",
+        )._reusable_prefix_checkpoints
+        if checkpoint.source_message_count == len(history)
+        and checkpoint.prefix_fingerprint == expected_fingerprint
+    ]
+    assert matching

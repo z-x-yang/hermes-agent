@@ -304,6 +304,19 @@ def test_cache_prefix_fingerprint_includes_cache_scope_headers():
     assert first != second
 
 
+def test_cache_prefix_fingerprint_ignores_internal_dispatch_sentinels():
+    request = {"messages": [{"role": "user", "content": "same prefix"}]}
+    with_bedrock_dispatch = {
+        **request,
+        "__bedrock_converse__": True,
+        "__bedrock_region__": "us-east-1",
+    }
+
+    assert fingerprint_cache_visible_prefix(with_bedrock_dispatch) == (
+        fingerprint_cache_visible_prefix(request)
+    )
+
+
 def test_make_summary_runtime_forwards_ephemeral_output_tokens_to_codex_build_kwargs():
     agent = FakeCodexAgentForSummaryRuntime()
     runtime = make_summary_runtime(agent)

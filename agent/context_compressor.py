@@ -1619,12 +1619,23 @@ class ContextCompressor(ContextEngine):
         fingerprint = str(prefix_fingerprint or "")
         if source_end <= 0 or not fingerprint:
             return
-        self._reusable_prefix_checkpoints.append(ReusablePrefixCheckpoint(
+        checkpoint = ReusablePrefixCheckpoint(
             source_message_count=source_end,
             prefix_fingerprint=fingerprint,
             recorded_at=time.monotonic(),
-        ))
-        self._reusable_prefix_checkpoints = self._reusable_prefix_checkpoints[-50:]
+        )
+        # Do not truncate per-session checkpoints: with a fixed-size retained
+        # tail, both the desired cut and newest endpoints advance together, so a
+        # recency cap can permanently discard every endpoint at/before the cut.
+        # Session reset/end already clears the list; dedupe repeated tool-loop
+        # calls that prove the same endpoint instead.
+        if any(
+            existing.source_message_count == checkpoint.source_message_count
+            and existing.prefix_fingerprint == checkpoint.prefix_fingerprint
+            for existing in self._reusable_prefix_checkpoints
+        ):
+            return
+        self._reusable_prefix_checkpoints.append(checkpoint)
 
     def _select_reusable_prefix_checkpoint(
         self,

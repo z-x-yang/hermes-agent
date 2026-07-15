@@ -61,6 +61,11 @@ def fingerprint_cache_visible_prefix(
         key: value
         for key, value in api_kwargs.items()
         if key not in _NON_PREFIX_REQUEST_FIELDS
+        and not (
+            isinstance(key, str)
+            and key.startswith("__")
+            and key.endswith("__")
+        )
     }
     if not prompt:
         return ""
@@ -112,6 +117,20 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
                 provider_messages = [
                     {"role": "system", "content": system_prompt}
                 ] + provider_messages
+            prefill_messages = getattr(agent, "prefill_messages", None) or []
+            if prefill_messages:
+                system_offset = (
+                    1
+                    if provider_messages
+                    and isinstance(provider_messages[0], dict)
+                    and provider_messages[0].get("role") == "system"
+                    else 0
+                )
+                provider_messages[system_offset:system_offset] = [
+                    message.copy()
+                    for message in prefill_messages
+                    if isinstance(message, dict)
+                ]
             if getattr(agent, "_use_prompt_caching", False):
                 from agent.prompt_caching import apply_anthropic_cache_control
 

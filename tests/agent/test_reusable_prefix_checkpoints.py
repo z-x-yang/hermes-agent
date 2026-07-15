@@ -204,3 +204,24 @@ def test_checkpoint_loss_during_summary_preserves_original_transcript(monkeypatc
     assert compressor._last_compression_audit_record["abort_reason"] == (
         "reusable_prefix_checkpoint_unavailable"
     )
+
+
+def test_checkpoint_retention_covers_tail_spanning_more_than_fifty_calls():
+    compressor = _compressor()
+    messages = [
+        {"role": "user", "content": f"message-{index}"}
+        for index in range(201)
+    ]
+    for source_end in range(1, 202, 2):
+        compressor.record_reusable_prefix_checkpoint(
+            source_message_count=source_end,
+            prefix_fingerprint=_fingerprint(messages[:source_end]),
+        )
+
+    checkpoint = compressor._select_reusable_prefix_checkpoint(
+        messages,
+        desired_end=101,
+    )
+
+    assert checkpoint is not None
+    assert checkpoint.source_message_count == 101
