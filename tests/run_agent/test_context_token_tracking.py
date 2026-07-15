@@ -186,7 +186,7 @@ def test_prefill_main_checkpoint_matches_summary_runtime_prefix(monkeypatch):
     assert checkpoint.prefix_fingerprint == summary_fingerprint
 
 
-def test_turn_local_user_injection_records_reconstructable_prefix_checkpoint(monkeypatch):
+def test_turn_local_user_injection_does_not_invent_pre_user_checkpoint(monkeypatch):
     agent = _make_agent(
         monkeypatch,
         "anthropic_messages",
@@ -212,14 +212,10 @@ def test_turn_local_user_injection_records_reconstructable_prefix_checkpoint(mon
 
     agent.run_conversation("current question", conversation_history=history)
 
-    expected_fingerprint = make_summary_runtime(agent).fingerprint_prefix(history)
-    matching = [
-        checkpoint
-        for checkpoint in getattr(
-            agent,
-            "context_compressor",
-        )._reusable_prefix_checkpoints
-        if checkpoint.source_message_count == len(history)
-        and checkpoint.prefix_fingerprint == expected_fingerprint
+    checkpoints = getattr(
+        agent,
+        "context_compressor",
+    )._reusable_prefix_checkpoints
+    assert [checkpoint.source_message_count for checkpoint in checkpoints] == [
+        len(history) + 1
     ]
-    assert matching

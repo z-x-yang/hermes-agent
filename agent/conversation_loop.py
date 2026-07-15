@@ -29,10 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.chat_completion_helpers import prepare_provider_visible_messages
-from agent.compression_summary_runtime import (
-    fingerprint_cache_visible_prefix,
-    make_summary_runtime,
-)
+from agent.compression_summary_runtime import fingerprint_cache_visible_prefix
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
@@ -910,7 +907,6 @@ def run_conversation(
             )
 
         api_messages = []
-        turn_local_context_injected = False
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
 
@@ -931,7 +927,6 @@ def run_conversation(
                     _base = api_msg.get("content", "")
                     if isinstance(_base, str):
                         api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
-                        turn_local_context_injected = True
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved
@@ -996,7 +991,6 @@ def run_conversation(
                             _base = _msg.get("content", "")
                             if isinstance(_base, str):
                                 _msg["content"] = _base + "\n\n" + _moa_context
-                                turn_local_context_injected = True
                             break
             except Exception as _moa_exc:
                 logger.warning("MoA context aggregation failed: %s", _moa_exc)
@@ -1009,13 +1003,12 @@ def run_conversation(
 
             _pending_runtime_status = consume_runtime_context_statuses(agent)
             if _pending_runtime_status:
-                if inject_runtime_context_statuses(
+                inject_runtime_context_statuses(
                     api_messages,
                     _pending_runtime_status,
                     agent=agent,
                     turn_id=turn_id,
-                ):
-                    turn_local_context_injected = True
+                )
         except Exception as _runtime_status_exc:
             logger.debug("runtime context status injection skipped: %s", _runtime_status_exc)
 
@@ -1313,21 +1306,14 @@ def run_conversation(
 
                 successful_request_kwargs = None
                 successful_request_source_message_count = 0
-                successful_reconstructable_source_message_count = 0
 
                 def _perform_api_call(next_api_kwargs):
                     nonlocal provider_backend_invoked_this_iteration
                     nonlocal successful_request_kwargs
                     nonlocal successful_request_source_message_count
-                    nonlocal successful_reconstructable_source_message_count
                     provider_backend_invoked_this_iteration = True
                     successful_request_kwargs = dict(next_api_kwargs)
                     successful_request_source_message_count = len(messages)
-                    successful_reconstructable_source_message_count = (
-                        int(current_turn_user_idx)
-                        if turn_local_context_injected
-                        else 0
-                    )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -2290,22 +2276,6 @@ def run_conversation(
                         source_message_count=successful_request_source_message_count,
                         prefix_fingerprint=checkpoint_fingerprint,
                     )
-                    reconstructable_end = (
-                        successful_reconstructable_source_message_count
-                    )
-                    # Turn-local memory/plugin/status text is deliberately not
-                    # persisted, so the full endpoint cannot be rebuilt later.
-                    # The immediately preceding transcript boundary is still a
-                    # prefix of this same successful request; record that
-                    # reconstructable checkpoint without retaining injected text.
-                    if 0 < reconstructable_end < successful_request_source_message_count:
-                        reconstructable_fingerprint = make_summary_runtime(
-                            agent
-                        ).fingerprint_prefix(messages[:reconstructable_end])
-                        agent.context_compressor.record_reusable_prefix_checkpoint(
-                            source_message_count=reconstructable_end,
-                            prefix_fingerprint=reconstructable_fingerprint,
-                        )
                 except Exception:
                     logger.debug(
                         "Failed to record reusable prefix checkpoint",
