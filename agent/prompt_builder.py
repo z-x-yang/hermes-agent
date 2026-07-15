@@ -1259,7 +1259,7 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 64
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-_SKILLS_SNAPSHOT_VERSION = 3
+_SKILLS_SNAPSHOT_VERSION = 4
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1367,6 +1367,9 @@ def _build_snapshot_entry(
     platforms = frontmatter.get("platforms") or []
     if isinstance(platforms, str):
         platforms = [platforms]
+    environments = frontmatter.get("environments") or []
+    if isinstance(environments, str):
+        environments = [environments]
 
     return {
         "skill_name": skill_name,
@@ -1374,6 +1377,7 @@ def _build_snapshot_entry(
         "frontmatter_name": str(frontmatter.get("name", skill_name)),
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
+        "environments": [str(e).strip() for e in environments if str(e).strip()],
         "conditions": extract_skill_conditions(frontmatter),
         "unsupported_restrictive_fields": unsupported_restrictive_skill_fields(frontmatter),
     }
@@ -1443,8 +1447,9 @@ def _skill_should_show(
     return True
 
 
-_SKILL_INDEX_BUDGET_FRACTION = 0.01
+_SKILL_INDEX_BUDGET_FRACTION = 0.015
 _SKILL_INDEX_CHARS_PER_TOKEN = 4.0
+_SKILL_DESCRIPTION_PREVIEW_CHARS = 60
 _SKILL_CREATION_GRACE_DAYS = 7
 _ALWAYS_FULL_SKILL_NAMES = frozenset({
     "apple-ecosystem",
@@ -1497,21 +1502,29 @@ def _recent_agent_created(record: dict, now: datetime) -> bool:
     return age_days <= _SKILL_CREATION_GRACE_DAYS
 
 
-def _select_full_skill_descriptions(
+def _skill_description_preview(description: str) -> str:
+    """Return the stable routing floor shown for every described skill."""
+    if len(description) <= _SKILL_DESCRIPTION_PREVIEW_CHARS:
+        return description
+    return description[: _SKILL_DESCRIPTION_PREVIEW_CHARS - 3] + "..."
+
+
+def _select_skill_descriptions(
     skills_by_category: "dict[str, list[tuple[str, str]]]",
     category_descriptions: "dict[str, str]",
     demoted: "frozenset[str]",
     context_length: "int | None",
-) -> tuple[set[str], bool]:
-    """Select whole descriptions within a Claude-style listing budget."""
+) -> tuple[dict[str, str], bool]:
+    """Render a 60-char floor, then upgrade priority skills within budget."""
     candidates: list[tuple[str, str]] = []
+    preview_only_names: set[str] = set()
     base_chars = 0
     for category in sorted(skills_by_category):
-        names = sorted({name for name, _ in skills_by_category[category]})
-        if category in demoted:
-            base_chars += len(f"  {category} [names only]: {', '.join(names)}\n")
-            continue
-        category_line = f"  {category}: {category_descriptions.get(category, '')}".rstrip()
+        is_preview_only = category in demoted
+        if is_preview_only:
+            category_line = f"  {category} [previews only]:"
+        else:
+            category_line = f"  {category}: {category_descriptions.get(category, '')}".rstrip()
         base_chars += len(category_line) + 1
         seen = set()
         for name, desc in sorted(skills_by_category[category], key=lambda item: item[0]):
@@ -1521,9 +1534,19 @@ def _select_full_skill_descriptions(
             base_chars += len(f"    - {name}\n")
             if desc:
                 candidates.append((name, desc))
+                if is_preview_only:
+                    preview_only_names.add(name)
 
     if not context_length:
-        return {name for name, _ in candidates}, False
+        rendered = {
+            name: (
+                _skill_description_preview(desc)
+                if name in preview_only_names
+                else desc
+            )
+            for name, desc in candidates
+        }
+        return rendered, any(rendered[name] != desc for name, desc in candidates)
 
     try:
         from tools.skill_usage import load_usage
@@ -1536,14 +1559,16 @@ def _select_full_skill_descriptions(
     canonical = {
         name for name, _ in candidates if name in _ALWAYS_FULL_SKILL_NAMES
     }
-    description_by_name = dict(candidates)
-    canonical_cost = sum(len(description_by_name[name]) + 2 for name in canonical)
+    rendered = {
+        name: desc if name in canonical else _skill_description_preview(desc)
+        for name, desc in candidates
+    }
+    baseline_cost = sum(len(desc) + 2 for desc in rendered.values())
     budget_chars = max(
-        base_chars + canonical_cost,
+        base_chars + baseline_cost,
         int(context_length * _SKILL_INDEX_BUDGET_FRACTION * _SKILL_INDEX_CHARS_PER_TOKEN),
     )
-    selected = set(canonical)
-    remaining = budget_chars - base_chars - canonical_cost
+    remaining = budget_chars - base_chars - baseline_cost
 
     def _rank(item: tuple[str, str]) -> tuple[int, float, str]:
         name, _ = item
@@ -1552,15 +1577,18 @@ def _select_full_skill_descriptions(
         return (tier, -_skill_usage_priority(record, now), name)
 
     for name, desc in sorted(
-        (item for item in candidates if item[0] not in canonical),
+        (
+            item for item in candidates
+            if item[0] not in canonical and item[0] not in preview_only_names
+        ),
         key=_rank,
     ):
-        cost = len(desc) + 2
-        if cost <= remaining:
-            selected.add(name)
-            remaining -= cost
+        upgrade_cost = len(desc) - len(rendered[name])
+        if upgrade_cost <= remaining:
+            rendered[name] = desc
+            remaining -= upgrade_cost
 
-    return selected, len(selected) < len(candidates)
+    return rendered, any(rendered[name] != desc for name, desc in candidates)
 
 
 def build_skills_system_prompt(
@@ -1578,11 +1606,13 @@ def build_skills_system_prompt(
          mtime/size manifest — survives process restarts
 
     A session-keyed rendered listing is frozen even when usage or skill metadata
-    changes; a new session re-ranks descriptions. The listing receives 1% of the
-    internal context window in characters. All names remain visible; full
-    descriptions go first to the explicitly approved canonical owners, then
-    newly agent-created skills during their grace period, then usage × recency
-    priority. Curator pin state does not participate in routing priority.
+    changes; a new session re-ranks descriptions. The nominal listing budget is
+    1.5% of the internal context window. Every described skill keeps a
+    60-character routing preview; explicitly approved canonical owners stay
+    full, then newly agent-created skills and usage × recency priority consume
+    any remaining upgrade budget. Compact categories keep previews but skip
+    full-description upgrades. Curator pin state does not participate in
+    routing priority.
 
     Falls back to a full filesystem scan when both layers miss.
 
@@ -1645,7 +1675,10 @@ def build_skills_system_prompt(
             category = entry.get("category") or "general"
             frontmatter_name = entry.get("frontmatter_name") or skill_name
             platforms = entry.get("platforms") or []
+            environments = entry.get("environments") or []
             if not skill_matches_platform({"platforms": platforms}):
+                continue
+            if not skill_matches_environment({"environments": environments}):
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
@@ -1793,7 +1826,7 @@ def build_skills_system_prompt(
         cat for cat in skills_by_category
         if cat.split("/", 1)[0] in (compact_categories or frozenset())
     )
-    full_description_names, budget_truncated = _select_full_skill_descriptions(
+    rendered_descriptions, budget_truncated = _select_skill_descriptions(
         skills_by_category,
         category_descriptions,
         demoted,
@@ -1803,14 +1836,14 @@ def build_skills_system_prompt(
     hidden_notes = []
     if demoted:
         hidden_notes.append(
-            "Categories marked [names only] are outside the current coding context, "
-            "so their descriptions are omitted — the skills work normally and load "
-            "with skill_view(name) as usual."
+            "Categories marked [previews only] are outside the current coding context, "
+            "so their skills keep the 60-character routing floor but, apart from "
+            "approved always-full owners, do not consume full-description upgrade budget."
         )
     if budget_truncated:
         hidden_notes.append(
-            "Lower-priority skills may be listed by name only to keep the routing "
-            "index bounded; use skills_list or skill_view(name) for full details."
+            "Every described skill keeps a 60-character routing preview; priority "
+            "skills may expand to their full description within the bounded index."
         )
     hidden_note = (
         "\n(" + " ".join(hidden_notes) + ")"
@@ -1825,20 +1858,20 @@ def build_skills_system_prompt(
             # Deduplicate and sort skills within each category
             seen = set()
             if category in demoted:
-                names = sorted({name for name, _ in skills_by_category[category]})
-                index_lines.append(f"  {category} [names only]: {', '.join(names)}")
-                continue
-            cat_desc = category_descriptions.get(category, "")
-            if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
+                index_lines.append(f"  {category} [previews only]:")
             else:
-                index_lines.append(f"  {category}:")
+                cat_desc = category_descriptions.get(category, "")
+                if cat_desc:
+                    index_lines.append(f"  {category}: {cat_desc}")
+                else:
+                    index_lines.append(f"  {category}:")
             for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
                 if name in seen:
                     continue
                 seen.add(name)
-                if desc and name in full_description_names:
-                    index_lines.append(f"    - {name}: {desc}")
+                shown_desc = rendered_descriptions.get(name, "")
+                if shown_desc:
+                    index_lines.append(f"    - {name}: {shown_desc}")
                 else:
                     index_lines.append(f"    - {name}")
 

@@ -65,6 +65,7 @@ class TestBuildLearnPrompt:
         assert "capability" in std
         assert "trigger" in std
         assert "workflow" in std
+        assert "first 60" in std
 
     def test_teaches_the_full_hardline_standards(self):
         # Routing description, platform gating, author credit, and tool framing

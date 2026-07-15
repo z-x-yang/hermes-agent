@@ -36,12 +36,13 @@ Frontmatter:
 - description: ONE concise routing sentence, preferably under 500 characters
   and never over the Agent Skills hard limit of 1024 characters. State both
   the capability and the concrete trigger conditions/contexts that should load
-  the skill; front-load distinctive domain, tool, symptom, and artifact
-  keywords. Do NOT summarize the procedure or workflow, because that lets the
-  model imitate the preview instead of loading the full skill. No marketing
-  words (powerful, comprehensive, seamless, advanced, robust). Do NOT repeat
-  the skill name. If the description contains a colon, wrap the whole value in
-  double quotes.
+  the skill. The first 60 characters are the stable baseline preview, so make
+  them independently routeable: front-load the decisive domain, tool, symptom,
+  artifact, or trigger keywords instead of a generic preamble. Do NOT summarize
+  the procedure or workflow, because that lets the model imitate the preview
+  instead of loading the full skill. No marketing words (powerful,
+  comprehensive, seamless, advanced, robust). Do NOT repeat the skill name. If
+  the description contains a colon, wrap the whole value in double quotes.
     Good: `Use when searching arXiv by keyword, author, category, or paper ID.`
     Bad:  `Searches arXiv, downloads results, ranks papers, and writes a digest.`
 - version: 0.1.0

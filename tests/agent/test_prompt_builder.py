@@ -459,7 +459,8 @@ class TestBuildSkillsSystemPrompt:
         }
         for name in sorted(always_full | {"ordinary-high-usage"}):
             marker = "FULL_" + name.upper().replace("-", "_")
-            description = marker + " " + "canonical routing boundary " * 4
+            tail = "TAIL_" + name.upper().replace("-", "_")
+            description = marker + " " + "canonical routing boundary " * 4 + tail
             skill_dir = tmp_path / "skills" / "routing" / name
             skill_dir.mkdir(parents=True)
             (skill_dir / "SKILL.md").write_text(
@@ -481,18 +482,28 @@ class TestBuildSkillsSystemPrompt:
 
         assert all(name in result for name in always_full | {"ordinary-high-usage"})
         for name in always_full:
-            assert "FULL_" + name.upper().replace("-", "_") in result
-        assert "FULL_ORDINARY_HIGH_USAGE" not in result
+            assert "TAIL_" + name.upper().replace("-", "_") in result
+        assert "TAIL_ORDINARY_HIGH_USAGE" not in result
 
     def test_budget_keeps_owners_new_skills_and_frequent_skills(
         self, monkeypatch, tmp_path
     ):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         descriptions = {
-            "writing-skills": "AUTHORING_OWNER " + "precise trigger guidance " * 3,
-            "new-background-skill": "CREATION_GRACE " + "new reusable workflow " * 3,
-            "frequent-skill": "FREQUENT_WINNER " + "often used operational route " * 3,
-            "unused-skill": "UNUSED_LOSER " + "rarely relevant archive route " * 3,
+            "writing-skills": (
+                "AUTHORING_OWNER " + "precise trigger guidance " * 6 + "OWNER_TAIL"
+            ),
+            "new-background-skill": (
+                "CREATION_GRACE " + "new reusable workflow " * 8 + "GRACE_TAIL"
+            ),
+            "frequent-skill": (
+                "FREQUENT_WINNER " + "often used operational route " * 7
+                + "FREQUENT_TAIL"
+            ),
+            "unused-skill": (
+                "UNUSED_LOSER " + "rarely relevant archive route " * 7
+                + "UNUSED_TAIL"
+            ),
         }
         for name, description in descriptions.items():
             skill_dir = tmp_path / "skills" / "routing" / name
@@ -519,15 +530,15 @@ class TestBuildSkillsSystemPrompt:
         }))
 
         result = build_skills_system_prompt(
-            context_length=10_000,
+            context_length=14_000,
             session_id="priority-session",
         )
 
         assert all(name in result for name in descriptions)
-        assert "AUTHORING_OWNER" in result
-        assert "CREATION_GRACE" in result
-        assert "FREQUENT_WINNER" in result
-        assert "UNUSED_LOSER" not in result
+        assert "OWNER_TAIL" in result
+        assert "GRACE_TAIL" in result
+        assert "FREQUENT_TAIL" in result
+        assert "UNUSED_TAIL" not in result
 
     def test_curator_pin_does_not_raise_main_listing_priority(
         self, monkeypatch, tmp_path
@@ -535,9 +546,12 @@ class TestBuildSkillsSystemPrompt:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         descriptions = {
             "writing-skills": "AUTHORING_OWNER routing contract.",
-            "pinned-cron-skill": "PINNED_CRON_ONLY " + "cron-only routing " * 8,
+            "pinned-cron-skill": (
+                "PINNED_CRON_ONLY " + "cron-only routing " * 8 + "PINNED_TAIL"
+            ),
             "frequent-general-skill": (
                 "FREQUENT_GENERAL " + "general planning route " * 7
+                + "FREQUENT_GENERAL_TAIL"
             ),
         }
         for name, description in descriptions.items():
@@ -569,8 +583,56 @@ class TestBuildSkillsSystemPrompt:
 
         assert all(name in result for name in descriptions)
         assert "AUTHORING_OWNER" in result
-        assert "FREQUENT_GENERAL" in result
-        assert "PINNED_CRON_ONLY" not in result
+        assert "FREQUENT_GENERAL_TAIL" in result
+        assert "PINNED_TAIL" not in result
+
+    def test_every_skill_gets_a_sixty_character_preview_before_upgrades(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        owner_dir = tmp_path / "skills" / "routing" / "writing-skills"
+        owner_dir.mkdir(parents=True)
+        (owner_dir / "SKILL.md").write_text(
+            "---\nname: writing-skills\ndescription: AUTHORING_OWNER routing contract.\n---\n"
+        )
+
+        usage = {}
+        now = datetime.now(timezone.utc).isoformat()
+        for index in range(40):
+            name = f"ordinary-skill-{index:02d}"
+            marker = "HIGH_TRIGGER" if index == 0 else f"ROUTE_{index:02d}"
+            description = marker + " " + ("routing context " * 14) + f"TAIL_{index:02d}"
+            skill_dir = tmp_path / "skills" / "routing" / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {description}\n---\n"
+            )
+            usage[name] = {
+                "use_count": 100 if index == 0 else 0,
+                "last_used_at": now if index == 0 else None,
+            }
+        (tmp_path / "skills" / ".usage.json").write_text(json.dumps(usage))
+
+        result = build_skills_system_prompt(
+            context_length=64_000,
+            session_id="sixty-character-preview-floor",
+        )
+        index_block = result.split("<available_skills>\n", 1)[1].split(
+            "\n</available_skills>", 1
+        )[0]
+        skill_lines = {
+            line.strip()[2:].split(": ", 1)[0]: line.strip()[2:]
+            for line in index_block.splitlines()
+            if line.startswith("    - ")
+        }
+
+        assert len(skill_lines) == 41
+        assert all(": " in line for line in skill_lines.values())
+        assert "TAIL_00" in skill_lines["ordinary-skill-00"]
+        low_preview = skill_lines["ordinary-skill-39"].split(": ", 1)[1]
+        assert len(low_preview) == 60
+        assert low_preview.endswith("...")
+        assert "TAIL_39" not in low_preview
 
     def test_many_grace_skills_stay_within_listing_budget(
         self, monkeypatch, tmp_path
@@ -586,7 +648,11 @@ class TestBuildSkillsSystemPrompt:
         )
         for index in range(20):
             name = f"new-skill-{index:02d}"
-            description = f"GRACE_DESC_{index:02d} " + "new workflow routing context " * 8
+            description = (
+                f"GRACE_DESC_{index:02d} "
+                + "new workflow routing context " * 8
+                + f"FULL_TAIL_{index:02d}"
+            )
             skill_dir = tmp_path / "skills" / "routing" / name
             skill_dir.mkdir(parents=True)
             (skill_dir / "SKILL.md").write_text(
@@ -608,10 +674,11 @@ class TestBuildSkillsSystemPrompt:
             "\n</available_skills>", 1
         )[0]
 
-        assert len(index_block) <= 2_600
+        assert len(index_block) <= 3_900
         assert all(f"new-skill-{index:02d}" in index_block for index in range(20))
-        shown_grace_descriptions = index_block.count("GRACE_DESC_")
-        assert 0 < shown_grace_descriptions < 20
+        assert index_block.count("GRACE_DESC_") == 20
+        shown_full_descriptions = index_block.count("FULL_TAIL_")
+        assert 0 < shown_full_descriptions < 20
         assert "AUTHORING_OWNER" in index_block
 
     def test_usage_ranking_refreshes_only_for_a_new_session(
@@ -621,8 +688,13 @@ class TestBuildSkillsSystemPrompt:
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         descriptions = {
-            "first-skill": "FIRST_PRIORITY " + "first route guidance " * 4,
-            "second-skill": "SECOND_PRIORITY " + "second route guidance " * 4,
+            "first-skill": (
+                "FIRST_PRIORITY " + "first route guidance " * 8 + "FIRST_FULL_TAIL"
+            ),
+            "second-skill": (
+                "SECOND_PRIORITY " + "second route guidance " * 8
+                + "SECOND_FULL_TAIL"
+            ),
         }
         for name, description in descriptions.items():
             skill_dir = tmp_path / "skills" / "routing" / name
@@ -638,11 +710,11 @@ class TestBuildSkillsSystemPrompt:
             "second-skill": {"use_count": 0, "last_used_at": None},
         }))
         first = build_skills_system_prompt(
-            context_length=5_000,
+            context_length=6_000,
             session_id="stable-session",
         )
-        assert "FIRST_PRIORITY" in first
-        assert "SECOND_PRIORITY" not in first
+        assert "FIRST_FULL_TAIL" in first
+        assert "SECOND_FULL_TAIL" not in first
 
         usage_path.write_text(json.dumps({
             "first-skill": {"use_count": 0, "last_used_at": None},
@@ -651,17 +723,17 @@ class TestBuildSkillsSystemPrompt:
         clear_skills_system_prompt_cache()
 
         same_session = build_skills_system_prompt(
-            context_length=5_000,
+            context_length=6_000,
             session_id="stable-session",
         )
         next_session = build_skills_system_prompt(
-            context_length=5_000,
+            context_length=6_000,
             session_id="next-session",
         )
 
         assert same_session == first
-        assert "SECOND_PRIORITY" in next_session
-        assert "FIRST_PRIORITY" not in next_session
+        assert "SECOND_FULL_TAIL" in next_session
+        assert "FIRST_FULL_TAIL" not in next_session
 
     def test_targeted_session_cache_clear_does_not_touch_other_sessions(
         self, monkeypatch, tmp_path
@@ -675,9 +747,11 @@ class TestBuildSkillsSystemPrompt:
         ):
             skill_dir = tmp_path / "skills" / "routing" / name
             skill_dir.mkdir(parents=True)
+            tail = marker.replace("PRIORITY", "FULL_TAIL")
             (skill_dir / "SKILL.md").write_text(
                 f"---\nname: {name}\ndescription: {marker} "
                 + ("routing context " * 8)
+                + tail
                 + "\n---\n"
             )
 
@@ -688,12 +762,13 @@ class TestBuildSkillsSystemPrompt:
             "second-skill": {"use_count": 0, "last_used_at": None},
         }))
         first_a = build_skills_system_prompt(
-            context_length=5_000, session_id="session-a"
+            context_length=6_000, session_id="session-a"
         )
         first_b = build_skills_system_prompt(
-            context_length=5_000, session_id="session-b"
+            context_length=6_000, session_id="session-b"
         )
-        assert "FIRST_PRIORITY" in first_a
+        assert "FIRST_FULL_TAIL" in first_a
+        assert "SECOND_FULL_TAIL" not in first_a
         assert first_b == first_a
 
         usage_path.write_text(json.dumps({
@@ -703,13 +778,13 @@ class TestBuildSkillsSystemPrompt:
         clear_skills_system_prompt_cache(session_id="session-a")
 
         refreshed_a = build_skills_system_prompt(
-            context_length=5_000, session_id="session-a"
+            context_length=6_000, session_id="session-a"
         )
         frozen_b = build_skills_system_prompt(
-            context_length=5_000, session_id="session-b"
+            context_length=6_000, session_id="session-b"
         )
-        assert "SECOND_PRIORITY" in refreshed_a
-        assert "FIRST_PRIORITY" not in refreshed_a
+        assert "SECOND_FULL_TAIL" in refreshed_a
+        assert "FIRST_FULL_TAIL" not in refreshed_a
         assert frozen_b == first_b
 
     def test_skill_routing_uses_description_match_not_partial_relevance(
@@ -742,33 +817,30 @@ class TestBuildSkillsSystemPrompt:
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
-    def test_compact_categories_demoted_to_names_only(self, monkeypatch, tmp_path):
-        """Posture-driven demotion keeps every skill NAME visible.
-
-        Demoted categories lose their descriptions, never their entries —
-        full pruning caused silent capability loss in a real workflow
-        (agent-created skills are the model's project memory, and models
-        don't rediscover them via skills_list once the index goes quiet).
-        """
+    def test_compact_categories_demoted_to_previews_only(self, monkeypatch, tmp_path):
+        """Posture compaction suppresses upgrades, never routing previews."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        for cat, name in (("social-media", "tweet-stuff"), ("github", "pr-review")):
+        descriptions = {
+            ("social-media", "tweet-stuff"): (
+                "TWEET_PREVIEW " + "social publishing route " * 5 + "TWEET_FULL_TAIL"
+            ),
+            ("github", "pr-review"): "Does pr-review things",
+        }
+        for (cat, name), description in descriptions.items():
             d = tmp_path / "skills" / cat / name
             d.mkdir(parents=True)
             (d / "SKILL.md").write_text(
-                f"---\nname: {name}\ndescription: Does {name} things\n---\n"
+                f"---\nname: {name}\ndescription: {description}\n---\n"
             )
 
         result = build_skills_system_prompt(
             compact_categories=frozenset({"social-media"})
         )
-        # Coding-adjacent category keeps its full entry.
         assert "pr-review" in result and "Does pr-review things" in result
-        # Demoted category: name stays visible, description is dropped.
-        assert "tweet-stuff" in result
-        assert "Does tweet-stuff things" not in result
-        assert "social-media [names only]" in result
-        # Disclosure note explains the demotion and how to load.
-        assert "skill_view" in result
+        assert "tweet-stuff: TWEET_PREVIEW" in result
+        assert "TWEET_FULL_TAIL" not in result
+        assert "social-media [previews only]" in result
+        assert "60-character routing preview" in result
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(
         self, monkeypatch, tmp_path
@@ -777,18 +849,42 @@ class TestBuildSkillsSystemPrompt:
         d = tmp_path / "skills" / "social-media" / "twitter" / "thread-writer"
         d.mkdir(parents=True)
         (d / "SKILL.md").write_text(
-            "---\nname: thread-writer\ndescription: Write threads\n---\n"
+            "---\nname: thread-writer\ndescription: THREAD_PREVIEW "
+            + "social thread routing " * 5
+            + "THREAD_FULL_TAIL\n---\n"
         )
-        # Nested category ("social-media/twitter") demoted via its parent:
-        # name visible, description gone.
         compact = build_skills_system_prompt(
             compact_categories=frozenset({"social-media"})
         )
-        assert "thread-writer" in compact
-        assert "Write threads" not in compact
+        assert "thread-writer: THREAD_PREVIEW" in compact
+        assert "THREAD_FULL_TAIL" not in compact
         # Unfiltered call must not be served from the compacted cache entry.
         full = build_skills_system_prompt()
-        assert "Write threads" in full
+        assert "THREAD_FULL_TAIL" in full
+
+    def test_snapshot_preserves_environment_incompatibility(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        hidden = tmp_path / "skills" / "devops" / "kanban-workflows"
+        hidden.mkdir(parents=True)
+        (hidden / "SKILL.md").write_text(
+            "---\nname: kanban-workflows\ndescription: Kanban worker routing\n"
+            "environments: [kanban]\n---\n"
+        )
+        visible = tmp_path / "skills" / "devops" / "ordinary-workflow"
+        visible.mkdir(parents=True)
+        (visible / "SKILL.md").write_text(
+            "---\nname: ordinary-workflow\ndescription: Ordinary routing\n---\n"
+        )
+
+        cold = build_skills_system_prompt(session_id="cold-scan")
+        hot = build_skills_system_prompt(session_id="snapshot-reuse")
+
+        assert "ordinary-workflow" in cold and "ordinary-workflow" in hot
+        assert "kanban-workflows" not in cold
+        assert "kanban-workflows" not in hot
 
     def test_excludes_incompatible_platform_skills(self, monkeypatch, tmp_path):
         """Skills with platforms: [macos] should not appear on Linux."""
