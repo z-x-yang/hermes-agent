@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from dataclasses import dataclass
@@ -22,7 +23,11 @@ class SummaryRuntime:
     summary_runtime_shape: str | None
     summary_runtime_toolset_source: str | None
     build_kwargs: Callable[[list[dict[str, Any]], int], dict[str, Any]]
+    build_kwargs_from_provider_messages: Callable[
+        [list[dict[str, Any]], int], dict[str, Any]
+    ]
     fingerprint_prefix: Callable[[list[dict[str, Any]]], str]
+    fingerprint_provider_messages: Callable[[list[dict[str, Any]]], str]
     invoke: Callable[[dict[str, Any]], Any]
     estimate_request_tokens: Callable[[dict[str, Any]], int]
     activate_fallback: Callable[[BaseException], bool] | None = None
@@ -154,6 +159,26 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
         finally:
             agent._ephemeral_max_output_tokens = old_ephemeral
 
+    def _build_kwargs_from_provider_messages(
+        provider_messages: list[dict[str, Any]],
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        old_ephemeral = getattr(agent, "_ephemeral_max_output_tokens", None)
+        try:
+            agent._ephemeral_max_output_tokens = max_tokens
+            api_kwargs = agent._build_api_kwargs(copy.deepcopy(provider_messages))
+            try:
+                transport = agent._get_transport()
+                api_kwargs = transport.preflight_kwargs(
+                    api_kwargs,
+                    allow_stream=False,
+                )
+            except (AttributeError, NotImplementedError):
+                pass
+            return api_kwargs
+        finally:
+            agent._ephemeral_max_output_tokens = old_ephemeral
+
     @contextmanager
     def _suppress_main_stream_callbacks():
         """Keep internal summarizer deltas out of user-facing streams."""
@@ -177,6 +202,18 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
     def _fingerprint_prefix(messages: list[dict[str, Any]]) -> str:
         return fingerprint_cache_visible_prefix(
             _build_kwargs(messages, 1),
+            lineage=(
+                str(getattr(agent, "provider", "") or ""),
+                str(getattr(agent, "model", "") or ""),
+                str(getattr(agent, "api_mode", "") or ""),
+                str(getattr(agent, "base_url", "") or ""),
+                str(getattr(agent, "api_key", "") or ""),
+            ),
+        )
+
+    def _fingerprint_provider_messages(messages: list[dict[str, Any]]) -> str:
+        return fingerprint_cache_visible_prefix(
+            _build_kwargs_from_provider_messages(messages, 1),
             lineage=(
                 str(getattr(agent, "provider", "") or ""),
                 str(getattr(agent, "model", "") or ""),
@@ -223,7 +260,9 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
         summary_runtime_shape=getattr(agent, "_summary_runtime_shape", None),
         summary_runtime_toolset_source=getattr(agent, "_summary_runtime_toolset_source", None),
         build_kwargs=_build_kwargs,
+        build_kwargs_from_provider_messages=_build_kwargs_from_provider_messages,
         fingerprint_prefix=_fingerprint_prefix,
+        fingerprint_provider_messages=_fingerprint_provider_messages,
         invoke=_invoke,
         estimate_request_tokens=estimate_request_context_tokens,
         activate_fallback=_activate_fallback,

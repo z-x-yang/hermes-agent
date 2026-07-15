@@ -1306,14 +1306,17 @@ def run_conversation(
 
                 successful_request_kwargs = None
                 successful_request_source_message_count = 0
+                successful_request_provider_messages = None
 
                 def _perform_api_call(next_api_kwargs):
                     nonlocal provider_backend_invoked_this_iteration
                     nonlocal successful_request_kwargs
                     nonlocal successful_request_source_message_count
+                    nonlocal successful_request_provider_messages
                     provider_backend_invoked_this_iteration = True
                     successful_request_kwargs = dict(next_api_kwargs)
                     successful_request_source_message_count = len(messages)
+                    successful_request_provider_messages = api_messages
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -2275,6 +2278,7 @@ def run_conversation(
                     agent.context_compressor.record_reusable_prefix_checkpoint(
                         source_message_count=successful_request_source_message_count,
                         prefix_fingerprint=checkpoint_fingerprint,
+                        provider_messages=successful_request_provider_messages,
                     )
                 except Exception:
                     logger.debug(

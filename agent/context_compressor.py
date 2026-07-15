@@ -16,6 +16,7 @@ Improvements over v2:
   - Richer tool call/result detail in summarizer input
 """
 
+import copy
 import hashlib
 import json
 import logging
@@ -330,6 +331,7 @@ class ReusablePrefixCheckpoint:
     source_message_count: int
     prefix_fingerprint: str
     recorded_at: float
+    provider_messages: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1524,6 +1526,7 @@ class ContextCompressor(ContextEngine):
         self._last_compress_aborted = False
         self._last_compress_deferred = False
         self._reusable_prefix_checkpoints = []
+        self._latest_reusable_prefix_checkpoint = None
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
@@ -1584,6 +1587,7 @@ class ContextCompressor(ContextEngine):
         self._last_compress_aborted = False
         self._last_compress_deferred = False
         self._reusable_prefix_checkpoints = []
+        self._latest_reusable_prefix_checkpoint = None
         self._context_probed = False
         self._context_probe_persistable = False
         self.last_real_prompt_tokens = 0
@@ -1613,6 +1617,7 @@ class ContextCompressor(ContextEngine):
         *,
         source_message_count: int,
         prefix_fingerprint: str,
+        provider_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Remember one successful API-request endpoint."""
         source_end = int(source_message_count or 0)
@@ -1623,53 +1628,33 @@ class ContextCompressor(ContextEngine):
             source_message_count=source_end,
             prefix_fingerprint=fingerprint,
             recorded_at=time.monotonic(),
+            provider_messages=tuple(
+                copy.deepcopy(message)
+                for message in (provider_messages or [])
+                if isinstance(message, dict)
+            ),
         )
-        # Do not truncate per-session checkpoints: with a fixed-size retained
-        # tail, both the desired cut and newest endpoints advance together, so a
-        # recency cap can permanently discard every endpoint at/before the cut.
-        # Session reset/end already clears the list; dedupe repeated tool-loop
-        # calls that prove the same endpoint instead.
-        if any(
-            existing.source_message_count == checkpoint.source_message_count
-            and existing.prefix_fingerprint == checkpoint.prefix_fingerprint
-            for existing in self._reusable_prefix_checkpoints
-        ):
-            return
-        self._reusable_prefix_checkpoints.append(checkpoint)
+        self._latest_reusable_prefix_checkpoint = checkpoint
+        # Compatibility/readback surface: keep a one-element list instead of a
+        # second historical checkpoint mechanism. The previous snapshot becomes
+        # unreachable immediately and can be reclaimed.
+        self._reusable_prefix_checkpoints[:] = [checkpoint]
 
     def _select_reusable_prefix_checkpoint(
         self,
         messages: List[Dict[str, Any]],
         desired_end: int,
     ) -> Any:
-        """Return the nearest unchanged successful endpoint before the cut."""
-        if self._summary_runtime_factory is None:
-            return None
-        try:
-            runtime = self._summary_runtime_factory()
-        except Exception:
-            logger.debug("Failed to build summary runtime for checkpoint selection", exc_info=True)
-            return None
-        fingerprint_prefix = getattr(runtime, "fingerprint_prefix", None)
-        if not callable(fingerprint_prefix):
-            return None
-
-        selected = None
-        for checkpoint in self._reusable_prefix_checkpoints:
-            source_end = checkpoint.source_message_count
-            if source_end <= 0 or source_end > desired_end:
-                continue
-            try:
-                current_fingerprint = str(fingerprint_prefix(messages[:source_end]) or "")
-            except Exception:
-                logger.debug("Failed to fingerprint summary prefix checkpoint", exc_info=True)
-                continue
-            if current_fingerprint == checkpoint.prefix_fingerprint and (
-                selected is None
-                or source_end > selected.source_message_count
-            ):
-                selected = checkpoint
-        return selected
+        """Return the single latest replayable successful request endpoint."""
+        del desired_end  # The cut may move forward to preserve cache reuse.
+        latest = self._latest_reusable_prefix_checkpoint
+        if (
+            latest is not None
+            and latest.provider_messages
+            and 0 < latest.source_message_count <= len(messages)
+        ):
+            return latest
+        return None
 
     def estimate_provider_messages_tokens(self, messages: List[Dict[str, Any]]) -> int:
         """Estimate only provider-visible message payload for this compressor route."""
@@ -2010,6 +1995,7 @@ class ContextCompressor(ContextEngine):
         self._last_summary_call_audit: dict[str, Any] = {}
         self._last_summary_sample: dict[str, Any] | None = None
         self._reusable_prefix_checkpoints: list[Any] = []
+        self._latest_reusable_prefix_checkpoint: Any = None
         self._last_reusable_prefix_checkpoint_audit: dict[str, Any] = {}
         self._last_compress_deferred = False
         self._reset_cheap_tool_cleanup_audit()
@@ -4755,7 +4741,20 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
             source_messages=source_messages,
             compress_end=compress_end,
         )
-        prefix_messages = list(source_messages[:compress_end])
+        replay_checkpoint = self._latest_reusable_prefix_checkpoint
+        replaying_successful_endpoint = bool(
+            replay_checkpoint is not None
+            and replay_checkpoint.provider_messages
+            and replay_checkpoint.source_message_count == compress_end
+            and self._last_reusable_prefix_checkpoint_audit.get("selected")
+        )
+        if replaying_successful_endpoint and replay_checkpoint is not None:
+            prefix_messages = [
+                copy.deepcopy(message)
+                for message in replay_checkpoint.provider_messages
+            ]
+        else:
+            prefix_messages = list(source_messages[:compress_end])
         previous_summary_in_prefix = bool(previous_summary_for_prompt)
         instruction = self._build_append_cached_summary_instruction(
             rules,
@@ -4765,7 +4764,11 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
         )
         base_audit: dict[str, Any] = {
             "mode": "append_cached",
-            "source_binding": "provider_payload_prefix_to_compress_end",
+            "source_binding": (
+                "latest_successful_provider_request_endpoint"
+                if replaying_successful_endpoint
+                else "provider_payload_prefix_to_compress_end"
+            ),
             "rules_hash": rules.rules_hash,
             "cache_eligible": False,
             "cache_key_runtime": {},
@@ -4795,19 +4798,28 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
 
         checkpoint_audit = self._last_reusable_prefix_checkpoint_audit
         if bool(checkpoint_audit.get("selected")):
-            fingerprint_prefix = getattr(runtime, "fingerprint_prefix", None)
-            if callable(fingerprint_prefix):
+            fingerprint_provider_messages = getattr(
+                runtime,
+                "fingerprint_provider_messages",
+                None,
+            )
+            if (
+                not replaying_successful_endpoint
+                or replay_checkpoint is None
+                or not callable(fingerprint_provider_messages)
+            ):
+                checkpoint_matches_runtime = False
+            else:
                 try:
-                    runtime_fingerprint = str(fingerprint_prefix(prefix_messages) or "")
+                    runtime_fingerprint = str(
+                        fingerprint_provider_messages(prefix_messages) or ""
+                    )
                 except Exception:
                     runtime_fingerprint = ""
-            else:
-                runtime_fingerprint = ""
-            checkpoint_matches_runtime = bool(runtime_fingerprint) and any(
-                checkpoint.source_message_count == compress_end
-                and checkpoint.prefix_fingerprint == runtime_fingerprint
-                for checkpoint in self._reusable_prefix_checkpoints
-            )
+                checkpoint_matches_runtime = (
+                    replay_checkpoint.source_message_count == compress_end
+                    and replay_checkpoint.prefix_fingerprint == runtime_fingerprint
+                )
             checkpoint_audit["runtime_revalidated"] = checkpoint_matches_runtime
             if not checkpoint_matches_runtime:
                 self._last_compress_deferred = True
@@ -4818,7 +4830,15 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
 
         request_messages = prefix_messages + [{"role": "user", "content": instruction}]
         requested_output_tokens = int(summary_budget * 1.3)
-        api_kwargs = runtime.build_kwargs(request_messages, requested_output_tokens)
+        if replaying_successful_endpoint:
+            build_kwargs = getattr(
+                runtime,
+                "build_kwargs_from_provider_messages",
+                runtime.build_kwargs,
+            )
+        else:
+            build_kwargs = runtime.build_kwargs
+        api_kwargs = build_kwargs(request_messages, requested_output_tokens)
         tool_choice_requested = False
         if append_cfg.allow_tool_choice_none:
             api_kwargs, tool_choice_requested = apply_summary_tool_choice_none(
@@ -6135,12 +6155,21 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
             and not force
             and trigger_reason == "token_threshold"
         ):
-            checkpoint = self._select_reusable_prefix_checkpoint(messages, compress_end)
+            desired_compress_end = compress_end
+            checkpoint = self._select_reusable_prefix_checkpoint(
+                messages,
+                desired_compress_end,
+            )
             if checkpoint is not None:
                 compress_end = int(checkpoint.source_message_count)
                 self._last_reusable_prefix_checkpoint_audit = {
                     "selected": True,
+                    "desired_source_message_count": desired_compress_end,
                     "source_message_count": compress_end,
+                    "tail_messages_reduced_by": max(
+                        0,
+                        compress_end - desired_compress_end,
+                    ),
                     "prefix_fingerprint": str(checkpoint.prefix_fingerprint)[:16],
                 }
             else:

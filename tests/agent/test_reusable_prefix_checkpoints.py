@@ -93,7 +93,7 @@ def test_append_cached_auto_compression_defers_without_reusable_prefix_checkpoin
         ("provider-anthropic", "anthropic_messages"),
     ],
 )
-def test_append_cached_aligns_to_latest_matching_checkpoint(
+def test_append_cached_uses_latest_replayable_endpoint(
     monkeypatch,
     provider: str,
     api_mode: str,
@@ -104,6 +104,7 @@ def test_append_cached_aligns_to_latest_matching_checkpoint(
     compressor.record_reusable_prefix_checkpoint(
         source_message_count=4,
         prefix_fingerprint=_fingerprint(messages[:4]),
+        provider_messages=messages[:4],
     )
 
     monkeypatch.setattr(compressor, "_find_tail_cut_by_tokens", lambda _messages, _start: 5)
@@ -131,6 +132,50 @@ def test_append_cached_aligns_to_latest_matching_checkpoint(
     ]
     assert receipt["selected"] is True
     assert receipt["source_message_count"] == 4
+
+
+def test_auto_compression_moves_cut_forward_to_latest_successful_endpoint(monkeypatch):
+    compressor = _compressor()
+    messages = _messages()
+    replay_messages = [message.copy() for message in messages[:6]]
+    replay_messages[1]["content"] += "\n\nturn-local context"
+    captured = {}
+
+    compressor.record_reusable_prefix_checkpoint(
+        source_message_count=6,
+        prefix_fingerprint=_fingerprint(replay_messages),
+        provider_messages=replay_messages,
+    )
+    monkeypatch.setattr(
+        compressor,
+        "_find_tail_cut_by_tokens",
+        lambda _messages, _start: 4,
+    )
+
+    def _summary(_turns, *_args, **kwargs):
+        captured["compress_end"] = kwargs["compress_end"]
+        return "## Current Work\n- latest endpoint"
+
+    monkeypatch.setattr(compressor, "_generate_summary", _summary)
+
+    result = compressor.compress(
+        messages,
+        current_tokens=80_000,
+        force=False,
+        trigger_reason="token_threshold",
+    )
+
+    assert compressor._last_compress_deferred is False
+    assert captured["compress_end"] == 6
+    assert "a3" in result[-2]["content"]
+    assert result[-1] == messages[-1]
+    receipt = compressor._last_compression_audit_record[
+        "reusable_prefix_checkpoint"
+    ]
+    assert receipt["selected"] is True
+    assert receipt["desired_source_message_count"] == 4
+    assert receipt["source_message_count"] == 6
+    assert receipt["tail_messages_reduced_by"] == 2
 
 
 def test_history_rewrite_invalidates_reusable_prefix_checkpoint(monkeypatch):
@@ -206,22 +251,22 @@ def test_checkpoint_loss_during_summary_preserves_original_transcript(monkeypatc
     )
 
 
-def test_checkpoint_retention_covers_tail_spanning_more_than_fifty_calls():
+def test_only_latest_successful_endpoint_snapshot_is_retained():
     compressor = _compressor()
     messages = [
         {"role": "user", "content": f"message-{index}"}
         for index in range(201)
     ]
     for source_end in range(1, 202, 2):
+        provider_messages = [message.copy() for message in messages[:source_end]]
         compressor.record_reusable_prefix_checkpoint(
             source_message_count=source_end,
-            prefix_fingerprint=_fingerprint(messages[:source_end]),
+            prefix_fingerprint=_fingerprint(provider_messages),
+            provider_messages=provider_messages,
         )
 
-    checkpoint = compressor._select_reusable_prefix_checkpoint(
-        messages,
-        desired_end=101,
-    )
-
+    assert len(compressor._reusable_prefix_checkpoints) == 1
+    checkpoint = compressor._latest_reusable_prefix_checkpoint
     assert checkpoint is not None
-    assert checkpoint.source_message_count == 101
+    assert checkpoint.source_message_count == 201
+    assert len(checkpoint.provider_messages) == 201

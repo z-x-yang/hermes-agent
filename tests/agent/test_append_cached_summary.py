@@ -537,6 +537,12 @@ class CapturingRuntime:
     def fingerprint_prefix(self, _messages: list[dict[str, Any]]) -> str:
         return self.fingerprint_value
 
+    def fingerprint_provider_messages(
+        self,
+        _messages: list[dict[str, Any]],
+    ) -> str:
+        return self.fingerprint_value
+
     def build_kwargs(self, messages: list[dict[str, Any]], max_tokens: int) -> dict[str, Any]:
         self.captured_messages = messages
         self.captured_kwargs = {
@@ -754,6 +760,46 @@ def test_append_cached_request_uses_prefix_to_compress_end_and_excludes_tail_mar
     assert request_audit["retained_tail_excluded"] is True
     assert request_audit["rough_tokens_estimate"] == request_audit["tokens_estimate"]
     assert request_audit["request_shape_estimate_tokens"] == request_audit["tokens_estimate"]
+
+
+def test_append_cached_replays_latest_successful_endpoint_snapshot():
+    runtime = CapturingRuntime()
+    with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+        compressor = ContextCompressor(
+            model="gpt-5.5",
+            quiet_mode=True,
+            summary_call_mode="append_cached",
+            append_cached_summary={"fallback_to_serialized_prompt": False},
+        )
+    compressor.bind_summary_runtime_factory(lambda: runtime)
+    raw_messages = [
+        {"role": "user", "content": "old prefix"},
+        {"role": "assistant", "content": "old assistant"},
+    ]
+    successful_endpoint = [message.copy() for message in raw_messages]
+    successful_endpoint[0]["content"] += "\n\nTURN_LOCAL_CONTEXT"
+    compressor.record_reusable_prefix_checkpoint(
+        source_message_count=2,
+        prefix_fingerprint=runtime.fingerprint_value,
+        provider_messages=successful_endpoint,
+    )
+    compressor._last_reusable_prefix_checkpoint_audit = {
+        "selected": True,
+        "source_message_count": 2,
+    }
+
+    summary = compressor._generate_summary(
+        raw_messages,
+        source_messages=raw_messages,
+        summarize_start=0,
+        compress_end=2,
+        focus_topic=None,
+    )
+
+    assert summary is not None
+    assert runtime.captured_messages is not None
+    assert runtime.captured_messages[:-1] == successful_endpoint
+    assert "TURN_LOCAL_CONTEXT" in runtime.captured_messages[0]["content"]
 
 
 def test_append_cached_uses_runtime_context_limit_not_threshold_tokens():
@@ -1009,6 +1055,7 @@ def test_auto_checkpoint_admission_does_not_leak_across_provider_fallback():
     compressor.record_reusable_prefix_checkpoint(
         source_message_count=1,
         prefix_fingerprint="primary-checkpoint",
+        provider_messages=[{"role": "user", "content": "old prefix"}],
     )
     compressor._last_reusable_prefix_checkpoint_audit = {"selected": True}
     compressor.bind_summary_runtime_factory(lambda: runtimes.pop(0))
