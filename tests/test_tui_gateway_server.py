@@ -6080,7 +6080,15 @@ def test_session_list_returns_clean_error_when_state_db_is_unavailable(monkeypat
 
 def test_session_list_filters_system_only_model_switch_shell(monkeypatch):
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, offset=0):
+        def list_sessions_rich(
+            self,
+            *,
+            source=None,
+            limit=200,
+            offset=0,
+            order_by_last_active=False,
+            compact_rows=False,
+        ):
             return [
                 {
                     "id": "k-B",
@@ -6104,8 +6112,13 @@ def test_session_list_filters_system_only_model_switch_shell(monkeypatch):
             if session_id == "k-B":
                 return [
                     {
-                        "role": "system",
-                        "content": "[System: The active model for this chat has changed]",
+                        "role": "user",
+                        "content": (
+                            "[System: The active model for this chat has changed to "
+                            "zai/glm-5.1 via provider zai. From this point forward, use "
+                            "this runtime metadata when answering questions about what "
+                            "model/provider is active.]"
+                        ),
                     }
                 ]
             return [{"role": "user", "content": "hello"}]
@@ -6119,7 +6132,15 @@ def test_session_list_filters_system_only_model_switch_shell(monkeypatch):
 
 def test_session_list_keeps_projected_compression_tip_with_real_root(monkeypatch):
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, offset=0):
+        def list_sessions_rich(
+            self,
+            *,
+            source=None,
+            limit=200,
+            offset=0,
+            order_by_last_active=False,
+            compact_rows=False,
+        ):
             return [
                 {
                     "id": "tip",
@@ -6155,7 +6176,15 @@ def test_session_list_keeps_projected_compression_tip_with_real_root(monkeypatch
 
 def test_session_list_surfaces_activity_inspection_error(monkeypatch):
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, offset=0):
+        def list_sessions_rich(
+            self,
+            *,
+            source=None,
+            limit=200,
+            offset=0,
+            order_by_last_active=False,
+            compact_rows=False,
+        ):
             return [
                 {
                     "id": "broken",
@@ -6184,8 +6213,16 @@ def test_session_list_pages_past_filtered_metadata_shells(monkeypatch):
     calls = []
 
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, offset=0):
-            calls.append((limit, offset))
+        def list_sessions_rich(
+            self,
+            *,
+            source=None,
+            limit=200,
+            offset=0,
+            order_by_last_active=False,
+            compact_rows=False,
+        ):
+            calls.append((limit, offset, order_by_last_active, compact_rows))
             if offset == 0:
                 return [
                     {
@@ -6222,7 +6259,7 @@ def test_session_list_pages_past_filtered_metadata_shells(monkeypatch):
     assert resp is not None
 
     assert [s["id"] for s in resp["result"]["sessions"]] == ["real"]
-    assert calls == [(200, 0), (200, 200)]
+    assert calls == [(200, 0, True, True), (200, 200, True, True)]
 
 
 # --------------------------------------------------------------------------
@@ -7016,7 +7053,15 @@ def test_session_most_recent_returns_null_when_only_tool_rows(monkeypatch):
 
 def test_session_most_recent_skips_system_only_shell(monkeypatch):
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, offset=0):
+        def list_sessions_rich(
+            self,
+            *,
+            source=None,
+            limit=200,
+            offset=0,
+            order_by_last_active=False,
+            compact_rows=False,
+        ):
             return [
                 {
                     "id": "k-B",
@@ -7037,7 +7082,17 @@ def test_session_most_recent_skips_system_only_shell(monkeypatch):
 
         def get_messages_as_conversation(self, session_id):
             if session_id == "k-B":
-                return [{"role": "system", "content": "model switched"}]
+                return [
+                    {
+                        "role": "user",
+                        "content": (
+                            "[System: The active model for this chat has changed to "
+                            "zai/glm-5.1 via provider zai. From this point forward, use "
+                            "this runtime metadata when answering questions about what "
+                            "model/provider is active.]"
+                        ),
+                    }
+                ]
             return [{"role": "user", "content": "hello"}]
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -7051,7 +7106,15 @@ def test_session_most_recent_skips_system_only_shell(monkeypatch):
 
 def test_session_most_recent_keeps_projected_compression_tip_with_real_root(monkeypatch):
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, offset=0):
+        def list_sessions_rich(
+            self,
+            *,
+            source=None,
+            limit=200,
+            offset=0,
+            order_by_last_active=False,
+            compact_rows=False,
+        ):
             return [
                 {
                     "id": "tip",
@@ -7092,8 +7155,16 @@ def test_session_most_recent_pages_past_filtered_metadata_shells(monkeypatch):
     calls = []
 
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, offset=0):
-            calls.append((limit, offset))
+        def list_sessions_rich(
+            self,
+            *,
+            source=None,
+            limit=200,
+            offset=0,
+            order_by_last_active=False,
+            compact_rows=False,
+        ):
+            calls.append((limit, offset, order_by_last_active, compact_rows))
             if offset == 0:
                 return [
                     {
@@ -7131,7 +7202,7 @@ def test_session_most_recent_pages_past_filtered_metadata_shells(monkeypatch):
     assert resp is not None
 
     assert resp["result"]["session_id"] == "real"
-    assert calls == [(200, 0), (200, 200)]
+    assert calls == [(200, 0, True, True), (200, 200, True, True)]
 
 
 def test_session_most_recent_folds_db_exception_into_null_result(monkeypatch):

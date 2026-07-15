@@ -2434,6 +2434,23 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
         logger.debug("failed to persist live session system prompt", exc_info=True)
 
 
+_MODEL_SWITCH_MARKER_PREFIX = "[System: The active model for this chat has changed to "
+_MODEL_SWITCH_MARKER_SUFFIX = (
+    ". From this point forward, use this runtime metadata when answering questions "
+    "about what model/provider is active.]"
+)
+
+
+def _is_model_switch_marker(message: dict) -> bool:
+    """Identify the synthetic model-switch marker independent of transport role."""
+    content = message.get("content")
+    return (
+        isinstance(content, str)
+        and content.startswith(_MODEL_SWITCH_MARKER_PREFIX)
+        and content.endswith(_MODEL_SWITCH_MARKER_SUFFIX)
+    )
+
+
 def _history_has_real_activity(history: list | None) -> bool:
     """Return True once a transcript has user-visible conversation content.
 
@@ -2443,6 +2460,8 @@ def _history_has_real_activity(history: list | None) -> bool:
     """
     for msg in history or []:
         if not isinstance(msg, dict):
+            continue
+        if _is_model_switch_marker(msg):
             continue
         role = str(msg.get("role") or "").strip().lower()
         if role not in {"user", "assistant", "tool"}:
@@ -2517,11 +2536,7 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
         return
 
     provider_part = f" via provider {provider}" if provider else ""
-    marker = (
-        "[System: The active model for this chat has changed to "
-        f"{model}{provider_part}. From this point forward, use this runtime "
-        "metadata when answering questions about what model/provider is active.]"
-    )
+    marker = f"{_MODEL_SWITCH_MARKER_PREFIX}{model}{provider_part}{_MODEL_SWITCH_MARKER_SUFFIX}"
     # Persist as a user message, not a system message.  The gateway appends
     # this marker after prior conversation turns, and strict OpenAI-compatible
     # providers (vLLM, Qwen) reject system messages that are not at the
@@ -5457,6 +5472,8 @@ def _(rid, params: dict) -> dict:
                 source=None,  # type: ignore[arg-type]
                 limit=page_size,
                 offset=offset,
+                order_by_last_active=True,
+                compact_rows=True,
             )
             if not page:
                 break
@@ -5518,6 +5535,8 @@ def _(rid, params: dict) -> dict:
                 source=None,  # type: ignore[arg-type]
                 limit=page_size,
                 offset=offset,
+                order_by_last_active=True,
+                compact_rows=True,
             )
             if not page:
                 break
