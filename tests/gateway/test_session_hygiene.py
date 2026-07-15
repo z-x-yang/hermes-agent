@@ -37,18 +37,28 @@ def _make_history(n_messages: int, content_size: int = 100) -> list:
     return history
 
 
+def _make_history_at_least_tokens(n_messages: int, target_tokens: int) -> list:
+    """Build a deterministic transcript above a tokenizer-backed target."""
+    low = 10
+    high = max(10, target_tokens * 8 // max(1, n_messages))
+    while estimate_messages_tokens_rough(
+        _make_history(n_messages, content_size=high)
+    ) < target_tokens:
+        high *= 2
+
+    while low < high:
+        mid = (low + high) // 2
+        candidate = _make_history(n_messages, content_size=mid)
+        if estimate_messages_tokens_rough(candidate) >= target_tokens:
+            high = mid
+        else:
+            low = mid + 1
+    return _make_history(n_messages, content_size=low)
+
+
 def _make_large_history_tokens(target_tokens: int) -> list:
-    """Build a history that estimates to roughly target_tokens tokens."""
-    # estimate_messages_tokens_rough counts total chars in str(msg) // 4
-    # Each msg dict has ~60 chars of overhead + content chars
-    # So for N tokens we need roughly N * 4 total chars across all messages
-    target_chars = target_tokens * 4
-    # Each message as a dict string is roughly len(content) + 60 chars
-    msg_overhead = 60
-    # Use 50 messages with appropriately sized content
-    n_msgs = 50
-    content_size = max(10, (target_chars // n_msgs) - msg_overhead)
-    return _make_history(n_msgs, content_size=content_size)
+    """Build a 50-message history at or above ``target_tokens``."""
+    return _make_history_at_least_tokens(50, target_tokens)
 
 
 class HygieneCaptureAdapter(BasePlatformAdapter):
@@ -291,7 +301,7 @@ class TestTokenEstimation:
 
         With a 200k model at 85% threshold (170k), this should trigger.
         """
-        history = _make_history(648, content_size=1800)
+        history = _make_history_at_least_tokens(648, 180_000)
         tokens = estimate_messages_tokens_rough(history)
         # Should be well above the 170K threshold for a 200k model
         threshold = int(200_000 * 0.85)

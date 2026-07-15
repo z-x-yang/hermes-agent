@@ -14,6 +14,7 @@ from agent.context_compressor import (
     _IMAGE_CHAR_EQUIVALENT,
     _IMAGE_TOKEN_ESTIMATE,
     _content_length_for_budget,
+    _estimate_msg_budget_tokens,
 )
 
 
@@ -138,3 +139,17 @@ class TestTokenBudgetWithImages:
             f"Expected image-heavy tail to be trimmed; compressor placed cut at "
             f"{cut} out of {len(messages)} (image tokens were likely ignored)."
         )
+
+    def test_tail_message_estimate_preserves_1600_token_image_floor(self):
+        content = [
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{i}"},
+            }
+            for i in range(5)
+        ]
+        msg = {"role": "user", "content": content}
+        legacy_floor = _content_length_for_budget(content) // _CHARS_PER_TOKEN + 10
+
+        assert legacy_floor == 5 * _IMAGE_TOKEN_ESTIMATE + 10
+        assert _estimate_msg_budget_tokens(msg) >= legacy_floor

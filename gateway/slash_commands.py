@@ -4134,8 +4134,9 @@ class GatewaySlashCommandsMixin:
     def _context_breakdown_lines(self, agent, source) -> list[str]:
         """Render the per-category context breakdown for /usage.
 
-        Estimated (chars/4) — same engine the desktop popover uses. Returns an
-        empty list and never raises on failure so /usage stays robust.
+        Estimated with the canonical ``o200k_base`` tokenizer — the same engine
+        the desktop popover uses. Returns an empty list and never raises on
+        failure so /usage stays robust.
         """
         try:
             from agent.context_breakdown import compute_session_context_breakdown
@@ -4279,7 +4280,7 @@ class GatewaySlashCommandsMixin:
             if ctx.compression_count:
                 lines.append(t("gateway.usage.label_compressions", count=ctx.compression_count))
 
-            # Per-category context breakdown (estimated — chars/4 heuristic).
+            # Per-category context breakdown (estimated with ``o200k_base``).
             # Same engine the desktop popover uses (PR #54907). The system
             # prompt / tools / skills / memory slices read off the live agent;
             # the conversation slice is estimated from the session transcript.

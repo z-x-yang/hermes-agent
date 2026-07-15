@@ -254,6 +254,18 @@ class TestThresholdGate:
         big_t = estimate_tokens_from_schemas(big)
         assert big_t > small_t * 10
 
+    def test_token_estimate_uses_o200k_for_multilingual_schemas(self):
+        import tiktoken
+        from tools.tool_search import estimate_tokens_from_schemas
+
+        schemas = [_td("demo", "检索项目记录并总结关键决策。" * 100)]
+        payload = json.dumps(
+            schemas, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        expected = len(tiktoken.get_encoding("o200k_base").encode(payload))
+
+        assert estimate_tokens_from_schemas(schemas) == expected
+
     def test_active_context_length_honors_internal_compression_window(self, monkeypatch):
         """Tool-search auto gate uses Hermes' internal context window, not runtime."""
         import agent.model_metadata as model_metadata

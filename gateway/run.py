@@ -11157,9 +11157,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Token source priority:
         # 1. Actual API-reported prompt_tokens from the last turn
         #    (stored in session_entry.last_prompt_tokens)
-        # 2. Rough char-based estimate (str(msg)//4). Overestimates
-        #    by 30-50% on code/JSON-heavy sessions, but that just
-        #    means hygiene fires a bit early — safe and harmless.
+        # 2. Canonical ``o200k_base`` estimate from the persisted transcript.
+        #    This remains a preflight estimate; provider-reported usage wins
+        #    whenever available.
         # -----------------------------------------------------------------
         if history and len(history) >= 4:
             from agent.model_metadata import (
@@ -11333,7 +11333,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _msg_count = len(history)
 
                 # Prefer actual API-reported tokens from the last turn
-                # (stored in session entry) over the rough char-based estimate.
+                # (stored in session entry) over the tokenizer-backed estimate.
                 _stored_tokens = session_entry.last_prompt_tokens
                 if _stored_tokens > 0:
                     _approx_tokens = _stored_tokens

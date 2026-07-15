@@ -47,8 +47,37 @@ def test_estimate_tool_tokens_is_cached():
     assert first is second
 
 
-def test_estimate_tool_tokens_returns_empty_when_tiktoken_unavailable(monkeypatch):
-    """Graceful degradation when tiktoken cannot be imported."""
+@_needs_tiktoken
+def test_estimate_tool_tokens_uses_canonical_o200k_counter(monkeypatch):
+    import json
+    import tiktoken
+    import hermes_cli.tools_config as tc
+    import model_tools  # noqa: F401
+    from tools.registry import registry
+
+    schema = {
+        "name": "demo",
+        "description": "检索项目记录并总结关键决策。" * 100,
+        "parameters": {"type": "object"},
+    }
+    monkeypatch.setattr(registry, "get_all_tool_names", lambda: ["demo"])
+    monkeypatch.setattr(registry, "get_schema", lambda name: schema)
+    tc._tool_token_cache = None
+
+    payload = json.dumps(
+        {"type": "function", "function": schema},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    expected = len(tiktoken.get_encoding("o200k_base").encode(payload))
+
+    assert tc._estimate_tool_tokens() == {"demo": expected}
+    tc._tool_token_cache = None
+
+
+def test_estimate_tool_tokens_returns_empty_when_registry_unavailable(monkeypatch):
+    """Graceful degradation when the tool registry cannot be imported."""
     import hermes_cli.tools_config as tc
     tc._tool_token_cache = None
 
@@ -56,7 +85,7 @@ def test_estimate_tool_tokens_returns_empty_when_tiktoken_unavailable(monkeypatc
     real_import = builtins.__import__
 
     def mock_import(name, *args, **kwargs):
-        if name == "tiktoken":
+        if name == "model_tools":
             raise ImportError("mocked")
         return real_import(name, *args, **kwargs)
 
@@ -65,8 +94,8 @@ def test_estimate_tool_tokens_returns_empty_when_tiktoken_unavailable(monkeypatc
     result = tc._estimate_tool_tokens()
 
     assert result == {}
+    tc._tool_token_cache = None
 
-    # Reset cache for other tests
     tc._tool_token_cache = None
 
 

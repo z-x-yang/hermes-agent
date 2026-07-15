@@ -11,8 +11,21 @@ Covers:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import tiktoken
+
+
+def _o200k_json_tokens(value) -> int:
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return len(tiktoken.get_encoding("o200k_base").encode(payload))
+
+
+def _o200k_text_tokens(text: str) -> int:
+    return len(tiktoken.get_encoding("o200k_base").encode(text))
 
 
 def _write_config(tmp_path: Path, body: str) -> None:
@@ -48,8 +61,9 @@ def test_estimator_chat_completions_messages():
             {"role": "assistant", "content": "y" * 400},
         ],
     }
-    # 800+ chars from messages -> ~200 tokens (char/4 estimate)
-    assert estimate_request_context_tokens(payload) >= 200
+    assert estimate_request_context_tokens(payload) == _o200k_json_tokens(
+        payload["messages"]
+    )
 
 
 def test_estimator_responses_api_input():
@@ -60,9 +74,83 @@ def test_estimator_responses_api_input():
         "input": "x" * 4000,
         "tools": [{"name": "t", "description": "d" * 200}],
     }
-    # input(4000) + instructions(1000) + tools (~stringified) -> well over 1000 tokens
     tokens = estimate_request_context_tokens(payload)
-    assert tokens >= 1200, f"Responses API estimator returned {tokens}"
+    expected = (
+        _o200k_text_tokens(payload["instructions"])
+        + _o200k_text_tokens(payload["input"])
+        + _o200k_json_tokens(payload["tools"])
+    )
+    assert tokens == expected
+
+
+def test_estimator_responses_api_uses_o200k_for_multilingual_payload():
+    from agent.chat_completion_helpers import estimate_request_context_tokens
+
+    payload = {
+        "model": "gpt-5.6",
+        "instructions": "请根据项目记录回答。" * 100,
+        "input": "总结这些关键决策和未决问题。" * 100,
+        "tools": [{"name": "demo", "description": "检索项目记录。" * 100}],
+    }
+    enc = tiktoken.get_encoding("o200k_base")
+    tool_json = json.dumps(
+        payload["tools"],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    expected = (
+        len(enc.encode(payload["instructions"]))
+        + len(enc.encode(payload["input"]))
+        + len(enc.encode(tool_json))
+    )
+
+    assert estimate_request_context_tokens(payload) == expected
+
+
+def test_estimator_responses_api_image_uses_fixed_cost_not_base64_size():
+    from agent.chat_completion_helpers import estimate_request_context_tokens
+
+    def payload(base64_size: int) -> dict:
+        return {
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "describe"},
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64," + ("A" * base64_size),
+                    },
+                ],
+            }],
+        }
+
+    small = estimate_request_context_tokens(payload(4))
+    large = estimate_request_context_tokens(payload(1_000_000))
+
+    assert small == large
+    assert small >= 1_500
+
+
+def test_estimator_bare_multimodal_messages_use_fixed_image_cost():
+    from agent.chat_completion_helpers import estimate_request_context_tokens
+
+    def messages(base64_size: int) -> list[dict]:
+        return [{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64," + ("A" * base64_size)
+                },
+            }],
+        }]
+
+    small = estimate_request_context_tokens(messages(4))
+    large = estimate_request_context_tokens(messages(1_000_000))
+
+    assert small == large
+    assert small >= 1_500
 
 
 def test_estimator_responses_api_long_session_triggers_tier():
@@ -70,7 +158,7 @@ def test_estimator_responses_api_long_session_triggers_tier():
     from agent.chat_completion_helpers import estimate_request_context_tokens
     payload = {
         "model": "gpt-5.5",
-        "input": "x" * 240_000,  # ~60k tokens (240k chars / 4)
+        "input": "x" * 408_000,
         "instructions": "s" * 4000,
     }
     assert estimate_request_context_tokens(payload) > 50_000
@@ -81,7 +169,7 @@ def test_estimator_bare_list_back_compat():
     messages = [
         {"role": "user", "content": "x" * 800},
     ]
-    assert estimate_request_context_tokens(messages) >= 200
+    assert estimate_request_context_tokens(messages) == _o200k_json_tokens(messages)
 
 
 def test_estimator_empty_inputs():
@@ -133,7 +221,7 @@ def test_long_codex_request_bumps_to_50k_tier(monkeypatch, tmp_path):
     _write_config(tmp_path, "")
 
     agent = _make_agent(tmp_path)
-    payload = {"model": "gpt-5.5", "input": "x" * 240_000, "instructions": ""}
+    payload = {"model": "gpt-5.5", "input": "x" * 408_000, "instructions": ""}
     timeout = agent._compute_non_stream_stale_timeout(payload)
     assert timeout >= 150.0
     assert timeout < 240.0
@@ -147,7 +235,7 @@ def test_very_long_codex_request_bumps_to_100k_tier(monkeypatch, tmp_path):
     _write_config(tmp_path, "")
 
     agent = _make_agent(tmp_path)
-    payload = {"model": "gpt-5.5", "input": "x" * 500_000, "instructions": ""}
+    payload = {"model": "gpt-5.5", "input": "x" * 808_000, "instructions": ""}
     assert agent._compute_non_stream_stale_timeout(payload) >= 240.0
 
 
@@ -166,7 +254,7 @@ def test_chat_completions_long_messages_bumps_tier(monkeypatch, tmp_path):
     )
     payload = {
         "model": "gpt-5.4",
-        "messages": [{"role": "user", "content": "x" * 240_000}],
+        "messages": [{"role": "user", "content": "x" * 408_000}],
     }
     assert agent._compute_non_stream_stale_timeout(payload) >= 150.0
 

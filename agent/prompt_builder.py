@@ -1177,41 +1177,34 @@ CONTEXT_FILE_MAX_CHARS = 20_000
 CONTEXT_TRUNCATE_HEAD_RATIO = 0.7
 CONTEXT_TRUNCATE_TAIL_RATIO = 0.2
 
-# Dynamic-cap parameters (used when no explicit context_file_max_chars is set).
-# The cap scales with the model's context window so large-context models rarely
-# truncate a project doc, while small-context models stay at the historical
-# 20K floor. ~4 chars/token is the usual English heuristic; we spend a small
-# slice of the window on context files since they share the cached prefix with
-# the system prompt, tools, memory, and the whole conversation.
-_CONTEXT_FILE_CHARS_PER_TOKEN = 4
+# Dynamic-budget parameters (used when no explicit context_file_max_chars is set).
+# Runtime truncation spends a small slice of the context window in real
+# ``o200k_base`` tokens. The 5K floor and 125K ceiling preserve the historical
+# 20K/500K English-oriented bounds without using chars/4 for live decisions.
+_CONTEXT_FILE_MIN_TOKENS = 5_000
 _CONTEXT_FILE_WINDOW_FRACTION = 0.06
-_CONTEXT_FILE_DYNAMIC_CEILING = 500_000
+_CONTEXT_FILE_DYNAMIC_CEILING_TOKENS = 125_000
 
 
-def _dynamic_context_file_max_chars(context_length: Optional[int]) -> int:
-    """Derive a char cap from the model's context window.
-
-    Returns at least ``CONTEXT_FILE_MAX_CHARS`` (the historical 20K floor) and
-    at most ``_CONTEXT_FILE_DYNAMIC_CEILING``. When ``context_length`` is
-    unknown/invalid, returns the flat default so behavior is unchanged.
-    """
+def _dynamic_context_file_max_tokens(context_length: Optional[int]) -> int:
+    """Derive the dynamic context-file budget in canonical estimate tokens."""
     if not isinstance(context_length, int) or context_length <= 0:
-        return CONTEXT_FILE_MAX_CHARS
-    budget = int(
-        context_length * _CONTEXT_FILE_CHARS_PER_TOKEN * _CONTEXT_FILE_WINDOW_FRACTION
+        return _CONTEXT_FILE_MIN_TOKENS
+    budget = int(context_length * _CONTEXT_FILE_WINDOW_FRACTION)
+    return max(
+        _CONTEXT_FILE_MIN_TOKENS,
+        min(budget, _CONTEXT_FILE_DYNAMIC_CEILING_TOKENS),
     )
-    return max(CONTEXT_FILE_MAX_CHARS, min(budget, _CONTEXT_FILE_DYNAMIC_CEILING))
 
 
-def _get_context_file_max_chars(context_length: Optional[int] = None) -> int:
-    """Return the context-file truncation limit.
+def _get_context_file_max_chars(
+    context_length: Optional[int] = None,
+) -> Optional[int]:
+    """Return an explicit char cap, or the legacy fallback without a window.
 
-    Resolution order:
-      1. Explicit ``context_file_max_chars`` in config.yaml — user knows best,
-         always wins (including over the dynamic cap).
-      2. Dynamic cap derived from the model's ``context_length`` when provided
-         (scales the budget to the window; floor 20K, ceiling 500K).
-      3. ``CONTEXT_FILE_MAX_CHARS`` (20K) as the upstream-compatible fallback.
+    A configured ``context_file_max_chars`` remains a literal character limit.
+    When a valid context window is available and no override is configured,
+    ``None`` selects the tokenizer-backed dynamic path.
     """
     try:
         from hermes_cli.config import load_config
@@ -1221,7 +1214,9 @@ def _get_context_file_max_chars(context_length: Optional[int] = None) -> int:
             return int(val)
     except Exception as e:
         logger.debug("Could not read context_file_max_chars from config: %s", e)
-    return _dynamic_context_file_max_chars(context_length)
+    if not isinstance(context_length, int) or context_length <= 0:
+        return CONTEXT_FILE_MAX_CHARS
+    return None
 
 # Collect truncation warnings so the caller (run_agent) can surface them.
 # A ContextVar (not a module-global list) isolates accumulation per thread /
@@ -1448,7 +1443,6 @@ def _skill_should_show(
 
 
 _SKILL_INDEX_BUDGET_FRACTION = 0.015
-_SKILL_INDEX_CHARS_PER_TOKEN = 4.0
 _SKILL_DESCRIPTION_PREVIEW_CHARS = 60
 _SKILL_CREATION_GRACE_DAYS = 7
 _ALWAYS_FULL_SKILL_NAMES = frozenset({
@@ -1516,26 +1510,29 @@ def _select_skill_descriptions(
     context_length: "int | None",
 ) -> tuple[dict[str, str], bool]:
     """Render a 60-char floor, then upgrade priority skills within budget."""
+    from agent.token_estimator import count_text_tokens
+
     candidates: list[tuple[str, str]] = []
     preview_only_names: set[str] = set()
-    base_chars = 0
+    base_tokens = 0
     for category in sorted(skills_by_category):
         is_preview_only = category in demoted
         if is_preview_only:
             category_line = f"  {category} [previews only]:"
         else:
             category_line = f"  {category}: {category_descriptions.get(category, '')}".rstrip()
-        base_chars += len(category_line) + 1
+        base_tokens += count_text_tokens(category_line + "\n")
         seen = set()
         for name, desc in sorted(skills_by_category[category], key=lambda item: item[0]):
             if name in seen:
                 continue
             seen.add(name)
-            base_chars += len(f"    - {name}\n")
             if desc:
                 candidates.append((name, desc))
                 if is_preview_only:
                     preview_only_names.add(name)
+            else:
+                base_tokens += count_text_tokens(f"    - {name}\n")
 
     if not context_length:
         rendered = {
@@ -1563,12 +1560,17 @@ def _select_skill_descriptions(
         name: desc if name in canonical else _skill_description_preview(desc)
         for name, desc in candidates
     }
-    baseline_cost = sum(len(desc) + 2 for desc in rendered.values())
-    budget_chars = max(
-        base_chars + baseline_cost,
-        int(context_length * _SKILL_INDEX_BUDGET_FRACTION * _SKILL_INDEX_CHARS_PER_TOKEN),
+    def _entry_cost(name: str, description: str) -> int:
+        return count_text_tokens(f"    - {name}: {description}\n")
+
+    baseline_cost = sum(
+        _entry_cost(name, desc) for name, desc in rendered.items()
     )
-    remaining = budget_chars - base_chars - baseline_cost
+    budget_tokens = max(
+        base_tokens + baseline_cost,
+        int(context_length * _SKILL_INDEX_BUDGET_FRACTION),
+    )
+    remaining = budget_tokens - base_tokens - baseline_cost
 
     def _rank(item: tuple[str, str]) -> tuple[int, float, str]:
         name, _ = item
@@ -1583,7 +1585,7 @@ def _select_skill_descriptions(
         ),
         key=_rank,
     ):
-        upgrade_cost = len(desc) - len(rendered[name])
+        upgrade_cost = _entry_cost(name, desc) - _entry_cost(name, rendered[name])
         if upgrade_cost <= remaining:
             rendered[name] = desc
             remaining -= upgrade_cost
@@ -1996,25 +1998,55 @@ def _truncate_content(
     """
     if max_chars is None:
         max_chars = _get_context_file_max_chars(context_length)
-    if len(content) <= max_chars:
-        return content
     target = read_path or filename
+
+    if max_chars is not None:
+        if len(content) <= max_chars:
+            return content
+        msg = (
+            f"⚠️  Context file {filename} TRUNCATED: "
+            f"{len(content)} chars exceeds limit of {max_chars} — "
+            f"trim the file, pin a larger context_file_max_chars, or use a "
+            f"larger-context model!"
+        )
+        logger.warning(msg)
+        _record_truncation_warning(msg)
+        head_chars = int(max_chars * CONTEXT_TRUNCATE_HEAD_RATIO)
+        tail_chars = int(max_chars * CONTEXT_TRUNCATE_TAIL_RATIO)
+        head = content[:head_chars]
+        tail = content[-tail_chars:]
+        marker = (
+            f"\n\n[...truncated {filename}: kept {head_chars}+{tail_chars} of "
+            f"{len(content)} chars. The middle is omitted — if you need the full "
+            f"instructions, read the complete file with the read_file tool: "
+            f"{target}]\n\n"
+        )
+        return head + marker + tail
+
+    from agent.token_estimator import split_text_for_token_budget
+
+    max_tokens = _dynamic_context_file_max_tokens(context_length)
+    split = split_text_for_token_budget(
+        content,
+        max_tokens,
+        head_ratio=CONTEXT_TRUNCATE_HEAD_RATIO,
+        tail_ratio=CONTEXT_TRUNCATE_TAIL_RATIO,
+    )
+    if split is None:
+        return content
+    head, tail, total_tokens, head_tokens, tail_tokens = split
     msg = (
         f"⚠️  Context file {filename} TRUNCATED: "
-        f"{len(content)} chars exceeds limit of {max_chars} — "
-        f"trim the file, pin a larger context_file_max_chars, or use a "
-        f"larger-context model!"
+        f"{total_tokens} estimated tokens exceeds limit of {max_tokens} — "
+        f"trim the file, set context_file_max_chars for an explicit override, "
+        f"or use a larger-context model!"
     )
     logger.warning(msg)
     _record_truncation_warning(msg)
-    head_chars = int(max_chars * CONTEXT_TRUNCATE_HEAD_RATIO)
-    tail_chars = int(max_chars * CONTEXT_TRUNCATE_TAIL_RATIO)
-    head = content[:head_chars]
-    tail = content[-tail_chars:]
     marker = (
-        f"\n\n[...truncated {filename}: kept {head_chars}+{tail_chars} of "
-        f"{len(content)} chars. The middle is omitted — if you need the full "
-        f"instructions, read the complete file with the read_file tool: "
+        f"\n\n[...truncated {filename}: kept {head_tokens}+{tail_tokens} of "
+        f"{total_tokens} estimated tokens. The middle is omitted — if you need "
+        f"the full instructions, read the complete file with the read_file tool: "
         f"{target}]\n\n"
     )
     return head + marker + tail

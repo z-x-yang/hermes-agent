@@ -1,14 +1,12 @@
 """Live session context-window breakdown for UI surfaces.
 
 Estimates how the next provider request is composed: system prompt tiers,
-tool schemas, and conversation history. Uses the same rough char/4 heuristic
-as ``agent.model_metadata.estimate_request_tokens_rough`` so numbers align
-with compression thresholds — not exact tokenizer counts.
+tool schemas, and conversation history. Uses the canonical ``o200k_base``
+runtime estimator so UI categories align with compression thresholds.
 """
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -29,15 +27,17 @@ _CATEGORY_COLORS = {
 
 
 def _chars_to_tokens(text: str) -> int:
-    if not text:
-        return 0
-    return (len(text) + 3) // 4
+    from agent.token_estimator import count_text_tokens
+
+    return count_text_tokens(text)
 
 
 def _json_tokens(value: Any) -> int:
     if not value:
         return 0
-    return _chars_to_tokens(json.dumps(value, ensure_ascii=False))
+    from agent.token_estimator import count_json_tokens
+
+    return count_json_tokens(value)
 
 
 def _tool_name(tool: dict) -> str:
@@ -136,10 +136,10 @@ def compute_session_context_breakdown(
     measured_used = int(getattr(comp, "last_prompt_tokens", 0) or 0) if comp else 0
     if measured_used > 0:
         # ``last_prompt_tokens`` is the provider-observed request size that
-        # /usage shows as the current context.  The category estimates use a
-        # coarse chars/4 heuristic and can overshoot it, especially after
-        # compression.  Keep the user-facing breakdown on the same basis by
-        # treating conversation as the measured residual after prompt/tool
+        # /usage shows as the current context. Category buckets are independent
+        # ``o200k_base`` estimates and can still overshoot provider accounting,
+        # especially after compression. Keep the user-facing breakdown on the
+        # same basis by treating conversation as the measured residual after
         # categories, rather than showing a conversation slice larger than the
         # displayed total context.
         non_conversation_total = sum(

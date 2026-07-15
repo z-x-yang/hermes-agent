@@ -2152,7 +2152,7 @@ class TestCompressionAuditLog:
                 protect_last_n=10,
                 quiet_mode=True,
             )
-        c.tail_token_budget = 10_000
+        c.tail_token_budget = 2_000
 
         msgs: list[dict[str, Any]] = [{"role": "system", "content": "System prompt"}]
         for i in range(100):

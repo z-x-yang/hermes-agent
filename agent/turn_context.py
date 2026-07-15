@@ -76,13 +76,13 @@ def _should_run_preflight_estimate(
 
     Returns ``True`` when either:
       (a) message count exceeds the protected ranges (the historical gate), or
-      (b) a cheap char-based estimate already crosses the configured threshold
+      (b) a tokenizer-backed estimate already crosses the configured threshold
           — the few-but-huge case from issue #27405 that the count-only gate
           would silently skip (a handful of very large messages never trips
           the count condition, so compression was never attempted and the
           turn hit a hard context-overflow error).
 
-    Branch (b) uses ``estimate_messages_tokens_rough`` (the shared char-based
+    Branch (b) uses ``estimate_messages_tokens_rough`` (the shared tokenizer
     estimator) so a single large base64 image isn't mistaken for ~250K tokens.
     It intentionally undercounts vs. the full request estimate — it omits the
     system prompt and tool schemas — because it is only a *hint* deciding

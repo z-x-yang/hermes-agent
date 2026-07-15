@@ -1837,23 +1837,17 @@ _tool_token_cache: Optional[Dict[str, int]] = None
 def _estimate_tool_tokens() -> Dict[str, int]:
     """Return estimated token counts per individual tool name.
 
-    Uses tiktoken (cl100k_base) to count tokens in the JSON-serialised
+    Uses the canonical ``o200k_base`` counter on the JSON-serialised
     OpenAI-format tool schema.  Triggers tool discovery on first call,
     then caches the result for the rest of the process.
 
-    Returns an empty dict when tiktoken or the registry is unavailable.
+    Returns an empty dict when the registry is unavailable.
     """
     global _tool_token_cache
     if _tool_token_cache is not None:
         return _tool_token_cache
 
-    try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-    except Exception:
-        logger.debug("tiktoken unavailable; skipping tool token estimation")
-        _tool_token_cache = {}
-        return _tool_token_cache
+    from agent.token_estimator import count_json_tokens
 
     try:
         # Trigger full tool discovery (imports all tool modules).
@@ -1870,8 +1864,9 @@ def _estimate_tool_tokens() -> Dict[str, int]:
         if schema:
             # Mirror what gets sent to the API:
             # {"type": "function", "function": <schema>}
-            text = _json.dumps({"type": "function", "function": schema})
-            counts[name] = len(enc.encode(text))
+            counts[name] = count_json_tokens(
+                {"type": "function", "function": schema}
+            )
     _tool_token_cache = counts
     return _tool_token_cache
 

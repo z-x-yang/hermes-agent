@@ -453,7 +453,8 @@ class CheapToolResultCleanupResult:
     post_tokens_estimate: int | None = None
 
 
-# Chars per token rough estimate
+# Compatibility conversion for legacy serializer/character windows only. Live
+# request and context estimates use agent.token_estimator instead.
 _CHARS_PER_TOKEN = 4
 # Flat token cost per attached image part.  Real cost varies by provider and
 # dimensions (Anthropic ≈ width×height/750, GPT-4o up to ~1700 for
@@ -704,13 +705,14 @@ def _estimate_provider_visible_messages_tokens_rough(
     if _api_mode_uses_codex_responses(api_mode):
         try:
             from agent.codex_responses_adapter import _chat_messages_to_responses_input
+            from agent.token_estimator import count_json_tokens_with_images
 
             items = _chat_messages_to_responses_input(
                 messages,
                 replay_encrypted_reasoning=True,
                 current_issuer_kind=None,
             )
-            return (len(str(items)) + 3) // _CHARS_PER_TOKEN
+            return count_json_tokens_with_images(items)
         except Exception:
             # Fall back to the conservative chat-shape estimator if the Responses
             # converter is unavailable in a test/minimal runtime.
@@ -738,6 +740,8 @@ def _estimate_provider_visible_request_tokens_rough(
     model: Any = "",
     base_url: Any = "",
 ) -> int:
+    from agent.token_estimator import count_json_tokens, count_text_tokens
+
     total = _estimate_provider_visible_messages_tokens_rough(
         messages,
         api_mode=api_mode,
@@ -745,10 +749,9 @@ def _estimate_provider_visible_request_tokens_rough(
         model=model,
         base_url=base_url,
     )
-    if system_prompt:
-        total += (len(system_prompt) + 3) // _CHARS_PER_TOKEN
+    total += count_text_tokens(system_prompt)
     if tools:
-        total += (len(str(tools)) + 3) // _CHARS_PER_TOKEN
+        total += count_json_tokens(tools)
     return int(total)
 
 
@@ -815,12 +818,12 @@ def _estimate_msg_budget_tokens(
     budget_msg = _retained_provider_payload_message_for_budget(
         msg, provider_model=provider_model
     )
-    content_len = _content_length_for_budget(budget_msg.get("content") or "")
-    tokens = content_len // _CHARS_PER_TOKEN + 10  # +10 for role/key overhead
-    for tc in budget_msg.get("tool_calls") or []:
-        if isinstance(tc, dict):
-            tokens += len(str(tc)) // _CHARS_PER_TOKEN
-    return max(tokens, estimate_messages_tokens_rough([budget_msg]))
+    canonical_tokens = estimate_messages_tokens_rough([budget_msg])
+    from agent.token_estimator import strip_image_payloads_for_token_estimate
+
+    _, image_count = strip_image_payloads_for_token_estimate(budget_msg)
+    image_floor = image_count * _IMAGE_TOKEN_ESTIMATE + 10 if image_count else 0
+    return max(canonical_tokens, image_floor)
 
 
 def _content_text_for_contains(content: Any) -> str:
@@ -2853,8 +2856,9 @@ class ContextCompressor(ContextEngine):
         tool_calls = msg.get("tool_calls") or []
         if not isinstance(tool_calls, list):
             return 0
-        chars = sum(len(str(tool_call)) for tool_call in tool_calls)
-        return (chars + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN if chars else 0
+        from agent.token_estimator import count_json_tokens
+
+        return count_json_tokens(tool_calls) if tool_calls else 0
 
     @staticmethod
     def _audit_content_has_payload(content: Any) -> bool:
@@ -3524,7 +3528,10 @@ class ContextCompressor(ContextEngine):
             + int(self.max_summary_tokens * self._SUMMARY_SOURCE_OUTPUT_RESERVE_MULTIPLIER)
             + self._SUMMARY_SOURCE_PROMPT_RESERVE_TOKENS
         )
-        return max(self._SUMMARY_SOURCE_MIN_CHARS // _CHARS_PER_TOKEN, window_tokens - reserved_tokens)
+        return max(
+            self._SUMMARY_SOURCE_MIN_CHARS // _CHARS_PER_TOKEN,
+            window_tokens - reserved_tokens,
+        )
 
     def _summary_source_char_budget(self) -> int:
         """Global char budget for serialized raw source fed to the summarizer.
@@ -3532,9 +3539,9 @@ class ContextCompressor(ContextEngine):
         Source fidelity means the summarized window should not be pre-pruned to
         one-line tool placeholders, but it still needs an explicit global bound
         so a tool-heavy session can be compacted instead of overflowing the
-        summary model. The bound is expressed in chars because the serializer
-        already works in char windows and rough token accounting uses 4 chars ≈
-        1 token throughout this module.
+        summary model. This is an execution cap, not the request token estimator.
+        The serializer already slices source in character windows, so it uses the
+        compatibility conversion after the real token headroom is resolved.
         """
         return self._summary_source_token_budget() * _CHARS_PER_TOKEN
 

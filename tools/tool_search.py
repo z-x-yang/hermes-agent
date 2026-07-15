@@ -48,15 +48,6 @@ TOOL_CALL_NAME = "tool_call"
 
 BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_NAME})
 
-# When estimating tokens from char count without a real tokenizer, this is
-# the cheap rule of thumb that's stable across providers. Roughly 4 chars
-# per token for English+JSON. Underestimating leads to false negatives
-# (tool search not activated when it should); overestimating leads to false
-# positives (activated when not needed). 4.0 errs slightly toward
-# underestimating, which is the safer default.
-CHARS_PER_TOKEN = 4.0
-
-
 # ---------------------------------------------------------------------------
 # Configuration plumbing
 # ---------------------------------------------------------------------------
@@ -241,20 +232,11 @@ def classify_tools(
 
 
 def estimate_tokens_from_schemas(tool_defs: Iterable[Dict[str, Any]]) -> int:
-    """Estimate the token cost of a tool-defs list via the chars/4 rule.
+    """Estimate schema tokens with the canonical runtime encoding."""
+    from agent.token_estimator import count_json_tokens
 
-    Cheap and stable across providers. The number doesn't need to be exact —
-    it gates the activate/skip decision, and a typical 200K context with a
-    10% threshold means the decision flips around 20K tokens of schema.
-    Order-of-magnitude precision is fine.
-    """
-    total_chars = 0
-    for td in tool_defs:
-        try:
-            total_chars += len(json.dumps(td, ensure_ascii=False, separators=(",", ":")))
-        except (TypeError, ValueError):
-            total_chars += len(str(td))
-    return int(math.ceil(total_chars / CHARS_PER_TOKEN))
+    defs = list(tool_defs)
+    return count_json_tokens(defs) if defs else 0
 
 
 def should_activate(

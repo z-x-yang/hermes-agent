@@ -18,6 +18,7 @@ from agent.context_compressor import (
     _CHARS_PER_TOKEN,
     _estimate_msg_budget_tokens,
 )
+from agent.model_metadata import estimate_messages_tokens_rough
 
 
 def _assistant_with_tool_calls(n_calls: int, *, args: str = '{"path":"a"}') -> dict:
@@ -63,10 +64,9 @@ class TestToolCallEnvelopeEstimate:
         five = _estimate_msg_budget_tokens(_assistant_with_tool_calls(5))
         assert five > one * 3
 
-    def test_no_tool_calls_matches_content_estimate(self):
+    def test_no_tool_calls_matches_message_estimator(self):
         msg = {"role": "user", "content": "x" * 400}
-        # Plain message: content//4 + 10 overhead, behavior unchanged.
-        assert _estimate_msg_budget_tokens(msg) == 400 // _CHARS_PER_TOKEN + 10
+        assert _estimate_msg_budget_tokens(msg) == estimate_messages_tokens_rough([msg])
 
     def test_non_dict_tool_calls_do_not_crash(self):
         msg = {"role": "assistant", "content": "hi", "tool_calls": ["weird", None]}

@@ -10,9 +10,11 @@ Coverage levels:
   Persistent cache       — save/load, corruption, update, provider isolation
 """
 
+import json
 import time
 
 import pytest
+import tiktoken
 import yaml
 from unittest.mock import patch, MagicMock
 
@@ -23,6 +25,7 @@ from agent.model_metadata import (
     _strip_provider_prefix,
     estimate_tokens_rough,
     estimate_messages_tokens_rough,
+    estimate_request_tokens_rough,
     get_model_context_length,
     get_next_probe_tier,
     get_cached_context_length,
@@ -31,6 +34,13 @@ from agent.model_metadata import (
     fetch_model_metadata,
     _MODEL_CACHE_TTL,
 )
+
+
+def _o200k_json_tokens(value):
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return len(tiktoken.get_encoding("o200k_base").encode(payload))
 
 
 # =========================================================================
@@ -45,44 +55,35 @@ class TestEstimateTokensRough:
         assert estimate_tokens_rough(None) == 0
 
     def test_known_length(self):
-        assert estimate_tokens_rough("a" * 400) == 100
+        assert estimate_tokens_rough("a" * 400) == 50
 
     def test_short_text(self):
-        # "hello" = 5 chars → ceil(5/4) = 2
-        assert estimate_tokens_rough("hello") == 2
+        assert estimate_tokens_rough("hello") == 1
 
     def test_proportional(self):
         short = estimate_tokens_rough("hello world")
         long = estimate_tokens_rough("hello world " * 100)
         assert long > short
 
-    def test_unicode_multibyte(self):
-        """Unicode chars are still 1 Python char each — 4 chars/token holds."""
-        text = "你好世界"  # 4 CJK characters
-        assert estimate_tokens_rough(text) == 1
+    def test_unicode_uses_o200k_tokenization(self):
+        """CJK estimates must follow o200k rather than a chars/4 heuristic."""
+        assert estimate_tokens_rough("你好世界") == 2
 
 
 class TestEstimateMessagesTokensRough:
     def test_empty_list(self):
         assert estimate_messages_tokens_rough([]) == 0
 
-    def test_single_message_concrete_value(self):
-        """Verify against known str(msg) length (ceiling division)."""
-        msg = {"role": "user", "content": "a" * 400}
-        result = estimate_messages_tokens_rough([msg])
-        n = len(str(msg))
-        expected = (n + 3) // 4
-        assert result == expected
+    def test_single_message_uses_o200k_json_count(self):
+        msg = {"role": "user", "content": "你好世界"}
+        assert estimate_messages_tokens_rough([msg]) == _o200k_json_tokens([msg])
 
-    def test_multiple_messages_additive(self):
+    def test_multiple_messages_use_o200k_json_count(self):
         msgs = [
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi there, how can I help?"},
         ]
-        result = estimate_messages_tokens_rough(msgs)
-        n = sum(len(str(m)) for m in msgs)
-        expected = (n + 3) // 4
-        assert result == expected
+        assert estimate_messages_tokens_rough(msgs) == _o200k_json_tokens(msgs)
 
     def test_tool_call_message(self):
         """Tool call messages with no 'content' key still contribute tokens."""
@@ -90,7 +91,7 @@ class TestEstimateMessagesTokensRough:
                "tool_calls": [{"id": "1", "function": {"name": "terminal", "arguments": "{}"}}]}
         result = estimate_messages_tokens_rough([msg])
         assert result > 0
-        assert result == (len(str(msg)) + 3) // 4
+        assert result == _o200k_json_tokens([msg])
 
     def test_message_with_list_content(self):
         """Vision messages with multimodal content arrays.
@@ -118,6 +119,29 @@ class TestEstimateMessagesTokensRough:
         ]}
         result = estimate_messages_tokens_rough([msg])
         assert result < 5000
+
+
+class TestEstimateRequestTokensRough:
+    def test_system_and_tools_use_o200k_counts(self):
+        system_prompt = "这是一个用于验证中文系统提示词估算的句子。" * 100
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "demo",
+                    "description": "检索项目记录并总结关键决策。" * 50,
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+        expected = (
+            len(tiktoken.get_encoding("o200k_base").encode(system_prompt))
+            + _o200k_json_tokens(tools)
+        )
+
+        assert estimate_request_tokens_rough(
+            [], system_prompt=system_prompt, tools=tools
+        ) == expected
 
 
 # =========================================================================

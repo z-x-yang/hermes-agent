@@ -2004,8 +2004,9 @@ def _parent_summary_char_budget(parent_agent, n_summaries: int) -> Optional[int]
     The overflow this guards against is N summaries entering the parent
     context at once (batch fan-out), not any single summary being large.  We
     take a fraction of the headroom the parent has left (resolved context
-    length minus what's already in its prompt) and divide it across the batch,
-    converting tokens→chars at the standard ~4 chars/token estimate.
+    length minus what's already in its prompt) and divide it across the batch.
+    The final tokens→chars conversion preserves the legacy character output cap;
+    it is not used to estimate request content.
 
     Returns the per-summary char budget, or None when the parent's context
     state is unknown (no compressor / no token count) — in which case the
@@ -2034,7 +2035,8 @@ def _parent_summary_char_budget(parent_agent, n_summaries: int) -> Optional[int]
 
         batch_token_budget = int(headroom_tokens * _SUMMARY_HEADROOM_FRACTION)
         per_summary_tokens = batch_token_budget // max(1, n_summaries)
-        per_summary_chars = per_summary_tokens * 4  # ~4 chars/token
+        # Character execution cap; request token estimates use agent.token_estimator.
+        per_summary_chars = per_summary_tokens * 4
         return max(_MIN_SUMMARY_CHARS, per_summary_chars)
     except Exception:
         logger.debug("Summary budget computation failed", exc_info=True)

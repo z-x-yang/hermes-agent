@@ -8,6 +8,7 @@ import sys
 from datetime import datetime, timezone
 
 import pytest
+import tiktoken
 
 from agent.prompt_builder import (
     _scan_context_content,
@@ -21,9 +22,11 @@ from agent.prompt_builder import (
     build_nous_subscription_prompt,
     build_context_files_prompt,
     CONTEXT_FILE_MAX_CHARS,
-    _dynamic_context_file_max_chars,
+    _dynamic_context_file_max_tokens,
     _get_context_file_max_chars,
-    _CONTEXT_FILE_DYNAMIC_CEILING,
+    _CONTEXT_FILE_DYNAMIC_CEILING_TOKENS,
+    _CONTEXT_FILE_MIN_TOKENS,
+    _select_skill_descriptions,
     DEFAULT_AGENT_IDENTITY,
     drain_truncation_warnings,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
@@ -37,6 +40,10 @@ from agent.prompt_builder import (
     WSL_ENVIRONMENT_HINT,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
+
+
+def _o200k_tokens(text: str) -> int:
+    return len(tiktoken.get_encoding("o200k_base").encode(text))
 
 
 # =========================================================================
@@ -236,27 +243,38 @@ class TestDynamicContextFileCap:
         monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
 
     def test_dynamic_floor_for_small_window(self):
-        # A small context window never drops below the historical 20K floor.
-        assert _dynamic_context_file_max_chars(8_000) == CONTEXT_FILE_MAX_CHARS
+        assert _dynamic_context_file_max_tokens(8_000) == _CONTEXT_FILE_MIN_TOKENS
+
+    def test_dynamic_truncation_is_token_aware_for_multilingual_content(self):
+        content = "这是中文。" * 2_000
+        assert len(content) < CONTEXT_FILE_MAX_CHARS
+
+        result = _truncate_content(
+            content,
+            "AGENTS.md",
+            context_length=8_000,
+        )
+
+        assert "truncated" in result.lower()
 
     def test_dynamic_scales_above_floor_for_large_window(self):
-        # 200K-token window → ~48K (200000 * 4 * 0.06), well above the floor
-        # and above Codex's 32 KiB project_doc default.
-        cap = _dynamic_context_file_max_chars(200_000)
-        assert cap == 48_000
-        assert cap > CONTEXT_FILE_MAX_CHARS
+        # 200K-token window → 12K tokens (200000 * 0.06).
+        cap = _dynamic_context_file_max_tokens(200_000)
+        assert cap == 12_000
+        assert cap > _CONTEXT_FILE_MIN_TOKENS
 
     def test_dynamic_respects_ceiling(self):
-        # An enormous window is clamped to the ceiling.
-        assert _dynamic_context_file_max_chars(100_000_000) == _CONTEXT_FILE_DYNAMIC_CEILING
+        assert (
+            _dynamic_context_file_max_tokens(100_000_000)
+            == _CONTEXT_FILE_DYNAMIC_CEILING_TOKENS
+        )
 
-    def test_none_context_length_falls_back_to_flat_default(self):
-        assert _dynamic_context_file_max_chars(None) == CONTEXT_FILE_MAX_CHARS
-        assert _dynamic_context_file_max_chars(0) == CONTEXT_FILE_MAX_CHARS
+    def test_none_context_length_uses_token_floor(self):
+        assert _dynamic_context_file_max_tokens(None) == _CONTEXT_FILE_MIN_TOKENS
+        assert _dynamic_context_file_max_tokens(0) == _CONTEXT_FILE_MIN_TOKENS
 
-    def test_get_context_file_max_chars_uses_context_length(self):
-        # With no explicit config, the resolver derives the cap from context.
-        assert _get_context_file_max_chars(200_000) == 48_000
+    def test_get_context_file_max_chars_selects_dynamic_token_path(self):
+        assert _get_context_file_max_chars(200_000) is None
         assert _get_context_file_max_chars(None) == CONTEXT_FILE_MAX_CHARS
 
     def test_explicit_config_beats_dynamic(self, monkeypatch):
@@ -268,9 +286,9 @@ class TestDynamicContextFileCap:
         assert _get_context_file_max_chars(200_000) == 1_000
 
     def test_large_window_avoids_truncation_of_midsize_doc(self):
-        # A 30K-char AGENTS.md is truncated at the flat default but survives
-        # whole on a large-context model (dynamic cap ~48K).
-        content = "z" * 30_000
+        # This payload is ~8K o200k tokens: it is truncated by the 5K floor
+        # but fits the 12K budget of a 200K-token context window.
+        content = "z" * 16_000
         small = _truncate_content(content, "AGENTS.md", context_length=8_000)
         big = _truncate_content(content, "AGENTS.md", context_length=200_000)
         assert "truncated" in small.lower()
@@ -439,6 +457,18 @@ class TestBuildSkillsSystemPrompt:
 
         assert description in result
 
+    def test_skill_budget_uses_o200k_for_multilingual_descriptions(self):
+        description = "检索项目记录并总结关键决策。" * 20 + "FULL_TAIL"
+        rendered, compacted = _select_skill_descriptions(
+            {"research": [("multilingual-skill", description)]},
+            {"research": "Research workflows"},
+            frozenset(),
+            6_000,
+        )
+
+        assert compacted is True
+        assert "FULL_TAIL" not in rendered["multilingual-skill"]
+
     def test_approved_canonical_owners_always_keep_full_descriptions(
         self, monkeypatch, tmp_path
     ):
@@ -530,7 +560,7 @@ class TestBuildSkillsSystemPrompt:
         }))
 
         result = build_skills_system_prompt(
-            context_length=14_000,
+            context_length=10_000,
             session_id="priority-session",
         )
 
@@ -577,7 +607,7 @@ class TestBuildSkillsSystemPrompt:
         }))
 
         result = build_skills_system_prompt(
-            context_length=7_500,
+            context_length=6_000,
             session_id="pin-is-not-routing-priority",
         )
 
@@ -674,7 +704,7 @@ class TestBuildSkillsSystemPrompt:
             "\n</available_skills>", 1
         )[0]
 
-        assert len(index_block) <= 3_900
+        assert _o200k_tokens(index_block) <= 960
         assert all(f"new-skill-{index:02d}" in index_block for index in range(20))
         assert index_block.count("GRACE_DESC_") == 20
         shown_full_descriptions = index_block.count("FULL_TAIL_")
@@ -710,7 +740,7 @@ class TestBuildSkillsSystemPrompt:
             "second-skill": {"use_count": 0, "last_used_at": None},
         }))
         first = build_skills_system_prompt(
-            context_length=6_000,
+            context_length=5_000,
             session_id="stable-session",
         )
         assert "FIRST_FULL_TAIL" in first
@@ -723,11 +753,11 @@ class TestBuildSkillsSystemPrompt:
         clear_skills_system_prompt_cache()
 
         same_session = build_skills_system_prompt(
-            context_length=6_000,
+            context_length=5_000,
             session_id="stable-session",
         )
         next_session = build_skills_system_prompt(
-            context_length=6_000,
+            context_length=5_000,
             session_id="next-session",
         )
 
@@ -762,10 +792,10 @@ class TestBuildSkillsSystemPrompt:
             "second-skill": {"use_count": 0, "last_used_at": None},
         }))
         first_a = build_skills_system_prompt(
-            context_length=6_000, session_id="session-a"
+            context_length=4_000, session_id="session-a"
         )
         first_b = build_skills_system_prompt(
-            context_length=6_000, session_id="session-b"
+            context_length=4_000, session_id="session-b"
         )
         assert "FIRST_FULL_TAIL" in first_a
         assert "SECOND_FULL_TAIL" not in first_a
@@ -778,10 +808,10 @@ class TestBuildSkillsSystemPrompt:
         clear_skills_system_prompt_cache(session_id="session-a")
 
         refreshed_a = build_skills_system_prompt(
-            context_length=6_000, session_id="session-a"
+            context_length=4_000, session_id="session-a"
         )
         frozen_b = build_skills_system_prompt(
-            context_length=6_000, session_id="session-b"
+            context_length=4_000, session_id="session-b"
         )
         assert "SECOND_FULL_TAIL" in refreshed_a
         assert "FIRST_FULL_TAIL" not in refreshed_a

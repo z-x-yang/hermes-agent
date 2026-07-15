@@ -61,10 +61,9 @@ class BudgetConfig:
 DEFAULT_BUDGET = BudgetConfig()
 
 
-# Token<->char conversion used when scaling the budget to a model's context
-# window. Deliberately conservative (a smaller divisor = more chars per token =
-# a larger char budget) would UNDER-protect small models, so we use the same
-# rough 4-chars-per-token ratio the estimator uses (agent/model_metadata.py).
+# Compatibility conversion for character-count output caps. This does not
+# estimate the token count of request content; live request estimates use
+# agent.token_estimator.
 _CHARS_PER_TOKEN: int = 4
 
 # Fraction of the active internal context window we allow a SINGLE tool result to

@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock, patch
 
+import tiktoken
+
 from agent.context_breakdown import compute_session_context_breakdown
 
 
@@ -54,6 +56,21 @@ def test_breakdown_includes_major_categories():
     assert {"system_prompt", "tool_definitions", "rules", "skills", "mcp", "subagent_definitions", "conversation"} <= ids
     assert data["context_max"] == 200_000
     assert data["estimated_total"] > 0
+
+
+def test_breakdown_uses_o200k_for_multilingual_system_prompt():
+    stable = "这是一个用于验证中文上下文估算的句子。" * 100
+    agent, parts = _make_agent(stable=stable, context="", volatile="", tools=[])
+    agent.tools = []
+
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        data = compute_session_context_breakdown(agent, [])
+
+    expected = len(tiktoken.get_encoding("o200k_base").encode(stable))
+    system_prompt = next(
+        item for item in data["categories"] if item["id"] == "system_prompt"
+    )
+    assert system_prompt["tokens"] == expected
 
 
 def test_breakdown_uses_measured_context_when_available():

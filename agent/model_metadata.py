@@ -2415,91 +2415,55 @@ async def get_model_context_length_async(
 
 
 def estimate_tokens_rough(text: str) -> int:
-    """Rough token estimate (~4 chars/token) for pre-flight checks.
+    """Token estimate using the canonical ``o200k_base`` encoding."""
+    from agent.token_estimator import count_text_tokens
 
-    Uses ceiling division so short texts (1-3 chars) never estimate as
-    0 tokens, which would cause the compressor and pre-flight checks to
-    systematically undercount when many short tool results are present.
-    """
-    if not text:
-        return 0
-    return (len(text) + 3) // 4
+    return count_text_tokens(text)
 
 
 def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
-    """Rough token estimate for a message list (pre-flight only).
+    """Tokenizer-backed estimate for a message list (pre-flight only).
 
     Image parts (base64 PNG/JPEG) are counted as a flat ~1500 tokens per
     image — the Anthropic pricing model — instead of counting raw base64
     character length. Without this, a single ~1MB screenshot would be
     estimated at ~250K tokens and trigger premature context compression.
     """
-    _IMAGE_TOKEN_COST = 1500
-    total_chars = 0
-    image_tokens = 0
+    if not messages:
+        return 0
+
+    from agent.token_estimator import IMAGE_TOKEN_ESTIMATE, count_json_tokens
+
+    image_count = 0
+    cleaned_messages = []
     for msg in messages:
-        total_chars += _estimate_message_chars(msg)
-        image_tokens += _count_image_tokens(msg, _IMAGE_TOKEN_COST)
-    return ((total_chars + 3) // 4) + image_tokens
+        cleaned, message_images = _message_for_token_estimation(msg)
+        cleaned_messages.append(cleaned)
+        image_count += message_images
+    return count_json_tokens(cleaned_messages) + image_count * IMAGE_TOKEN_ESTIMATE
 
 
-def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
-    """Count image-like content parts in a message; return their token cost."""
-    count = 0
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if isinstance(content, list):
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            ptype = part.get("type")
-            if ptype in {"image", "image_url", "input_image"}:
-                count += 1
-    stashed = msg.get("_anthropic_content_blocks") if isinstance(msg, dict) else None
-    if isinstance(stashed, list):
-        for part in stashed:
-            if isinstance(part, dict) and part.get("type") == "image":
-                count += 1
-    # Multimodal tool results that haven't been converted yet.
-    if isinstance(content, dict) and content.get("_multimodal"):
-        inner = content.get("content")
-        if isinstance(inner, list):
-            for part in inner:
-                if isinstance(part, dict) and part.get("type") in {"image", "image_url"}:
-                    count += 1
-    return count * cost_per_image
+def _message_for_token_estimation(msg: Dict[str, Any]) -> tuple[Any, int]:
+    """Return a JSON-safe message shadow and its fixed-cost image count.
 
-
-def _estimate_message_chars(msg: Dict[str, Any]) -> int:
-    """Char count for token estimation, excluding base64 image data.
-
-    Base64 images are counted via `_count_image_tokens` instead; including
-    their raw chars here would massively overestimate token usage.
+    The recursive sanitizer handles both Chat Completions and Responses-style
+    image nesting. Storage-only Anthropic blocks remain excluded from the JSON
+    shadow, while any images they represent still receive the fixed image cost.
     """
     if not isinstance(msg, dict):
-        return len(str(msg))
-    shadow: Dict[str, Any] = {}
-    for k, v in msg.items():
-        if k == "_anthropic_content_blocks":
-            continue
-        if k == "content":
-            if isinstance(v, list):
-                cleaned = []
-                for part in v:
-                    if isinstance(part, dict):
-                        if part.get("type") in {"image", "image_url", "input_image"}:
-                            cleaned.append({"type": part.get("type"), "image": "[stripped]"})
-                        else:
-                            cleaned.append(part)
-                    else:
-                        cleaned.append(part)
-                shadow[k] = cleaned
-            elif isinstance(v, dict) and v.get("_multimodal"):
-                shadow[k] = v.get("text_summary", "")
-            else:
-                shadow[k] = v
-        else:
-            shadow[k] = v
-    return len(str(shadow))
+        return str(msg), 0
+
+    from agent.token_estimator import strip_image_payloads_for_token_estimate
+
+    cleaned, image_count = strip_image_payloads_for_token_estimate(msg)
+    shadow = dict(cleaned)
+    shadow.pop("_anthropic_content_blocks", None)
+
+    content = msg.get("content")
+    if isinstance(content, dict) and content.get("_multimodal"):
+        shadow["content"] = content.get("text_summary", "")
+
+    return shadow, image_count
 
 
 def estimate_request_tokens_rough(
@@ -2516,11 +2480,11 @@ def estimate_request_tokens_rough(
     blind spot when only counting messages. Image content is counted
     at a flat per-image cost (see estimate_messages_tokens_rough).
     """
-    total = 0
-    if system_prompt:
-        total += (len(system_prompt) + 3) // 4
+    from agent.token_estimator import count_json_tokens, count_text_tokens
+
+    total = count_text_tokens(system_prompt)
     if messages:
         total += estimate_messages_tokens_rough(messages)
     if tools:
-        total += (len(str(tools)) + 3) // 4
+        total += count_json_tokens(tools)
     return total

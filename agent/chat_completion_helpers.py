@@ -88,40 +88,47 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
       - any other dict -> fall back to summing string values
     """
 
-    def _chars(value: Any) -> int:
-        if value is None:
+    from agent.model_metadata import estimate_messages_tokens_rough
+    from agent.token_estimator import (
+        count_json_tokens,
+        count_json_tokens_with_images,
+        count_text_tokens,
+    )
+
+    def _tokens(value: Any, *, image_aware: bool = False) -> int:
+        if value is None or value == "" or value == [] or value == {}:
             return 0
         if isinstance(value, str):
-            return len(value)
-        return len(str(value))
-
-    def _message_chars(messages: Any) -> int:
-        if not isinstance(messages, list):
-            return _chars(messages)
-        return sum(_chars(item) for item in messages)
+            return count_text_tokens(value)
+        if image_aware:
+            return count_json_tokens_with_images(value)
+        return count_json_tokens(value)
 
     if isinstance(api_payload, list):
-        return _message_chars(api_payload) // 4
+        return estimate_messages_tokens_rough(api_payload) if api_payload else 0
 
     if isinstance(api_payload, dict):
+        if not api_payload:
+            return 0
         messages = api_payload.get("messages")
         if isinstance(messages, list):
-            total_chars = _message_chars(messages)
+            total = estimate_messages_tokens_rough(messages)
             if "tools" in api_payload:
-                total_chars += _chars(api_payload.get("tools"))
-            return total_chars // 4
+                total += _tokens(api_payload.get("tools"))
+            return total
 
         if "input" in api_payload:
-            total_chars = (
-                _chars(api_payload.get("input"))
-                + _chars(api_payload.get("instructions"))
-                + _chars(api_payload.get("tools"))
+            return (
+                _tokens(api_payload.get("input"), image_aware=True)
+                + count_text_tokens(api_payload.get("instructions") or "")
+                + _tokens(api_payload.get("tools"))
             )
-            return total_chars // 4
 
-        return sum(_chars(value) for value in api_payload.values()) // 4
+        return sum(
+            _tokens(value, image_aware=True) for value in api_payload.values()
+        )
 
-    return _chars(api_payload) // 4
+    return _tokens(api_payload)
 
 
 def prepare_provider_visible_messages(

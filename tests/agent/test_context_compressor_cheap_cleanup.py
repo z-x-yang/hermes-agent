@@ -732,6 +732,48 @@ def test_cleanup_abort_preserves_raw_transcript_when_summary_generation_fails(mo
     assert not any("[Old tool result content cleared]" in str(msg.get("content")) for msg in out)
 
 
+def test_chat_provider_visible_request_estimate_uses_o200k_for_multilingual_payload():
+    import json
+    import tiktoken
+
+    c = _compressor(api_mode="chat_completions")
+    system_prompt = "这是中文系统提示。" * 100
+    tools = [{"name": "demo", "description": "检索项目记录。" * 100}]
+    enc = tiktoken.get_encoding("o200k_base")
+    tools_json = json.dumps(
+        tools, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    expected = len(enc.encode(system_prompt)) + len(enc.encode(tools_json))
+
+    assert c.estimate_provider_request_tokens(
+        [], system_prompt=system_prompt, tools=tools
+    ) == expected
+
+
+def test_codex_responses_image_estimate_uses_fixed_cost_not_base64_size():
+    c = _compressor(api_mode="codex_responses")
+
+    def messages(base64_size: int) -> list[dict]:
+        return [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64," + ("A" * base64_size)
+                    },
+                },
+            ],
+        }]
+
+    small = c.estimate_provider_messages_tokens(messages(4))
+    large = c.estimate_provider_messages_tokens(messages(1_000_000))
+
+    assert small == large
+    assert small >= 1_500
+
+
 def test_chat_provider_visible_estimate_ignores_storage_only_reasoning_metadata():
     c = _compressor(api_mode="chat_completions")
     messages = [
