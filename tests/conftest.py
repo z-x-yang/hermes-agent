@@ -20,11 +20,30 @@ test runner at ``scripts/run_tests.sh``.
 """
 
 import asyncio
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
+
+
+# Collection imports happen before autouse fixtures.  Some profile-bound modules
+# (notably ``cron.jobs``) resolve their storage paths at import time, so waiting
+# for ``_hermetic_environment`` can bind a test process to the developer's live
+# ~/.hermes before the first test starts.  Establish a process-local sandbox
+# before any test module is imported; the per-test fixture below still narrows
+# ordinary runtime lookups to a fresh tmp_path.
+_PYTEST_COLLECTION_HOME = Path(
+    tempfile.mkdtemp(prefix="evelyn-pytest-collection-")
+).resolve()
+for _subdir in ("cron", "sessions", "memories", "skills"):
+    (_PYTEST_COLLECTION_HOME / _subdir).mkdir()
+os.environ.pop("EVELYN_HOME", None)
+os.environ["HERMES_HOME"] = str(_PYTEST_COLLECTION_HOME)
+atexit.register(shutil.rmtree, _PYTEST_COLLECTION_HOME, True)
 
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent

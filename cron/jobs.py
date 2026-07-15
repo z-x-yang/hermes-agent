@@ -64,6 +64,11 @@ except ImportError:
 HERMES_DIR = get_hermes_home().resolve()
 CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
+# Exact pre-image of the most recent accepted registry write.  A fixed path is
+# intentional: frequent scheduler bookkeeping must not create an unbounded
+# backup directory, while one durable prior image is enough to roll back a bad
+# accepted write.
+JOBS_PREIMAGE_FILE = CRON_DIR / "jobs.preimage.json"
 # Heartbeat file the in-process ticker touches on every loop iteration. The
 # gateway process and the (separate) ``hermes cron status`` process share it
 # so status can tell whether the ticker THREAD is alive, not just whether the
@@ -86,6 +91,10 @@ _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
+
+
+class CronStoreBulkOverwriteError(RuntimeError):
+    """Raised when a whole-registry save looks like accidental replacement."""
 
 
 def _jobs_lock_file() -> Path:
@@ -686,9 +695,90 @@ def load_jobs() -> List[Dict[str, Any]]:
     )
 
 
-def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
+def _decode_jobs_preimage(raw: bytes) -> Optional[List[Dict[str, Any]]]:
+    """Best-effort decode of the current registry for replacement checks."""
+    try:
+        data = json.loads(raw.decode("utf-8"), strict=False)
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        jobs = data.get("jobs")
+    elif isinstance(data, list):
+        jobs = data
+    else:
+        return None
+    return jobs if isinstance(jobs, list) else None
+
+
+def _validate_registry_replacement(
+    existing: Optional[List[Dict[str, Any]]],
+    replacement: List[Dict[str, Any]],
+    *,
+    allow_bulk_replace: bool,
+) -> None:
+    """Reject suspicious whole-store replacement unless explicitly verified.
+
+    Normal CRUD and scheduler bookkeeping preserve almost every job ID.  A test
+    fixture or wrong-profile writer instead tends to replace a mature registry
+    with one/few records, or with a same-sized set of unrelated IDs.  Four jobs
+    is the minimum protected store so tiny test fixtures remain convenient.
+    """
+    if allow_bulk_replace or not existing or len(existing) < 4:
+        return
+
+    old_ids = {
+        str(job.get("id")) for job in existing
+        if isinstance(job, dict) and job.get("id")
+    }
+    new_ids = {
+        str(job.get("id")) for job in replacement
+        if isinstance(job, dict) and job.get("id")
+    }
+    overlap = len(old_ids & new_ids)
+    count_drop = len(replacement) * 2 <= len(existing)
+    identity_drop = overlap * 2 < len(old_ids)
+    if count_drop or identity_drop:
+        raise CronStoreBulkOverwriteError(
+            "Refusing suspicious bulk replacement of cron registry: "
+            f"old_count={len(existing)} new_count={len(replacement)} "
+            f"id_overlap={overlap}/{len(old_ids)}. "
+            "Use save_jobs(..., allow_bulk_replace=True) only after verifying "
+            "the target profile and preserving a recovery copy."
+        )
+
+
+def _write_jobs_preimage_unlocked(raw: bytes) -> None:
+    """Atomically preserve the exact current registry bytes with mode 0600."""
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(JOBS_PREIMAGE_FILE.parent), suffix=".tmp", prefix=".jobs_preimage_"
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        atomic_replace(tmp_path, JOBS_PREIMAGE_FILE)
+        _secure_file(JOBS_PREIMAGE_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _save_jobs_unlocked(
+    jobs: List[Dict[str, Any]], *, allow_bulk_replace: bool = False
+):
     """Save all jobs to storage. Caller must hold _jobs_lock()."""
     ensure_dirs()
+    preimage = JOBS_FILE.read_bytes() if JOBS_FILE.exists() else None
+    existing = _decode_jobs_preimage(preimage) if preimage is not None else None
+    _validate_registry_replacement(
+        existing, jobs, allow_bulk_replace=allow_bulk_replace
+    )
+    if preimage is not None:
+        _write_jobs_preimage_unlocked(preimage)
     fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -705,10 +795,12 @@ def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
         raise
 
 
-def save_jobs(jobs: List[Dict[str, Any]]):
-    """Save all jobs to storage."""
+def save_jobs(
+    jobs: List[Dict[str, Any]], *, allow_bulk_replace: bool = False
+):
+    """Save all jobs, rejecting suspicious whole-registry replacement by default."""
     with _jobs_lock():
-        _save_jobs_unlocked(jobs)
+        _save_jobs_unlocked(jobs, allow_bulk_replace=allow_bulk_replace)
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
@@ -1662,6 +1754,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
     due = []
     needs_save = False
+    removed_completed_oneshot = False
 
     for job in jobs:
         if not job.get("enabled", True):
@@ -1827,13 +1920,18 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                             if rj["id"] == job["id"]:
                                 raw_jobs.remove(rj)
                                 needs_save = True
+                                removed_completed_oneshot = True
                                 break
                         continue
 
             due.append(job)
 
     if needs_save:
-        save_jobs(raw_jobs)
+        # This is a trusted transform of the registry loaded under the store
+        # lock.  A single scan may legitimately prune most or all completed
+        # one-shots, which resembles accidental wholesale replacement by
+        # count/ID overlap alone.
+        save_jobs(raw_jobs, allow_bulk_replace=removed_completed_oneshot)
 
     return due
 
