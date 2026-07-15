@@ -1446,7 +1446,20 @@ def _skill_should_show(
 _SKILL_INDEX_BUDGET_FRACTION = 0.01
 _SKILL_INDEX_CHARS_PER_TOKEN = 4.0
 _SKILL_CREATION_GRACE_DAYS = 7
-_ALWAYS_FULL_SKILL_NAMES = frozenset({"writing-skills", "evelyn-agent"})
+_ALWAYS_FULL_SKILL_NAMES = frozenset({
+    "apple-ecosystem",
+    "email-outbound-gate",
+    "evelyn-agent",
+    "investing-manual",
+    "nature-methods-figure-production",
+    "notion-task-engine",
+    "reminder-task-bridge",
+    "research-experiment-recording",
+    "research-project-memory",
+    "scientific-research",
+    "writing-skills",
+    "zongxin-notion-second-brain",
+})
 
 
 def _parse_skill_usage_time(value) -> "datetime | None":
@@ -1535,12 +1548,7 @@ def _select_full_skill_descriptions(
     def _rank(item: tuple[str, str]) -> tuple[int, float, str]:
         name, _ = item
         record = usage.get(name) or {}
-        if bool(record.get("pinned")):
-            tier = 0
-        elif _recent_agent_created(record, now):
-            tier = 1
-        else:
-            tier = 2
+        tier = 0 if _recent_agent_created(record, now) else 1
         return (tier, -_skill_usage_priority(record, now), name)
 
     for name, desc in sorted(
@@ -1572,8 +1580,9 @@ def build_skills_system_prompt(
     A session-keyed rendered listing is frozen even when usage or skill metadata
     changes; a new session re-ranks descriptions. The listing receives 1% of the
     internal context window in characters. All names remain visible; full
-    descriptions go first to canonical/pinned owners, newly agent-created skills
-    during their grace period, then usage × recency priority.
+    descriptions go first to the explicitly approved canonical owners, then
+    newly agent-created skills during their grace period, then usage × recency
+    priority. Curator pin state does not participate in routing priority.
 
     Falls back to a full filesystem scan when both layers miss.
 

@@ -439,6 +439,51 @@ class TestBuildSkillsSystemPrompt:
 
         assert description in result
 
+    def test_approved_canonical_owners_always_keep_full_descriptions(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        always_full = {
+            "writing-skills",
+            "evelyn-agent",
+            "scientific-research",
+            "research-project-memory",
+            "research-experiment-recording",
+            "zongxin-notion-second-brain",
+            "notion-task-engine",
+            "email-outbound-gate",
+            "apple-ecosystem",
+            "investing-manual",
+            "reminder-task-bridge",
+            "nature-methods-figure-production",
+        }
+        for name in sorted(always_full | {"ordinary-high-usage"}):
+            marker = "FULL_" + name.upper().replace("-", "_")
+            description = marker + " " + "canonical routing boundary " * 4
+            skill_dir = tmp_path / "skills" / "routing" / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {description}\n---\n"
+            )
+
+        now = datetime.now(timezone.utc).isoformat()
+        (tmp_path / "skills" / ".usage.json").write_text(json.dumps({
+            "ordinary-high-usage": {
+                "use_count": 100,
+                "last_used_at": now,
+            },
+        }))
+
+        result = build_skills_system_prompt(
+            context_length=1_000,
+            session_id="approved-always-full-owners",
+        )
+
+        assert all(name in result for name in always_full | {"ordinary-high-usage"})
+        for name in always_full:
+            assert "FULL_" + name.upper().replace("-", "_") in result
+        assert "FULL_ORDINARY_HIGH_USAGE" not in result
+
     def test_budget_keeps_owners_new_skills_and_frequent_skills(
         self, monkeypatch, tmp_path
     ):
@@ -483,6 +528,49 @@ class TestBuildSkillsSystemPrompt:
         assert "CREATION_GRACE" in result
         assert "FREQUENT_WINNER" in result
         assert "UNUSED_LOSER" not in result
+
+    def test_curator_pin_does_not_raise_main_listing_priority(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        descriptions = {
+            "writing-skills": "AUTHORING_OWNER routing contract.",
+            "pinned-cron-skill": "PINNED_CRON_ONLY " + "cron-only routing " * 8,
+            "frequent-general-skill": (
+                "FREQUENT_GENERAL " + "general planning route " * 7
+            ),
+        }
+        for name, description in descriptions.items():
+            skill_dir = tmp_path / "skills" / "routing" / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {description}\n---\n"
+            )
+
+        now = datetime.now(timezone.utc).isoformat()
+        (tmp_path / "skills" / ".usage.json").write_text(json.dumps({
+            "pinned-cron-skill": {
+                "created_by": "agent",
+                "created_at": "2020-01-01T00:00:00+00:00",
+                "pinned": True,
+                "use_count": 0,
+                "last_used_at": None,
+            },
+            "frequent-general-skill": {
+                "use_count": 10,
+                "last_used_at": now,
+            },
+        }))
+
+        result = build_skills_system_prompt(
+            context_length=7_500,
+            session_id="pin-is-not-routing-priority",
+        )
+
+        assert all(name in result for name in descriptions)
+        assert "AUTHORING_OWNER" in result
+        assert "FREQUENT_GENERAL" in result
+        assert "PINNED_CRON_ONLY" not in result
 
     def test_many_grace_skills_stay_within_listing_budget(
         self, monkeypatch, tmp_path
