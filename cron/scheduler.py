@@ -123,6 +123,22 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
+class CronSkillLoadError(RuntimeError):
+    """A declared cron skill dependency could not be loaded safely."""
+
+    def __init__(self, job: dict, missing: list[str], *, bundle: str | None = None):
+        job_label = str(job.get("name") or job.get("id") or "<unknown>")
+        names = [str(name) for name in missing]
+        dependencies = ", ".join(names)
+        if bundle and names == [bundle]:
+            detail = f"required bundle '{bundle}' could not load"
+        elif bundle:
+            detail = f"bundle '{bundle}' is missing required skill(s): {dependencies}"
+        else:
+            detail = f"required skill(s) could not load: {dependencies}"
+        super().__init__(f"Cron job '{job_label}' blocked: {detail}")
+
+
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
@@ -1926,7 +1942,12 @@ def _parse_wake_gate(script_output: str) -> bool:
 
 
 def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
-    """Build the effective prompt for a cron job, optionally loading one or more skills first.
+    """Build the effective prompt for a cron job and load declared skills.
+
+    Every entry in ``skills`` is a required execution dependency. Missing,
+    invalid, or partially loaded bundle dependencies raise
+    ``CronSkillLoadError`` so the scheduled task cannot run with weakened
+    instructions.
 
     Args:
         job: The cron job dict.
@@ -2058,44 +2079,90 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
 
     parts = []
-    skipped: list[str] = []
     for skill_name in skill_names:
         # Cron jobs historically accepted only skill names here, but the CLI/gateway
         # slash-command path lets bundles shadow skills with the same slug. Mirror
         # that behavior so `skills: ["my-bundle"]` expands bundle members instead
         # of being treated as a missing skill.
-        bundle_key = resolve_bundle_command_key(skill_name.lstrip("/"))
-        if bundle_key:
-            bundle_payload = build_bundle_invocation_message(
-                bundle_key,
-                user_instruction="",
-                task_id=str(job.get("id") or "") or None,
-            )
-            if bundle_payload:
-                bundle_message, _loaded_bundle_skills, _missing_bundle_skills = bundle_payload
-                if parts:
-                    parts.append("")
-                parts.append(bundle_message)
-                continue
-            logger.warning(
-                "Cron job '%s': bundle '%s' could not load any skills, skipping",
+        try:
+            bundle_key = resolve_bundle_command_key(skill_name.lstrip("/"))
+        except Exception as exc:
+            logger.exception(
+                "Cron job '%s': failed to resolve required skill or bundle '%s'",
                 job.get("name", job.get("id")),
                 skill_name,
             )
-            skipped.append(skill_name)
+            raise CronSkillLoadError(job, [skill_name]) from exc
+        if bundle_key:
+            try:
+                bundle_payload = build_bundle_invocation_message(
+                    bundle_key,
+                    user_instruction="",
+                    task_id=str(job.get("id") or "") or None,
+                )
+                if not bundle_payload:
+                    logger.warning(
+                        "Cron job '%s': required bundle '%s' could not load any skills",
+                        job.get("name", job.get("id")),
+                        skill_name,
+                    )
+                    raise CronSkillLoadError(job, [skill_name], bundle=skill_name)
+                bundle_message, _loaded_bundle_skills, missing_bundle_skills = bundle_payload
+                if missing_bundle_skills:
+                    raise CronSkillLoadError(
+                        job,
+                        list(missing_bundle_skills),
+                        bundle=skill_name,
+                    )
+            except CronSkillLoadError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "Cron job '%s': required bundle '%s' failed to load",
+                    job.get("name", job.get("id")),
+                    skill_name,
+                )
+                raise CronSkillLoadError(
+                    job,
+                    [skill_name],
+                    bundle=skill_name,
+                ) from exc
+            if parts:
+                parts.append("")
+            parts.append(bundle_message)
             continue
 
         try:
             loaded = json.loads(skill_view(skill_name))
-        except (json.JSONDecodeError, TypeError):
-            logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
-            skipped.append(skill_name)
-            continue
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning(
+                "Cron job '%s': required skill '%s' returned invalid JSON",
+                job.get("name", job.get("id")),
+                skill_name,
+            )
+            raise CronSkillLoadError(job, [skill_name]) from exc
+        except Exception as exc:
+            logger.exception(
+                "Cron job '%s': required skill '%s' failed to load",
+                job.get("name", job.get("id")),
+                skill_name,
+            )
+            raise CronSkillLoadError(job, [skill_name]) from exc
+        if not isinstance(loaded, dict):
+            logger.warning(
+                "Cron job '%s': required skill '%s' returned a non-object payload",
+                job.get("name", job.get("id")),
+                skill_name,
+            )
+            raise CronSkillLoadError(job, [skill_name])
         if not loaded.get("success"):
             error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
-            logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
-            skipped.append(skill_name)
-            continue
+            logger.warning(
+                "Cron job '%s': required skill failed to load — %s",
+                job.get("name", job.get("id")),
+                error,
+            )
+            raise CronSkillLoadError(job, [skill_name])
 
         # Bump usage so the curator sees this skill as actively used.
         try:
@@ -2113,15 +2180,6 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 content,
             ]
         )
-
-    if skipped:
-        notice = (
-            f"[IMPORTANT: The following skill(s) were listed for this job but could not be found "
-            f"and were skipped: {', '.join(skipped)}. "
-            f"Start your response with a brief notice so the user is aware, e.g.: "
-            f"'⚠️ Skill(s) not found and skipped: {', '.join(skipped)}']"
-        )
-        parts.insert(0, notice)
 
     if prompt:
         parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
@@ -2398,6 +2456,20 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
     try:
         prompt = _build_job_prompt(job, prerun_script=prerun_script)
+    except CronSkillLoadError as skill_exc:
+        logger.error(
+            "Job '%s' (ID: %s): required skill dependency failed — %s",
+            job_name, job_id, skill_exc,
+        )
+        blocked_doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Status:** BLOCKED\n\n"
+            "A declared skill dependency could not be loaded, so the agent was NOT run.\n\n"
+            f"**Skill load error:** {skill_exc}\n"
+        )
+        return False, blocked_doc, "", str(skill_exc)
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
         # injection scanner. Refuse to run the agent this tick and surface

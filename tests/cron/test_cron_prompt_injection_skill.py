@@ -263,7 +263,7 @@ class TestBuildJobPromptScansSkillContent:
         with pytest.raises(scheduler.CronPromptInjectionBlocked):
             scheduler._build_job_prompt(job)
 
-    def test_missing_skill_does_not_crash(self, cron_env):
+    def test_missing_skill_fails_closed(self, cron_env):
         _, scheduler = cron_env
         job = {
             "id": "job-missing",
@@ -271,10 +271,144 @@ class TestBuildJobPromptScansSkillContent:
             "prompt": "run task",
             "skills": ["does-not-exist"],
         }
-        # Should not raise — missing skills are skipped with a notice.
-        prompt = scheduler._build_job_prompt(job)
-        assert prompt is not None
-        assert "could not be found" in prompt
+        with pytest.raises(RuntimeError, match="does-not-exist") as exc_info:
+            scheduler._build_job_prompt(job)
+        assert exc_info.type.__name__ == "CronSkillLoadError"
+
+    def test_mixed_present_and_missing_skills_fail_closed(self, cron_env):
+        hermes_home, scheduler = cron_env
+        _plant_skill(hermes_home, "present-skill", "Required guidance.")
+        job = {
+            "id": "job-partial-skills",
+            "name": "partial skills",
+            "prompt": "run task",
+            "skills": ["present-skill", "missing-skill"],
+        }
+        with pytest.raises(RuntimeError, match="missing-skill") as exc_info:
+            scheduler._build_job_prompt(job)
+        assert exc_info.type.__name__ == "CronSkillLoadError"
+
+    def test_bundle_with_missing_member_fails_closed(self, cron_env):
+        hermes_home, scheduler = cron_env
+        _plant_skill(hermes_home, "present-member", "Present bundle guidance.")
+        _plant_bundle(
+            hermes_home,
+            "partial-bundle",
+            ["present-member", "missing-member"],
+        )
+        job = {
+            "id": "job-partial-bundle",
+            "name": "partial bundle",
+            "prompt": "run task",
+            "skills": ["partial-bundle"],
+        }
+        with pytest.raises(RuntimeError, match="missing-member") as exc_info:
+            scheduler._build_job_prompt(job)
+        assert exc_info.type.__name__ == "CronSkillLoadError"
+
+    def test_direct_skill_loader_exception_fails_closed(
+        self, cron_env, monkeypatch
+    ):
+        _, scheduler = cron_env
+        import tools.skills_tool as skills_tool
+
+        def _unreadable_skill(_name):
+            raise OSError("skill storage unavailable")
+
+        monkeypatch.setattr(skills_tool, "skill_view", _unreadable_skill)
+        with pytest.raises(scheduler.CronSkillLoadError, match="unreadable-skill"):
+            scheduler._build_job_prompt(
+                {
+                    "id": "job-unreadable-skill",
+                    "name": "unreadable skill",
+                    "prompt": "run task",
+                    "skills": ["unreadable-skill"],
+                }
+            )
+
+    def test_direct_skill_non_object_json_fails_closed(
+        self, cron_env, monkeypatch
+    ):
+        _, scheduler = cron_env
+        import tools.skills_tool as skills_tool
+
+        monkeypatch.setattr(skills_tool, "skill_view", lambda _name: "[]")
+        with pytest.raises(scheduler.CronSkillLoadError, match="invalid-payload"):
+            scheduler._build_job_prompt(
+                {
+                    "id": "job-invalid-payload",
+                    "name": "invalid payload",
+                    "prompt": "run task",
+                    "skills": ["invalid-payload"],
+                }
+            )
+
+    def test_run_job_bundle_builder_exception_returns_blocked_failure(
+        self, cron_env, monkeypatch
+    ):
+        hermes_home, scheduler = cron_env
+        _plant_skill(hermes_home, "bundle-member", "Required guidance.")
+        _plant_bundle(hermes_home, "broken-bundle", ["bundle-member"])
+
+        import agent.skill_bundles as skill_bundles
+        import hermes_state
+        import run_agent
+
+        def _broken_bundle(*_args, **_kwargs):
+            raise ValueError("invalid bundle render config")
+
+        monkeypatch.setattr(
+            skill_bundles,
+            "build_bundle_invocation_message",
+            _broken_bundle,
+        )
+        monkeypatch.setattr(hermes_state, "SessionDB", lambda: None)
+
+        class AgentMustNotBeConstructed:
+            def __init__(self, *args, **kwargs):
+                pytest.fail("AIAgent must not be constructed when a bundle cannot load")
+
+        monkeypatch.setattr(run_agent, "AIAgent", AgentMustNotBeConstructed)
+        success, output_doc, final_response, error = scheduler.run_job(
+            {
+                "id": "job-broken-bundle",
+                "name": "broken bundle",
+                "prompt": "run task",
+                "skills": ["broken-bundle"],
+            }
+        )
+        assert success is False
+        assert final_response == ""
+        assert "broken-bundle" in output_doc
+        assert "broken-bundle" in (error or "")
+
+    def test_run_job_missing_skill_returns_failure_before_agent_construction(
+        self, cron_env, monkeypatch
+    ):
+        _, scheduler = cron_env
+        import hermes_state
+        import run_agent
+
+        monkeypatch.setattr(hermes_state, "SessionDB", lambda: None)
+
+        class AgentMustNotBeConstructed:
+            def __init__(self, *args, **kwargs):
+                pytest.fail("AIAgent must not be constructed when a declared skill cannot load")
+
+        monkeypatch.setattr(run_agent, "AIAgent", AgentMustNotBeConstructed)
+        result = scheduler.run_job(
+            {
+                "id": "job-missing-runtime",
+                "name": "missing runtime",
+                "prompt": "run task",
+                "skills": ["does-not-exist"],
+            }
+        )
+        success, output_doc, final_response, error = result
+        assert success is False
+        assert final_response == ""
+        assert "does-not-exist" in output_doc
+        assert "does-not-exist" in (error or "")
 
     def test_skill_bundle_in_job_skills_loads_referenced_skills(self, cron_env):
         hermes_home, scheduler = cron_env

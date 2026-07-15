@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
+import cron.scheduler as scheduler
 from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
@@ -2850,44 +2851,46 @@ class TestRunJobWakeGate:
 
 
 class TestBuildJobPromptMissingSkill:
-    """Verify that a missing skill logs a warning and does not crash the job."""
+    """Declared skill dependencies fail closed instead of weakening a cron job."""
 
     def _missing_skill_view(self, name: str) -> str:
         return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
 
-    def test_missing_skill_does_not_raise(self):
-        """Job should run even when a referenced skill is not installed."""
+    def test_missing_skill_raises_typed_error(self):
         with patch("tools.skills_tool.skill_view", side_effect=self._missing_skill_view):
-            result = _build_job_prompt({"skills": ["ghost-skill"], "prompt": "do something"})
-        # prompt is preserved even though skill was skipped
-        assert "do something" in result
+            with pytest.raises(scheduler.CronSkillLoadError, match="ghost-skill"):
+                _build_job_prompt({"skills": ["ghost-skill"], "prompt": "do something"})
 
-    def test_missing_skill_injects_user_notice_into_prompt(self):
-        """A system notice about the missing skill is injected into the prompt."""
+    def test_missing_skill_error_identifies_job_and_dependency(self):
         with patch("tools.skills_tool.skill_view", side_effect=self._missing_skill_view):
-            result = _build_job_prompt({"skills": ["ghost-skill"], "prompt": "do something"})
-        assert "ghost-skill" in result
-        assert "not found" in result.lower() or "skipped" in result.lower()
+            with pytest.raises(scheduler.CronSkillLoadError) as exc_info:
+                _build_job_prompt(
+                    {"name": "My Job", "skills": ["ghost-skill"], "prompt": "do something"}
+                )
+        message = str(exc_info.value)
+        assert "My Job" in message
+        assert "ghost-skill" in message
 
     def test_missing_skill_logs_warning(self, caplog):
-        """A warning is logged when a skill cannot be found."""
         with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
             with patch("tools.skills_tool.skill_view", side_effect=self._missing_skill_view):
-                _build_job_prompt({"name": "My Job", "skills": ["ghost-skill"], "prompt": "do something"})
+                with pytest.raises(scheduler.CronSkillLoadError):
+                    _build_job_prompt(
+                        {"name": "My Job", "skills": ["ghost-skill"], "prompt": "do something"}
+                    )
         assert any("ghost-skill" in record.message for record in caplog.records)
 
-    def test_valid_skill_loaded_alongside_missing(self):
-        """A valid skill is still loaded when another skill in the list is missing."""
-
+    def test_valid_skill_alongside_missing_still_fails_closed(self):
         def _mixed_skill_view(name: str) -> str:
             if name == "real-skill":
                 return json.dumps({"success": True, "content": "Real skill content."})
             return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
 
         with patch("tools.skills_tool.skill_view", side_effect=_mixed_skill_view):
-            result = _build_job_prompt({"skills": ["ghost-skill", "real-skill"], "prompt": "go"})
-        assert "Real skill content." in result
-        assert "go" in result
+            with pytest.raises(scheduler.CronSkillLoadError, match="ghost-skill"):
+                _build_job_prompt(
+                    {"skills": ["real-skill", "ghost-skill"], "prompt": "go"}
+                )
 
 
 class TestBuildJobPromptBumpUse:
@@ -2915,7 +2918,8 @@ class TestBuildJobPromptBumpUse:
             return json.dumps({"success": False, "error": "not found"})
 
         with patch("tools.skills_tool.skill_view", side_effect=_missing_view), \
-             patch("tools.skill_usage.bump_use") as mock_bump:
+             patch("tools.skill_usage.bump_use") as mock_bump, \
+             pytest.raises(scheduler.CronSkillLoadError):
             _build_job_prompt({"skills": ["ghost"], "prompt": "go"})
 
         assert mock_bump.call_count == 0

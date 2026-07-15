@@ -1957,11 +1957,12 @@ def rewrite_skill_refs(
     """Rewrite cron job skill references after a curator consolidation pass.
 
     When the curator consolidates a skill X into umbrella Y (or archives X
-    as pruned), any cron job that lists ``X`` in its ``skills`` field will
-    fail to load ``X`` at run time — the scheduler logs a warning and
-    skips the skill, so the job runs without the instructions it was
-    scheduled to follow. See cron/scheduler.py where ``skill_view`` is
-    called per skill name.
+    as pruned), existing jobs may still store ``skills: ["X"]``. Without this
+    rewrite they will fail to load ``X`` at run time. The scheduler fails closed
+    before constructing the agent, so the job cannot run without instructions
+    it was scheduled to follow. This rewrite keeps valid jobs running after
+    curator consolidation. See cron/scheduler.py where ``skill_view`` is called
+    per skill name.
 
     This function repairs cron jobs in-place:
 
