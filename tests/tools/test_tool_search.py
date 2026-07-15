@@ -344,6 +344,24 @@ class TestRetrieval:
         hits = search_catalog(self._fake_catalog(), "github", limit=1)
         assert len(hits) <= 1
 
+    def test_description_preview_keeps_capability_and_late_query_match(self):
+        from tools.tool_search import _description_preview
+
+        description = (
+            "Create and manage deployment records for an application. "
+            + "General operational context. " * 20
+            + "Use this tool for blue-green rollback coordination and audit receipts."
+        )
+        preview = _description_preview(
+            description,
+            "blue-green rollback coordination",
+        )
+
+        assert preview.startswith("Create and manage deployment records")
+        assert "blue-green rollback coordination" in preview
+        assert len(preview) <= 400
+        assert "…" in preview
+
 
 # ---------------------------------------------------------------------------
 # Assembly — the full passthrough/activate decision.

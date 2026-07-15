@@ -454,7 +454,7 @@ def _dispatch_agent_tool_search_bridge(agent, function_name: str, function_args:
         return json.dumps({
             "query": query,
             "total_available": len(catalog),
-            "matches": [_ts._format_search_hit(hit) for hit in hits],
+            "matches": [_ts._format_search_hit(hit, query) for hit in hits],
         }, ensure_ascii=False)
 
     if function_name == _ts.TOOL_DESCRIBE_NAME:

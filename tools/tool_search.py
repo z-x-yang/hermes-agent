@@ -632,13 +632,50 @@ def is_bridge_tool(name: str) -> bool:
     return name in BRIDGE_TOOL_NAMES
 
 
-def _format_search_hit(entry: CatalogEntry) -> Dict[str, Any]:
+def _description_preview(description: str, query: str, limit: int = 400) -> str:
+    """Keep the capability lead plus query-relevant context within ``limit``."""
+    text = description or ""
+    if len(text) <= limit:
+        return text
+
+    head_limit = min(160, limit // 2)
+    lower_text = text.lower()
+    matches = []
+    for term in dict.fromkeys(_tokenize(query)):
+        position = lower_text.find(term, head_limit)
+        if position >= 0:
+            matches.append((position, term))
+
+    if not matches:
+        return text[: limit - 1].rstrip() + "…"
+
+    # Longer terms are generally more discriminative; break ties earlier.
+    anchor, _ = max(matches, key=lambda item: (len(item[1]), -item[0]))
+    head = text[:head_limit].rstrip()
+    if " " in head and not text[head_limit].isspace():
+        head = head.rsplit(" ", 1)[0]
+
+    separator = " … "
+    fragment_limit = limit - len(head) - len(separator) - 1
+    fragment_start = max(head_limit, anchor - fragment_limit // 3)
+    nearby_space = text.rfind(" ", head_limit, fragment_start)
+    if nearby_space >= head_limit:
+        fragment_start = nearby_space + 1
+    fragment_end = min(len(text), fragment_start + fragment_limit)
+    fragment = text[fragment_start:fragment_end].strip()
+    if fragment_end < len(text) and " " in fragment:
+        fragment = fragment.rsplit(" ", 1)[0]
+
+    suffix = "…" if fragment_end < len(text) else ""
+    return (head + separator + fragment + suffix)[:limit]
+
+
+def _format_search_hit(entry: CatalogEntry, query: str) -> Dict[str, Any]:
     return {
         "name": entry.name,
         "source": entry.source,
         "source_name": entry.source_name,
-        # Cap description so a chatty MCP server doesn't blow up the result.
-        "description": (entry.description or "")[:400],
+        "description": _description_preview(entry.description, query),
     }
 
 
@@ -667,7 +704,7 @@ def dispatch_tool_search(args: Dict[str, Any],
     return json.dumps({
         "query": query,
         "total_available": len(catalog),
-        "matches": [_format_search_hit(h) for h in hits],
+        "matches": [_format_search_hit(hit, query) for hit in hits],
     }, ensure_ascii=False)
 
 
