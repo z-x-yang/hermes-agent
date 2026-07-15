@@ -1533,7 +1533,11 @@ class CLICommandsMixin:
                 print(out)
                 return
         from hermes_cli.skills_hub import handle_skills_slash
-        handle_skills_slash(cmd, ChatConsole())
+        handle_skills_slash(
+            cmd,
+            ChatConsole(),
+            active_agent=getattr(self, "agent", None),
+        )
 
     def _handle_learn_command(self, cmd: str):
         """Handle /learn — distill a reusable skill from anything the user describes.

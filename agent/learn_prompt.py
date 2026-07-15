@@ -12,8 +12,8 @@ that instructs the live agent to:
      current conversation for "what I just did", the user's text for pasted
      material).
   2. Author a single ``SKILL.md`` via ``skill_manage`` that follows the Hermes
-     skill-authoring standards (description <=60 chars, the modern section
-     order, Hermes-tool framing, no invented commands).
+     skill-authoring standards (routing-rich description within the Agent Skills
+     limit, the modern section order, Hermes-tool framing, no invented commands).
 
 There is no separate distillation engine and no model-tool footprint: the
 agent does the work with its existing toolset, so this works identically on
@@ -33,18 +33,17 @@ HARDLINE rules a maintainer enforces in review:
 
 Frontmatter:
 - name: lowercase-hyphenated, <=64 chars, no spaces.
-- description: ONE sentence, **<=60 characters**, ends with a period. State the
-  capability, not the implementation. No marketing words (powerful,
-  comprehensive, seamless, advanced, robust). Do NOT repeat the skill name. If
-  the description contains a colon, wrap the whole value in double quotes.
-  This is the most-violated rule and it is NOT cosmetic: the system-prompt
-  skill index truncates the description to 60 chars and loads it every
-  session, so anything past char 60 is silently cut and never routes. After
-  you write the description, COUNT the characters; if it is over 60, cut it
-  down before saving — do not ship a sentence and hope.
-    Good (<=60): `Search arXiv papers by keyword, author, or ID.`
-    Bad (123):   `A comprehensive skill that lets the agent search arXiv for
-                  academic papers using keywords, authors, and categories.`
+- description: ONE concise routing sentence, preferably under 500 characters
+  and never over the Agent Skills hard limit of 1024 characters. State both
+  the capability and the concrete trigger conditions/contexts that should load
+  the skill; front-load distinctive domain, tool, symptom, and artifact
+  keywords. Do NOT summarize the procedure or workflow, because that lets the
+  model imitate the preview instead of loading the full skill. No marketing
+  words (powerful, comprehensive, seamless, advanced, robust). Do NOT repeat
+  the skill name. If the description contains a colon, wrap the whole value in
+  double quotes.
+    Good: `Use when searching arXiv by keyword, author, category, or paper ID.`
+    Bad:  `Searches arXiv, downloads results, ranks papers, and writes a digest.`
 - version: 0.1.0
 - author: always the literal value `Hermes`. NEVER fill it from the host
   environment — the OS/login username (e.g. the `user=` line in your

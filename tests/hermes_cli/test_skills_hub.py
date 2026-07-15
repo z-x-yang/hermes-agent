@@ -249,6 +249,64 @@ def test_do_update_reinstalls_outdated_skills(monkeypatch):
     assert "Updated 1 skill" in output
 
 
+def test_handle_skills_slash_now_targets_only_active_agent(monkeypatch):
+    import hermes_cli.skills_hub as cli_hub
+
+    captured = {}
+    active_agent = object()
+
+    def fake_install(identifier, **kwargs):
+        captured["identifier"] = identifier
+        captured.update(kwargs)
+
+    monkeypatch.setattr(cli_hub, "do_install", fake_install)
+
+    handle_skills_slash(
+        "/skills install official/example --now",
+        console=ChatConsole(),
+        active_agent=active_agent,
+    )
+
+    assert captured["identifier"] == "official/example"
+    assert captured["invalidate_cache"] is True
+    assert captured["active_agent"] is active_agent
+
+
+def test_refresh_active_skill_prompt_is_session_local(monkeypatch):
+    import hermes_cli.skills_hub as cli_hub
+
+    calls = []
+
+    class _DB:
+        def update_system_prompt(self, session_id, prompt):
+            calls.append(("persist", session_id, prompt))
+
+    class _Agent:
+        session_id = "current-session"
+        _session_skills_prompt = "OLD_SKILL_INDEX"
+        _cached_system_prompt = "OLD_SYSTEM_PROMPT"
+        _session_db = _DB()
+
+        def _build_system_prompt(self, _message):
+            assert self._session_skills_prompt is None
+            return "NEW_SYSTEM_PROMPT"
+
+    monkeypatch.setattr(
+        cli_hub,
+        "_clear_skill_prompt_cache_for_session",
+        lambda session_id: calls.append(("clear", session_id)),
+    )
+    agent = _Agent()
+
+    cli_hub._refresh_active_skill_prompt(agent)
+
+    assert agent._cached_system_prompt == "NEW_SYSTEM_PROMPT"
+    assert calls == [
+        ("clear", "current-session"),
+        ("persist", "current-session", "NEW_SYSTEM_PROMPT"),
+    ]
+
+
 def test_handle_skills_slash_search_accepts_chatconsole_without_status_errors():
     results = [type("R", (), {
         "name": "kubernetes",

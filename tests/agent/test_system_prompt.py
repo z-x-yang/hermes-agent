@@ -80,6 +80,59 @@ class TestDeferredToolDiscoveryGuidance:
         assert "tool visibility is partial" not in stable
 
 
+class TestSkillListingSessionInputs:
+    def test_passes_session_and_internal_context_length(self):
+        captured = {}
+
+        def fake_skills_prompt(**kwargs):
+            captured.update(kwargs)
+            return ""
+
+        agent = _make_agent(
+            valid_tool_names=["skill_view"],
+            session_id="skill-session-123",
+            context_compressor=SimpleNamespace(compression_context_length=272_000),
+        )
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+            patch("run_agent.get_toolset_for_tool", return_value="skills"),
+            patch("run_agent.build_skills_system_prompt", side_effect=fake_skills_prompt),
+        ):
+            build_system_prompt_parts(agent)
+
+        assert captured["session_id"] == "skill-session-123"
+        assert captured["context_length"] == 272_000
+
+    def test_agent_keeps_same_skill_listing_across_prompt_rebuilds(self):
+        rendered = iter(["FIRST_SKILL_LISTING", "SECOND_SKILL_LISTING"])
+        agent = _make_agent(
+            valid_tool_names=["skill_view"],
+            session_id="stable-agent-session",
+            context_compressor=SimpleNamespace(compression_context_length=272_000),
+        )
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+            patch("run_agent.get_toolset_for_tool", return_value="skills"),
+            patch(
+                "run_agent.build_skills_system_prompt",
+                side_effect=lambda **_: next(rendered),
+            ) as mock_build,
+        ):
+            first = build_system_prompt_parts(agent)["stable"]
+            second = build_system_prompt_parts(agent)["stable"]
+
+        assert "FIRST_SKILL_LISTING" in first
+        assert "FIRST_SKILL_LISTING" in second
+        assert "SECOND_SKILL_LISTING" not in second
+        assert mock_build.call_count == 1
+
+
 def _init_code_repo(path):
     """A git repo that actually holds code — the coding posture requires a source
     file (or manifest), not a bare ``.git`` (a prose/notes repo stays general)."""

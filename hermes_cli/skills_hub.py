@@ -46,6 +46,37 @@ def _display_source(r) -> str:
 # Shared do_* functions
 # ---------------------------------------------------------------------------
 
+def _clear_skill_prompt_cache_for_session(session_id: str) -> None:
+    from agent.prompt_builder import clear_skills_system_prompt_cache
+
+    clear_skills_system_prompt_cache(
+        clear_snapshot=True,
+        session_id=session_id,
+    )
+
+
+def _refresh_active_skill_prompt(active_agent: Any) -> None:
+    """Rebuild only one live agent's prompt for an explicit ``--now`` action."""
+    session_id = str(getattr(active_agent, "session_id", "") or "")
+    _clear_skill_prompt_cache_for_session(session_id)
+    active_agent._session_skills_prompt = None
+    prompt = active_agent._build_system_prompt(None)
+    active_agent._cached_system_prompt = prompt
+    session_db = getattr(active_agent, "_session_db", None)
+    if session_db and session_id:
+        session_db.update_system_prompt(session_id, prompt)
+
+
+def _invalidate_skills_after_change(active_agent: Any = None) -> None:
+    """Refresh metadata, and opt one explicit live session into a prompt rebuild."""
+    if active_agent is not None:
+        _refresh_active_skill_prompt(active_agent)
+        return
+    from agent.prompt_builder import clear_skills_system_prompt_cache
+
+    clear_skills_system_prompt_cache(clear_snapshot=True)
+
+
 def _resolve_short_name(name: str, sources, console: Console) -> str:
     """
     Resolve a short skill name (e.g. 'pptx') to a full identifier by searching
@@ -502,7 +533,8 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
 def do_install(identifier: str, category: str = "", force: bool = False,
                console: Optional[Console] = None, skip_confirm: bool = False,
                invalidate_cache: bool = True,
-               name_override: str = "") -> None:
+               name_override: str = "",
+               active_agent: Any = None) -> None:
     """Fetch, quarantine, scan, confirm, and install a skill.
 
     ``name_override`` lets non-interactive callers (slash commands, gateway,
@@ -757,12 +789,12 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         pass
 
     if invalidate_cache:
-        # Invalidate the skills prompt cache so the new skill appears immediately
+        # Normal mutations update metadata for future sessions. Explicit --now
+        # additionally rebuilds only the caller's active agent/session.
         try:
-            from agent.prompt_builder import clear_skills_system_prompt_cache
-            clear_skills_system_prompt_cache(clear_snapshot=True)
-        except Exception:
-            pass
+            _invalidate_skills_after_change(active_agent)
+        except Exception as exc:
+            c.print(f"[yellow]Installed, but live prompt refresh failed:[/] {exc}")
     else:
         c.print("[dim]Skill will be available in your next session.[/]")
         c.print("[dim]Use /reset to start a new session now, or --now to activate immediately (invalidates prompt cache).[/]\n")
@@ -1095,7 +1127,8 @@ def do_audit(name: Optional[str] = None, console: Optional[Console] = None,
 
 def do_uninstall(name: str, console: Optional[Console] = None,
                  skip_confirm: bool = False,
-                 invalidate_cache: bool = True) -> None:
+                 invalidate_cache: bool = True,
+                 active_agent: Any = None) -> None:
     """Remove a hub-installed skill with confirmation."""
     from tools.skills_hub import uninstall_skill
 
@@ -1117,10 +1150,9 @@ def do_uninstall(name: str, console: Optional[Console] = None,
         c.print(f"[bold green]{msg}[/]\n")
         if invalidate_cache:
             try:
-                from agent.prompt_builder import clear_skills_system_prompt_cache
-                clear_skills_system_prompt_cache(clear_snapshot=True)
-            except Exception:
-                pass
+                _invalidate_skills_after_change(active_agent)
+            except Exception as exc:
+                c.print(f"[yellow]Uninstalled, but live prompt refresh failed:[/] {exc}")
         else:
             c.print("[dim]Change will take effect in your next session.[/]")
             c.print("[dim]Use /reset to start a new session now, or --now to apply immediately (invalidates prompt cache).[/]\n")
@@ -1131,7 +1163,8 @@ def do_uninstall(name: str, console: Optional[Console] = None,
 def do_reset(name: str, restore: bool = False,
              console: Optional[Console] = None,
              skip_confirm: bool = False,
-             invalidate_cache: bool = True) -> None:
+             invalidate_cache: bool = True,
+             active_agent: Any = None) -> None:
     """Reset a bundled skill's manifest tracking (+ optionally restore from bundled)."""
     from tools.skills_sync import reset_bundled_skill
 
@@ -1164,10 +1197,9 @@ def do_reset(name: str, restore: bool = False,
 
     if invalidate_cache:
         try:
-            from agent.prompt_builder import clear_skills_system_prompt_cache
-            clear_skills_system_prompt_cache(clear_snapshot=True)
-        except Exception:
-            pass
+            _invalidate_skills_after_change(active_agent)
+        except Exception as exc:
+            c.print(f"[yellow]Reset completed, but live prompt refresh failed:[/] {exc}")
     else:
         c.print("[dim]Change will take effect in your next session.[/]")
         c.print("[dim]Use /reset to start a new session now, or --now to apply immediately (invalidates prompt cache).[/]\n")
@@ -1757,7 +1789,11 @@ def skills_command(args) -> None:
 # Slash command entry point (/skills in chat)
 # ---------------------------------------------------------------------------
 
-def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
+def handle_skills_slash(
+    cmd: str,
+    console: Optional[Console] = None,
+    active_agent: Any = None,
+) -> None:
     """
     Parse and dispatch `/skills <subcommand> [args]` from the chat interface.
 
@@ -1868,7 +1904,8 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
                 name_override = args[i + 1]
         do_install(identifier, category=category, force=force,
                    skip_confirm=skip_confirm, invalidate_cache=invalidate_cache,
-                   name_override=name_override, console=c)
+                   name_override=name_override, console=c,
+                   active_agent=active_agent if invalidate_cache else None)
 
     elif action == "inspect":
         if not args:
@@ -1905,8 +1942,13 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
         # Slash commands run inside prompt_toolkit where input() hangs.
         skip_confirm = True
         invalidate_cache = "--now" in args
-        do_uninstall(args[0], console=c, skip_confirm=skip_confirm,
-                     invalidate_cache=invalidate_cache)
+        do_uninstall(
+            args[0],
+            console=c,
+            skip_confirm=skip_confirm,
+            invalidate_cache=invalidate_cache,
+            active_agent=active_agent if invalidate_cache else None,
+        )
 
     elif action == "reset":
         if not args:
@@ -1918,8 +1960,14 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
         restore = "--restore" in args
         invalidate_cache = "--now" in args
         # Slash commands can't prompt — --restore in slash mode is implicit consent.
-        do_reset(name, restore=restore, console=c, skip_confirm=True,
-                 invalidate_cache=invalidate_cache)
+        do_reset(
+            name,
+            restore=restore,
+            console=c,
+            skip_confirm=True,
+            invalidate_cache=invalidate_cache,
+            active_agent=active_agent if invalidate_cache else None,
+        )
 
     elif action in {"list-modified", "modified"}:
         do_list_modified(console=c, as_json="--json" in args)

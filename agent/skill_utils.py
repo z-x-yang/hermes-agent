@@ -791,15 +791,17 @@ def resolve_skill_config_values(
 
 # ── Description extraction ────────────────────────────────────────────────
 
+SKILL_DESCRIPTION_MAX_CHARS = 1024
+
 
 def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
-    """Extract a truncated description from parsed frontmatter."""
+    """Extract the full Agent Skills-compliant routing description."""
     raw_desc = frontmatter.get("description", "")
     if not raw_desc:
         return ""
     desc = str(raw_desc).strip().strip("'\"")
-    if len(desc) > 60:
-        return desc[:57] + "..."
+    if len(desc) > SKILL_DESCRIPTION_MAX_CHARS:
+        return desc[: SKILL_DESCRIPTION_MAX_CHARS - 3] + "..."
     return desc
 
 

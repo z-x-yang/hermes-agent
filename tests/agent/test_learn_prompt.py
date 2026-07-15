@@ -59,16 +59,18 @@ class TestBuildLearnPrompt:
     def test_whitespace_only_request_is_treated_as_empty(self):
         assert build_learn_prompt("   \n  ") == build_learn_prompt("")
 
-    def test_description_length_rule_is_in_the_standards(self):
-        # The single most-violated rule must be explicit in the prompt.
-        assert "60" in _AUTHORING_STANDARDS
+    def test_description_routing_contract_is_in_the_standards(self):
+        std = _AUTHORING_STANDARDS.lower()
+        assert "1024" in std
+        assert "capability" in std
+        assert "trigger" in std
+        assert "workflow" in std
 
     def test_teaches_the_full_hardline_standards(self):
-        # description length — otherwise distilled skills miss platform gating,
-        # author credit, and the tool-framing table. Lock the coverage in.
+        # Routing description, platform gating, author credit, and tool framing
+        # are the load-bearing house standards.
         std = _AUTHORING_STANDARDS.lower()
-        # #1 description: the count-and-trim self-check (the reported bug).
-        assert "count" in std and "60" in std
+        assert "1024" in std and "trigger" in std
         # #3 platforms gating against OS-bound primitives.
         assert "platforms" in std
         # author is always the literal Hermes, never the host/OS identity (#52368).

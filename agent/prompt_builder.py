@@ -10,6 +10,7 @@ import os
 import threading
 import contextvars
 from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
 
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
@@ -1255,20 +1256,41 @@ def drain_truncation_warnings() -> list:
 # Skills prompt cache
 # =========================================================================
 
-_SKILLS_PROMPT_CACHE_MAX = 8
+_SKILLS_PROMPT_CACHE_MAX = 64
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-_SKILLS_SNAPSHOT_VERSION = 2
+_SKILLS_SNAPSHOT_VERSION = 3
 
 
 def _skills_prompt_snapshot_path() -> Path:
     return get_hermes_home() / ".skills_prompt_snapshot.json"
 
 
-def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
-    """Drop the in-process skills prompt cache (and optionally the disk snapshot)."""
+def clear_skills_system_prompt_cache(
+    *,
+    clear_snapshot: bool = False,
+    clear_session_prompts: bool = False,
+    session_id: str | None = None,
+) -> None:
+    """Invalidate skill metadata without disturbing unrelated live sessions.
+
+    Usage changes and autonomous skill edits should affect the next session,
+    not rewrite the current session's cached system prefix. ``session_id`` is
+    the explicit session-local ``--now`` escape hatch. Test/process teardown
+    may pass ``clear_session_prompts=True`` for a complete reset.
+    """
     with _SKILLS_PROMPT_CACHE_LOCK:
-        _SKILLS_PROMPT_CACHE.clear()
+        if clear_session_prompts:
+            _SKILLS_PROMPT_CACHE.clear()
+        elif session_id is not None:
+            target = str(session_id)
+            for key in list(_SKILLS_PROMPT_CACHE):
+                if key[-1] == target:
+                    del _SKILLS_PROMPT_CACHE[key]
+        else:
+            for key in list(_SKILLS_PROMPT_CACHE):
+                if not key[-1]:
+                    del _SKILLS_PROMPT_CACHE[key]
     if clear_snapshot:
         try:
             _skills_prompt_snapshot_path().unlink(missing_ok=True)
@@ -1421,17 +1443,137 @@ def _skill_should_show(
     return True
 
 
+_SKILL_INDEX_BUDGET_FRACTION = 0.01
+_SKILL_INDEX_CHARS_PER_TOKEN = 4.0
+_SKILL_CREATION_GRACE_DAYS = 7
+_ALWAYS_FULL_SKILL_NAMES = frozenset({"writing-skills", "evelyn-agent"})
+
+
+def _parse_skill_usage_time(value) -> "datetime | None":
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _skill_usage_priority(record: dict, now: datetime) -> float:
+    try:
+        use_count = max(0, int(record.get("use_count") or 0))
+    except (TypeError, ValueError):
+        use_count = 0
+    last_used = _parse_skill_usage_time(record.get("last_used_at"))
+    if use_count <= 0 or last_used is None:
+        return 0.0
+    age_days = max(0.0, (now - last_used).total_seconds() / 86_400.0)
+    recency = max(0.5 ** (age_days / 7.0), 0.1)
+    return use_count * recency
+
+
+def _recent_agent_created(record: dict, now: datetime) -> bool:
+    if record.get("created_by") != "agent":
+        return False
+    created_at = _parse_skill_usage_time(record.get("created_at"))
+    if created_at is None:
+        return False
+    age_days = max(0.0, (now - created_at).total_seconds() / 86_400.0)
+    return age_days <= _SKILL_CREATION_GRACE_DAYS
+
+
+def _select_full_skill_descriptions(
+    skills_by_category: "dict[str, list[tuple[str, str]]]",
+    category_descriptions: "dict[str, str]",
+    demoted: "frozenset[str]",
+    context_length: "int | None",
+) -> tuple[set[str], bool]:
+    """Select whole descriptions within a Claude-style listing budget."""
+    candidates: list[tuple[str, str]] = []
+    base_chars = 0
+    for category in sorted(skills_by_category):
+        names = sorted({name for name, _ in skills_by_category[category]})
+        if category in demoted:
+            base_chars += len(f"  {category} [names only]: {', '.join(names)}\n")
+            continue
+        category_line = f"  {category}: {category_descriptions.get(category, '')}".rstrip()
+        base_chars += len(category_line) + 1
+        seen = set()
+        for name, desc in sorted(skills_by_category[category], key=lambda item: item[0]):
+            if name in seen:
+                continue
+            seen.add(name)
+            base_chars += len(f"    - {name}\n")
+            if desc:
+                candidates.append((name, desc))
+
+    if not context_length:
+        return {name for name, _ in candidates}, False
+
+    try:
+        from tools.skill_usage import load_usage
+
+        usage = load_usage()
+    except Exception:
+        usage = {}
+    now = datetime.now(timezone.utc)
+
+    canonical = {
+        name for name, _ in candidates if name in _ALWAYS_FULL_SKILL_NAMES
+    }
+    description_by_name = dict(candidates)
+    canonical_cost = sum(len(description_by_name[name]) + 2 for name in canonical)
+    budget_chars = max(
+        base_chars + canonical_cost,
+        int(context_length * _SKILL_INDEX_BUDGET_FRACTION * _SKILL_INDEX_CHARS_PER_TOKEN),
+    )
+    selected = set(canonical)
+    remaining = budget_chars - base_chars - canonical_cost
+
+    def _rank(item: tuple[str, str]) -> tuple[int, float, str]:
+        name, _ = item
+        record = usage.get(name) or {}
+        if bool(record.get("pinned")):
+            tier = 0
+        elif _recent_agent_created(record, now):
+            tier = 1
+        else:
+            tier = 2
+        return (tier, -_skill_usage_priority(record, now), name)
+
+    for name, desc in sorted(
+        (item for item in candidates if item[0] not in canonical),
+        key=_rank,
+    ):
+        cost = len(desc) + 2
+        if cost <= remaining:
+            selected.add(name)
+            remaining -= cost
+
+    return selected, len(selected) < len(candidates)
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
+    context_length: "int | None" = None,
+    session_id: "str | None" = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
     Two-layer cache:
-      1. In-process LRU dict keyed by (skills_dir, tools, toolsets, hidden)
-      2. Disk snapshot (``.skills_prompt_snapshot.json``) validated by
+      1. In-process LRU keyed by source/tool surface, context budget, and session
+      2. Disk metadata snapshot (``.skills_prompt_snapshot.json``) validated by
          mtime/size manifest — survives process restarts
+
+    A session-keyed rendered listing is frozen even when usage or skill metadata
+    changes; a new session re-ranks descriptions. The listing receives 1% of the
+    internal context window in characters. All names remain visible; full
+    descriptions go first to canonical/pinned owners, newly agent-created skills
+    during their grace period, then usage × recency priority.
 
     Falls back to a full filesystem scan when both layers miss.
 
@@ -1470,6 +1612,8 @@ def build_skills_system_prompt(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        int(context_length or 0),
+        str(session_id or ""),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1640,14 +1784,29 @@ def build_skills_system_prompt(
         cat for cat in skills_by_category
         if cat.split("/", 1)[0] in (compact_categories or frozenset())
     )
+    full_description_names, budget_truncated = _select_full_skill_descriptions(
+        skills_by_category,
+        category_descriptions,
+        demoted,
+        context_length,
+    )
 
-    hidden_note = ""
+    hidden_notes = []
     if demoted:
-        hidden_note = (
-            "\n(Categories marked [names only] are outside the current coding "
-            "context, so their descriptions are omitted — the skills work "
-            "normally and load with skill_view(name) as usual.)"
+        hidden_notes.append(
+            "Categories marked [names only] are outside the current coding context, "
+            "so their descriptions are omitted — the skills work normally and load "
+            "with skill_view(name) as usual."
         )
+    if budget_truncated:
+        hidden_notes.append(
+            "Lower-priority skills may be listed by name only to keep the routing "
+            "index bounded; use skills_list or skill_view(name) for full details."
+        )
+    hidden_note = (
+        "\n(" + " ".join(hidden_notes) + ")"
+        if hidden_notes else ""
+    )
 
     if not skills_by_category:
         result = ""
@@ -1669,7 +1828,7 @@ def build_skills_system_prompt(
                 if name in seen:
                     continue
                 seen.add(name)
-                if desc:
+                if desc and name in full_description_names:
                     index_lines.append(f"    - {name}: {desc}")
                 else:
                     index_lines.append(f"    - {name}")

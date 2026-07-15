@@ -2,8 +2,10 @@
 
 import builtins
 import importlib
+import json
 import logging
 import sys
+from datetime import datetime, timezone
 
 import pytest
 
@@ -311,12 +313,12 @@ class TestParseSkillFile:
         is_compat, frontmatter, desc = _parse_skill_file(skill_file)
         assert desc == ""
 
-    def test_long_description_truncated(self, tmp_path):
+    def test_long_description_capped_at_agent_skills_limit(self, tmp_path):
         skill_file = tmp_path / "SKILL.md"
-        long_desc = "A" * 100
+        long_desc = "A" * 1_500
         skill_file.write_text(f"---\ndescription: {long_desc}\n---\n")
         _, _, desc = _parse_skill_file(skill_file)
-        assert len(desc) <= 60
+        assert len(desc) == 1_024
         assert desc.endswith("...")
 
     def test_nonexistent_file_returns_defaults(self, tmp_path):
@@ -394,9 +396,15 @@ class TestBuildSkillsSystemPrompt:
     def _clear_skills_cache(self):
         """Ensure the in-process skills prompt cache doesn't leak between tests."""
         from agent.prompt_builder import clear_skills_system_prompt_cache
-        clear_skills_system_prompt_cache(clear_snapshot=True)
+        clear_skills_system_prompt_cache(
+            clear_snapshot=True,
+            clear_session_prompts=True,
+        )
         yield
-        clear_skills_system_prompt_cache(clear_snapshot=True)
+        clear_skills_system_prompt_cache(
+            clear_snapshot=True,
+            clear_session_prompts=True,
+        )
 
     def test_empty_when_no_skills_dir(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -414,6 +422,207 @@ class TestBuildSkillsSystemPrompt:
         assert "python-debug" in result
         assert "Debug Python scripts" in result
         assert "available_skills" in result
+
+    def test_preserves_full_spec_compliant_skill_description(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        description = (
+            "Use when creating or editing reusable Evelyn skills, especially when "
+            "routing depends on precise capability keywords and trigger conditions."
+        )
+        skill_dir = tmp_path / "skills" / "authoring" / "writing-skills"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: writing-skills\ndescription: {description}\n---\n"
+        )
+
+        result = build_skills_system_prompt(context_length=272_000)
+
+        assert description in result
+
+    def test_budget_keeps_owners_new_skills_and_frequent_skills(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        descriptions = {
+            "writing-skills": "AUTHORING_OWNER " + "precise trigger guidance " * 3,
+            "new-background-skill": "CREATION_GRACE " + "new reusable workflow " * 3,
+            "frequent-skill": "FREQUENT_WINNER " + "often used operational route " * 3,
+            "unused-skill": "UNUSED_LOSER " + "rarely relevant archive route " * 3,
+        }
+        for name, description in descriptions.items():
+            skill_dir = tmp_path / "skills" / "routing" / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {description}\n---\n"
+            )
+
+        now = datetime.now(timezone.utc).isoformat()
+        usage_path = tmp_path / "skills" / ".usage.json"
+        usage_path.write_text(json.dumps({
+            "new-background-skill": {
+                "created_by": "agent",
+                "created_at": now,
+                "use_count": 0,
+                "last_used_at": None,
+            },
+            "frequent-skill": {
+                "created_by": None,
+                "created_at": now,
+                "use_count": 5,
+                "last_used_at": now,
+            },
+        }))
+
+        result = build_skills_system_prompt(
+            context_length=10_000,
+            session_id="priority-session",
+        )
+
+        assert all(name in result for name in descriptions)
+        assert "AUTHORING_OWNER" in result
+        assert "CREATION_GRACE" in result
+        assert "FREQUENT_WINNER" in result
+        assert "UNUSED_LOSER" not in result
+
+    def test_many_grace_skills_stay_within_listing_budget(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        now = datetime.now(timezone.utc).isoformat()
+        usage = {}
+
+        owner_dir = tmp_path / "skills" / "routing" / "writing-skills"
+        owner_dir.mkdir(parents=True)
+        (owner_dir / "SKILL.md").write_text(
+            "---\nname: writing-skills\ndescription: AUTHORING_OWNER routing contract.\n---\n"
+        )
+        for index in range(20):
+            name = f"new-skill-{index:02d}"
+            description = f"GRACE_DESC_{index:02d} " + "new workflow routing context " * 8
+            skill_dir = tmp_path / "skills" / "routing" / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {description}\n---\n"
+            )
+            usage[name] = {
+                "created_by": "agent",
+                "created_at": now,
+                "use_count": 0,
+                "last_used_at": None,
+            }
+        (tmp_path / "skills" / ".usage.json").write_text(json.dumps(usage))
+
+        result = build_skills_system_prompt(
+            context_length=64_000,
+            session_id="bounded-grace-session",
+        )
+        index_block = result.split("<available_skills>\n", 1)[1].split(
+            "\n</available_skills>", 1
+        )[0]
+
+        assert len(index_block) <= 2_600
+        assert all(f"new-skill-{index:02d}" in index_block for index in range(20))
+        shown_grace_descriptions = index_block.count("GRACE_DESC_")
+        assert 0 < shown_grace_descriptions < 20
+        assert "AUTHORING_OWNER" in index_block
+
+    def test_usage_ranking_refreshes_only_for_a_new_session(
+        self, monkeypatch, tmp_path
+    ):
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        descriptions = {
+            "first-skill": "FIRST_PRIORITY " + "first route guidance " * 4,
+            "second-skill": "SECOND_PRIORITY " + "second route guidance " * 4,
+        }
+        for name, description in descriptions.items():
+            skill_dir = tmp_path / "skills" / "routing" / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {description}\n---\n"
+            )
+
+        now = datetime.now(timezone.utc).isoformat()
+        usage_path = tmp_path / "skills" / ".usage.json"
+        usage_path.write_text(json.dumps({
+            "first-skill": {"use_count": 5, "last_used_at": now},
+            "second-skill": {"use_count": 0, "last_used_at": None},
+        }))
+        first = build_skills_system_prompt(
+            context_length=5_000,
+            session_id="stable-session",
+        )
+        assert "FIRST_PRIORITY" in first
+        assert "SECOND_PRIORITY" not in first
+
+        usage_path.write_text(json.dumps({
+            "first-skill": {"use_count": 0, "last_used_at": None},
+            "second-skill": {"use_count": 8, "last_used_at": now},
+        }))
+        clear_skills_system_prompt_cache()
+
+        same_session = build_skills_system_prompt(
+            context_length=5_000,
+            session_id="stable-session",
+        )
+        next_session = build_skills_system_prompt(
+            context_length=5_000,
+            session_id="next-session",
+        )
+
+        assert same_session == first
+        assert "SECOND_PRIORITY" in next_session
+        assert "FIRST_PRIORITY" not in next_session
+
+    def test_targeted_session_cache_clear_does_not_touch_other_sessions(
+        self, monkeypatch, tmp_path
+    ):
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for name, marker in (
+            ("first-skill", "FIRST_PRIORITY"),
+            ("second-skill", "SECOND_PRIORITY"),
+        ):
+            skill_dir = tmp_path / "skills" / "routing" / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {marker} "
+                + ("routing context " * 8)
+                + "\n---\n"
+            )
+
+        now = datetime.now(timezone.utc).isoformat()
+        usage_path = tmp_path / "skills" / ".usage.json"
+        usage_path.write_text(json.dumps({
+            "first-skill": {"use_count": 9, "last_used_at": now},
+            "second-skill": {"use_count": 0, "last_used_at": None},
+        }))
+        first_a = build_skills_system_prompt(
+            context_length=5_000, session_id="session-a"
+        )
+        first_b = build_skills_system_prompt(
+            context_length=5_000, session_id="session-b"
+        )
+        assert "FIRST_PRIORITY" in first_a
+        assert first_b == first_a
+
+        usage_path.write_text(json.dumps({
+            "first-skill": {"use_count": 0, "last_used_at": None},
+            "second-skill": {"use_count": 9, "last_used_at": now},
+        }))
+        clear_skills_system_prompt_cache(session_id="session-a")
+
+        refreshed_a = build_skills_system_prompt(
+            context_length=5_000, session_id="session-a"
+        )
+        frozen_b = build_skills_system_prompt(
+            context_length=5_000, session_id="session-b"
+        )
+        assert "SECOND_PRIORITY" in refreshed_a
+        assert "FIRST_PRIORITY" not in refreshed_a
+        assert frozen_b == first_b
 
     def test_skill_routing_uses_description_match_not_partial_relevance(
         self, monkeypatch, tmp_path
@@ -1478,9 +1687,15 @@ class TestBuildSkillsSystemPromptConditional:
     @pytest.fixture(autouse=True)
     def _clear_skills_cache(self):
         from agent.prompt_builder import clear_skills_system_prompt_cache
-        clear_skills_system_prompt_cache(clear_snapshot=True)
+        clear_skills_system_prompt_cache(
+            clear_snapshot=True,
+            clear_session_prompts=True,
+        )
         yield
-        clear_skills_system_prompt_cache(clear_snapshot=True)
+        clear_skills_system_prompt_cache(
+            clear_snapshot=True,
+            clear_session_prompts=True,
+        )
 
     def test_fallback_skill_hidden_when_primary_available(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

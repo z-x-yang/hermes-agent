@@ -334,15 +334,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             )
         except Exception:
             _compact_cats = frozenset()
-        skills_prompt = _r.build_skills_system_prompt(
-            available_tools=agent.valid_tool_names,
-            available_toolsets=avail_toolsets,
-            compact_categories=_compact_cats or None,
-        )
-        skills_prompt = _adapt_skills_prompt_for_readonly_aliases(
-            skills_prompt,
-            agent.valid_tool_names,
-        )
+        skills_prompt = getattr(agent, "_session_skills_prompt", None)
+        if skills_prompt is None:
+            skills_prompt = _r.build_skills_system_prompt(
+                available_tools=agent.valid_tool_names,
+                available_toolsets=avail_toolsets,
+                compact_categories=_compact_cats or None,
+                context_length=_ctx_len,
+                session_id=getattr(agent, "session_id", None),
+            )
+            skills_prompt = _adapt_skills_prompt_for_readonly_aliases(
+                skills_prompt,
+                agent.valid_tool_names,
+            )
+            agent._session_skills_prompt = skills_prompt
     else:
         skills_prompt = ""
     if skills_prompt:
