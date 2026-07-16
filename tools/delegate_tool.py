@@ -1578,14 +1578,29 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: profile override > delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
     try:
-        # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
-        # False (``reasoning_effort: false``) to "" and inherit the parent
-        # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        # Keep raw values — ``str(x or "")`` would coerce a YAML boolean False
+        # to "" and inherit instead of disabling thinking for children.
+        agents_cfg = delegation_cfg.get("agents")
+        profile_cfg = (
+            agents_cfg.get(profile.name)
+            if isinstance(agents_cfg, dict)
+            else None
+        )
+        profile_effort = (
+            profile_cfg.get("reasoning_effort")
+            if isinstance(profile_cfg, dict)
+            else None
+        )
+        if profile_effort or profile_effort is False:
+            delegation_effort = profile_effort
+            effort_label = f"delegation.agents.{profile.name}.reasoning_effort"
+        else:
+            delegation_effort = delegation_cfg.get("reasoning_effort")
+            effort_label = "delegation.reasoning_effort"
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -1594,7 +1609,8 @@ def _build_child_agent(
                 child_reasoning = parsed
             else:
                 logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                    "Unknown %s '%s', inheriting parent level",
+                    effort_label,
                     delegation_effort,
                 )
     except Exception as exc:

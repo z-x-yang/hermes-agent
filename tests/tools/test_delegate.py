@@ -2508,6 +2508,35 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config")
     @patch("run_agent.AIAgent")
+    def test_profile_reasoning_effort_overrides_delegation_default(self, MockAgent, mock_cfg):
+        mock_cfg.return_value = {
+            "max_iterations": 50,
+            "reasoning_effort": "high",
+            "agents": {"Plan": {"reasoning_effort": "xhigh"}},
+        }
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "medium"}
+
+        _build_child_agent(
+            task_index=0,
+            description="test",
+            prompt="",
+            toolsets=None,
+            model=None,
+            max_iterations=50,
+            parent_agent=parent,
+            task_count=1,
+            profile=get_subagent_profile("Plan"),
+        )
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(
+            call_kwargs["reasoning_config"],
+            {"enabled": True, "effort": "xhigh"},
+        )
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
     def test_override_reasoning_effort_none_disables(self, MockAgent, mock_cfg):
         """delegation.reasoning_effort: 'none' disables thinking for subagents."""
         mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": "none"}

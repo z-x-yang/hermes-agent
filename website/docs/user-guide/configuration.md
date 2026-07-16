@@ -1906,7 +1906,7 @@ checkpoints:
 
 ## Delegation
 
-Configure provider routing, concurrency, runtime-derived nesting, profile timeouts, and automatic GP retention under `delegation`. Model-facing calls use `description`, `prompt`, optional `subagent_type`, optional `run_in_background`, and optional `review_root` only for a top-level single Reviewer. `review_root` must be an exact absolute local Git worktree root; remote/cluster roots are unsupported. Operator controls below are not exposed to the model.
+Configure provider routing, reasoning effort, concurrency, runtime-derived nesting, profile timeouts, and automatic GP retention under `delegation`. Model-facing calls use `description`, `prompt`, optional `subagent_type`, optional `run_in_background`, and optional `review_root` only for a top-level single Reviewer. `review_root` must be an exact absolute local Git worktree root; remote/cluster roots are unsupported. Operator controls below are not exposed to the model.
 
 ```yaml
 delegation:
@@ -1916,6 +1916,7 @@ delegation:
   # base_url: "http://localhost:1234/v1"
   # api_key: "local-key"
   # api_mode: ""  # chat_completions, codex_responses, anthropic_messages, or auto
+  # reasoning_effort: high  # Omission inherits the parent.
 
   max_global_concurrent_children: 20
   max_concurrent_children: 5
@@ -1936,9 +1937,11 @@ delegation:
       foreground_wait_timeout_seconds: 900
       child_run_timeout_seconds: 1800
     Plan:
+      reasoning_effort: xhigh
       foreground_wait_timeout_seconds: 1800
       child_run_timeout_seconds: 3600
     Reviewer:
+      reasoning_effort: xhigh
       foreground_wait_timeout_seconds: 1800
       child_run_timeout_seconds: 3600
     general-purpose:
@@ -1970,6 +1973,8 @@ delegation:
 ### Provider and model routing
 
 By default, subagents inherit the parent provider/model. Shared `delegation.provider`/`model` overrides that default; `delegation.agents.<type>.provider`/`model` overrides one profile. A configured direct `base_url` takes precedence over `provider`; endpoint-scoped credential rules fail closed rather than forwarding an unrelated provider key. Main and child agents use the same provider-visible estimation, tool-output cleanup, context compression, and provider context-error recovery. There is no child-only raw-byte governance fit gate or governance-triggered provider fallback.
+
+Reasoning uses the same precedence: `delegation.agents.<type>.reasoning_effort` overrides `delegation.reasoning_effort`, which overrides the parent's current reasoning level. Valid values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max` where the selected provider supports them.
 
 Retained records do not store credentials or custom endpoint secrets. Continuation resolves credentials again from current trusted configuration.
 

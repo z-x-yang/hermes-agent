@@ -1618,7 +1618,7 @@ checkpoints:
 
 ## 委托
 
-在 `delegation` 下配置 provider routing、并发、运行时派生 nesting、profile timeout 与 GP 自动保留。模型调用使用 `description`、`prompt`、可选 `subagent_type`、可选 `run_in_background`，以及仅限顶层单个 Reviewer 的可选 `review_root`。`review_root` 必须是本机 absolute Git worktree 精确根目录；不支持 remote/cluster root。下面的 operator controls 不向模型暴露。
+在 `delegation` 下配置 provider routing、reasoning effort、并发、运行时派生 nesting、profile timeout 与 GP 自动保留。模型调用使用 `description`、`prompt`、可选 `subagent_type`、可选 `run_in_background`，以及仅限顶层单个 Reviewer 的可选 `review_root`。`review_root` 必须是本机 absolute Git worktree 精确根目录；不支持 remote/cluster root。下面的 operator controls 不向模型暴露。
 
 ```yaml
 delegation:
@@ -1628,6 +1628,7 @@ delegation:
   # base_url: "http://localhost:1234/v1"
   # api_key: "local-key"
   # api_mode: ""
+  # reasoning_effort: high  # 省略时继承 parent。
 
   max_global_concurrent_children: 20
   max_concurrent_children: 5
@@ -1647,9 +1648,11 @@ delegation:
       foreground_wait_timeout_seconds: 900
       child_run_timeout_seconds: 1800
     Plan:
+      reasoning_effort: xhigh
       foreground_wait_timeout_seconds: 1800
       child_run_timeout_seconds: 3600
     Reviewer:
+      reasoning_effort: xhigh
       foreground_wait_timeout_seconds: 1800
       child_run_timeout_seconds: 3600
     general-purpose:
@@ -1675,6 +1678,8 @@ delegation:
 ### Provider 与 model routing
 
 默认继承 parent provider/model。共享 `delegation.provider`/`model` 可覆盖默认值；`delegation.agents.<type>.provider`/`model` 可覆盖单个 profile。直接 `base_url` 优先于 provider；endpoint credential 不匹配时 fail closed，不会转发无关 provider key。main 与 child 共用同一套 provider-visible estimate、tool-output cleanup、context compression 与 provider context-error recovery；不再有 child-only raw-byte governance fit gate 或 governance-triggered provider fallback。
+
+Reasoning 采用同样的优先级：`delegation.agents.<type>.reasoning_effort` 覆盖 `delegation.reasoning_effort`，后者再覆盖 parent 当前的 reasoning level。Provider 支持时可用值为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh` 和 `max`。
 
 Retained record 不保存 credentials 或自定义 endpoint secret；continuation 从当前 trusted config 重新解析。
 
