@@ -45,7 +45,7 @@ from contextvars import copy_context
 from copy import deepcopy
 from pathlib import Path
 from datetime import datetime
-from typing import Callable, Dict, Optional, Any, List, Union
+from typing import Callable, Dict, Optional, Any, List, Tuple, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -1252,6 +1252,124 @@ def _strip_auto_continue_noise(content: Any) -> Any:
             return ""
         text = text[end + 1 :].lstrip()
     return text
+
+
+def _interruption_reason_phrase(resume_entry: Any) -> str:
+    reason = getattr(resume_entry, "resume_reason", None) or "restart_timeout"
+    if reason == "restart_timeout":
+        return "a gateway restart"
+    if reason == "shutdown_timeout":
+        return "a gateway shutdown"
+    return "a gateway interruption"
+
+
+def _is_startup_auto_resume_event(event: Any) -> bool:
+    """Return whether *event* is the scheduler's trusted resume turn.
+
+    ``MessageEvent.metadata`` is intentionally free-form adapter/plugin data,
+    so the key alone is not an authority signal.  The scheduler also stamps
+    its synthetic event ``internal=True``; require both markers before
+    suppressing normal inbound attribution or forcing recovery guidance.
+    """
+    return bool(
+        getattr(event, "internal", False)
+        and (getattr(event, "metadata", None) or {}).get("startup_auto_resume")
+    )
+
+
+def _apply_interruption_recovery_note(
+    message: str,
+    *,
+    resume_entry: Any,
+    history: List[Dict[str, Any]],
+    agent_history: List[Dict[str, Any]],
+    startup_auto_resume: bool = False,
+    window_secs: Optional[float] = None,
+) -> Tuple[str, bool]:
+    """Prepend the interruption-recovery system note to a user turn.
+
+    Returns ``(message, injected)`` — ``injected`` tells the caller to keep
+    the original text as the transcript row (``persist_user_message``) so
+    API-only guidance never replays as user-authored text.
+
+    ``startup_auto_resume`` marks the synthetic turn dispatched by
+    ``_schedule_resume_pending_sessions``.  It is an explicit event flag,
+    NOT derived from "text is empty": gateway decorators (shared-session
+    sender prefix, Discord trigger-id preamble) made the empty-text
+    contract unreliable in production — the model received a contentless
+    "new message" and replied with "you sent a blank message" noise.  The
+    flag always injects the "session restored" guidance: the scheduler
+    freshness-gated before synthesizing the turn, and the turn's only
+    purpose is recovery, so it must never dispatch as a blank user turn
+    even when the marker went stale or was cleared in between.
+    """
+    window = (
+        float(window_secs)
+        if window_secs is not None
+        else _auto_continue_freshness_window()
+    )
+    _interruption_is_fresh = _is_fresh_gateway_interruption(
+        _last_transcript_timestamp(history),
+        window_secs=window,
+    )
+
+    # resume_pending freshness uses a SECOND signal in addition to the
+    # transcript clock.  The restart watchdog stamps the session with
+    # ``last_resume_marked_at`` at interrupt time — that is the correct
+    # "when were we interrupted" signal.  The transcript clock can be far
+    # older: an active thread you return to may have its last persisted row
+    # hours back, even though the interruption itself just happened.  Treat
+    # the marker as fresh when EITHER signal is fresh.
+    _resume_mark_is_fresh = False
+    if resume_entry is not None and getattr(resume_entry, "resume_pending", False):
+        _resume_mark_is_fresh = _is_fresh_gateway_interruption(
+            getattr(resume_entry, "last_resume_marked_at", None),
+            window_secs=window,
+        )
+    _is_resume_pending = bool(
+        resume_entry is not None
+        and getattr(resume_entry, "resume_pending", False)
+        and (_interruption_is_fresh or _resume_mark_is_fresh)
+    )
+
+    if _is_resume_pending or startup_auto_resume:
+        _reason_phrase = _interruption_reason_phrase(resume_entry)
+        # Only a REAL user message gets the "address the new message"
+        # guidance.  The synthetic startup turn has no new message to
+        # address — whatever text it carries is decorator/system residue —
+        # so the model is told to report recovery instead.
+        if message and not startup_auto_resume:
+            _resume_guidance = (
+                "Address the user's NEW message below FIRST and focus "
+                "on what the user is asking now."
+            )
+        else:
+            _resume_guidance = (
+                "Report to the user that the session was restored "
+                "successfully and ask what they would like to do next."
+            )
+        message = (
+            f"[System note: The previous turn was interrupted by "
+            f"{_reason_phrase}; the gateway is now back online. "
+            f"Any restart/shutdown command in the history has already "
+            f"run — do NOT re-execute or verify it. {_resume_guidance} "
+            f"Do NOT re-execute old tool calls — skip any unfinished "
+            f"work from the conversation history.]"
+            + (f"\n\n{message}" if message else "")
+        )
+        return message, True
+
+    if agent_history and agent_history[-1].get("role") == "tool" and _interruption_is_fresh:
+        message = (
+            "[System note: A new message has arrived. The conversation "
+            "history contains pending tool outputs from an interrupted turn. "
+            "IGNORE those pending results. Address the user's NEW message "
+            "below FIRST. Do NOT re-execute old tool calls from the history.]\n\n"
+            + message
+        )
+        return message, True
+
+    return message, False
 
 # Tools in this set return their deliverable artifact as a JSON payload with a
 # local-file path field rather than a literal ``MEDIA:`` tag (e.g. image_generate
@@ -6817,12 +6935,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
-        ``resume_pending`` already preserves the transcript AND the existing
-        ``_is_resume_pending`` branch in ``_handle_message_with_agent``
-        injects a reason-aware recovery system note on the next turn.  This
-        method closes the UX gap by synthesizing that next turn once
-        adapters are back online — the event text is empty so the existing
-        injection path owns the wording and we never double up.
+        ``resume_pending`` already preserves the transcript AND
+        ``_apply_interruption_recovery_note`` injects a reason-aware recovery
+        system note on the next turn.  This method closes the UX gap by
+        synthesizing that next turn once adapters are back online.  The event
+        carries empty text plus an explicit ``startup_auto_resume`` metadata
+        flag — the flag (not the empty text) is what selects the "session
+        restored" wording downstream and keeps the inbound decorators off
+        this turn, so we never double up or leak a blank user message.
 
         Adapters that are not yet ready (adapter missing from
         ``self.adapters``) are skipped silently; their sessions stay
@@ -6953,9 +7073,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agents_ts[entry.session_key] = time.time()
             self._persist_active_agents()
 
-            # Empty-text internal event — the _is_resume_pending branch in
-            # _handle_message_with_agent prepends the proper reason-aware
-            # system note before the turn runs.
+            # Empty-text internal event.  The ``startup_auto_resume`` metadata
+            # flag — not the empty text — is what routes this turn into the
+            # reason-aware recovery note in _run_agent_inner and makes the
+            # inbound decorators (sender prefix, Discord trigger-id preamble)
+            # leave it untouched.
             event = MessageEvent(
                 text="",
                 message_type=MessageType.TEXT,
@@ -6967,6 +7089,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # an unanchored plain send.
                 message_id=getattr(source, "message_id", None),
                 internal=True,
+                metadata={"startup_auto_resume": True},
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
@@ -10599,12 +10722,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # concurrently preparing multimodal turns on the same runner.
         self._consume_pending_native_image_paths(session_key)
 
+        # The synthetic startup auto-resume turn carries no user-authored
+        # text.  Decorating it (sender prefix, trigger-id preamble) would
+        # persist a fabricated user message and present the model with a
+        # contentless "new message", so all inbound decoration is skipped.
+        _startup_auto_resume = _is_startup_auto_resume_event(event)
+
         _is_shared_multi_user = is_shared_multi_user_session(
             source,
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
-        if _is_shared_multi_user and source.user_name:
+        if _is_shared_multi_user and source.user_name and not _startup_auto_resume:
             message_text = f"[{source.user_name}] {message_text}"
 
         # Prepend channel context from history backfill (if any).  This
@@ -10798,6 +10927,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source is not None
             and getattr(source, "platform", None) == Platform.DISCORD
             and getattr(event, "message_id", None)
+            and not _startup_auto_resume
         ):
             from gateway.session import _discord_tools_loaded as _disc_tools_loaded
             if _disc_tools_loaded():
@@ -11815,6 +11945,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                startup_auto_resume=_is_startup_auto_resume_event(event),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -16859,6 +16990,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        persist_user_message: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -17142,7 +17274,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return {
             "final_response": full_response or "(No response from remote agent)",
             "messages": [
-                {"role": "user", "content": message},
+                {
+                    "role": "user",
+                    "content": (
+                        persist_user_message
+                        if persist_user_message is not None
+                        else message
+                    ),
+                },
                 {"role": "assistant", "content": full_response},
             ],
             "api_calls": 1,
@@ -17169,6 +17308,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        startup_auto_resume: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -17187,6 +17327,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                startup_auto_resume=startup_auto_resume,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -17198,6 +17339,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                startup_auto_resume=startup_auto_resume,
             )
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
@@ -17230,6 +17372,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        startup_auto_resume: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -17245,6 +17388,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            _proxy_persist_user_message = persist_user_message
+            if startup_auto_resume:
+                _pre_note_message = message
+                _resume_entry = None
+                if session_key:
+                    try:
+                        _resume_entry = self.session_store._entries.get(session_key)
+                    except Exception:
+                        _resume_entry = None
+                message, _recovery_note_injected = _apply_interruption_recovery_note(
+                    message,
+                    resume_entry=_resume_entry,
+                    history=history,
+                    # Only the explicit startup path reaches this early proxy
+                    # branch; generic interrupted-tool fallback remains local
+                    # agent behavior and does not participate here.
+                    agent_history=[],
+                    startup_auto_resume=True,
+                )
+                if _recovery_note_injected and _proxy_persist_user_message is None:
+                    _proxy_persist_user_message = _pre_note_message
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -17254,6 +17418,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                persist_user_message=_proxy_persist_user_message,
             )
 
         from run_agent import AIAgent
@@ -18950,34 +19115,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _msn:
                 message = _msn + "\n\n" + message
 
-            # Auto-continue: if the loaded history ends with a tool result,
-            # the previous agent turn was interrupted mid-work (gateway
-            # restart, crash, SIGTERM).  Prepend a system note so the model
-            # finishes processing the pending tool results before addressing
-            # the user's new message.  (#4493)
-            #
-            # Session-level resume_pending (set on drain-timeout shutdown)
-            # escalates the wording — the transcript's last role may be
-            # anything (tool, assistant with unfinished work, etc.), so we
-            # give a stronger, reason-aware instruction that subsumes the
-            # tool-tail case.
-            #
-            # Freshness gate (#16802): both branches are gated on the age
-            # of the last persisted transcript row.  That is the correct
-            # "when did we last do anything here" signal for both the
-            # resume_pending path (restart watchdog) and the tool-tail
-            # path (in-flight tool loop killed).  We read ``history[-1]``
-            # here because ``agent_history`` has already stripped the
-            # ``timestamp`` field off tool/tool_call rows for API purity
-            # (see the `k != "timestamp"` filter above).  Rows without a
-            # timestamp (legacy transcripts) are treated as fresh so the
-            # historical auto-continue behaviour is preserved.
-            _freshness_window = _auto_continue_freshness_window()
-            _interruption_is_fresh = _is_fresh_gateway_interruption(
-                _last_transcript_timestamp(history),
-                window_secs=_freshness_window,
-            )
-
+            # Auto-continue: if the previous agent turn was interrupted
+            # mid-work (gateway restart, crash, SIGTERM), prepend the
+            # reason-aware recovery note.  The synthetic startup resume turn
+            # is identified by its explicit ``startup_auto_resume`` flag —
+            # never by "text is empty"; see _apply_interruption_recovery_note
+            # for the full contract and freshness semantics.  (#4493, #16802)
             _resume_entry = None
             if session_key:
                 try:
@@ -18985,78 +19128,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     _resume_entry = None
 
-            # resume_pending freshness uses a SECOND signal in addition to the
-            # transcript clock above.  The restart watchdog stamps the session
-            # with ``last_resume_marked_at`` at interrupt time — that is the
-            # correct "when were we interrupted" signal.  The transcript clock
-            # (_interruption_is_fresh) can be far older: an active thread you
-            # return to may have its last persisted row hours back, even though
-            # the interruption itself just happened.  Gating resume_pending on
-            # the transcript clock alone makes the recovery note silently drop,
-            # and because the startup auto-resume turn carries empty text
-            # (_schedule_resume_pending_sessions), the model then receives a
-            # blank user message and replies with confused "the message came
-            # through blank" noise.  Treat the marker as fresh when
-            # EITHER signal is fresh so the two freshness checks agree.
-            _resume_mark_is_fresh = False
-            if _resume_entry is not None and getattr(_resume_entry, "resume_pending", False):
-                _resume_mark_is_fresh = _is_fresh_gateway_interruption(
-                    getattr(_resume_entry, "last_resume_marked_at", None),
-                    window_secs=_freshness_window,
-                )
-            _is_resume_pending = bool(
-                _resume_entry is not None
-                and getattr(_resume_entry, "resume_pending", False)
-                and (_interruption_is_fresh or _resume_mark_is_fresh)
+            _pre_note_message = message
+            message, _recovery_note_injected = _apply_interruption_recovery_note(
+                message,
+                resume_entry=_resume_entry,
+                history=history,
+                agent_history=agent_history,
+                startup_auto_resume=startup_auto_resume,
             )
-            _has_fresh_tool_tail = bool(
-                agent_history
-                and agent_history[-1].get("role") == "tool"
-                and _interruption_is_fresh
-            )
-
-            if _is_resume_pending:
-                _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
-                _reason_phrase = (
-                    "a gateway restart"
-                    if _reason == "restart_timeout"
-                    else "a gateway shutdown"
-                    if _reason == "shutdown_timeout"
-                    else "a gateway interruption"
-                )
-                _persist_user_message_override = message
-                # The empty-message case is the auto-resume startup turn
-                # synthesized by _schedule_resume_pending_sessions — there is
-                # no NEW user message to address, so tell the model to report
-                # recovery instead of the (nonexistent) "new message".
-                if message:
-                    _resume_guidance = (
-                        "Address the user's NEW message below FIRST and focus "
-                        "on what the user is asking now."
-                    )
-                else:
-                    _resume_guidance = (
-                        "Report to the user that the session was restored "
-                        "successfully and ask what they would like to do next."
-                    )
-                message = (
-                    f"[System note: The previous turn was interrupted by "
-                    f"{_reason_phrase}; the gateway is now back online. "
-                    f"Any restart/shutdown command in the history has already "
-                    f"run — do NOT re-execute or verify it. {_resume_guidance} "
-                    f"Do NOT re-execute old tool calls — skip any unfinished "
-                    f"work from the conversation history.]"
-                    + (f"\n\n{message}" if message else "")
-                )
-            elif _has_fresh_tool_tail:
-                _persist_user_message_override = message
-                message = (
-                    "[System note: A new message has arrived. The conversation "
-                    "history contains pending tool outputs from an interrupted turn. "
-                    "IGNORE those pending results. Address the user's NEW message "
-                    "below FIRST. Do NOT re-execute old tool calls from the history.]\n\n"
-                    + message
-                )
+            if _recovery_note_injected:
+                # Keep the original (pre-note) text as the transcript row so
+                # API-only guidance never replays as user-authored text.
+                _persist_user_message_override = _pre_note_message
 
             # Consume one-shot /reload-skills note (if the user ran
             # /reload-skills since their last turn in this session). Same
@@ -19068,42 +19151,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _srn = _pending_notes.pop(session_key, None)
                 if _srn:
                     message = _srn + "\n\n" + message
-
-            # Safety net: a startup auto-resume event carries empty
-            # text and relies on the resume_pending branch above to supply the
-            # recovery note.  If that branch did not fire for any reason (e.g.
-            # both freshness signals disagreed, or the marker was cleared
-            # between scheduling and dispatch) we must NOT hand the model a
-            # blank user turn — it responds with confused "the message came
-            # through blank" noise.  Restricted to resume_pending sessions so
-            # legitimately empty user turns (e.g. an image with no caption,
-            # wrapped as native content below) are untouched.
-            if (
-                isinstance(message, str)
-                and not message.strip()
-                and _resume_entry is not None
-                and getattr(_resume_entry, "resume_pending", False)
-            ):
-                _sn_reason = (
-                    getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
-                )
-                _sn_reason_phrase = (
-                    "a gateway restart"
-                    if _sn_reason == "restart_timeout"
-                    else "a gateway shutdown"
-                    if _sn_reason == "shutdown_timeout"
-                    else "a gateway interruption"
-                )
-                message = (
-                    f"[System note: The previous turn was interrupted by "
-                    f"{_sn_reason_phrase}; the gateway is now back online. "
-                    f"Any restart/shutdown command in the history has already "
-                    f"run — do NOT re-execute or verify it. Report to the user "
-                    f"that the session was restored successfully and ask what "
-                    f"they would like to do next. Do NOT re-execute old tool "
-                    f"calls — skip any unfinished work from the conversation "
-                    f"history.]"
-                )
 
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)

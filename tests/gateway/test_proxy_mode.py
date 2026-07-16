@@ -1,5 +1,6 @@
 """Tests for gateway proxy mode — forwarding messages to a remote API server."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -203,6 +204,45 @@ class TestRunAgentProxyDispatch:
         assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
 
     @pytest.mark.asyncio
+    async def test_startup_auto_resume_injects_recovery_note_before_proxy(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        source = _make_source()
+        runner.session_store = MagicMock()
+        runner.session_store._entries = {
+            "test-key": SimpleNamespace(
+                resume_reason="restart_timeout",
+                resume_pending=False,
+            )
+        }
+        runner._run_agent_via_proxy = AsyncMock(
+            return_value={
+                "final_response": "Session restored.",
+                "messages": [],
+                "api_calls": 1,
+                "tools": [],
+            }
+        )
+
+        await runner._run_agent(
+            message="",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="test-session-123",
+            session_key="test-key",
+            startup_auto_resume=True,
+        )
+
+        kwargs = runner._run_agent_via_proxy.call_args.kwargs
+        assert "[System note:" in kwargs["message"]
+        assert "restored successfully" in kwargs["message"]
+        assert "NEW message" not in kwargs["message"]
+        assert kwargs["persist_user_message"] == ""
+
+    @pytest.mark.asyncio
     async def test_run_agent_skips_proxy_when_not_configured(self, monkeypatch):
         monkeypatch.delenv("GATEWAY_PROXY_URL", raising=False)
         runner = _make_runner()
@@ -279,6 +319,43 @@ class TestRunAgentViaProxy:
 
         # Verify response was assembled
         assert result["final_response"] == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_api_only_recovery_note_is_not_returned_for_persistence(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        source = _make_source()
+        recovery_note = (
+            "[System note: the gateway is back online. Report that the "
+            "session was restored successfully.]"
+        )
+        resp = _FakeSSEResponse(
+            status=200,
+            sse_chunks=[
+                'data: {"choices":[{"delta":{"content":"Restored"}}]}\n\n'
+                "data: [DONE]\n\n"
+            ],
+        )
+        session = _FakeSession(resp)
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent_via_proxy(
+                        message=recovery_note,
+                        persist_user_message="",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="session-abc",
+                    )
+
+        assert session.captured_json is not None
+        assert session.captured_json["messages"][-1]["content"] == recovery_note
+        assert result["messages"][0] == {"role": "user", "content": ""}
+        assert recovery_note not in str(result["messages"])
 
     @pytest.mark.asyncio
     async def test_handles_http_error(self, monkeypatch):

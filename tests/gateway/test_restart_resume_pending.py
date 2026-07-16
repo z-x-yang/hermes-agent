@@ -116,108 +116,32 @@ def _simulate_note_injection(
     *,
     agent_history: list | None = None,
     window_secs: float | None = None,
+    startup_auto_resume: bool = False,
 ) -> str:
-    """Mirror the note-injection logic in gateway/run.py _run_agent().
+    """Thin wrapper over the REAL production note-injection helper.
+
+    Earlier versions of this file hand-mirrored the logic from
+    gateway/run.py, which let production and tests drift apart — exactly
+    how the decorated-blank-turn bug shipped.  Tests now exercise
+    ``_apply_interruption_recovery_note`` itself.
 
     The freshness signal reads ``history[-1].timestamp`` (the raw transcript
     row), NOT ``agent_history[-1].timestamp`` (which has been stripped).
     Tests pass the raw ``history`` — ``agent_history`` is derived from it
     via the real conversion if not supplied explicitly.
     """
+    from gateway.run import _apply_interruption_recovery_note
+
     if agent_history is None:
         agent_history = _build_agent_history(history)
-
-    window = (
-        float(window_secs)
-        if window_secs is not None
-        else _auto_continue_freshness_window()
+    message, _injected = _apply_interruption_recovery_note(
+        user_message,
+        resume_entry=resume_entry,
+        history=history,
+        agent_history=agent_history,
+        startup_auto_resume=startup_auto_resume,
+        window_secs=window_secs,
     )
-    interruption_is_fresh = _is_fresh_gateway_interruption(
-        _last_transcript_timestamp(history),
-        window_secs=window,
-    )
-
-    message = user_message
-    resume_mark_is_fresh = False
-    if resume_entry is not None and getattr(resume_entry, "resume_pending", False):
-        resume_mark_is_fresh = _is_fresh_gateway_interruption(
-            getattr(resume_entry, "last_resume_marked_at", None),
-            window_secs=window,
-        )
-    is_resume_pending = bool(
-        resume_entry is not None
-        and getattr(resume_entry, "resume_pending", False)
-        and (interruption_is_fresh or resume_mark_is_fresh)
-    )
-    has_fresh_tool_tail = bool(
-        agent_history
-        and agent_history[-1].get("role") == "tool"
-        and interruption_is_fresh
-    )
-
-    if is_resume_pending:
-        reason = getattr(resume_entry, "resume_reason", None) or "restart_timeout"
-        reason_phrase = (
-            "a gateway restart"
-            if reason == "restart_timeout"
-            else "a gateway shutdown"
-            if reason == "shutdown_timeout"
-            else "a gateway interruption"
-        )
-        if message:
-            resume_guidance = (
-                "Address the user's NEW message below FIRST and focus "
-                "on what the user is asking now."
-            )
-        else:
-            resume_guidance = (
-                "Report to the user that the session was restored "
-                "successfully and ask what they would like to do next."
-            )
-        message = (
-            f"[System note: The previous turn was interrupted by "
-            f"{reason_phrase}; the gateway is now back online. "
-            f"Any restart/shutdown command in the history has already "
-            f"run — do NOT re-execute or verify it. {resume_guidance} "
-            f"Do NOT re-execute old tool calls — skip any unfinished "
-            f"work from the conversation history.]"
-            + (f"\n\n{message}" if message else "")
-        )
-    elif has_fresh_tool_tail:
-        message = (
-            "[System note: A new message has arrived. The conversation "
-            "history contains pending tool outputs from an interrupted turn. "
-            "IGNORE those pending results. Address the user's NEW message "
-            "below FIRST. Do NOT re-execute old tool calls from the history.]\n\n"
-            + message
-        )
-
-    # Empty-turn safety net: mirrors gateway/run.py — a blank
-    # auto-resume turn on a resume_pending session must never reach the model.
-    if (
-        isinstance(message, str)
-        and not message.strip()
-        and resume_entry is not None
-        and getattr(resume_entry, "resume_pending", False)
-    ):
-        sn_reason = getattr(resume_entry, "resume_reason", None) or "restart_timeout"
-        sn_reason_phrase = (
-            "a gateway restart"
-            if sn_reason == "restart_timeout"
-            else "a gateway shutdown"
-            if sn_reason == "shutdown_timeout"
-            else "a gateway interruption"
-        )
-        message = (
-            f"[System note: The previous turn was interrupted by "
-            f"{sn_reason_phrase}; the gateway is now back online. "
-            f"Any restart/shutdown command in the history has already "
-            f"run — do NOT re-execute or verify it. Report to the user "
-            f"that the session was restored successfully and ask what "
-            f"they would like to do next. Do NOT re-execute old tool "
-            f"calls — skip any unfinished work from the conversation "
-            f"history.]"
-        )
     return message
 
 
@@ -656,30 +580,25 @@ class TestResumePendingSystemNote:
         assert "[System note:" in result
         assert "gateway restart" in result
 
-    def test_empty_resume_turn_never_reaches_model_blank(self):
-        """Regression: a blank auto-resume turn on a resume_pending
-        session must be backfilled with a recovery note, never sent empty.
-
-        _schedule_resume_pending_sessions dispatches an empty-text internal
-        event. If the resume_pending branch did not fire, the safety net
-        must still produce non-blank text so the model does not reply with
-        confused 'the message came through blank' noise.
+    def test_unflagged_empty_turn_on_stale_marker_is_untouched(self):
+        """"Text is empty" is no longer a recovery signal.  A legitimately
+        empty user turn (e.g. an uncaptioned image) on a session whose
+        resume marker went stale must pass through unchanged — the synthetic
+        startup resume turn carries the explicit ``startup_auto_resume``
+        flag instead (see TestStartupAutoResumeFlag).
         """
         entry = self._pending_entry()
-        # Force the resume_pending branch to miss by making BOTH signals stale,
-        # so only the empty-turn safety net can save us.
         entry.last_resume_marked_at = datetime.now() - timedelta(hours=2)
         history = [
             {"role": "assistant", "content": "old", "timestamp": time.time() - 7200},
         ]
         result = _simulate_note_injection(
             history=history,
-            user_message="",  # the empty auto-resume event text
+            user_message="",
             resume_entry=entry,
             window_secs=1800,
         )
-        assert result.strip(), "blank turn must never reach the model"
-        assert "[System note:" in result
+        assert result == ""
 
     def test_empty_turn_guard_only_applies_to_resume_pending(self):
         """The empty-turn backfill must NOT fire for ordinary sessions —
@@ -866,6 +785,205 @@ class TestResumePendingSystemNote:
         assert "NEW message" not in result
         # Nothing appended after the closing bracket (no empty user text).
         assert result.rstrip().endswith("]")
+
+
+# ---------------------------------------------------------------------------
+# Startup auto-resume: explicit event flag (not the empty-text contract)
+# ---------------------------------------------------------------------------
+
+
+class TestStartupAutoResumeFlag:
+    """The synthetic startup resume turn is identified by an explicit
+    ``metadata["startup_auto_resume"]`` flag, never by "text is empty".
+
+    The empty-text contract broke in production: gateway-level decorators
+    (shared-session sender prefix ``[Name] ``, Discord ``[Triggering message
+    id: ...]`` preamble) made the synthetic turn non-empty before the
+    emptiness checks ran, so the model received a contentless "new message"
+    and replied with "you sent a blank message" noise.
+    """
+
+    def _pending_entry(self, reason="restart_timeout") -> SessionEntry:
+        now = datetime.now()
+        return SessionEntry(
+            session_key="agent:main:discord:group:chan:u1",
+            session_id="sid",
+            created_at=now,
+            updated_at=now,
+            resume_pending=True,
+            resume_reason=reason,
+            last_resume_marked_at=now,
+        )
+
+    def _apply(self, message, entry, *, history=None, flag=True, window_secs=None):
+        from gateway.run import _apply_interruption_recovery_note
+
+        history = history if history is not None else [
+            {"role": "assistant", "content": "in progress", "timestamp": time.time()},
+        ]
+        agent_history = _build_agent_history(history)
+        return _apply_interruption_recovery_note(
+            message,
+            resume_entry=entry,
+            history=history,
+            agent_history=agent_history,
+            startup_auto_resume=flag,
+            window_secs=window_secs,
+        )
+
+    def test_flag_forces_restored_guidance_despite_decorated_text(self):
+        """Even if a decorator made the synthetic turn non-empty, the flag
+        must select the "session restored" guidance — never "address the
+        user's NEW message" (there is no new message)."""
+        decorated = (
+            "[Triggering message id: `123` — use as `message_id` for "
+            "reply/react/pin via the discord tools.]\n\n[Need222Say] "
+        )
+        result, injected = self._apply(decorated, self._pending_entry())
+        assert injected is True
+        assert "restored successfully" in result
+        assert "ask what they would like to do next" in result
+        assert "NEW message" not in result
+
+    def test_flag_injects_even_when_freshness_signals_stale(self):
+        """The scheduler already freshness-gated before synthesizing the
+        turn; the note must not silently drop at dispatch time."""
+        entry = self._pending_entry()
+        entry.last_resume_marked_at = datetime.now() - timedelta(hours=2)
+        history = [
+            {"role": "assistant", "content": "old", "timestamp": time.time() - 7200},
+        ]
+        result, injected = self._apply(
+            "", entry, history=history, window_secs=1800
+        )
+        assert injected is True
+        assert "[System note:" in result
+        assert "restored successfully" in result
+
+    def test_flag_injects_without_resume_entry(self):
+        """Race guard: resume_pending cleared between scheduling and
+        dispatch must still produce a recovery note, not a blank turn."""
+        result, injected = self._apply("", None)
+        assert injected is True
+        assert "[System note:" in result
+        assert "restored successfully" in result
+
+    def test_flag_uses_reason_phrase_from_entry(self):
+        result, _ = self._apply("", self._pending_entry(reason="shutdown_timeout"))
+        assert "gateway shutdown" in result
+
+    def test_real_message_without_flag_keeps_new_message_guidance(self):
+        """A real user message resuming a pending session is unchanged:
+        the model is told to address the NEW message first."""
+        result, injected = self._apply("continue", self._pending_entry(), flag=False)
+        assert injected is True
+        assert "NEW message" in result
+        assert "continue" in result
+
+    def test_no_flag_no_resume_no_tool_tail_is_untouched(self):
+        result, injected = self._apply("hello", None, flag=False)
+        assert injected is False
+        assert result == "hello"
+
+
+class TestStartupAutoResumeSkipsDecorators:
+    """_prepare_inbound_message_text must not decorate the synthetic
+    startup resume turn — the transcript would record a fabricated user
+    message and the emptiness-independent guidance would still trail a
+    contentless "new message"."""
+
+    def _make_runner(self):
+        from gateway.config import GatewayConfig, PlatformConfig
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(enabled=True, token="fake"),
+            },
+            group_sessions_per_user=False,
+        )
+        runner.adapters = {}
+        runner._model = "openai/gpt-4.1-mini"
+        runner._base_url = None
+        return runner
+
+    def _discord_source(self):
+        return SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chan-1",
+            chat_name="Server",
+            chat_type="group",
+            user_id="u1",
+            user_name="Need222Say",
+            message_id="1526459403014897734",
+        )
+
+    @pytest.mark.asyncio
+    async def test_decorators_apply_to_real_messages(self):
+        """Control: a real inbound message on the same source IS decorated
+        (sender prefix + Discord trigger-id preamble)."""
+        import gateway.session as _gs
+
+        runner = self._make_runner()
+        source = self._discord_source()
+        event = MessageEvent(
+            text="hello",
+            source=source,
+            message_id="1526459403014897734",
+        )
+        with patch.object(_gs, "_discord_tools_loaded", return_value=True):
+            result = await runner._prepare_inbound_message_text(
+                event=event, source=source, history=[]
+            )
+        assert "[Need222Say]" in result
+        assert "Triggering message id" in result
+
+    @pytest.mark.asyncio
+    async def test_flagged_synthetic_turn_stays_empty(self):
+        import gateway.session as _gs
+
+        runner = self._make_runner()
+        source = self._discord_source()
+        event = MessageEvent(
+            text="",
+            source=source,
+            message_id="1526459403014897734",
+            internal=True,
+            metadata={"startup_auto_resume": True},
+        )
+        with patch.object(_gs, "_discord_tools_loaded", return_value=True):
+            result = await runner._prepare_inbound_message_text(
+                event=event, source=source, history=[]
+            )
+        assert result == ""
+
+    @pytest.mark.asyncio
+    async def test_metadata_flag_does_not_trust_non_internal_event(self):
+        """Adapter/plugin metadata is free-form and is not itself a trust signal.
+
+        Only the scheduler's synthetic internal event may bypass sender and
+        trigger-id decoration.  A real inbound event carrying the same metadata
+        key must retain normal attribution and reply anchoring.
+        """
+        import gateway.session as _gs
+
+        runner = self._make_runner()
+        source = self._discord_source()
+        event = MessageEvent(
+            text="hello",
+            source=source,
+            message_id="1526459403014897734",
+            internal=False,
+            metadata={"startup_auto_resume": True},
+        )
+        with patch.object(_gs, "_discord_tools_loaded", return_value=True):
+            result = await runner._prepare_inbound_message_text(
+                event=event, source=source, history=[]
+            )
+        assert result is not None
+        assert "[Need222Say]" in result
+        assert "Triggering message id" in result
 
 
 # ---------------------------------------------------------------------------
@@ -1114,10 +1232,11 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     assert event.internal is True
     assert event.message_type == MessageType.TEXT
     assert event.source == source
-    # Text is empty — the existing _is_resume_pending branch in
-    # _handle_message_with_agent owns the system-note injection so we don't
-    # double it up.
+    # Text is empty — the recovery note is injected downstream, keyed on the
+    # explicit metadata flag (the empty-text contract proved unreliable once
+    # decorators like the sender prefix ran before the emptiness checks).
     assert event.text == ""
+    assert event.metadata.get("startup_auto_resume") is True
     assert (
         runner.session_store._entries[pending_entry.session_key]
         .last_startup_auto_resume_at
