@@ -52,3 +52,13 @@ def test_memory_schema_is_well_formed():
 
 def test_memory_schema_is_json_serializable():
     json.dumps(MEMORY_SCHEMA)
+
+
+def test_memory_description_routes_skill_bound_and_project_truth_elsewhere():
+    text = MEMORY_SCHEMA["description"].lower()
+    assert "even when no particular skill is loaded" in text
+    assert "only matters when a named skill applies" in text
+    assert "patch that skill instead of memory" in text
+    assert "project-specific changing truth" in text
+    assert "canonical project source" in text
+    assert "do not duplicate the same lesson" in text

@@ -141,6 +141,14 @@ class TestDelegateRequirements(unittest.TestCase):
             description,
         )
 
+    def test_description_uses_delegation_as_bounded_context_firewall(self):
+        description = DELEGATE_TASK_SCHEMA["description"].lower()
+        self.assertIn("context firewall", description)
+        self.assertIn("high-noise exploration", description)
+        self.assertIn("logs or repository sweeps", description)
+        self.assertIn("conclusions, evidence handles, uncertainty", description)
+        self.assertIn("not raw dumps", description)
+
     def test_reviewer_uses_profile_description_and_ordinary_prompt_schema(self):
         profile = get_subagent_profile("Reviewer")
         properties = DELEGATE_TASK_SCHEMA["parameters"]["properties"]

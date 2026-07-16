@@ -4157,9 +4157,11 @@ DELEGATE_TASK_SCHEMA = {
         "completion. Children have fresh context, so prompts must include all required "
         "paths, constraints, and exact return requirements. Brief a lookup with the exact "
         "locator or command. Brief an investigation with the question, known facts, evidence "
-        "boundary, and stop condition—not prescribed steps. The parent owns synthesis, "
-        "decisions, and any follow-on authorization. Work runs in the background by default; "
-        "set run_in_background=false only when the result is needed before continuing."
+        "boundary, and stop condition—not prescribed steps. Use delegation as a context firewall "
+        "for high-noise exploration, logs or repository sweeps, and multi-source synthesis; ask "
+        "for conclusions, evidence handles, uncertainty, and next steps, not raw dumps. The parent "
+        "owns synthesis, decisions, and any follow-on authorization. Work runs in the background "
+        "by default; set run_in_background=false only when the result is needed before continuing."
     ),
     "parameters": {
         "type": "object",

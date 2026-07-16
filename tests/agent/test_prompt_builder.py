@@ -59,6 +59,17 @@ class TestGuidanceConstants:
         assert "like a diary" not in MEMORY_GUIDANCE
         assert ">80%" not in MEMORY_GUIDANCE
 
+    def test_memory_guidance_routes_scenario_specific_lessons_to_skills(self):
+        text = MEMORY_GUIDANCE.lower()
+        assert "even when no particular skill is loaded" in text
+        assert "only matters when a specific skill's trigger matches" in text
+        assert "patch that skill instead of memory" in text
+        assert "project-specific changing truth" in text
+        assert "canonical project source" in text
+        assert "do not duplicate the same lesson" in text
+        assert "write the canonical destination" in text
+        assert "read it back" in text
+
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
@@ -491,6 +502,24 @@ class TestBuildSkillsSystemPrompt:
         assert "python-debug" in result
         assert "Debug Python scripts" in result
         assert "available_skills" in result
+
+    def test_skill_control_plane_owns_progressive_disclosure(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "routing" / "domain-owner"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: domain-owner\ndescription: Own this domain\n---\n"
+        )
+
+        text = build_skills_system_prompt().lower()
+
+        assert "narrowest canonical owner" in text
+        assert "generic process skills are satellites" in text
+        assert "their own observable trigger" in text
+        assert "main `skill.md` is the ordinary path" in text
+        assert "references only when" in text
+        assert "no matching skill is not a blocker" in text
+        assert "do not stack skills merely because" in text
 
     def test_preserves_full_spec_compliant_skill_description(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

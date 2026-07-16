@@ -19,6 +19,7 @@ from tools.skill_manager_tool import (
     _write_file,
     _remove_file,
     skill_manage,
+    SKILL_MANAGE_SCHEMA,
     MAX_NAME_LENGTH,
 )
 
@@ -53,6 +54,14 @@ description: Updated description.
 
 Step 1: Do the new thing.
 """
+
+
+def test_skill_manage_description_prefers_skill_for_trigger_bound_lessons():
+    text = SKILL_MANAGE_SCHEMA["description"].lower()
+    assert "only relevant when an existing skill's trigger matches" in text
+    assert "patch that skill instead of memory" in text
+    assert "cross-domain facts" in text
+    assert "unrelated turns" in text
 
 
 # ---------------------------------------------------------------------------

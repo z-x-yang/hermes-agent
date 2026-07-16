@@ -21,16 +21,14 @@ from run_agent import AIAgent
 # _SKILL_REVIEW_PROMPT
 # ---------------------------------------------------------------------------
 
-def test_skill_review_prompt_biases_toward_active_updates():
-    """Prompt must frame updating as the default stance, not something rare."""
+def test_skill_review_prompt_updates_only_on_durable_reusable_signal():
+    """No-update is normal; the prompt must not manufacture skill work."""
     prompt = AIAgent._SKILL_REVIEW_PROMPT
-    assert "ACTIVE" in prompt or "active" in prompt.lower(), (
-        "must tell the reviewer to be active"
-    )
-    # "missed learning opportunity" or equivalent framing for not acting
-    assert "missed" in prompt.lower() or "opportunity" in prompt.lower(), (
-        "must frame inaction as a miss, not a neutral outcome"
-    )
+    lower = prompt.lower()
+    assert "durable" in lower and "reusable" in lower
+    assert "nothing to save" in lower
+    assert "most sessions produce" not in lower
+    assert "missed learning opportunity" not in lower
 
 
 def test_skill_review_prompt_treats_user_corrections_as_skill_signal():
@@ -127,18 +125,25 @@ def test_skill_review_prompt_still_has_opt_out_clause():
 # ---------------------------------------------------------------------------
 
 def test_combined_review_prompt_has_memory_section():
-    """Memory half must still cover user facts and preferences."""
+    """Memory half must still cover cross-domain user facts and preferences."""
     prompt = AIAgent._COMBINED_REVIEW_PROMPT
-    assert "**Memory**" in prompt
-    assert "memory tool" in prompt
+    lower = prompt.lower()
+    assert "**memory**" in lower
+    assert "memory tool" in lower
+    assert "even when no particular skill is loaded" in lower
+    assert "specific skill's trigger matches" in lower
+    assert "do not duplicate the same lesson" in lower
+    assert "both should carry" not in lower
 
 
-def test_combined_review_prompt_skills_biased_toward_active_updates():
-    """Skills half must carry the active-update bias."""
+def test_combined_review_prompt_avoids_skill_inflation():
+    """Skills half needs evidence, not an always-update prior."""
     prompt = AIAgent._COMBINED_REVIEW_PROMPT
-    assert "**Skills**" in prompt
-    assert "ACTIVE" in prompt or "active" in prompt.lower()
-    assert "missed" in prompt.lower() or "opportunity" in prompt.lower()
+    lower = prompt.lower()
+    assert "**skills**" in lower
+    assert "durable" in lower and "reusable" in lower
+    assert "most sessions produce" not in lower
+    assert "missed learning opportunity" not in lower
 
 
 def test_combined_review_prompt_treats_user_corrections_as_skill_signal():
@@ -223,13 +228,16 @@ def test_combined_review_prompt_has_anti_pattern_guidance():
 
 
 # ---------------------------------------------------------------------------
-# _MEMORY_REVIEW_PROMPT — unchanged, still memory-focused
+# _MEMORY_REVIEW_PROMPT — cross-domain placement gate
 # ---------------------------------------------------------------------------
 
-def test_memory_review_prompt_still_focused_on_user_facts():
-    """Memory-only review prompt stays focused on user facts — not touched by this change."""
+def test_memory_review_prompt_keeps_only_cross_domain_user_facts():
+    """Memory-only review must reject skill-bound placement even without skill tools."""
     prompt = AIAgent._MEMORY_REVIEW_PROMPT
-    # The memory-only prompt should NOT drift into skill territory
+    lower = prompt.lower()
     assert "skills_list" not in prompt
     assert "SURVEY" not in prompt
-    assert "memory tool" in prompt
+    assert "memory tool" in lower
+    assert "even when no particular skill is loaded" in lower
+    assert "only matters when a specific skill" in lower
+    assert "do not save it to memory" in lower
