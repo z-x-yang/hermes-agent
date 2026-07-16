@@ -461,6 +461,20 @@ class TestBuildSkillsSystemPrompt:
             "zongxin-notion-second-brain",
         })
 
+    def test_process_routing_capsule_keeps_trigger_before_ellipsis(self):
+        from agent.prompt_builder import _skill_description_preview
+
+        description = (
+            "Use only for observed technical failures with an oracle. "
+            "Includes runtime and data-pipeline failures."
+        )
+        preview = _skill_description_preview(description)
+
+        assert len(preview) == 60
+        assert "failures" in preview
+        assert "oracle" in preview
+        assert preview.endswith("...")
+
     def test_empty_when_no_skills_dir(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         result = build_skills_system_prompt()
