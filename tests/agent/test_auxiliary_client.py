@@ -5018,6 +5018,44 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert fake_client.responses.kwargs["stream"] is True
         assert response.choices[0].message.content == "summary"
 
+    def test_incomplete_terminal_with_partial_text_maps_to_finish_reason_length(self):
+        """Output-cap truncation must be visible to callers as finish_reason=length.
+
+        The adapter used to hard-code finish_reason="stop", which let the
+        compression summarizer accept a truncated checkpoint as if it were
+        complete (2026-07-16 adversarial review finding).
+        """
+        message_item = SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text="partial summary text")],
+        )
+        events = [
+            SimpleNamespace(type="response.output_item.done", item=message_item),
+            SimpleNamespace(type="response.incomplete", response=SimpleNamespace(
+                status="incomplete",
+                id="r1",
+                usage=None,
+                incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+            )),
+        ]
+
+        class _FakeCreateStream:
+            def __iter__(self): return iter(events)
+            def close(self): pass
+
+        fake_client = SimpleNamespace(
+            responses=SimpleNamespace(create=lambda **kwargs: _FakeCreateStream())
+        )
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+
+        response = adapter.create(
+            messages=[{"role": "user", "content": "summarize this"}],
+            timeout=5,
+        )
+
+        assert response.choices[0].message.content == "partial summary text"
+        assert response.choices[0].finish_reason == "length"
+
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
         class _SlowAliveCreateStream:
             def __iter__(self):

@@ -80,10 +80,11 @@ def test_extract_summary_response_content_reads_codex_responses_output_text_item
         ]
     )
 
-    content, tool_call_violation = extract_summary_response_content(response)
+    content, tool_call_violation, truncated = extract_summary_response_content(response)
 
     assert content == "summary from responses item"
     assert tool_call_violation is False
+    assert truncated is False
 
 
 def test_extract_summary_response_content_flags_codex_responses_tool_calls():
@@ -91,10 +92,11 @@ def test_extract_summary_response_content_flags_codex_responses_tool_calls():
         output=[SimpleNamespace(type="function_call", name="terminal", arguments="{}")]
     )
 
-    content, tool_call_violation = extract_summary_response_content(response)
+    content, tool_call_violation, truncated = extract_summary_response_content(response)
 
     assert content == ""
     assert tool_call_violation is True
+    assert truncated is False
 
 
 def test_extract_summary_cache_stats_treats_zero_cached_tokens_as_reported():
@@ -546,9 +548,7 @@ def test_context_compressor_accepts_summary_call_mode_without_changing_default_b
 def test_serialized_and_append_instruction_share_rules_hash():
     with patch("agent.context_compressor.get_model_context_length", return_value=100000):
         compressor = ContextCompressor(model="test/model", quiet_mode=True)
-    turns = [{"role": "user", "content": "remember USER_MARKER"}]
-    budget = compressor._compute_summary_budget(turns)
-    rules = compressor._build_summary_rules(turns, budget)
+    rules = compressor._build_summary_rules()
     serialized = compressor._build_serialized_summary_prompt(
         rules,
         "[user] remember USER_MARKER",
@@ -556,17 +556,16 @@ def test_serialized_and_append_instruction_share_rules_hash():
     )
     append_instruction = compressor._build_append_cached_summary_instruction(
         rules,
-        previous_summary=None,
         focus_topic=None,
     )
     assert isinstance(rules, SummaryRules)
     assert rules.rules_hash.startswith("sha256:")
     assert "## All User Messages" in serialized
     assert "## All User Messages" in append_instruction
-    assert rules.rules_hash == compressor._build_summary_rules(turns, budget).rules_hash
+    assert rules.rules_hash == compressor._build_summary_rules().rules_hash
 
 
-def test_summary_budget_depends_only_on_serialized_summary_source():
+def test_serialized_summary_source_ignores_storage_only_payload():
     with patch("agent.context_compressor.get_model_context_length", return_value=100000):
         compressor = ContextCompressor(model="test/model", quiet_mode=True)
     base = [{"role": "assistant", "content": "same visible summary source"}]
@@ -585,47 +584,18 @@ def test_summary_budget_depends_only_on_serialized_summary_source():
     assert compressor._serialize_for_summary(base) == compressor._serialize_for_summary(
         with_storage_only_payload
     )
-    assert compressor._compute_summary_budget(base) == compressor._compute_summary_budget(
-        with_storage_only_payload
-    )
 
 
 def test_append_instruction_does_not_embed_serialized_turns():
     with patch("agent.context_compressor.get_model_context_length", return_value=100000):
         compressor = ContextCompressor(model="test/model", quiet_mode=True)
-    turns = [{"role": "user", "content": "UNIQUE_SERIALIZED_HISTORY_MARKER"}]
-    rules = compressor._build_summary_rules(turns, compressor._compute_summary_budget(turns))
+    rules = compressor._build_summary_rules()
     append_instruction = compressor._build_append_cached_summary_instruction(
         rules,
-        previous_summary=None,
         focus_topic=None,
     )
     assert "TURNS TO SUMMARIZE" not in append_instruction
-    assert "UNIQUE_SERIALIZED_HISTORY_MARKER" not in append_instruction
-
-
-def test_append_instruction_is_invariant_to_previous_summary_state():
-    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-        compressor = ContextCompressor(model="test/model", quiet_mode=True)
-    turns = [{"role": "user", "content": "new delta"}]
-    rules = compressor._build_summary_rules(turns, compressor._compute_summary_budget(turns))
-    without_previous = compressor._build_append_cached_summary_instruction(
-        rules,
-        previous_summary=None,
-        focus_topic=None,
-        previous_summary_in_prefix=False,
-    )
-    with_previous = compressor._build_append_cached_summary_instruction(
-        rules,
-        previous_summary="PREVIOUS_SUMMARY_MUST_NOT_BE_IN_APPEND_PROMPT",
-        focus_topic=None,
-        previous_summary_in_prefix=True,
-    )
-
-    assert with_previous == without_previous
-    assert "PREVIOUS_SUMMARY_MUST_NOT_BE_IN_APPEND_PROMPT" not in with_previous
-    assert "earlier compaction summary" not in with_previous.lower()
-    assert "intentionally not repeated" not in with_previous.lower()
+    assert "PREVIOUS SUMMARY:" not in append_instruction
 
 
 @dataclass

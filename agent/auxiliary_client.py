@@ -1133,7 +1133,17 @@ class _CodexCompletionsAdapter:
                 f"output text (reason: {_reason})"
             )
 
-        # Build a response that looks like chat.completions
+        # Build a response that looks like chat.completions. An incomplete
+        # terminal WITH partial text maps to finish_reason="length" (the chat
+        # convention for output-cap truncation) so callers that must reject
+        # truncated bodies — e.g. the compression summarizer — can see it;
+        # hard-coding "stop" here previously masked truncation entirely.
+        if tool_calls_raw:
+            finish_reason = "tool_calls"
+        elif getattr(final, "status", None) == "incomplete":
+            finish_reason = "length"
+        else:
+            finish_reason = "stop"
         message = SimpleNamespace(
             role="assistant",
             content=content,
@@ -1142,7 +1152,7 @@ class _CodexCompletionsAdapter:
         choice = SimpleNamespace(
             index=0,
             message=message,
-            finish_reason="stop" if not tool_calls_raw else "tool_calls",
+            finish_reason=finish_reason,
         )
         return SimpleNamespace(
             choices=[choice],

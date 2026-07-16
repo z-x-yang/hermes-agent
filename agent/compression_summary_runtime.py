@@ -348,8 +348,14 @@ def apply_summary_tool_choice_none(
     return updated, True
 
 
-def extract_summary_response_content(response: Any) -> tuple[str, bool]:
-    """Return response text and whether the model attempted a tool call."""
+def extract_summary_response_content(response: Any) -> tuple[str, bool, bool]:
+    """Return ``(text, attempted_tool_call, truncated)`` for a summary response.
+
+    ``truncated`` is True when the provider cut the output at a token limit —
+    chat-shaped ``finish_reason == "length"`` or responses-shaped
+    ``status == "incomplete"`` / ``incomplete_details``. A truncated summary is
+    corrupted checkpoint state and must never be accepted by callers.
+    """
     def _get(obj: Any, name: str, default: Any = None) -> Any:
         if isinstance(obj, dict):
             return obj.get(name, default)
@@ -378,25 +384,30 @@ def extract_summary_response_content(response: Any) -> tuple[str, bool]:
 
     choices = getattr(response, "choices", None) or []
     if not choices:
+        status = str(_get(response, "status", "") or "").strip().lower()
+        truncated = status == "incomplete" or bool(_get(response, "incomplete_details"))
         output = _get(response, "output") or []
         content_parts: list[str] = []
         if isinstance(output, list):
             for item in output:
                 item_type = str(_get(item, "type", "") or "").strip().lower()
                 if item_type in {"function_call", "custom_tool_call"}:
-                    return "", True
+                    return "", True, truncated
                 if item_type != "message":
                     continue
                 text = _content_text(_get(item, "content", ""))
                 if text:
                     content_parts.append(text)
         if content_parts:
-            return "\n".join(content_parts).strip(), False
+            return "\n".join(content_parts).strip(), False, truncated
         output_text = _get(response, "output_text")
         if isinstance(output_text, str) and output_text.strip():
-            return output_text.strip(), False
-        return "", False
-    message = getattr(choices[0], "message", None)
+            return output_text.strip(), False, truncated
+        return "", False, truncated
+    first_choice = choices[0]
+    finish_reason = _get(first_choice, "finish_reason")
+    truncated = str(finish_reason or "").strip().lower() == "length"
+    message = _get(first_choice, "message")
     if isinstance(message, dict):
         tool_calls = message.get("tool_calls") or []
         content = message.get("content")
@@ -404,8 +415,8 @@ def extract_summary_response_content(response: Any) -> tuple[str, bool]:
         tool_calls = getattr(message, "tool_calls", None) or []
         content = getattr(message, "content", message)
     if tool_calls:
-        return "", True
-    return _content_text(content), False
+        return "", True, truncated
+    return _content_text(content), False, truncated
 
 
 def extract_summary_cache_stats(response: Any) -> dict[str, Any]:

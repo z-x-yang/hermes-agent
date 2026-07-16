@@ -129,7 +129,12 @@ def test_first_compaction_prompt_instructs_full_user_message_listing():
     # The section is now the LLM's responsibility, with explicit requirements.
     assert "List EVERY real user message" in captured_prompt
     assert "add a brief annotation" in captured_prompt
-    assert "never merge, reorder, or drop entries" in captured_prompt
+    assert "never drop or reorder entries" in captured_prompt
+    assert "never merge entries that carry distinct content" in captured_prompt
+    # The only sanctioned exception: folding consecutive pure-continuation
+    # messages into a range entry without renumbering.
+    assert "folded into a single entry" in captured_prompt
+    assert "never renumber" in captured_prompt
     # Referential closure: annotations must resolve against the whole summary
     # (an LLM reader), not against turns the compaction dropped.
     assert (

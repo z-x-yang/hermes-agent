@@ -18,7 +18,6 @@ def _make_compressor():
     compressor.context_length = 200000
     compressor.threshold_percent = 0.80
     compressor.threshold_tokens = 160000
-    compressor.max_summary_tokens = 10000
     compressor.quiet_mode = True
     compressor.compression_count = 0
     compressor.last_prompt_tokens = 0

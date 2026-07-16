@@ -51,7 +51,6 @@ def _make_compressor():
     c.last_total_tokens = 100000
     c._summary_failure_cooldown_until = 0.0
     c._max_compaction_summary_tokens = 0
-    c.summary_budget_tokens = 0
     c.abort_on_summary_failure = False
     c._last_compress_aborted = False
     c._summary_model_fallen_back = False

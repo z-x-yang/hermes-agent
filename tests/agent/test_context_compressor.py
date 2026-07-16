@@ -381,13 +381,9 @@ class TestCompress:
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
-        rules = c._build_summary_rules(
-            [{"role": "user", "content": "Compress this prefix"}],
-            summary_budget=2000,
-        )
+        rules = c._build_summary_rules()
         instruction = c._build_append_cached_summary_instruction(
             rules,
-            previous_summary=None,
             focus_topic=None,
         )
 
@@ -1704,9 +1700,12 @@ class TestRetainedTailBudgeting:
             )
 
         # The compression model can accept a 272k-token input window.  The source
-        # serializer should therefore leave room for previous-summary/template/output
+        # serializer should therefore leave room for previous-summary/prompt/output
         # reserves, not clamp the middle-window source at 180k chars (~45k tokens).
-        assert c._summary_source_char_budget() == 891_200
+        # window = min(272_000, 272_000 * 0.95 threshold) = 258_400 tokens, minus
+        # 20k previous-summary + 32k output allowance + 8k prompt scaffolding
+        # reserves = 198_400 tokens = 793_600 chars.
+        assert c._summary_source_char_budget() == 793_600
         assert c._summary_source_char_budget() > 568_699
 
     def test_summary_source_overflow_compacts_tool_outputs_oldest_first(self):
@@ -2724,10 +2723,6 @@ Latest user says: {tail_text}
 ## All User Messages
 1. “{tail_text}” — should stay in retained tail only.
 """
-        rules = c._build_summary_rules(
-            [{"role": "user", "content": "older summarized request"}],
-            summary_budget=1000,
-        )
         previous_for_prompt = c._previous_summary_for_summary_prompt(
             source_messages=[
                 {"role": "assistant", "content": "older assistant"},
@@ -2737,14 +2732,8 @@ Latest user says: {tail_text}
             compress_end=2,
         )
 
-        instruction = c._build_append_cached_summary_instruction(
-            rules,
-            previous_summary=previous_for_prompt,
-        )
-
         assert "older summarized request" not in previous_for_prompt
-        assert tail_text not in instruction
-        assert "retained tail user message omitted" not in instruction
+        assert tail_text not in previous_for_prompt
 
     def test_user_ledger_skips_sender_only_gateway_prefix_rows(self):
         turns = [
@@ -4491,16 +4480,6 @@ class TestSummaryTargetRatio:
         # 1M context window * 0.40 ratio = 400K
         assert c.tail_token_budget == 400_000
 
-    def test_summary_cap_scales_with_context(self):
-        """Max summary tokens should be 5% of context, capped at 12K."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
-            c = ContextCompressor(model="test", quiet_mode=True)
-        assert c.max_summary_tokens == 10_000  # 200K * 0.05
-
-        with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
-            c = ContextCompressor(model="test", quiet_mode=True)
-        assert c.max_summary_tokens == 12_000  # capped at 12K ceiling
-
     def test_ratio_clamped(self):
         """Ratio should allow sub-10% tail targets but still reject negative/high values."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
@@ -5000,12 +4979,10 @@ class TestUpdateModelBudgets:
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             comp = ContextCompressor("model-a", threshold_percent=0.50, quiet_mode=True)
         old_tail = comp.tail_token_budget
-        old_max_summary = comp.max_summary_tokens
 
         comp.update_model("model-b", context_length=32_000)
         assert comp.tail_token_budget != old_tail, "tail_token_budget should change"
         assert comp.tail_token_budget < old_tail, "smaller context → smaller budget"
-        assert comp.max_summary_tokens != old_max_summary, "max_summary_tokens should change"
 
     def test_budgets_proportional(self):
         """Budgets should be proportional to context_length after update."""
@@ -5014,7 +4991,6 @@ class TestUpdateModelBudgets:
             comp = ContextCompressor("model-a", threshold_percent=0.50, quiet_mode=True)
         comp.update_model("model-b", context_length=10_000)
         assert comp.tail_token_budget == int(10_000 * comp.summary_target_ratio)
-        assert comp.max_summary_tokens == min(int(10_000 * 0.05), 12_000)
 
 
 class TestUpdateModelResetsCalibration:

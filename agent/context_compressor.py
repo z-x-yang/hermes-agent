@@ -243,12 +243,32 @@ _HISTORICAL_SUMMARY_PREFIXES = (
     "config, etc.) may reflect work described here — avoid repeating it:",
 )
 
-# Minimum tokens for the summary output
-_MIN_SUMMARY_TOKENS = 2000
-# Proportion of compressed content to allocate for summary
-_SUMMARY_RATIO = 0.20
-# Absolute ceiling for summary tokens (even on very large context windows)
-_SUMMARY_TOKENS_CEILING = 12_000
+# Fixed completion allowance requested for summary calls. The iterative
+# summary is a rewrite of the full accumulated checkpoint, so its size is
+# driven by how much load-bearing state must survive — not by how large the
+# newly compacted input slice happens to be. The former input-delta-derived
+# ``summary_budget`` (input tokens × 0.20, clamped to [2000, 12000]) was
+# retired 2026-07-16: on the ChatGPT Codex backend it was never sent at all
+# (transports/codex.py withholds max_output_tokens for is_codex_backend), and
+# on relay fallbacks its small values could hard-truncate a late-chain
+# summary mid-section. Providers that accept an output cap now get this flat,
+# generous allowance; truncation is detected and treated as a hard failure.
+_SUMMARY_OUTPUT_TOKENS_ALLOWANCE = 32_000
+
+# Deterministic backstop for the LLM-written ``## All User Messages`` section.
+# The ledger carries every user message forward across compactions by design,
+# so in pathological ultra-long sessions it could grow without bound. Beyond
+# this rough-token cap the OLDEST whole entries are dropped behind an explicit
+# omission marker; dropped text remains recoverable from the session
+# transcript and the compression_user_messages.jsonl sidecar.
+_AUM_LEDGER_MAX_TOKENS = 20_000
+_AUM_BACKSTOP_MARKER_TEMPLATE = (
+    "[Ledger backstop: earliest {count} user messages omitted to bound this "
+    "section; full history remains in the session transcript]"
+)
+_AUM_BACKSTOP_MARKER_RE = re.compile(
+    r"^\[Ledger backstop: earliest (\d+) user messages omitted"
+)
 
 # Deterministic user-message ledger budget.  The verbatim ledger is only
 # rendered for the no-LLM static fallback summary; the LLM-written
@@ -401,7 +421,6 @@ class SummaryRules:
     preamble: str
     minimal_sufficient_state_rule: str
     template_sections: str
-    summary_budget: int
     rules_hash: str
 
 
@@ -2125,9 +2144,6 @@ class ContextCompressor(ContextEngine):
         # which may intentionally be smaller than the model's runtime window.
         target_tokens = int(self.compression_context_length * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
-        self.max_summary_tokens = min(
-            int(self.compression_context_length * 0.05), _SUMMARY_TOKENS_CEILING,
-        )
 
         # Final-request calibration is lineage-specific. A route/model switch
         # invalidates the previous successful request's actual+semantic baseline.
@@ -2318,9 +2334,6 @@ class ContextCompressor(ContextEngine):
         # to keep before rolling it up".
         target_tokens = int(self.compression_context_length * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
-        self.max_summary_tokens = min(
-            int(self.compression_context_length * 0.05), _SUMMARY_TOKENS_CEILING,
-        )
 
         if not quiet_mode:
             logger.info(
@@ -3763,20 +3776,6 @@ class ContextCompressor(ContextEngine):
             },
         }
 
-    def _compute_summary_budget_from_source(self, serialized_source: str) -> int:
-        """Scale output budget from the exact source presented to the summarizer."""
-        from agent.token_estimator import count_text_tokens
-
-        content_tokens = count_text_tokens(serialized_source)
-        budget = int(content_tokens * _SUMMARY_RATIO)
-        return max(_MIN_SUMMARY_TOKENS, min(budget, self.max_summary_tokens))
-
-    def _compute_summary_budget(self, turns_to_summarize: List[Dict[str, Any]]) -> int:
-        """Scale budget from the canonical serialized summary source."""
-        return self._compute_summary_budget_from_source(
-            self._serialize_for_summary(turns_to_summarize)
-        )
-
     # Summarizer-input limits.  Tool result bodies are rendered in full first;
     # these non-tool caps keep huge user/assistant prose from being duplicated
     # in the prompt when deterministic ledgers or prior summaries already carry
@@ -3789,13 +3788,13 @@ class ContextCompressor(ContextEngine):
     _TOOL_ARGS_HEAD = 1200    # kept from the start of tool args during fallback
     _SUMMARY_SOURCE_MIN_CHARS = 24_000
     # Reserve input/output room outside the serialized source: the iterative
-    # prompt may include the previous summary (up to max_summary_tokens), the
-    # API call reserves completion tokens (max_tokens ~= summary_budget * 1.3),
-    # and the fixed compaction instructions/template need a small input cushion.
-    # The source budget itself should scale with the compression model's actual
-    # context window; do not cap large-window models at the old 180k-char guard.
+    # prompt may include the previous summary, the API call requests the fixed
+    # completion allowance, and the fixed compaction instructions/template need
+    # a small input cushion. The source budget itself should scale with the
+    # compression model's actual context window; do not cap large-window models
+    # at the old 180k-char guard.
     _SUMMARY_SOURCE_PROMPT_RESERVE_TOKENS = 8_000
-    _SUMMARY_SOURCE_OUTPUT_RESERVE_MULTIPLIER = 1.3
+    _SUMMARY_SOURCE_PREV_SUMMARY_RESERVE_TOKENS = 20_000
 
     def _summary_source_token_budget(self) -> int:
         """Rough token budget for serialized raw source fed to the summarizer.
@@ -3808,8 +3807,8 @@ class ContextCompressor(ContextEngine):
         """
         window_tokens = max(0, min(int(self.context_length), int(self.threshold_tokens)))
         reserved_tokens = (
-            int(self.max_summary_tokens)
-            + int(self.max_summary_tokens * self._SUMMARY_SOURCE_OUTPUT_RESERVE_MULTIPLIER)
+            self._SUMMARY_SOURCE_PREV_SUMMARY_RESERVE_TOKENS
+            + _SUMMARY_OUTPUT_TOKENS_ALLOWANCE
             + self._SUMMARY_SOURCE_PROMPT_RESERVE_TOKENS
         )
         return max(
@@ -4051,14 +4050,26 @@ class ContextCompressor(ContextEngine):
             if m:
                 title = m.group(1).strip()
                 norm = title.rstrip(":").strip().lower()
-                is_canonical = any(
-                    norm == c or norm.startswith(c) or (len(norm) >= 8 and c.startswith(norm))
-                    for c in canon
+                canonical_title = next(
+                    (
+                        _CANONICAL_SUMMARY_HEADINGS[i]
+                        for i, c in enumerate(canon)
+                        if norm == c
+                        or norm.startswith(c)
+                        or (len(norm) >= 8 and c.startswith(norm))
+                    ),
+                    None,
                 )
-                if not is_canonical:
+                if canonical_title is None:
                     out.append(f"**{title}**")
                     demoted += 1
                     continue
+                # Rewrite tolerated variants ("## All User Messages:", casing
+                # drift) to the exact canonical heading — every downstream
+                # consumer (section extraction, ledger parsing/backstop,
+                # retained-tail sanitizing) matches headings exactly.
+                out.append(f"## {canonical_title}")
+                continue
             out.append(line)
         return "\n".join(out), demoted
 
@@ -4082,6 +4093,182 @@ class ContextCompressor(ContextEngine):
                 body_end = absolute
                 break
         return text[body_start:body_end].strip()
+
+    @classmethod
+    def _enforce_user_ledger_backstop(
+        cls,
+        summary: str,
+        *,
+        previous_summary: str | None = None,
+        max_tokens: int = _AUM_LEDGER_MAX_TOKENS,
+    ) -> tuple[str, int]:
+        """Deterministically bound the LLM-written ``## All User Messages``.
+
+        The ledger accumulates every user message across compactions by
+        design, so in ultra-long sessions it can grow without bound and starve
+        the technical sections. Beyond ``max_tokens`` (rough chars/4), the
+        OLDEST whole entries are dropped behind an explicit omission marker
+        placed as the section's first line. The marker count is cumulative and
+        monotonic across compactions (a folded range entry counts as the
+        number of messages it covers); if the model drops, moves, duplicates,
+        or regresses the marker while rewriting, it is repaired from the
+        largest count visible in the current section or ``previous_summary``.
+        At least the latest entry is always kept. Returns
+        ``(summary, user_messages_omitted_this_pass)``; the summary is
+        byte-identical when nothing had to change.
+        """
+        text = summary or ""
+        heading_match = None
+        for match in re.finditer(rf"(?m)^{re.escape(_USER_LEDGER_HEADING)}\s*$", text):
+            if not cls._is_inside_fenced_code_block(text, match.start()):
+                heading_match = match
+                break
+        if heading_match is None:
+            return summary, 0
+        body_start = heading_match.end()
+        body_end = len(text)
+        for match in re.finditer(r"(?m)^## .+\s*$", text[body_start:]):
+            absolute = body_start + match.start()
+            if not cls._is_inside_fenced_code_block(text, absolute):
+                body_end = absolute
+                break
+        section = text[body_start:body_end].strip()
+
+        prev_marker_count = 0
+        if previous_summary:
+            prev_lines = cls._extract_all_user_messages_section(previous_summary).splitlines()
+            for prev_line in prev_lines:
+                prev_marker = _AUM_BACKSTOP_MARKER_RE.match(prev_line.strip())
+                if prev_marker:
+                    prev_marker_count = max(prev_marker_count, int(prev_marker.group(1)))
+
+        if not section or section == "None.":
+            if prev_marker_count <= 0:
+                return summary, 0
+            # The model rewrote the section to nothing while the previous
+            # summary recorded deterministic omissions — losing the marker
+            # would silently forget that messages were ever dropped.
+            marker_line = _AUM_BACKSTOP_MARKER_TEMPLATE.format(count=prev_marker_count)
+            new_body = marker_line if not section else f"{marker_line}\n{section}"
+            rebuilt = text[:body_start].rstrip() + "\n" + new_body
+            suffix = text[body_end:].lstrip("\n")
+            if suffix:
+                rebuilt += "\n\n" + suffix
+            return rebuilt, 0
+
+        lines = section.splitlines()
+        # Single fence-tracked pass: recover the cumulative omission count
+        # from marker lines (the model may have moved, duplicated, dropped, or
+        # regressed the canonical first-line marker while rewriting), strip
+        # every marker copy, and group the rest into whole entries. A new
+        # entry starts at a numbered line (``7.``/``7)`` or a folded range
+        # ``2–5.``) outside fenced code blocks; everything else continues the
+        # current entry (or the section header if no entry has started yet).
+        # Fenced lines are never treated as markers or entry starts — quoted
+        # user text may contain look-alike lines. Fences are matched
+        # CommonMark-style by opener character and minimum length so an
+        # embedded shorter fence inside a longer one does not desync tracking.
+        entry_start_re = re.compile(r"^(\d+)(?:\s*[–—-]\s*(\d+))?[.)]\s")
+        current_marker_counts: list[int] = []
+        first_line_marker_count: int | None = None
+        header: list[str] = []
+        entries: list[list[str]] = []
+        entry_message_counts: list[int] = []
+        fence_char: str | None = None
+        fence_len = 0
+
+        def _fence_open(stripped_line: str) -> tuple[str, int] | None:
+            fence = re.match(r"^([`~]{3,})", stripped_line)
+            if fence:
+                return fence.group(1)[0], len(fence.group(1))
+            return None
+
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            in_fence = fence_char is not None
+            if not in_fence:
+                marker = _AUM_BACKSTOP_MARKER_RE.match(stripped)
+                if marker:
+                    count = int(marker.group(1))
+                    current_marker_counts.append(count)
+                    if index == 0:
+                        first_line_marker_count = count
+                    continue
+                entry_match = entry_start_re.match(stripped)
+                if entry_match:
+                    entries.append([line])
+                    range_end = entry_match.group(2)
+                    entry_message_counts.append(
+                        int(range_end) - int(entry_match.group(1)) + 1
+                        if range_end
+                        else 1
+                    )
+                    opened = _fence_open(stripped)
+                    if opened:
+                        fence_char, fence_len = opened
+                    continue
+            if entries:
+                entries[-1].append(line)
+            else:
+                header.append(line)
+            if in_fence:
+                if re.match(rf"^{re.escape(fence_char)}{{{fence_len},}}\s*$", stripped):
+                    fence_char, fence_len = None, 0
+            else:
+                opened = _fence_open(stripped)
+                if opened:
+                    fence_char, fence_len = opened
+
+        # Monotonic cumulative count: trust the largest marker seen anywhere
+        # (current section or previous summary); a first-line marker whose
+        # count regressed, a duplicated/moved marker, or a dropped marker all
+        # require a rebuild.
+        prior_omitted = max([prev_marker_count, *current_marker_counts], default=0)
+        marker_needs_repair = prior_omitted > 0 and (
+            first_line_marker_count != prior_omitted or len(current_marker_counts) > 1
+        )
+
+        def _rough_tokens(entry_group: list[list[str]]) -> int:
+            return sum(len(entry_line) for entry in entry_group for entry_line in entry) // 4
+
+        omitted_messages = 0
+        dropped_entries = 0
+        kept = entries
+        while len(kept) > 1 and _rough_tokens(kept) > max_tokens:
+            omitted_messages += entry_message_counts[dropped_entries]
+            dropped_entries += 1
+            kept = kept[1:]
+        if (
+            not entries
+            and _rough_tokens([header]) > max_tokens
+        ):
+            # Numbered-entry parsing found nothing to drop but the section is
+            # oversized (the model drifted to an unrecognized list style).
+            # Never silently fail open: surface it loudly so the drift is
+            # visible in logs and the audit sidecar.
+            logger.warning(
+                "Compression summary: All User Messages exceeds %d rough tokens "
+                "but no numbered entries were recognized; backstop cannot prune "
+                "(model drifted from the required entry format)",
+                max_tokens,
+            )
+
+        if omitted_messages == 0 and not marker_needs_repair:
+            return summary, 0
+
+        total_omitted = prior_omitted + omitted_messages
+        new_lines: list[str] = []
+        if total_omitted > 0:
+            new_lines.append(_AUM_BACKSTOP_MARKER_TEMPLATE.format(count=total_omitted))
+        new_lines.extend(header)
+        for entry in kept:
+            new_lines.extend(entry)
+        new_body = "\n".join(new_lines).strip("\n")
+        rebuilt = text[:body_start].rstrip() + "\n" + new_body
+        suffix = text[body_end:].lstrip("\n")
+        if suffix:
+            rebuilt += "\n\n" + suffix
+        return rebuilt, omitted_messages
 
     @classmethod
     def _parse_previous_user_ledger_entries(cls, summary: str | None) -> list[dict[str, Any]]:
@@ -4144,7 +4331,9 @@ class ContextCompressor(ContextEngine):
         # Preserve those whole legacy lines as user evidence once, then future
         # compactions will re-render them in the deterministic fenced format.
         legacy_entries: list[dict[str, Any]] = []
-        entry_start = re.compile(r"^(?:(?:\d+\.)|[-*])\s+(?P<body>.*)$")
+        entry_start = re.compile(
+            r"^(?:(?:\d+(?:\s*[–—-]\s*\d+)?\.)|[-*])\s+(?P<body>.*)$"
+        )
         idx = 0
         while idx < len(lines):
             line = lines[idx].strip()
@@ -4713,11 +4902,7 @@ Verify current repository/session state with tools, then continue from the prote
         self._summary_failure_cooldown_error = None
 
 
-    def _build_summary_rules(
-        self,
-        turns_to_summarize: List[Dict[str, Any]],
-        summary_budget: int,
-    ) -> SummaryRules:
+    def _build_summary_rules(self) -> SummaryRules:
         """Build transport-independent summary instructions without source text."""
         # Current date for temporal anchoring (see ## Temporal Anchoring below).
         # Date-only granularity matches system_prompt.py:337 (PR #20451) and the
@@ -4825,7 +5010,7 @@ Do not preserve completed or cancelled work as pending. Preserve durable knowled
 [Reasoning that changes future judgment: tradeoffs, rejected paths, source authority, confidence, supersession logic, uncertainty, and why the current approach was chosen. Preserve reasoning only when forgetting it would change future behavior.]
 
 ## All User Messages
-[List EVERY real user message from the conversation being summarized, in order, numbered, with none omitted — including one-word replies and interjections. Quote the user's exact wording verbatim in the user's language; truncate only very long messages with "..." while keeping the actionable part verbatim. Do not include this compaction instruction itself in All User Messages; it is the summarizer's task instruction, not a conversation message to preserve. After each quote, add a brief annotation of what the message was doing: approving or rejecting a proposal, correcting the agent's course, interjecting a new idea mid-task, reacting to intermediate progress output, or answering a question. Write each annotation so its intent and its target are resolvable by a reader who has this whole summary but not the compacted turns: whatever the message acted on — a proposal, option, question, plan, or "the current direction" — must be restated in the annotation or defined elsewhere in this summary and referred to by the same name. A bare label ("option A", "the clarification") is acceptable only when that referent is defined elsewhere in this summary; never point at something that survives only in the now-compacted turns the reader can no longer see. This matters most for one-word replies and interjections, whose meaning lives entirely in what they answered. Do not list tool results or system-injected notes stored as user-role rows — blocks starting with "[Your active task list was preserved...]", "[ASYNC DELEGATION ... COMPLETE...]", or "[IMPORTANT: Background process ...]" (with or without a "[Sender]" prefix) are not user messages. Chat-platform scaffolding is not user text either: when a user-role row embeds history or reply context, quote only the user's actual words — the text after the last "[New message]" marker — and drop "[Replying to: ...]" wrappers. When updating a previous summary, carry forward EVERY entry already listed in its All User Messages section and append entries for new user messages; never merge, reorder, or drop entries.]
+[List EVERY real user message from the conversation being summarized, in order, numbered, with none omitted — including one-word replies and interjections. Quote the user's exact wording verbatim in the user's language; truncate only very long messages with "..." while keeping the actionable part verbatim. Do not include this compaction instruction itself in All User Messages; it is the summarizer's task instruction, not a conversation message to preserve. After each quote, add a brief annotation of what the message was doing: approving or rejecting a proposal, correcting the agent's course, interjecting a new idea mid-task, reacting to intermediate progress output, or answering a question. Write each annotation so its intent and its target are resolvable by a reader who has this whole summary but not the compacted turns: whatever the message acted on — a proposal, option, question, plan, or "the current direction" — must be restated in the annotation or defined elsewhere in this summary and referred to by the same name. A bare label ("option A", "the clarification") is acceptable only when that referent is defined elsewhere in this summary; never point at something that survives only in the now-compacted turns the reader can no longer see. This matters most for one-word replies and interjections, whose meaning lives entirely in what they answered. Do not list tool results or system-injected notes stored as user-role rows — blocks starting with "[Your active task list was preserved...]", "[ASYNC DELEGATION ... COMPLETE...]", or "[IMPORTANT: Background process ...]" (with or without a "[Sender]" prefix) are not user messages. Chat-platform scaffolding is not user text either: when a user-role row embeds history or reply context, quote only the user's actual words — the text after the last "[New message]" marker — and drop "[Replying to: ...]" wrappers. When updating a previous summary, carry forward EVERY entry already listed in its All User Messages section and append entries for new user messages; never drop or reorder entries, and never merge entries that carry distinct content. One folding exception exists: a run of CONSECUTIVE messages that each carry no content beyond approving continuation of the current work (e.g. "continue", "go on", an empty message, or a bare status ping with no new words) may be folded into a single entry covering the run — write it with the original numbering as a range (e.g. "9–12.") plus a note of how many messages it covers, and never renumber the remaining entries. Never fold a message that corrects course, chooses an option, adds a constraint, or introduces anything new, and carry an existing folded range entry forward verbatim like any other entry. If a line beginning with "[Ledger backstop:" is present in the previous ledger, keep it verbatim as the first line of this section — it records earlier deterministically omitted messages.]
 
 ## Pending Tasks
 [Only tasks that are still genuinely pending, blocked, or awaiting decision. Do not include completed, cancelled, or superseded work here; preserve durable knowledge from that work in the appropriate sections. If none, write "None."]
@@ -4836,7 +5021,7 @@ Do not preserve completed or cancelled work as pending. Preserve durable knowled
 ## Optional Next Step
 [The single best continuation action from this checkpoint, based on the minimal sufficient working state and current continuation state. If there is a next step, include direct quotes from the most recent conversation showing exactly what task was being worked on and where it left off, or cite the numbered All User Messages entry that authorizes the step. If no action should be taken, write "None."]
 
-Target ~{summary_budget} tokens. Be CONCRETE — name exact file paths, commands, error messages, line numbers, and specific decided values. Apply one read-to-act test to every value: will the next agent have to READ it to act — to decide, call, resume, poll, or cancel? If yes, inline it. If it only records what already happened and can be re-fetched from a durable source (a ledger, `sacct`, the artifact's own output) when it is actually needed, keep a recovery pointer instead, or omit it. The test turns on the value's ROLE, not its type: the same job ID is live state while the job runs (put it in Current Work) and mere history once it finishes. Concrete means the load-bearing values, not bulk transcription. Avoid vague descriptions like "made some changes" — say exactly what changed.
+Be CONCRETE — name exact file paths, commands, error messages, line numbers, and specific decided values. Apply one read-to-act test to every value: will the next agent have to READ it to act — to decide, call, resume, poll, or cancel? If yes, inline it. If it only records what already happened and can be re-fetched from a durable source (a ledger, `sacct`, the artifact's own output) when it is actually needed, keep a recovery pointer instead, or omit it. The test turns on the value's ROLE, not its type: the same job ID is live state while the job runs (put it in Current Work) and mere history once it finishes. Concrete means the load-bearing values, not bulk transcription. Avoid vague descriptions like "made some changes" — say exactly what changed.
 {_temporal_anchoring_rule}
 Write only the <analysis> and <summary> blocks. Do not include any other preamble or prefix. The <analysis> block will be stripped before the summary is stored."""
 
@@ -4844,7 +5029,6 @@ Write only the <analysis> and <summary> blocks. Do not include any other preambl
             preamble=_summarizer_preamble,
             minimal_sufficient_state_rule=_minimal_sufficient_state_rule,
             template_sections=_template_sections,
-            summary_budget=summary_budget,
             rules_hash=_hash_summary_rules(
                 _summarizer_preamble,
                 _minimal_sufficient_state_rule,
@@ -4885,7 +5069,7 @@ Role=user messages in NEW TURNS TO INCORPORATE are authoritative over PREVIOUS S
 
 {rules.minimal_sufficient_state_rule}
 
-Update the summary using this exact nine-section structure. Incorporate the new turns, and remove or mark obsolete information when messages inside the summarized slice cancelled, narrowed, or replaced earlier work. Keep "## Pending Tasks" limited to genuinely open work visible from the previous summary plus the new summarized turns. Update "## Current Work" and "## Optional Next Step" to reflect the precise continuation point at the compression boundary. Do not preserve completed or cancelled work as pending. In "## All User Messages", carry forward every entry from the previous summary and append the new turns' real user messages; never drop, merge, or paraphrase away a user's wording.
+Update the summary using this exact nine-section structure. Incorporate the new turns, and remove or mark obsolete information when messages inside the summarized slice cancelled, narrowed, or replaced earlier work. When a statement from the previous summary is still valid and unchanged, carry its wording forward unchanged rather than re-paraphrasing it; rewrite only what actually changed. Keep "## Pending Tasks" limited to genuinely open work visible from the previous summary plus the new summarized turns. Update "## Current Work" and "## Optional Next Step" to reflect the precise continuation point at the compression boundary. Do not preserve completed or cancelled work as pending. In "## All User Messages", carry forward every entry from the previous summary and append the new turns' real user messages; never drop or paraphrase away a user's wording, and merge nothing except the pure-continuation folding rule defined in the section template.
 
 {rules.template_sections}"""
         else:
@@ -4907,21 +5091,20 @@ Use this exact structure:
     def _build_append_cached_summary_instruction(
         self,
         rules: SummaryRules,
-        previous_summary: Optional[str],
         focus_topic: Optional[str] = None,
-        *,
-        previous_summary_in_prefix: bool = False,
     ) -> str:
         """Build the final user instruction for append-cached summary calls."""
         prompt = f"""{rules.preamble}
 
 Write the replacement structured checkpoint summary using the provider-visible compacted prefix above. The retained tail is not included in this request and will remain verbatim after the summary.
 
+If a message above begins with "[CONTEXT COMPACTION]", it is the previous checkpoint summary: treat it as the accumulated working state, and treat the turns after it as the delta to incorporate. When a statement from that previous summary is still valid and unchanged, carry its wording forward unchanged rather than re-paraphrasing it; rewrite only what actually changed.
+
 Role=user messages above are authoritative. If messages conflict, preserve the newer user state in active sections.
 
 {rules.minimal_sufficient_state_rule}
 
-Use this exact nine-section structure. Incorporate the conversation above, and remove or mark obsolete information when messages inside the summarized slice cancelled, narrowed, or replaced earlier work. Keep "## Pending Tasks" limited to genuinely open work visible above. Update "## Current Work" and "## Optional Next Step" to reflect the precise continuation point at the compression boundary. Do not preserve completed or cancelled work as pending. In "## All User Messages", preserve every existing entry visible above and append the conversation's real user messages; never drop, merge, or paraphrase away a user's wording.
+Use this exact nine-section structure. Incorporate the conversation above, and remove or mark obsolete information when messages inside the summarized slice cancelled, narrowed, or replaced earlier work. Keep "## Pending Tasks" limited to genuinely open work visible above. Update "## Current Work" and "## Optional Next Step" to reflect the precise continuation point at the compression boundary. Do not preserve completed or cancelled work as pending. In "## All User Messages", preserve every existing entry visible above and append the conversation's real user messages; never drop or paraphrase away a user's wording, and merge nothing except the pure-continuation folding rule defined in the section template.
 
 {rules.template_sections}"""
 
@@ -4946,13 +5129,12 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
             extract_summary_response_content,
         )
 
-        summary_budget = self._compute_summary_budget(turns_to_summarize)
         append_cfg = getattr(
             self,
             "append_cached_summary",
             AppendCachedSummaryConfig.normalized(None),
         )
-        rules = self._build_summary_rules(turns_to_summarize, summary_budget)
+        rules = self._build_summary_rules()
         previous_summary_for_prompt = self._previous_summary_for_summary_prompt(
             source_messages=source_messages,
             compress_end=compress_end,
@@ -4978,9 +5160,7 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
         previous_summary_in_prefix = bool(previous_summary_for_prompt)
         instruction = self._build_append_cached_summary_instruction(
             rules,
-            previous_summary=None,
             focus_topic=focus_topic,
-            previous_summary_in_prefix=previous_summary_in_prefix,
         )
         base_audit: dict[str, Any] = {
             "mode": "append_cached",
@@ -5070,11 +5250,9 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
                 turns_to_summarize = list(
                     source_messages[summarize_start:compress_end]
                 )
-                summary_budget = self._compute_summary_budget(turns_to_summarize)
-                rules = self._build_summary_rules(
-                    turns_to_summarize,
-                    summary_budget,
-                )
+                # rules and the appended instruction do not depend on the
+                # summarized window, so only the prefix/previous-summary state
+                # needs recomputing at the fallback boundary.
                 previous_summary_for_prompt = (
                     self._previous_summary_for_summary_prompt(
                         source_messages=source_messages,
@@ -5083,12 +5261,6 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
                 )
                 prefix_messages = list(source_messages[:compress_end])
                 previous_summary_in_prefix = bool(previous_summary_for_prompt)
-                instruction = self._build_append_cached_summary_instruction(
-                    rules,
-                    previous_summary=None,
-                    focus_topic=focus_topic,
-                    previous_summary_in_prefix=previous_summary_in_prefix,
-                )
                 replaying_successful_endpoint = False
                 base_audit["source_binding"] = (
                     "transcript_reconstructed_fallback"
@@ -5096,10 +5268,9 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
                 base_audit["anchor_fallback_reason"] = (
                     "runtime_fingerprint_mismatch"
                 )
-                base_audit["rules_hash"] = rules.rules_hash
 
         request_messages = prefix_messages + [{"role": "user", "content": instruction}]
-        requested_output_tokens = int(summary_budget * 1.3)
+        requested_output_tokens = _SUMMARY_OUTPUT_TOKENS_ALLOWANCE
         if replaying_successful_endpoint:
             build_kwargs = getattr(
                 runtime,
@@ -5171,12 +5342,24 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
         try:
             with aux_interrupt_protection():
                 response = runtime.invoke(api_kwargs)
-            content, tool_call_violation = extract_summary_response_content(response)
+            content, tool_call_violation, response_truncated = (
+                extract_summary_response_content(response)
+            )
             base_audit["tool_call_violation"] = bool(tool_call_violation)
             base_audit["cache"] = extract_summary_cache_stats(response)
             if tool_call_violation:
                 base_audit["fallback_reason"] = "summary_returned_tool_call"
                 self._last_summary_error = "append_cached summary response attempted a tool call"
+                return None
+            if response_truncated:
+                # A summary cut off by an output limit is corrupted state, not
+                # a shorter summary — injecting it would silently drop whatever
+                # sections followed the cut. Treat as a hard failure.
+                base_audit["fallback_reason"] = "summary_truncated"
+                self._last_summary_error = (
+                    "append_cached summary response was truncated by an output "
+                    "token limit"
+                )
                 return None
             if not content.strip():
                 base_audit["fallback_reason"] = "append_cached_validation_failed"
@@ -5193,6 +5376,18 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
                 logger.info(
                     "Compression summary: demoted %d non-canonical section heading(s) to prevent template erosion",
                     _demoted_sections,
+                )
+            summary, _aum_omitted = self._enforce_user_ledger_backstop(
+                summary, previous_summary=self._previous_summary
+            )
+            base_audit["user_ledger_backstop_omitted"] = _aum_omitted
+            if _aum_omitted:
+                logger.warning(
+                    "Compression summary: All User Messages ledger exceeded "
+                    "%d rough tokens; dropped the oldest %d user message(s) behind an "
+                    "explicit omission marker",
+                    _AUM_LEDGER_MAX_TOKENS,
+                    _aum_omitted,
                 )
             self._last_summary_user_message_ground_truth = [
                 entry["text"]
@@ -5393,8 +5588,7 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
 
         append_failure = dict(getattr(self, "_last_summary_call_audit", {}) or {})
         content_to_summarize = self._serialize_for_summary(turns_to_summarize)
-        summary_budget = self._compute_summary_budget_from_source(content_to_summarize)
-        rules = self._build_summary_rules(turns_to_summarize, summary_budget)
+        rules = self._build_summary_rules()
         prompt = self._build_serialized_summary_prompt(
             rules,
             content_to_summarize,
@@ -5424,7 +5618,7 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
                     "api_mode": self.api_mode,
                 },
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": int(summary_budget * 1.3),
+                "max_tokens": _SUMMARY_OUTPUT_TOKENS_ALLOWANCE,
                 # timeout resolved from auxiliary.compression.timeout config by call_llm
             }
             if self.summary_model:
@@ -5448,6 +5642,22 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
             # Handle cases where content is not a string (e.g., dict from llama.cpp)
             if not isinstance(content, str):
                 content = str(content) if content else ""
+            # A summary cut off by the provider's output limit is corrupted
+            # state — whatever sections followed the cut are gone. Never
+            # accept it as a checkpoint; abort this attempt instead.
+            finish_reason = getattr(response.choices[0], "finish_reason", None)
+            if isinstance(response.choices[0], dict):
+                finish_reason = response.choices[0].get("finish_reason")
+            if finish_reason == "length":
+                self._last_summary_call_audit["fallback_reason"] = "summary_truncated"
+                self._last_summary_error = (
+                    "serialized summary response was truncated by an output "
+                    "token limit (finish_reason=length, "
+                    f"provider={self.provider or 'auto'} "
+                    f"model={self.summary_model or self.model})"
+                )
+                self._last_summary_fail_closed_reason = "summary_truncated"
+                return None
             # Some OpenAI-compatible proxies (e.g. cmkey.cn, one-api channels)
             # return a well-formed HTTP 200 with an empty or whitespace-only
             # ``content`` instead of an error or empty ``choices``. That payload
@@ -5482,6 +5692,18 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
                     "Compression summary: demoted %d non-canonical section "
                     "heading(s) to prevent template erosion",
                     _demoted_sections,
+                )
+            summary, _aum_omitted = self._enforce_user_ledger_backstop(
+                summary, previous_summary=self._previous_summary
+            )
+            self._last_summary_call_audit["user_ledger_backstop_omitted"] = _aum_omitted
+            if _aum_omitted:
+                logger.warning(
+                    "Compression summary: All User Messages ledger exceeded "
+                    "%d rough tokens; dropped the oldest %d user message(s) behind an "
+                    "explicit omission marker",
+                    _AUM_LEDGER_MAX_TOKENS,
+                    _aum_omitted,
                 )
             # Ground truth for the audit sidecar: the window's real user
             # messages, verbatim. The LLM now owns the ## All User Messages
