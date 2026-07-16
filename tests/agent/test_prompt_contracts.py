@@ -92,6 +92,13 @@ class TestContractPresence:
 
 
 class TestContractGating:
+    def test_outward_actions_require_complete_payload_inspection(self):
+        text = SIDE_EFFECT_CONFIRMATION_GUIDANCE.lower()
+        assert "inspect the actual recipients" in text
+        assert "complete payload, including attachments" in text
+        assert "cannot inspect it completely" in text
+        assert "do not send, publish, or share it" in text
+
     def test_umbrella_flag_removes_contract_family(self):
         stable = _stable(_make_agent(_behavior_contracts=False))
         for block in (
@@ -151,6 +158,14 @@ class TestExecutionAndStoppingContract:
         assert "new evidence" in text
         assert "materially different strategy" in text
         assert "plan, review, or assessment" in text
+
+    def test_prevents_solution_inflation_and_silent_fallbacks(self):
+        text = TASK_COMPLETION_GUIDANCE.lower()
+        assert "features, refactors, abstractions, defensive layers" in text
+        assert "future compatibility" in text
+        assert "current done contract does not require" in text
+        assert "do not silently substitute a fallback" in text
+        assert "disclose the substitution and its limitations" in text
 
     def test_gpt_assembled_prompt_has_one_persistence_decision_center(self):
         stable = _stable(
