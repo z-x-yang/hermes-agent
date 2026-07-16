@@ -1731,7 +1731,13 @@ class AIAgent:
         from agent.agent_runtime_helpers import repair_message_sequence
         return repair_message_sequence(self, messages)
 
-    def _flush_messages_to_session_db(self, messages: List[Dict], conversation_history: List[Dict] = None):
+    def _flush_messages_to_session_db(
+        self,
+        messages: List[Dict],
+        conversation_history: Optional[List[Dict]] = None,
+        *,
+        raise_on_error: bool = False,
+    ):
         """Persist any un-flushed messages to the SQLite session store.
 
         Deduplicates via an intrinsic ``_DB_PERSISTED_MARKER`` stamped on each
@@ -1742,6 +1748,10 @@ class AIAgent:
         CPython could alias onto a freed-then-reused address (#50372). The
         ``_flushed_db_message_ids`` attribute is now only a one-shot seed
         (translated to markers, then cleared each flush), not a persisted set.
+
+        Set ``raise_on_error=True`` at durability boundaries that must not
+        proceed after an incomplete flush (notably in-place compaction). Normal
+        turn-finalization and teardown paths remain best-effort by default.
 
         Note: the marker is stamped on the live/shared conversation dict, which
         correctly makes re-persistence idempotent across turns. No code path
@@ -1911,6 +1921,8 @@ class AIAgent:
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
+            if raise_on_error:
+                raise
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """

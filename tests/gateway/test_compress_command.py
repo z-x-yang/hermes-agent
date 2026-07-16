@@ -697,6 +697,57 @@ async def test_compress_command_passes_tool_messages_to_compressor():
 
 
 @pytest.mark.asyncio
+async def test_compress_command_seeds_flush_dedup_for_rebuilt_transcript():
+    """Manual /compress rebuilds the transcript FROM session-store rows, so
+    every message is durable before compression starts. The temp agent must be
+    seeded with the flush-dedup protocol (_flushed_db_message_ids +
+    _flushed_db_message_session_id + non-zero _last_flushed_db_idx) so the
+    in-place pre-compaction flush inside compress_context — which persists and
+    counts genuinely un-flushed current-turn messages — does not re-append the
+    whole rebuilt history to the live session (duplicating rows and inflating
+    the cumulative message/tool-call counters)."""
+    history = _make_tool_history()
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.context_compressor._last_compress_aborted = False
+    agent_instance.context_compressor._last_aux_model_failure_model = None
+    agent_instance.session_id = "sess-1"
+    captured = {}
+
+    def _compress(messages, *_args, **_kwargs):
+        captured["messages"] = messages
+        return (
+            [
+                messages[0],
+                {"role": "assistant", "content": "compressed summary"},
+                messages[-1],
+            ],
+            "",
+        )
+
+    agent_instance._compress_context.side_effect = _compress
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+    ):
+        await runner._handle_compress_command(_make_event())
+
+    replayable = captured["messages"]
+    assert len(replayable) > 0
+    assert agent_instance._flushed_db_message_ids == {id(m) for m in replayable}
+    assert agent_instance._flushed_db_message_session_id == agent_instance.session_id
+    assert agent_instance._last_flushed_db_idx == len(replayable)
+
+
+@pytest.mark.asyncio
 async def test_compress_command_does_not_rewrite_after_in_place_archive():
     """When _compress_context already wrote an in-place archive, gateway
     /compress must not call rewrite_transcript and destroy archived rows.

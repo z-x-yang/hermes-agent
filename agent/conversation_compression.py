@@ -717,6 +717,16 @@ def compress_context(
         agent._cached_system_prompt = new_system_prompt
 
         if agent._session_db:
+            if in_place:
+                # Hard durability boundary: every current-turn call must be
+                # counted before compaction rewrites the live transcript. Keep
+                # this outside the best-effort session bookkeeping block below
+                # so a failed flush aborts before archive_and_compact mutates
+                # any durable rows.
+                agent._flush_messages_to_session_db(
+                    messages,
+                    raise_on_error=True,
+                )
             try:
                 # Trigger memory extraction on the current session before the
                 # transcript is rewritten (runs in BOTH modes — the logical
@@ -730,19 +740,19 @@ def compress_context(
                     # renumber, no contextvar/env/logging re-sync. The session's
                     # id, title, cwd, /goal, and gateway routing all stay put.
                     #
+                    # The strict pre-flush above persisted un-written
+                    # current-turn rows through append_message, the single
+                    # chokepoint for cumulative tool-call accounting.
+                    # It also preserved the ORIGINAL rows before the compressor's
+                    # tail projections can replace them in the live transcript.
                     # Durable, NON-DESTRUCTIVE replace: soft-archive the
                     # pre-compaction turns (active=0, kept on disk + FTS-searchable +
                     # recoverable) and insert `compressed` as the new live (active=1)
-                    # set, atomically. `compressed` already carries the surviving
-                    # tail (current-turn messages the compressor kept via
-                    # protect_last_n), so we DON'T pre-flush here — a flush would
-                    # INSERT current-turn rows that archive_and_compact would then
-                    # archive alongside the rest (harmless but wasted writes). The
-                    # live-context load filters active=1, so a resume reloads ONLY
-                    # the compacted set; the original turns remain under the SAME id
-                    # for search/recovery (Teknium review — keep one durable id
-                    # WITHOUT destroying history, unlike a hard replace_messages).
-                    # See #38763.
+                    # set, atomically. The live-context load filters active=1, so a
+                    # resume reloads ONLY the compacted set; the original turns
+                    # remain under the SAME id for search/recovery (Teknium review —
+                    # keep one durable id WITHOUT destroying history, unlike a hard
+                    # replace_messages). See #38763.
                     output_row_ids = None
                     if hasattr(agent._session_db, "archive_and_compact_returning_ids"):
                         output_row_ids = agent._session_db.archive_and_compact_returning_ids(

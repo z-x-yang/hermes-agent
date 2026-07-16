@@ -125,10 +125,26 @@ def test_in_place_compression_rebaselines_session_db_flush_ids():
     assert returned is compressed
     assert agent._session_db.archived == compressed
 
+    # The pre-compaction flush persisted the (never-flushed) originals exactly
+    # once — that is the single chokepoint feeding the cumulative
+    # message_count/tool_call_count accounting. The compressed rows are written
+    # by archive_and_compact only, never by the flush path.
+    assert [m["content"] for m in agent._session_db.appended] == [
+        "old user",
+        "old assistant",
+        "current user",
+    ]
+
     # Normal turn cleanup path after compression.
     agent._flush_messages_to_session_db(returned, original)
 
-    assert agent._session_db.appended == []
+    # Unchanged: the same turn's final flush must not append the compressed
+    # summary/protected tail a second time (flush-cursor seed honored).
+    assert [m["content"] for m in agent._session_db.appended] == [
+        "old user",
+        "old assistant",
+        "current user",
+    ]
 
 
 def test_in_place_compression_writes_persist_audit_with_output_row_ids():

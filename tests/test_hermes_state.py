@@ -5150,6 +5150,46 @@ def test_archive_and_compact_returning_ids_reports_fresh_active_rows(db):
     assert len(db.get_messages("s-rowids", include_inactive=True)) == 4
 
 
+def test_archive_and_compact_preserves_cumulative_tool_call_count(db):
+    """Compaction is a transcript rewrite, not an append event: it must NOT
+    clobber cumulative tool_call_count. That column feeds usage stats and
+    quality audits (insights, web dashboard SUMs); resetting it to the live-set
+    count silently discarded the pre-compaction window (observed: 277 reported
+    vs 1,722 durable distinct calls). message_count intentionally follows the
+    active transcript and acts as the gateway's cross-process change signal.
+    """
+    db.create_session(session_id="s-counters", source="cli")
+    db.append_message("s-counters", role="user", content="q1")
+    db.append_message(
+        "s-counters",
+        role="assistant",
+        content=None,
+        tool_calls=[
+            {"id": "tc-1", "function": {"name": "f", "arguments": "{}"}},
+            {"id": "tc-2", "function": {"name": "g", "arguments": "{}"}},
+        ],
+    )
+    db.append_message("s-counters", role="tool", content="r1", tool_call_id="tc-1")
+    db.append_message("s-counters", role="tool", content="r2", tool_call_id="tc-2")
+    db.append_message("s-counters", role="assistant", content="answer")
+
+    before = db.get_session("s-counters")
+    assert before["message_count"] == 5
+    assert before["tool_call_count"] == 2
+
+    db.archive_and_compact(
+        "s-counters",
+        [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "assistant", "content": "answer"},
+        ],
+    )
+
+    after = db.get_session("s-counters")
+    assert after["message_count"] == 2
+    assert after["tool_call_count"] == 2
+
+
 def test_sessiondb_read_only_connection_enables_query_only(tmp_path):
     path = tmp_path / "state.db"
     writable = SessionDB(db_path=path)

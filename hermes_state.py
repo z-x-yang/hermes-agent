@@ -3710,8 +3710,11 @@ class SessionDB:
         durability, or rewind/undo rows) untouched. Callers that share a session
         id with an agent already running in-place compaction must use this so a
         full-history rewrite doesn't wipe the rows the agent deliberately
-        archived. ``message_count``/``tool_call_count`` then track the live set,
-        matching :meth:`archive_and_compact`.
+        archived. In this mode ``message_count`` follows the replacement live
+        set, while cumulative ``tool_call_count`` is preserved because the
+        replacement is a replay of calls already represented by the retained
+        archive. A full destructive replacement resets both counters to the
+        replacement set.
         """
 
         active_clause = " AND active = 1" if active_only else ""
@@ -3721,17 +3724,19 @@ class SessionDB:
                 f"DELETE FROM messages WHERE session_id = ?{active_clause}",
                 (session_id,),
             )
-            conn.execute(
-                "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
-                (session_id,),
-            )
             total_messages, total_tool_calls, _row_ids = self._insert_message_rows(
                 conn, session_id, messages
             )
-            conn.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                (total_messages, total_tool_calls, session_id),
-            )
+            if active_only:
+                conn.execute(
+                    "UPDATE sessions SET message_count = ? WHERE id = ?",
+                    (total_messages, session_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                    (total_messages, total_tool_calls, session_id),
+                )
 
         self._execute_write(_do)
 
@@ -3766,14 +3771,20 @@ class SessionDB:
             "WHERE session_id = ? AND active = 1",
             (session_id,),
         )
-        inserted, tool_calls_total, inserted_row_ids = self._insert_message_rows(
+        inserted, _tool_calls_total, inserted_row_ids = self._insert_message_rows(
             conn, session_id, compacted_messages
         )
-        # message_count / tool_call_count reflect the LIVE (active) set —
-        # the archived rows are still on disk but not part of the live count.
+        # message_count is the active-transcript size and also the gateway's
+        # cross-process transcript-change fingerprint, so update it to the new
+        # live set. tool_call_count is different: it is cumulative executed-call
+        # accounting for usage/quality audits. Compacted rows replay calls that
+        # were already counted, so neither increment nor reset that counter.
+        # Resetting it to the live-set count (as #38763 did) silently discarded
+        # the whole pre-compaction window — observed as 277 reported calls vs
+        # 1,722 durable distinct tool_call_ids after three compactions.
         conn.execute(
-            "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-            (inserted, tool_calls_total, session_id),
+            "UPDATE sessions SET message_count = ? WHERE id = ?",
+            (inserted, session_id),
         )
         return inserted, inserted_row_ids
 
@@ -3800,8 +3811,9 @@ class SessionDB:
           recoverable via get_messages(..., include_inactive=True).
 
         This is the durability-preserving alternative to :meth:`replace_messages`
-        for compaction. ``message_count`` is set to the ACTIVE (compacted) count,
-        matching what the live load returns. Returns the new active count.
+        for compaction. ``message_count`` tracks the active compacted transcript;
+        ``tool_call_count`` remains cumulative because compaction does not
+        un-execute prior calls. Returns the new active count.
         """
 
         def _do(conn):

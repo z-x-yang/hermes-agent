@@ -3332,6 +3332,19 @@ class GatewaySlashCommandsMixin:
                 # the gateway session entry now points at the new id and
                 # must remain open for the next user turn.
                 tmp_agent._end_session_on_close = False
+                # The transcript entering _compress_context was rebuilt FROM
+                # session-store rows, so every message is durable already.
+                # Seed the flush dedup (the documented external-caller
+                # protocol on _flush_messages_to_session_db) so the
+                # pre-compaction flush inside compress_context — which exists
+                # to persist+count genuinely un-flushed current-turn messages
+                # — treats the whole rebuilt history as written instead of
+                # re-appending it to the live session. The seed is only
+                # honored when _last_flushed_db_idx is non-zero and the
+                # session ids match, so set all three together.
+                tmp_agent._flushed_db_message_ids = {id(m) for m in msgs}
+                tmp_agent._flushed_db_message_session_id = tmp_agent.session_id
+                tmp_agent._last_flushed_db_idx = len(msgs)
 
                 # The summariser runs with only the memory tool enabled, but the
                 # number shown to the user should include the normal platform

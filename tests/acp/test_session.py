@@ -353,13 +353,33 @@ class TestListAndCleanup:
         )
         state = manager.create_session(cwd="/work")
 
-        # Session flushed a live turn, then compaction archived it.
+        # Session flushed a live turn and one executed tool call, then
+        # compaction archived them.
         db.append_message(
             session_id=state.session_id, role="user", content="archived needle"
+        )
+        db.append_message(
+            session_id=state.session_id,
+            role="assistant",
+            tool_calls=[
+                {
+                    "id": "tc-archived",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        )
+        db.append_message(
+            session_id=state.session_id,
+            role="tool",
+            content="done",
+            tool_call_id="tc-archived",
         )
         db.archive_and_compact(
             state.session_id, [{"role": "user", "content": "compacted summary"}]
         )
+        compacted_session = db.get_session(state.session_id)
+        assert compacted_session is not None
+        assert compacted_session["tool_call_count"] == 1
 
         # Model switch: a fresh agent bound to THIS db but not yet self-created.
         state.agent = SimpleNamespace(
@@ -377,6 +397,11 @@ class TestListAndCleanup:
         assert "compacted summary" in contents
         hits = {r["session_id"] for r in db.search_messages("needle")}
         assert state.session_id in hits
+        # active_only is a replay of the already-counted live transcript. It
+        # must not erase calls retained in the archived transcript.
+        saved_session = db.get_session(state.session_id)
+        assert saved_session is not None
+        assert saved_session["tool_call_count"] == 1
 
     def test_cleanup_clears_all(self, manager):
         s1 = manager.create_session()
