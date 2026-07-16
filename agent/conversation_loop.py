@@ -410,23 +410,47 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 agent.session_id, exc,
             )
 
-    if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
-        # Continuing session — reuse the exact system prompt from the
-        # previous turn so the Anthropic cache prefix matches.
-        from agent.system_prompt import hydrate_deferred_tool_snapshot
-
-        hydrate_deferred_tool_snapshot(agent, stored_prompt)
-        agent._cached_system_prompt = stored_prompt
-        return
     if stored_prompt:
-        stored_state = "stale_runtime"
-        logger.info(
-            "Stored system prompt for session %s has stale runtime identity; "
-            "rebuilding for model=%s provider=%s.",
-            agent.session_id,
-            getattr(agent, "model", "") or "",
-            getattr(agent, "provider", "") or "",
-        )
+        if _stored_prompt_matches_runtime(agent, stored_prompt):
+            # Continuing session — reuse the exact system prompt only when its
+            # frozen deferred-tool authority still matches the live bridge.
+            from agent.system_prompt import hydrate_deferred_tool_snapshot
+            from tools.tool_search import TOOL_SEARCH_NAME
+
+            hydrate_deferred_tool_snapshot(agent, stored_prompt)
+            if TOOL_SEARCH_NAME in getattr(agent, "valid_tool_names", ()):
+                from agent.tool_executor import _tool_search_scoped_names
+
+                current_deferred_names = frozenset(
+                    _tool_search_scoped_names(agent)
+                )
+            else:
+                current_deferred_names = frozenset()
+            if current_deferred_names == agent._session_deferred_tool_names:
+                agent._cached_system_prompt = stored_prompt
+                return
+
+            stored_state = "stale_tool_authority"
+            force_rebuild = True
+            stored_deferred_count = len(agent._session_deferred_tool_names)
+            agent._session_deferred_tool_names = None
+            agent._session_deferred_tools_prompt = None
+            logger.info(
+                "Stored system prompt for session %s has stale deferred-tool "
+                "authority; rebuilding (%d stored names, %d live names).",
+                agent.session_id,
+                stored_deferred_count,
+                len(current_deferred_names),
+            )
+        else:
+            stored_state = "stale_runtime"
+            logger.info(
+                "Stored system prompt for session %s has stale runtime identity; "
+                "rebuilding for model=%s provider=%s.",
+                agent.session_id,
+                getattr(agent, "model", "") or "",
+                getattr(agent, "provider", "") or "",
+            )
 
     if conversation_history and stored_state in ("null", "empty"):
         # Continuing session whose stored prompt is unusable.  The

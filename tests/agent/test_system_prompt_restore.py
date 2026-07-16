@@ -81,18 +81,60 @@ class TestStoredPromptReuse:
         db = MagicMock()
         db.get_session.return_value = {"system_prompt": stored}
         agent = _make_agent(session_db=db)
+        agent.valid_tool_names = ["tool_search", "tool_describe", "tool_call"]
 
-        _restore_or_build_system_prompt(
-            agent,
-            None,
-            [{"role": "user", "content": "hi"}],
-        )
+        with patch(
+            "agent.tool_executor._tool_search_scoped_names",
+            return_value=frozenset({"discord", "mcp_notion_search"}),
+        ):
+            _restore_or_build_system_prompt(
+                agent,
+                None,
+                [{"role": "user", "content": "hi"}],
+            )
 
         assert agent._session_deferred_tool_names == frozenset({
             "discord",
             "mcp_notion_search",
         })
         assert agent._session_deferred_tools_prompt in stored
+
+    def test_deferred_authority_mismatch_rebuilds_without_session_start(self):
+        stored = (
+            "Identity\n\n"
+            "Deferred tools available in this session (names only; call "
+            "`tool_describe` with an exact name to load its schema):\n"
+            "- `deferred_tool`\n"
+            "- `newly_pinned_tool`\n\n"
+            "Other stable guidance"
+        )
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db, prebuilt_prompt="REFRESHED_PROMPT")
+        agent.valid_tool_names = ["tool_search", "tool_describe", "tool_call"]
+
+        with (
+            patch(
+                "agent.tool_executor._tool_search_scoped_names",
+                return_value=frozenset({"deferred_tool"}),
+            ),
+            patch("hermes_cli.plugins.invoke_hook") as session_start_hook,
+            patch("agent.credits_tracker.seed_credits_at_session_start") as credits_seed,
+        ):
+            _restore_or_build_system_prompt(
+                agent,
+                None,
+                [{"role": "user", "content": "hi"}],
+            )
+
+        agent._build_system_prompt.assert_called_once_with(None)
+        assert agent._cached_system_prompt == "REFRESHED_PROMPT"
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id,
+            "REFRESHED_PROMPT",
+        )
+        session_start_hook.assert_not_called()
+        credits_seed.assert_not_called()
 
     def test_forced_rebuild_skips_stored_prompt_once(self):
         """Explicit invalidation must not be undone by the DB restore path."""

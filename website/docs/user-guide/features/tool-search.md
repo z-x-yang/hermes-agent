@@ -144,8 +144,9 @@ to any progressive-disclosure design, not specific to this implementation:
   accuracy is still retrieval failure.
 - **Toolset edits invalidate cache.** The names-only index is frozen for the
   lifetime of a session so ordinary prompt rebuilds remain byte-stable. When an
-  MCP refresh actually changes the session's deferred-tool names, Hermes clears
-  that snapshot and rebuilds the system prompt. This is the same cache trade-off
+  MCP refresh changes the deferred names, or a restart resumes a prompt whose
+  saved index no longer matches the current pin/toolset authority, Hermes
+  rebuilds and persists the system prompt once. This is the same cache trade-off
   as any real toolset edit.
 
 ## Implementation details
