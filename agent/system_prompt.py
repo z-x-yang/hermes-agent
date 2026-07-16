@@ -50,6 +50,7 @@ from agent.prompt_contracts import (
     CONTEXT_CONTINUITY_NOTE,
     MEMORY_READBACK_NOTE,
     OBSERVED_CONTENT_BOUNDARY,
+    PROPORTIONALITY_GUIDANCE,
     SIDE_EFFECT_CONFIRMATION_GUIDANCE,
     TURN_COMPLETION_CHECK,
     USER_PRECEDENCE_NOTE,
@@ -292,6 +293,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if agent.valid_tool_names:
             stable_parts.append(ASSESSMENT_FIRST_GUIDANCE)
             stable_parts.append(SIDE_EFFECT_CONFIRMATION_GUIDANCE)
+            # Cross-domain process-weight invariant. Concrete workflow/tool
+            # triggers remain at their call sites; this block only prevents a
+            # loaded skill from upgrading a task by itself.
+            stable_parts.append(PROPORTIONALITY_GUIDANCE)
 
     # Universal parallel-tool-call guidance.  Tells the model to batch
     # independent tool calls into one assistant turn rather than emitting one

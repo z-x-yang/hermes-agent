@@ -122,6 +122,21 @@ SIDE_EFFECT_CONFIRMATION_GUIDANCE = (
     "your report, rather than guessing."
 )
 
+# Proportionality contract for agent process weight.  The system layer keeps
+# only the cross-domain invariant; each process skill/tool owns its concrete
+# observable trigger.  User requests for a minimal path cap ceremony without
+# weakening permission, safety, or the evidence needed to satisfy the real
+# done condition.
+PROPORTIONALITY_GUIDANCE = (
+    "# Proportionality\n"
+    "Start with the lightest process that can satisfy the user's request and "
+    "its real done condition. Complexity is earned by an observed failure or "
+    "boundary, not by anticipation or by loading a skill. If the user asks "
+    "for a minimal or quick path, treat that as a ceiling on ceremony—not on "
+    "safety, authority, or required evidence. Add each process step only for "
+    "its own observable trigger, and stop when the domain oracle passes."
+)
+
 # The semantic half of the injection defense.  The mechanical half — the
 # <untrusted_tool_result> wrapper in tool_dispatch_helpers — only covers
 # known-high-risk tools (web, browser, MCP); this block defines the trust
@@ -197,6 +212,7 @@ __all__ = [
     "COMMUNICATION_GUIDANCE",
     "ASSESSMENT_FIRST_GUIDANCE",
     "SIDE_EFFECT_CONFIRMATION_GUIDANCE",
+    "PROPORTIONALITY_GUIDANCE",
     "OBSERVED_CONTENT_BOUNDARY",
     "MEMORY_READBACK_NOTE",
     "CONTEXT_CONTINUITY_NOTE",

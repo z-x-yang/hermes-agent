@@ -15,6 +15,7 @@ from agent.prompt_contracts import (
     CONTEXT_CONTINUITY_NOTE,
     MEMORY_READBACK_NOTE,
     OBSERVED_CONTENT_BOUNDARY,
+    PROPORTIONALITY_GUIDANCE,
     SIDE_EFFECT_CONFIRMATION_GUIDANCE,
     TURN_COMPLETION_CHECK,
     USER_PRECEDENCE_NOTE,
@@ -63,6 +64,7 @@ ALL_CONTRACT_BLOCKS = (
     COMMUNICATION_GUIDANCE,
     ASSESSMENT_FIRST_GUIDANCE,
     SIDE_EFFECT_CONFIRMATION_GUIDANCE,
+    PROPORTIONALITY_GUIDANCE,
     OBSERVED_CONTENT_BOUNDARY,
     CONTEXT_CONTINUITY_NOTE,
     USER_PRECEDENCE_NOTE,
@@ -88,6 +90,7 @@ class TestContractPresence:
         stable = _stable(_make_agent(valid_tool_names=[]))
         assert ASSESSMENT_FIRST_GUIDANCE not in stable
         assert SIDE_EFFECT_CONFIRMATION_GUIDANCE not in stable
+        assert PROPORTIONALITY_GUIDANCE not in stable
         assert OBSERVED_CONTENT_BOUNDARY not in stable
         # Rides the task-completion gate, which requires tools too.
         assert TURN_COMPLETION_CHECK not in stable
@@ -100,6 +103,7 @@ class TestContractGating:
             COMMUNICATION_GUIDANCE,
             ASSESSMENT_FIRST_GUIDANCE,
             SIDE_EFFECT_CONFIRMATION_GUIDANCE,
+            PROPORTIONALITY_GUIDANCE,
             OBSERVED_CONTENT_BOUNDARY,
             CONTEXT_CONTINUITY_NOTE,
             USER_PRECEDENCE_NOTE,
@@ -138,6 +142,23 @@ class TestContractOrdering:
         check_at = stable.index(TURN_COMPLETION_CHECK)
         comm_at = stable.index(COMMUNICATION_GUIDANCE)
         assert task_at < check_at < comm_at
+
+    def test_proportionality_follows_permission_boundaries(self):
+        stable = _stable(_make_agent())
+        side_effect_at = stable.index(SIDE_EFFECT_CONFIRMATION_GUIDANCE)
+        proportionality_at = stable.index(PROPORTIONALITY_GUIDANCE)
+        parallel_at = stable.index("# Parallel tool calls")
+        assert side_effect_at < proportionality_at < parallel_at
+
+
+class TestProportionalityContract:
+    def test_minimality_caps_ceremony_not_safety_or_evidence(self):
+        assert "observed failure or boundary" in PROPORTIONALITY_GUIDANCE
+        assert "not by anticipation or by loading a skill" in PROPORTIONALITY_GUIDANCE
+        assert "ceiling on ceremony" in PROPORTIONALITY_GUIDANCE
+        assert "not on safety, authority, or required evidence" in PROPORTIONALITY_GUIDANCE
+        assert "own observable trigger" in PROPORTIONALITY_GUIDANCE
+        assert "stop when the domain oracle passes" in PROPORTIONALITY_GUIDANCE
 
 
 class TestCacheStability:

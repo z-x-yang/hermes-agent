@@ -439,6 +439,28 @@ class TestBuildSkillsSystemPrompt:
             clear_session_prompts=True,
         )
 
+    def test_routing_floor_and_approved_always_full_owners_are_stable(self):
+        from agent.prompt_builder import (
+            _ALWAYS_FULL_SKILL_NAMES,
+            _SKILL_DESCRIPTION_PREVIEW_CHARS,
+        )
+
+        assert _SKILL_DESCRIPTION_PREVIEW_CHARS == 60
+        assert _ALWAYS_FULL_SKILL_NAMES == frozenset({
+            "apple-ecosystem",
+            "email-outbound-gate",
+            "evelyn-agent",
+            "investing-manual",
+            "nature-methods-figure-production",
+            "notion-task-engine",
+            "reminder-task-bridge",
+            "research-experiment-recording",
+            "research-project-memory",
+            "scientific-research",
+            "writing-skills",
+            "zongxin-notion-second-brain",
+        })
+
     def test_empty_when_no_skills_dir(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         result = build_skills_system_prompt()
