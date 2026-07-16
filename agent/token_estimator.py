@@ -20,10 +20,16 @@ def _encoding():
 
 
 def count_text_tokens(text: object) -> int:
-    """Count text with the canonical runtime estimate encoding."""
+    """Count text with the canonical runtime estimate encoding.
+
+    Special-token literals (e.g. ``<|endoftext|>`` appearing in a transcript
+    that discusses tokenizers) are data to be counted, not control tokens, so
+    the disallowed-special check is disabled — an estimator must be total over
+    arbitrary text.
+    """
     if text is None or text == "":
         return 0
-    return len(_encoding().encode(str(text)))
+    return len(_encoding().encode(str(text), disallowed_special=()))
 
 
 def count_json_tokens(value: Any) -> int:
@@ -100,7 +106,7 @@ def split_text_for_token_budget(
     Returns ``None`` when the text already fits. Otherwise returns
     ``(head, tail, total_tokens, head_tokens, tail_tokens)``.
     """
-    tokens = _encoding().encode(text)
+    tokens = _encoding().encode(text, disallowed_special=())
     if len(tokens) <= max_tokens:
         return None
     head_tokens = int(max_tokens * head_ratio)
