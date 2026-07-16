@@ -1432,6 +1432,12 @@ def init_agent(
     # single turn; the runtime already executes such batches concurrently.
     agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
 
+    # Fork behavioral contracts umbrella toggle (agent/prompt_contracts.py:
+    # communication contract, assessment-first, side-effect confirmation,
+    # observed-content boundary, continuity + precedence notes).  Default
+    # True.  One flag for the whole family — they are designed as a set.
+    agent._behavior_contracts = bool(_agent_section.get("behavior_contracts", True))
+
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics

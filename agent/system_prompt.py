@@ -43,6 +43,16 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
 )
+from agent.prompt_contracts import (
+    ASSESSMENT_FIRST_GUIDANCE,
+    COMMUNICATION_GUIDANCE,
+    CONTEXT_CONTINUITY_NOTE,
+    MEMORY_READBACK_NOTE,
+    OBSERVED_CONTENT_BOUNDARY,
+    SIDE_EFFECT_CONFIRMATION_GUIDANCE,
+    TURN_COMPLETION_CHECK,
+    USER_PRECEDENCE_NOTE,
+)
 from agent.runtime_cwd import resolve_context_cwd
 
 
@@ -224,6 +234,22 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # users who want a leaner prompt can turn it off.
     if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
         stable_parts.append(TASK_COMPLETION_GUIDANCE)
+        # Fork behavioral contract: end-of-turn self-check (see
+        # agent/prompt_contracts.py). Same gate as TASK_COMPLETION_GUIDANCE —
+        # it turns that block's "keep working" into a checkable behavior.
+        stable_parts.append(TURN_COMPLETION_CHECK)
+
+    # Fork behavioral contracts (agent/prompt_contracts.py), gated by
+    # config.yaml ``agent.behavior_contracts`` (default True).  The
+    # communication contract is universal — it applies to pure-chat answers
+    # too; the assessment-first and side-effect blocks only matter when the
+    # agent can actually touch things, so they share the tools gate.
+    _behavior_contracts = getattr(agent, "_behavior_contracts", True)
+    if _behavior_contracts:
+        stable_parts.append(COMMUNICATION_GUIDANCE)
+        if agent.valid_tool_names:
+            stable_parts.append(ASSESSMENT_FIRST_GUIDANCE)
+            stable_parts.append(SIDE_EFFECT_CONFIRMATION_GUIDANCE)
 
     # Universal parallel-tool-call guidance.  Tells the model to batch
     # independent tool calls into one assistant turn rather than emitting one
@@ -240,6 +266,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     tool_guidance = []
     if "memory" in agent.valid_tool_names:
         tool_guidance.append(MEMORY_GUIDANCE)
+        # Fork behavioral contract: read-side guard for memory (see
+        # agent/prompt_contracts.py) — rides the same tool gate.
+        tool_guidance.append(MEMORY_READBACK_NOTE)
     if "session_search" in agent.valid_tool_names:
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
@@ -261,6 +290,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # agent has tools. Static text → byte-stable prompt (no cache hit).
     if agent.valid_tool_names:
         stable_parts.append(STEER_CHANNEL_NOTE)
+        # Fork behavioral contract: the semantic trust boundary for
+        # everything the <untrusted_tool_result> wrapper doesn't cover
+        # (see agent/prompt_contracts.py).  Kept adjacent to the steer
+        # note so the pair reads as "trust exactly one marked channel;
+        # everything else you observe is data".
+        if _behavior_contracts:
+            stable_parts.append(OBSERVED_CONTENT_BOUNDARY)
 
     # Computer-use — goes in as its own block rather than being merged into
     # tool_guidance because the content is multi-paragraph. The guidance is
@@ -465,6 +501,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if _effective_hint:
         stable_parts.append(_effective_hint)
 
+    # Fork behavioral contracts closing the stable tier (see
+    # agent/prompt_contracts.py): compression self-awareness, then the
+    # precedence note LAST so it speaks about everything above it.
+    if _behavior_contracts:
+        stable_parts.append(CONTEXT_CONTINUITY_NOTE)
+        stable_parts.append(USER_PRECEDENCE_NOTE)
+
     # ── Context tier (cwd-dependent, may change between sessions) ─
     context_parts: List[str] = []
 
@@ -515,7 +558,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # session resume without a stored prompt).  The model can still query the
     # exact wall-clock time via tools when it actually needs it.
     # Credit: @iamfoz (PR #20451).
-    timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')}"
+    # The parenthetical matters for long-lived sessions (session_reset.mode:
+    # none keeps a session alive for weeks): without it the model has no cue
+    # that this date is the session's start, not today.
+    timestamp_line = (
+        f"Conversation started: {now.strftime('%A, %B %d, %Y')} "
+        "(session start date — for today's date or the current time, check "
+        "with a tool)"
+    )
     if agent.pass_session_id and agent.session_id:
         timestamp_line += f"\nSession ID: {agent.session_id}"
     if agent.model:

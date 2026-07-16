@@ -35,7 +35,7 @@ At the start of every session, memory entries are loaded from disk and rendered 
 
 ```
 ══════════════════════════════════════════════
-MEMORY (your personal notes) [67% — 1,474/2,200 chars]
+MEMORY (your notes from past sessions — background context; may be stale) [67% — 1,474/2,200 chars]
 ══════════════════════════════════════════════
 User's project is a Rust web service at ~/code/myapi using Axum + SQLx
 §
