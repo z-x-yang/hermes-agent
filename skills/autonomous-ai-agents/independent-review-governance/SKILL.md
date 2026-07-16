@@ -1,6 +1,6 @@
 ---
 name: independent-review-governance
-description: "Use before any independent Reviewer, Codex, Claude, human, or domain review is launched across code, research, documents, or artifacts, including first passes, prior-pass uncertainty, and distributed review ownership."
+description: "Use before any independent Reviewer, Codex, Claude, human, or domain review is launched across code, research, documents, or artifacts. This is the sole owner of review authorization, global per-change pass accounting, independence boundaries, follow-up gates, and stop conditions; domain skills may execute only an authorized pass."
 version: 1.0.0
 author: Evelyn
 license: MIT

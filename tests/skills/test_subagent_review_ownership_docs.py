@@ -78,6 +78,8 @@ def test_review_owner_descriptions_are_disjoint_and_routeable():
         "description: \"Use only after independent-review-governance authorizes "
         "an independent pass" in code_review
     )
+    assert "sole owner of review authorization" in governance
+    assert "domain skills may execute only an authorized pass" in governance
 
 
 def test_governance_owns_authorization_budget_and_stop_not_code_mechanics():

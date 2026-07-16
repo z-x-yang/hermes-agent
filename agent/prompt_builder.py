@@ -1443,6 +1443,7 @@ _ALWAYS_FULL_SKILL_NAMES = frozenset({
     "apple-ecosystem",
     "email-outbound-gate",
     "evelyn-agent",
+    "independent-review-governance",
     "investing-manual",
     "nature-methods-figure-production",
     "notion-task-engine",

@@ -1,14 +1,14 @@
 ---
 title: "Independent Review Governance"
 sidebar_label: "Independent Review Governance"
-description: "Use before any independent Reviewer, Codex, Claude, human, or domain review is launched across code, research, documents, or artifacts, including first passe..."
+description: "Use before any independent Reviewer, Codex, Claude, human, or domain review is launched across code, research, documents, or artifacts. This is the sole owner..."
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Independent Review Governance
 
-Use before any independent Reviewer, Codex, Claude, human, or domain review is launched across code, research, documents, or artifacts, including first passes, prior-pass uncertainty, and distributed review ownership.
+Use before any independent Reviewer, Codex, Claude, human, or domain review is launched across code, research, documents, or artifacts. This is the sole owner of review authorization, global per-change pass accounting, independence boundaries, follow-up gates, and stop conditions; domain skills may execute only an authorized pass.
 
 ## Skill metadata
 
