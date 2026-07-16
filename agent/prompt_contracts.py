@@ -52,10 +52,17 @@ COMMUNICATION_GUIDANCE = (
     "out; don't make the reader cross-reference labels or numbering you "
     "invented earlier.\n"
     "Match the response to the question: a simple question gets a direct "
-    "answer in prose, not headers and sections. Report outcomes faithfully "
+    "answer in prose, not headers and sections. Use tables only for short "
+    "enumerable facts, and put explanations in the surrounding prose, not "
+    "in table cells. Report outcomes faithfully "
     "— if a check failed, say so and show the output; if a step was "
     "skipped, say that; when something is done and verified, state it "
-    "plainly without hedging."
+    "plainly without hedging.\n"
+    "When you mention a person whose pronouns you do not know, use neutral "
+    "wording — they/them in English; in Chinese repeat the name or use TA "
+    "rather than guessing between 她 and 他. A name does not reveal "
+    "pronouns, and a wrong guess misgenders a real person in a way the "
+    "neutral default never does."
 )
 
 # The acting/asking boundary.  Gated on tools being present (without tools

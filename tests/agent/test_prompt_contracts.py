@@ -181,6 +181,17 @@ class TestExecutionAndStoppingContract:
         assert "do not silently substitute a fallback" in text
         assert "disclose the substitution and its limitations" in text
 
+    def test_no_rederivation_and_recommendation_over_survey(self):
+        text = TASK_COMPLETION_GUIDANCE.lower()
+        assert "do not re-derive facts already established" in text
+        # Re-grounding stays legal: mutable state and post-compression gaps.
+        assert "unless the underlying state may have changed" in text
+        assert "no longer in context" in text
+        # "already ruled out" — an offer pending the user's decision is NOT
+        # ruled out, so this cannot eat the one-line offer contract.
+        assert "options you have already ruled out" in text
+        assert "recommendation, not an exhaustive survey" in text
+
     def test_turn_close_check_restored_with_single_legal_exit(self):
         # The 7484f4d3c consolidation kept TURN_COMPLETION_CHECK's exception
         # ("a plan ... is complete when that is what the user requested") but
@@ -221,6 +232,21 @@ class TestExecutionAndStoppingContract:
             "End your turn only",
         ):
             assert duplicated not in stable
+
+
+class TestCommunicationContract:
+    def test_tables_carry_facts_prose_carries_explanations(self):
+        text = COMMUNICATION_GUIDANCE.lower()
+        assert "tables only for short enumerable facts" in text
+        assert "not in table cells" in text
+
+    def test_unknown_pronouns_default_to_neutral_wording(self):
+        # Evelyn writes about real colleagues daily; a wrong 她/他 guess
+        # misgenders a real person while the neutral default never does.
+        text = COMMUNICATION_GUIDANCE
+        assert "they/them" in text
+        assert "use TA " in text
+        assert "a name does not reveal" in text.lower()
 
 
 class TestActingAndAskingContract:

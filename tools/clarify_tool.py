@@ -165,8 +165,11 @@ CLARIFY_SCHEMA = {
         "- You want to offer to save a skill or update memory\n"
         "- A decision has meaningful trade-offs the user should weigh in on\n\n"
         "Do NOT use this tool for simple yes/no confirmation of dangerous "
-        "commands (the terminal tool handles that). Prefer making a "
-        "reasonable default choice yourself when the decision is low-stakes."
+        "commands (the terminal tool handles that). Reserve mid-task "
+        "questions for decisions "
+        "where the user's answer changes what you do next. For choices with "
+        "a conventional default, or facts you can verify yourself, do not "
+        "ask: pick the obvious option, state it in your reply, and proceed."
     ),
     "parameters": {
         "type": "object",

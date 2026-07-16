@@ -4160,7 +4160,10 @@ DELEGATE_TASK_SCHEMA = {
         "boundary, and stop condition—not prescribed steps. Use delegation as a context firewall "
         "for high-noise exploration, logs or repository sweeps, and multi-source synthesis; ask "
         "for conclusions, evidence handles, uncertainty, and next steps, not raw dumps. The parent "
-        "owns synthesis, decisions, and any follow-on authorization. Work runs in the background "
+        "owns synthesis, decisions, and any follow-on authorization. Once a subtask is "
+        "delegated, do not duplicate the work while it runs — wait for the result. If it "
+        "comes back failed or never arrives, take the work back or re-delegate; a dead "
+        "delegation does not discharge the task. Work runs in the background "
         "by default; set run_in_background=false only when the result is needed before continuing."
     ),
     "parameters": {
