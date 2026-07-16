@@ -456,8 +456,9 @@ def bridge_tool_schemas(deferred_count: int) -> List[Dict[str, Any]]:
         "to be searched."
     )
     desc_describe = (
-        "Load the full JSON schema for an exact tool name. If you already know "
-        "the exact tool name, call this without searching first; otherwise use "
+        "Load the full JSON schema for one exact tool name or a batch of names. "
+        "Pass a string or an array of strings. If you already know the exact "
+        "tool names, call this without searching first; otherwise use "
         f"`{TOOL_SEARCH_NAME}`. Required before `{TOOL_CALL_NAME}` if the tool's "
         "parameters are unknown."
     )
@@ -498,8 +499,14 @@ def bridge_tool_schemas(deferred_count: int) -> List[Dict[str, Any]]:
                     "type": "object",
                     "properties": {
                         "name": {
-                            "type": "string",
-                            "description": "Exact tool name (as returned by tool_search).",
+                            "oneOf": [
+                                {"type": "string"},
+                                {"type": "array", "items": {"type": "string"}},
+                            ],
+                            "description": (
+                                "Exact tool name or names (as listed in the system "
+                                "prompt or returned by tool_search)."
+                            ),
                         },
                     },
                     "required": ["name"],
@@ -697,33 +704,80 @@ def dispatch_tool_describe(args: Dict[str, Any],
     """Execute the ``tool_describe`` bridge tool. Returns a JSON string."""
     if config is None:
         config = load_config()
-    name = str(args.get("name") or "").strip()
-    if not name:
-        return json.dumps({"error": "name is required"}, ensure_ascii=False)
-    if (
-        not is_deferrable_tool_name(name)
-        or matches_tool_pattern(name, config.always_visible_tools)
-    ):
-        return json.dumps({
-            "error": (
-                f"'{name}' is not a deferrable tool. If you see it in the tools list "
-                "already, call it directly; otherwise check the spelling against tool_search."
-            ),
-        }, ensure_ascii=False)
     _, deferrable = classify_tools(
         current_tool_defs, always_visible_tools=config.always_visible_tools
     )
-    for td in deferrable:
-        fn = td.get("function") or {}
-        if fn.get("name") == name:
-            return json.dumps({
-                "name": name,
-                "description": fn.get("description", ""),
-                "parameters": fn.get("parameters", {}),
-            }, ensure_ascii=False)
-    return json.dumps({
-        "error": f"'{name}' is not currently available. Re-run tool_search to refresh.",
-    }, ensure_ascii=False)
+    return describe_tool_definitions(
+        args,
+        deferrable_tool_defs=deferrable,
+        config=config,
+        require_registered_deferrable=True,
+    )
+
+
+def describe_tool_definitions(
+    args: Dict[str, Any],
+    *,
+    deferrable_tool_defs: List[Dict[str, Any]],
+    config: Optional[ToolSearchConfig] = None,
+    require_registered_deferrable: bool = True,
+) -> str:
+    """Describe one or many names from an already authority-scoped catalog."""
+    if config is None:
+        config = load_config()
+    raw_name = args.get("name")
+    is_batch = isinstance(raw_name, list)
+    if is_batch:
+        if not raw_name:
+            return json.dumps({"error": "name is required"}, ensure_ascii=False)
+        if any(not isinstance(name, str) or not name.strip() for name in raw_name):
+            return json.dumps(
+                {"error": "every name in the batch must be a non-empty string"},
+                ensure_ascii=False,
+            )
+        names = [name.strip() for name in raw_name]
+    else:
+        name = str(raw_name or "").strip()
+        if not name:
+            return json.dumps({"error": "name is required"}, ensure_ascii=False)
+        names = [name]
+
+    by_name = {
+        fn.get("name"): fn
+        for td in deferrable_tool_defs
+        for fn in [td.get("function") or {}]
+        if fn.get("name")
+    }
+
+    tools: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    for name in names:
+        if require_registered_deferrable and (
+            not is_deferrable_tool_name(name)
+            or matches_tool_pattern(name, config.always_visible_tools)
+        ):
+            error = (
+                f"'{name}' is not a deferrable tool. If you see it in the tools list "
+                "already, call it directly; otherwise check the spelling against tool_search."
+            )
+        else:
+            fn = by_name.get(name)
+            if fn is not None:
+                tools.append({
+                    "name": name,
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                })
+                continue
+            error = f"'{name}' is not currently available. Re-run tool_search to refresh."
+
+        if not is_batch:
+            return json.dumps({"error": error}, ensure_ascii=False)
+        errors.append({"name": name, "error": error})
+
+    if not is_batch:
+        return json.dumps(tools[0], ensure_ascii=False)
+    return json.dumps({"tools": tools, "errors": errors}, ensure_ascii=False)
 
 
 def scoped_deferrable_names(
@@ -853,6 +907,7 @@ __all__ = [
     "is_bridge_tool",
     "dispatch_tool_search",
     "dispatch_tool_describe",
+    "describe_tool_definitions",
     "resolve_underlying_call",
     "scoped_deferrable_names",
 ]

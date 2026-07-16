@@ -31,24 +31,26 @@ place of the deferred ones:
 
 ```
 tool_search(query, limit?)     — search the deferred-tool catalog
-tool_describe(name)            — load the full schema for one tool
+tool_describe(name | names[])  — load one or several full schemas
 tool_call(name, arguments)     — invoke a deferred tool
 ```
 
-If the exact deferred tool name is already known, the model can start with
-`tool_describe(name)` without running a keyword search first. Because the
-visible set is partial, a broader visible integration is not a substitute for
-an exact operation that may be deferred. When a request names an app or service
-and no already-visible dedicated tool matches, Tool Search is a mandatory
-discovery gate before browser, computer, or terminal.
+The system prompt contains a compact, names-only index of every deferred tool
+available to that session. If an exact name matches the requested operation, the
+model can start with `tool_describe(name)` without running a keyword search
+first. It can also pass an array of names to load several schemas in one round
+trip. Keyword search remains the fallback when the correct name is not obvious.
+Because the visible set is partial, a broader visible integration is not a
+substitute for an exact operation that may be deferred. When a request names an
+app or service and no already-visible dedicated tool matches, Tool Search is a
+mandatory discovery gate before browser, computer, or terminal.
 
 A typical interaction looks like:
 
 ```
-Model: tool_search("create a github issue")
-  → { matches: [{ name: "mcp_github_create_issue", ... }, ...] }
-Model: tool_describe("mcp_github_create_issue")
-  → { parameters: { type: "object", properties: { ... } } }
+System prompt index: mcp_github_create_issue, mcp_github_get_repo
+Model: tool_describe(["mcp_github_create_issue", "mcp_github_get_repo"])
+  → { tools: [{ name: "mcp_github_create_issue", parameters: ... }, ...], errors: [] }
 Model: tool_call("mcp_github_create_issue", { title: "...", body: "..." })
   → { ok: true, issue_number: 42 }
 ```
@@ -111,10 +113,11 @@ tools:
 
 ## When NOT to use it
 
-Tool Search trades a fixed per-turn token cost (the three bridge tool
-schemas, ~300 tokens) and extra round trips (describe → call when the exact
-name is known; otherwise search → describe → call) for the savings on the
-deferred schemas. It's a clear
+Tool Search trades a fixed per-turn token cost (the three bridge tool schemas
+plus the compact names-only index) and extra round trips (describe → call when
+the exact name is known; otherwise search → describe → call) for the savings on
+the deferred schemas. Batched describe avoids repeated schema-loading turns when
+several deferred tools are likely to be needed. It's a clear
 win when you have many tools and use few per turn; it's overhead when
 you have few tools total.
 
@@ -139,10 +142,11 @@ to any progressive-disclosure design, not specific to this implementation:
   less well; the published Anthropic numbers (49% → 74% on Opus 4 with
   vs. without tool search) show the upside but also that ~26 points of
   accuracy is still retrieval failure.
-- **Toolset edits invalidate cache.** Adding or removing a tool mid-
-  session changes the bridge tools' descriptions (which include the
-  count of deferred tools) and the catalog, so the prompt cache is
-  invalidated. This is the same trade-off as any toolset edit.
+- **Toolset edits invalidate cache.** The names-only index is frozen for the
+  lifetime of a session so ordinary prompt rebuilds remain byte-stable. When an
+  MCP refresh actually changes the session's deferred-tool names, Hermes clears
+  that snapshot and rebuilds the system prompt. This is the same cache trade-off
+  as any real toolset edit.
 
 ## Implementation details
 
@@ -155,6 +159,10 @@ to any progressive-disclosure design, not specific to this implementation:
   tool-defs list every assembly — no session-keyed `Map`. This avoids
   the class of bug where a stored catalog drifts out of sync with the
   live tool registry.
+- **The names-only index is session-stable and authority-scoped.** Its source is
+  the same deferrable slice accepted by the bridge after enabled/disabled
+  toolsets and subagent policy are applied. Prompt compression reuses the frozen
+  snapshot; a real MCP catalog change explicitly invalidates it.
 - **The catalog is scoped to the session's toolsets.** `tool_search`,
   `tool_describe`, and `tool_call` only ever see and invoke tools the
   session was actually granted. A subagent, kanban worker, or gateway

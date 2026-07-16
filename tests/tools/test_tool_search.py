@@ -840,6 +840,70 @@ class TestBridgeDispatch:
         )
         assert "error" in json.loads(result)
 
+    def test_tool_describe_schema_accepts_one_name_or_a_batch(self):
+        from tools.tool_search import bridge_tool_schemas
+
+        describe = next(
+            schema["function"]
+            for schema in bridge_tool_schemas(12)
+            if schema["function"]["name"] == "tool_describe"
+        )
+        variants = describe["parameters"]["properties"]["name"]["oneOf"]
+
+        assert {variant["type"] for variant in variants} == {"string", "array"}
+        array_variant = next(variant for variant in variants if variant["type"] == "array")
+        assert array_variant["items"] == {"type": "string"}
+
+    def test_tool_describe_rejects_non_string_batch_entries(self):
+        from tools.tool_search import describe_tool_definitions
+
+        parsed = json.loads(describe_tool_definitions(
+            {"name": ["valid_name", 42]},
+            deferrable_tool_defs=[],
+            require_registered_deferrable=False,
+        ))
+
+        assert parsed == {
+            "error": "every name in the batch must be a non-empty string"
+        }
+
+    def test_tool_describe_loads_multiple_schemas_in_one_call(self):
+        from tools.registry import registry
+        from tools.tool_search import dispatch_tool_describe
+
+        names = ["batch_describe_first", "batch_describe_second"]
+        missing = "missing_batch_tool"
+        defs = [
+            _td(name, f"schema for {name}", {"value": {"type": "string"}})
+            for name in names
+        ]
+        registered_defs = defs + [_td(missing, "registered but outside this session")]
+        try:
+            for definition in registered_defs:
+                fn = definition["function"]
+                registry.register(
+                    name=fn["name"],
+                    toolset="batch-describe-test",
+                    schema=fn,
+                    handler=lambda args: args,
+                )
+
+            result = dispatch_tool_describe(
+                {"name": [names[1], missing, names[0]]},
+                current_tool_defs=defs,
+            )
+        finally:
+            for name in [*names, missing]:
+                registry.deregister(name)
+
+        parsed = json.loads(result)
+        assert [tool["name"] for tool in parsed["tools"]] == [names[1], names[0]]
+        assert all("value" in tool["parameters"]["properties"] for tool in parsed["tools"])
+        assert parsed["errors"] == [{
+            "name": "missing_batch_tool",
+            "error": "'missing_batch_tool' is not currently available. Re-run tool_search to refresh.",
+        }]
+
     def test_resolve_underlying_call_parses_object_args(self):
         from tools.tool_search import resolve_underlying_call
         name, args, err = resolve_underlying_call({

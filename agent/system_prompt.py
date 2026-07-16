@@ -10,9 +10,10 @@ fork inherits the cached prompt verbatim.
 Three tiers are joined with ``\\n\\n``:
 
 * ``stable``   — identity (SOUL.md or DEFAULT_AGENT_IDENTITY), tool
-  guidance, computer-use guidance, nous subscription block, tool-use
-  enforcement guidance + per-model operational guidance, skills prompt,
-  alibaba model-name workaround, environment hints, platform hints.
+  guidance, deferred-tool name index, computer-use guidance, nous
+  subscription block, tool-use enforcement guidance + per-model operational
+  guidance, skills prompt, alibaba model-name workaround, environment hints,
+  platform hints.
 * ``context``  — caller-supplied ``system_message`` plus context files
   (AGENTS.md / .cursorrules / etc.) discovered under ``TERMINAL_CWD``.
 * ``volatile`` — memory snapshot, USER.md profile, external memory
@@ -86,6 +87,47 @@ _DEFERRED_TOOL_DISCOVERY_GUIDANCE = (
     "exactly matches the requested operation, search before substituting a broader "
     "integration, browser, computer, or terminal action."
 )
+_DEFERRED_TOOL_INDEX_HEADING = (
+    "Deferred tools available in this session (names only; call "
+    "`tool_describe` with an exact name to load its schema):"
+)
+
+
+def _render_deferred_tools_prompt(names: frozenset[str]) -> str:
+    if not names:
+        return ""
+    listing = "\n".join(f"- `{name}`" for name in sorted(names))
+    return f"{_DEFERRED_TOOL_INDEX_HEADING}\n{listing}"
+
+
+def _build_deferred_tools_prompt(agent: Any) -> str:
+    """Render the session's authority-scoped deferred-tool name index."""
+    try:
+        from agent.tool_executor import _tool_search_scoped_names
+
+        names = frozenset(_tool_search_scoped_names(agent))
+    except Exception:
+        names = frozenset()
+    agent._session_deferred_tool_names = names
+    return _render_deferred_tools_prompt(names)
+
+
+def hydrate_deferred_tool_snapshot(agent: Any, system_prompt: str) -> None:
+    """Recover the frozen deferred-tool index from a persisted prompt."""
+    start = (system_prompt or "").find(_DEFERRED_TOOL_INDEX_HEADING)
+    if start < 0:
+        names = frozenset()
+        rendered = ""
+    else:
+        end = system_prompt.find("\n\n", start)
+        rendered = system_prompt[start:] if end < 0 else system_prompt[start:end]
+        names = frozenset(
+            line[3:-1]
+            for line in rendered.splitlines()[1:]
+            if line.startswith("- `") and line.endswith("`") and len(line) > 5
+        )
+    agent._session_deferred_tool_names = names
+    agent._session_deferred_tools_prompt = rendered
 
 
 def _has_skill_read_tools(valid_tool_names: Any) -> bool:
@@ -308,6 +350,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     if "tool_search" in agent.valid_tool_names:
         stable_parts.append(_DEFERRED_TOOL_DISCOVERY_GUIDANCE)
+        deferred_tools_prompt = getattr(
+            agent, "_session_deferred_tools_prompt", None
+        )
+        if deferred_tools_prompt is None:
+            deferred_tools_prompt = _build_deferred_tools_prompt(agent)
+            agent._session_deferred_tools_prompt = deferred_tools_prompt
+        if deferred_tools_prompt:
+            stable_parts.append(deferred_tools_prompt)
+    else:
+        agent._session_deferred_tool_names = frozenset()
+        agent._session_deferred_tools_prompt = ""
 
     nous_subscription_prompt = _r.build_nous_subscription_prompt(agent.valid_tool_names)
     if nous_subscription_prompt:

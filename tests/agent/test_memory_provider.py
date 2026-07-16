@@ -1473,6 +1473,34 @@ class TestMemoryProviderToolSearchBridge:
         assert parsed["name"] == "fact_store"
         assert "action" in parsed["parameters"]["properties"]
 
+    def test_tool_describe_batches_agent_local_schemas(self):
+        from agent.tool_executor import _dispatch_agent_tool_search_bridge
+
+        agent = self._agent(
+            context_schemas=[{
+                "name": "lcm_grep",
+                "description": "Search compressed context slices.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                },
+            }],
+            context_tool_names={"lcm_grep"},
+        )
+        result = _dispatch_agent_tool_search_bridge(
+            agent,
+            "tool_describe",
+            {"name": ["fact_store", "lcm_grep"]},
+        )
+
+        assert result is not None
+        parsed = json.loads(result)
+        assert [tool["name"] for tool in parsed["tools"]] == [
+            "fact_store",
+            "lcm_grep",
+        ]
+        assert parsed["errors"] == []
+
     def test_tool_call_unwrap_allows_agent_local_memory_provider_tool(self):
         from agent.tool_executor import _resolve_agent_tool_call_bridge
 

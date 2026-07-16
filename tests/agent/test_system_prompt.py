@@ -76,8 +76,43 @@ class TestDeferredToolDiscoveryGuidance:
         assert "exactly matches the requested operation" in stable
 
     def test_absent_without_tool_search(self):
-        stable = _stable_prompt(_make_agent(valid_tool_names=["computer_use"]))
+        agent = _make_agent(valid_tool_names=["computer_use"])
+        stable = _stable_prompt(agent)
         assert "tool visibility is partial" not in stable
+        assert agent._session_deferred_tool_names == frozenset()
+        assert agent._session_deferred_tools_prompt == ""
+
+    def test_lists_only_session_scoped_deferred_tool_names(self):
+        agent = _make_agent(valid_tool_names=["tool_search", "tool_describe", "tool_call"])
+
+        with patch(
+            "agent.tool_executor._tool_search_scoped_names",
+            return_value=frozenset({"mcp_notion_search", "discord"}),
+        ):
+            stable = _stable_prompt(agent)
+
+        assert "Deferred tools available in this session" in stable
+        assert "- `discord`" in stable
+        assert "- `mcp_notion_search`" in stable
+        assert "mcp_outside_session" not in stable
+
+    def test_deferred_tool_index_is_frozen_for_the_session(self):
+        agent = _make_agent(valid_tool_names=["tool_search", "tool_describe", "tool_call"])
+
+        with patch(
+            "agent.tool_executor._tool_search_scoped_names",
+            side_effect=[
+                frozenset({"first_session_tool"}),
+                frozenset({"later_registry_tool"}),
+            ],
+        ) as scoped_names:
+            first = _stable_prompt(agent)
+            second = _stable_prompt(agent)
+
+        assert "first_session_tool" in first
+        assert "first_session_tool" in second
+        assert "later_registry_tool" not in second
+        assert scoped_names.call_count == 1
 
 
 class TestSkillListingSessionInputs:

@@ -132,6 +132,86 @@ def test_refresh_no_change_returns_empty_and_leaves_agent_untouched(monkeypatch)
     assert agent.tools is original_tools  # not replaced → no churn / no cache thrash
 
 
+def test_refresh_invalidates_frozen_deferred_index_when_catalog_changes(monkeypatch):
+    """A changed hidden catalog must rebuild the names-only system-prompt index."""
+    bridge_names = ["tool_search", "tool_describe", "tool_call"]
+    agent = _agent(bridge_names)
+    agent._session_deferred_tool_names = frozenset({"old_deferred_tool"})
+    agent._session_deferred_tools_prompt = "old index"
+    agent._cached_system_prompt = "cached prompt"
+
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool(name) for name in bridge_names],
+    )
+    monkeypatch.setattr(
+        "agent.tool_executor._tool_search_scoped_names",
+        lambda _agent: frozenset({"new_deferred_tool"}),
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == set()
+    assert agent._session_deferred_tool_names is None
+    assert agent._session_deferred_tools_prompt is None
+    assert agent._cached_system_prompt is None
+    assert agent._force_system_prompt_rebuild is True
+
+
+def test_refresh_preserves_frozen_deferred_index_when_catalog_is_unchanged(monkeypatch):
+    bridge_names = ["tool_search", "tool_describe", "tool_call"]
+    agent = _agent(bridge_names)
+    frozen_names = frozenset({"same_deferred_tool"})
+    agent._session_deferred_tool_names = frozen_names
+    agent._session_deferred_tools_prompt = "same index"
+    agent._cached_system_prompt = "cached prompt"
+
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool(name) for name in bridge_names],
+    )
+    monkeypatch.setattr(
+        "agent.tool_executor._tool_search_scoped_names",
+        lambda _agent: frozen_names,
+    )
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert agent._session_deferred_tool_names == frozen_names
+    assert agent._session_deferred_tools_prompt == "same index"
+    assert agent._cached_system_prompt == "cached prompt"
+
+
+def test_refresh_below_tool_search_threshold_preserves_empty_index(monkeypatch):
+    agent = _agent(["read_file"])
+    agent._session_deferred_tool_names = frozenset()
+    agent._session_deferred_tools_prompt = ""
+    agent._cached_system_prompt = "cached prompt without an index"
+    agent._force_system_prompt_rebuild = False
+
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool("read_file")],
+    )
+    monkeypatch.setattr(
+        "agent.tool_executor._tool_search_scoped_names",
+        lambda _agent: frozenset({"below_threshold_plugin"}),
+    )
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert agent._session_deferred_tool_names == frozenset()
+    assert agent._session_deferred_tools_prompt == ""
+    assert agent._cached_system_prompt == "cached prompt without an index"
+    assert agent._force_system_prompt_rebuild is False
+
+
 def test_refresh_detects_equal_size_swap(monkeypatch):
     """Name-based diff catches an add+remove of equal count (count-compare can't)."""
     agent = _agent(["a", "old_mcp_tool"])  # 2 tools

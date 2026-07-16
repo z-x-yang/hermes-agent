@@ -4706,6 +4706,30 @@ def has_registered_mcp_tools() -> bool:
         return bool(_mcp_tool_server_names)
 
 
+def _invalidate_deferred_tool_prompt_if_catalog_changed(agent) -> None:
+    """Drop the session-frozen names index when its live authority set changes."""
+    frozen = getattr(agent, "_session_deferred_tool_names", None)
+    if frozen is None:
+        return
+    try:
+        from agent.tool_executor import _tool_search_scoped_names
+        from tools.tool_search import TOOL_SEARCH_NAME
+
+        current = (
+            frozenset(_tool_search_scoped_names(agent))
+            if TOOL_SEARCH_NAME in getattr(agent, "valid_tool_names", ())
+            else frozenset()
+        )
+    except Exception:
+        return
+    if current == frozenset(frozen):
+        return
+    agent._session_deferred_tool_names = None
+    agent._session_deferred_tools_prompt = None
+    agent._cached_system_prompt = None
+    agent._force_system_prompt_rebuild = True
+
+
 def refresh_agent_mcp_tools(
     agent,
     *,
@@ -4741,11 +4765,14 @@ def refresh_agent_mcp_tools(
     cross-attribute half-swap.
 
     Returns the set of newly-added tool names (empty when nothing changed), so
-    callers can decide whether to notify the user / re-emit session info.  The
-    caller owns the prompt-cache contract: this helper does NOT check turn state,
-    because each caller has a different policy (``/reload-mcp`` rebuilds after
-    explicit user consent; the late-binding and between-turns paths only rebuild
-    at a turn boundary, before that turn's ``tools=`` prefix is assembled).
+    callers can decide whether to notify the user / re-emit session info. If a
+    session-frozen deferred-tool index exists and its authority-scoped names
+    change, this helper clears that index and marks the next prompt build to skip
+    stale DB restoration once. The caller still owns the turn boundary: this
+    helper does NOT check turn state because each caller has a different policy
+    (``/reload-mcp`` rebuilds after explicit user consent; the late-binding and
+    between-turns paths only rebuild at a turn boundary, before that turn's
+    ``tools=`` prefix is assembled).
     """
     from model_tools import get_tool_definitions
     from tools.registry import registry
@@ -4834,6 +4861,7 @@ def refresh_agent_mcp_tools(
             # by restricted profile policy and record the generation.
             agent._resolved_tool_definitions = tuple(resolved_defs)
             agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
+            _invalidate_deferred_tool_prompt_if_catalog_changed(agent)
             return set()
         agent.tools = new_defs
         agent.valid_tool_names = new_names
@@ -4844,6 +4872,7 @@ def refresh_agent_mcp_tools(
             engine_names.clear()
             engine_names.update(staged_engine_names)
         agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
+        _invalidate_deferred_tool_prompt_if_catalog_changed(agent)
         return new_names - current
 
 

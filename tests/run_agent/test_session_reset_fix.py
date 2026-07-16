@@ -51,6 +51,9 @@ def _make_minimal_agent() -> AIAgent:
     agent.context_compressor = None  # will be set per-test as needed
     # Session-scoped prompt state
     agent._session_skills_prompt = None
+    agent._session_deferred_tools_prompt = None
+    agent._session_deferred_tool_names = None
+    agent._force_system_prompt_rebuild = False
 
     return agent
 
@@ -99,6 +102,19 @@ class TestResetSessionState:
         agent.reset_session_state()
 
         assert agent._session_skills_prompt is None
+
+    def test_deferred_tool_listing_snapshot_cleared_on_reset(self):
+        """A new session must rebuild its scope-filtered deferred-tool index."""
+        agent = _make_minimal_agent()
+        agent._session_deferred_tools_prompt = "old deferred tools"
+        agent._session_deferred_tool_names = frozenset({"old_tool"})
+        agent._force_system_prompt_rebuild = True
+
+        agent.reset_session_state()
+
+        assert agent._session_deferred_tools_prompt is None
+        assert agent._session_deferred_tool_names is None
+        assert agent._force_system_prompt_rebuild is False
 
     def test_both_fields_cleared_together(self):
         """Both stale fields are cleared in a single reset_session_state() call."""

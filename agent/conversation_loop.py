@@ -389,7 +389,8 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     """
     stored_prompt = None
     stored_state = "missing"
-    if conversation_history and agent._session_db:
+    force_rebuild = bool(getattr(agent, "_force_system_prompt_rebuild", False))
+    if conversation_history and agent._session_db and not force_rebuild:
         try:
             session_row = agent._session_db.get_session(agent.session_id)
             if session_row is not None:
@@ -412,6 +413,9 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
+        from agent.system_prompt import hydrate_deferred_tool_snapshot
+
+        hydrate_deferred_tool_snapshot(agent, stored_prompt)
         agent._cached_system_prompt = stored_prompt
         return
     if stored_prompt:
@@ -440,33 +444,36 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # First turn of a new session (or recovering from a broken stored
     # prompt) — build from scratch.
     agent._cached_system_prompt = agent._build_system_prompt(system_message)
+    if force_rebuild:
+        agent._force_system_prompt_rebuild = False
 
-    # Plugin hook: on_session_start — fired once when a brand-new
-    # session is created (not on continuation).  Plugins can use this
-    # to initialise session-scoped state (e.g. warm a memory cache).
-    try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_start",
-            session_id=agent.session_id,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_start hook failed: %s", exc)
+    if not force_rebuild:
+        # Plugin hook: on_session_start — fired once when a brand-new
+        # session is created (not on continuation).  Plugins can use this
+        # to initialise session-scoped state (e.g. warm a memory cache).
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_start hook failed: %s", exc)
 
-    # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
-    # desktop build seeds at session OPEN (see seed_credits_at_session_start in
-    # tui_gateway), so this call is usually a no-op there (idempotent: skips when
-    # _credits_state already exists). For the plain CLI / any path that didn't seed
-    # at build, it primes credits state from /api/oauth/account (or a fixture) on the
-    # first turn so depletion / usage-band warnings fire. Fail-open inside the helper.
-    try:
-        from agent.credits_tracker import seed_credits_at_session_start
+        # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
+        # desktop build seeds at session OPEN (see seed_credits_at_session_start in
+        # tui_gateway), so this call is usually a no-op there (idempotent: skips when
+        # _credits_state already exists). For the plain CLI / any path that didn't seed
+        # at build, it primes credits state from /api/oauth/account (or a fixture) on the
+        # first turn so depletion / usage-band warnings fire. Fail-open inside the helper.
+        try:
+            from agent.credits_tracker import seed_credits_at_session_start
 
-        seed_credits_at_session_start(agent)
-    except Exception:
-        logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
+            seed_credits_at_session_start(agent)
+        except Exception:
+            logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
 
     # Persist the system prompt snapshot in SQLite.  Failure here used
     # to log at DEBUG, which silently broke prefix-cache reuse on the

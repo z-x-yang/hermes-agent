@@ -458,20 +458,12 @@ def _dispatch_agent_tool_search_bridge(agent, function_name: str, function_args:
         }, ensure_ascii=False)
 
     if function_name == _ts.TOOL_DESCRIBE_NAME:
-        name = str((function_args or {}).get("name") or "").strip()
-        if not name:
-            return json.dumps({"error": "name is required"}, ensure_ascii=False)
-        for td in _agent_bridge_deferrable_tool_defs(agent):
-            fn = td.get("function") or {}
-            if fn.get("name") == name:
-                return json.dumps({
-                    "name": name,
-                    "description": fn.get("description", ""),
-                    "parameters": fn.get("parameters", {}),
-                }, ensure_ascii=False)
-        return json.dumps({
-            "error": f"'{name}' is not currently available. Re-run tool_search to refresh.",
-        }, ensure_ascii=False)
+        return _ts.describe_tool_definitions(
+            function_args or {},
+            deferrable_tool_defs=_agent_bridge_deferrable_tool_defs(agent),
+            config=_ts.load_config(),
+            require_registered_deferrable=False,
+        )
 
     return None
 

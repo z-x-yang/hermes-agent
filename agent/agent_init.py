@@ -1984,6 +1984,9 @@ def init_agent(
         working_dir=os.getenv("TERMINAL_CWD") or None,
     )
     agent._user_turn_count = 0
+    agent._session_deferred_tools_prompt = None
+    agent._session_deferred_tool_names = None
+    agent._force_system_prompt_rebuild = False
 
     # Cumulative token usage for the session
     agent.session_prompt_tokens = 0

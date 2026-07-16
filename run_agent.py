@@ -732,10 +732,13 @@ class AIAgent:
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
         
-        # Turn counter and rendered routing index are session-scoped. A reused
-        # AIAgent must recompute skill priority after /new, /resume, or /branch.
+        # Turn counter and rendered routing indexes are session-scoped. A reused
+        # AIAgent must recompute them after /new, /resume, or /branch.
         self._user_turn_count = 0
         self._session_skills_prompt = None
+        self._session_deferred_tools_prompt = None
+        self._session_deferred_tool_names = None
+        self._force_system_prompt_rebuild = False
 
         # Context engine reset/transition (works for built-in compressor and plugins)
         self._transition_context_engine_session(
