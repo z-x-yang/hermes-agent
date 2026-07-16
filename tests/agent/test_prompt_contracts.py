@@ -159,6 +159,12 @@ class TestExecutionAndStoppingContract:
         assert "materially different strategy" in text
         assert "plan, review, or assessment" in text
 
+    def test_decision_grade_work_requires_persisted_rationale(self):
+        text = TASK_COMPLETION_GUIDANCE.lower()
+        assert "durable config, policy, or architecture" in text
+        assert "rationale and evidence anchors" in text
+        assert "where the next session will find them" in text
+
     def test_prevents_solution_inflation_and_silent_fallbacks(self):
         text = TASK_COMPLETION_GUIDANCE.lower()
         assert "features, refactors, abstractions, defensive layers" in text
