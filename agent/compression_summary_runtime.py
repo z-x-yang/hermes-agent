@@ -36,16 +36,12 @@ class SummaryRuntime:
 
 _NON_PREFIX_REQUEST_FIELDS = frozenset({
     "include",
-    "max_completion_tokens",
-    "max_output_tokens",
-    "max_tokens",
     "metadata",
     "n",
     "parallel_tool_calls",
     "response_format",
     "reasoning",
     "reasoning_effort",
-    "service_tier",
     "stop",
     "store",
     "stream",
@@ -225,14 +221,14 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
         for key in _NON_PREFIX_REQUEST_FIELDS:
             if key in controls:
                 api_kwargs[key] = copy.deepcopy(controls[key])
-        if not any(
-            key in api_kwargs
-            for key in ("max_output_tokens", "max_completion_tokens", "max_tokens")
+        if (
+            str(getattr(agent, "api_mode", "") or "") != "codex_responses"
+            and not any(
+                key in api_kwargs
+                for key in ("max_output_tokens", "max_completion_tokens", "max_tokens")
+            )
         ):
-            if str(getattr(agent, "api_mode", "") or "") == "codex_responses":
-                api_kwargs["max_output_tokens"] = max_tokens
-            else:
-                api_kwargs["max_tokens"] = max_tokens
+            api_kwargs["max_tokens"] = max_tokens
         return api_kwargs
 
     @contextmanager

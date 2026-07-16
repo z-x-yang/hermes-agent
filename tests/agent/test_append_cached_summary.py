@@ -301,7 +301,45 @@ def test_summary_runtime_replays_exact_provider_request_and_appends_instruction(
     assert kwargs["tools"] == provider_request["tools"]
     assert kwargs["prompt_cache_key"] == "stored-cache-scope"
     assert kwargs["extra_headers"] == {"x-cache-namespace": "stable"}
-    assert kwargs["max_output_tokens"] == 12_345
+    assert "max_output_tokens" not in kwargs
+
+
+def test_exact_replay_preserves_explicit_output_cap():
+    runtime = make_summary_runtime(ScopedCodexAgentForSummaryRuntime())
+    provider_request = cache_visible_request_payload({
+        "model": "gpt-5.6-sol",
+        "instructions": "STORED_FINAL_INSTRUCTIONS",
+        "input": [{"role": "user", "content": "cached prefix"}],
+        "max_output_tokens": 7_777,
+    })
+
+    kwargs = runtime.build_kwargs_from_provider_request(
+        provider_request,
+        "SUMMARY_INSTRUCTION",
+        32_000,
+    )
+
+    assert provider_request["max_output_tokens"] == 7_777
+    assert kwargs["max_output_tokens"] == 7_777
+
+
+def test_exact_replay_preserves_service_tier():
+    runtime = make_summary_runtime(ScopedCodexAgentForSummaryRuntime())
+    provider_request = cache_visible_request_payload({
+        "model": "gpt-5.6-sol",
+        "instructions": "STORED_FINAL_INSTRUCTIONS",
+        "input": [{"role": "user", "content": "cached prefix"}],
+        "service_tier": "priority",
+    })
+
+    kwargs = runtime.build_kwargs_from_provider_request(
+        provider_request,
+        "SUMMARY_INSTRUCTION",
+        32_000,
+    )
+
+    assert provider_request["service_tier"] == "priority"
+    assert kwargs["service_tier"] == "priority"
 
 
 def test_exact_replay_rebuilds_reasoning_controls_from_current_runtime():

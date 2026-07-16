@@ -866,6 +866,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
                 and "/backend-api/codex" in agent._base_url_lower
             )
         )
+        omit_max_output_tokens = is_codex_backend or agent.provider == "gptcodex"
         is_xai_responses = agent.provider in {"xai", "xai-oauth"} or agent._base_url_hostname == "api.x.ai"
         _msgs_for_codex = agent._prepare_messages_for_non_vision_model(api_messages)
 
@@ -916,6 +917,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             request_overrides=agent.request_overrides,
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
+            omit_max_output_tokens=omit_max_output_tokens,
             is_xai_responses=is_xai_responses,
             github_reasoning_extra=agent._github_models_reasoning_extra_body() if is_github_responses else None,
             replay_encrypted_reasoning=bool(

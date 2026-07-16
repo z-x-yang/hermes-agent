@@ -137,6 +137,7 @@ class ResponsesApiTransport(ProviderTransport):
             base_url_hostname: str | None — hostname for backend detection
             is_github_responses: bool — Copilot/GitHub models backend
             is_codex_backend: bool — chatgpt.com/backend-api/codex
+            omit_max_output_tokens: bool — endpoint rejects/forbids output caps
             is_xai_responses: bool — xAI/Grok backend
             github_reasoning_extra: dict | None — Copilot reasoning params
         """
@@ -158,6 +159,9 @@ class ResponsesApiTransport(ProviderTransport):
 
         is_github_responses = params.get("is_github_responses", False)
         is_codex_backend = params.get("is_codex_backend", False)
+        omit_max_output_tokens = bool(
+            is_codex_backend or params.get("omit_max_output_tokens", False)
+        )
         is_xai_responses = params.get("is_xai_responses", False)
         replay_encrypted_reasoning = bool(
             params.get("replay_encrypted_reasoning", True)
@@ -367,7 +371,7 @@ class ResponsesApiTransport(ProviderTransport):
                 kwargs["extra_headers"] = merged_extra_headers
 
         max_tokens = params.get("max_tokens")
-        if max_tokens is not None and not is_codex_backend:
+        if max_tokens is not None and not omit_max_output_tokens:
             kwargs["max_output_tokens"] = max_tokens
 
         if is_xai_responses and session_id:

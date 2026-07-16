@@ -544,6 +544,35 @@ class TestBuildApiKwargsCodex:
         kwargs = agent._build_api_kwargs(messages)
         assert "max_output_tokens" not in kwargs
 
+    def test_omits_max_output_tokens_for_gptcodex(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "gptcodex", api_mode="codex_responses",
+                            base_url="https://gptcodex.top/v1")
+        setattr(agent, "model", "gpt-5.6-sol")
+        setattr(agent, "max_tokens", 20)
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert "max_output_tokens" not in kwargs
+
+    def test_gptcodex_frozen_summary_omits_max_output_tokens(self, monkeypatch):
+        from agent.compression_summary_runtime import make_summary_runtime
+
+        agent = _make_agent(monkeypatch, "gptcodex", api_mode="codex_responses",
+                            base_url="https://gptcodex.top/v1")
+        setattr(agent, "model", "gpt-5.6-sol")
+        setattr(agent, "max_tokens", None)
+        provider_request = agent._build_api_kwargs([
+            {"role": "user", "content": "cached prefix"},
+        ])
+
+        kwargs = make_summary_runtime(agent).build_kwargs_from_provider_request(
+            provider_request,
+            "SUMMARY_INSTRUCTION",
+            32_000,
+        )
+
+        assert "max_output_tokens" not in provider_request
+        assert "max_output_tokens" not in kwargs
+
     def test_includes_encrypted_content_in_include(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
                             base_url="https://chatgpt.com/backend-api/codex")
