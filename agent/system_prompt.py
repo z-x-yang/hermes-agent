@@ -50,9 +50,7 @@ from agent.prompt_contracts import (
     CONTEXT_CONTINUITY_NOTE,
     MEMORY_READBACK_NOTE,
     OBSERVED_CONTENT_BOUNDARY,
-    PROPORTIONALITY_GUIDANCE,
     SIDE_EFFECT_CONFIRMATION_GUIDANCE,
-    TURN_COMPLETION_CHECK,
     USER_PRECEDENCE_NOTE,
 )
 from agent.runtime_cwd import resolve_context_cwd
@@ -269,18 +267,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         )
     )
 
-    # Universal task-completion / no-fabrication guidance.  Applied to ALL
-    # models regardless of tool_use_enforcement gating — the failure modes
-    # this targets (stopping after a stub; fabricating output when a real
-    # path is blocked) are not model-family specific.  Gated only by
+    # Universal execution-and-stopping contract. Applied to ALL models
+    # regardless of tool_use_enforcement gating. This is the sole owner of
+    # continue/retry/stop semantics and also preserves the working-artifact,
+    # no-fabrication, evidence, and proportionality invariants. Gated only by
     # config.yaml ``agent.task_completion_guidance`` (default True) so
     # users who want a leaner prompt can turn it off.
     if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
         stable_parts.append(TASK_COMPLETION_GUIDANCE)
-        # Fork behavioral contract: end-of-turn self-check (see
-        # agent/prompt_contracts.py). Same gate as TASK_COMPLETION_GUIDANCE —
-        # it turns that block's "keep working" into a checkable behavior.
-        stable_parts.append(TURN_COMPLETION_CHECK)
 
     # Fork behavioral contracts (agent/prompt_contracts.py), gated by
     # config.yaml ``agent.behavior_contracts`` (default True).  The
@@ -293,10 +287,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if agent.valid_tool_names:
             stable_parts.append(ASSESSMENT_FIRST_GUIDANCE)
             stable_parts.append(SIDE_EFFECT_CONFIRMATION_GUIDANCE)
-            # Cross-domain process-weight invariant. Concrete workflow/tool
-            # triggers remain at their call sites; this block only prevents a
-            # loaded skill from upgrading a task by itself.
-            stable_parts.append(PROPORTIONALITY_GUIDANCE)
 
     # Universal parallel-tool-call guidance.  Tells the model to batch
     # independent tool calls into one assistant turn rather than emitting one

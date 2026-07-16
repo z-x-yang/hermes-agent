@@ -2084,6 +2084,12 @@ class TestToolUseEnforcementGuidance:
     def test_guidance_requires_action(self):
         assert "MUST" in TOOL_USE_ENFORCEMENT_GUIDANCE
 
+    def test_guidance_does_not_duplicate_persistence_or_stopping(self):
+        text = TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
+        assert "keep working until" not in text
+        assert "do not stop" not in text
+        assert "until the task is actually complete" not in text
+
     def test_enforcement_models_includes_gpt(self):
         assert "gpt" in TOOL_USE_ENFORCEMENT_MODELS
 
@@ -2106,11 +2112,11 @@ class TestToolUseEnforcementGuidance:
 class TestOpenAIModelExecutionGuidance:
     """Tests for GPT/Codex-specific execution discipline guidance."""
 
-    def test_guidance_covers_tool_persistence(self):
+    def test_guidance_leaves_persistence_to_shared_execution_contract(self):
         text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
-        assert "tool_persistence" in text
-        assert "retry" in text
-        assert "empty" in text or "partial" in text
+        assert "tool_persistence" not in text
+        assert "keep calling tools until" not in text
+        assert "do not stop early" not in text
 
     def test_guidance_covers_prerequisite_checks(self):
         text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
@@ -2128,8 +2134,6 @@ class TestOpenAIModelExecutionGuidance:
         assert "hallucinate" in text or "guess" in text
 
     def test_guidance_uses_xml_tags(self):
-        assert "<tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
-        assert "</tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
         assert "<verification>" in OPENAI_MODEL_EXECUTION_GUIDANCE
         assert "</verification>" in OPENAI_MODEL_EXECUTION_GUIDANCE
 

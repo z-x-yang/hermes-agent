@@ -25,26 +25,6 @@ All constants are static text — they join the stable prompt tier and must
 stay byte-identical across builds to keep upstream prefix caches warm.
 """
 
-# Appended immediately after TASK_COMPLETION_GUIDANCE (same config gate:
-# ``agent.task_completion_guidance``).  Converts "keep working" from a
-# slogan into a checkable end-of-turn behavior.  The failure mode is a
-# turn that ends on "I'll do X next" — the model has already decided the
-# work is needed but hands it back to the user instead of doing it.
-# The exception clause keeps this from steamrolling assessment-only
-# requests (Codex review finding: "review this and list next steps"
-# must not turn into unauthorized edits after the findings are drafted).
-TURN_COMPLETION_CHECK = (
-    "Before ending your turn, check your last paragraph. If it is a plan, a "
-    "list of next steps, or a promise about work you have not done "
-    "('I'll…', 'next I would…'), do that work now with tool calls — "
-    "including retrying after errors and gathering missing information "
-    "yourself. Exception: when the user asked for a plan, review, or "
-    "assessment, that document IS the deliverable — presenting it ends the "
-    "turn, and implementing it is a separate request. End your turn only "
-    "when the task is complete or you are blocked on input only the user "
-    "can provide."
-)
-
 # Universal communication contract.  Not gated on tools: it applies to a
 # pure-chat answer as much as to a tool-heavy task.  Note: unlike some
 # harnesses, Hermes streams intermediate messages to the user on most
@@ -122,21 +102,6 @@ SIDE_EFFECT_CONFIRMATION_GUIDANCE = (
     "your report, rather than guessing."
 )
 
-# Proportionality contract for agent process weight.  The system layer keeps
-# only the cross-domain invariant; each process skill/tool owns its concrete
-# observable trigger.  User requests for a minimal path cap ceremony without
-# weakening permission, safety, or the evidence needed to satisfy the real
-# done condition.
-PROPORTIONALITY_GUIDANCE = (
-    "# Proportionality\n"
-    "Start with the lightest process that can satisfy the user's request and "
-    "its real done condition. Complexity is earned by an observed failure or "
-    "boundary, not by anticipation or by loading a skill. If the user asks "
-    "for a minimal or quick path, treat that as a ceiling on ceremony—not on "
-    "safety, authority, or required evidence. Add each process step only for "
-    "its own observable trigger, and stop when the domain oracle passes."
-)
-
 # The semantic half of the injection defense.  The mechanical half — the
 # <untrusted_tool_result> wrapper in tool_dispatch_helpers — only covers
 # known-high-risk tools (web, browser, MCP); this block defines the trust
@@ -208,11 +173,9 @@ USER_PRECEDENCE_NOTE = (
 )
 
 __all__ = [
-    "TURN_COMPLETION_CHECK",
     "COMMUNICATION_GUIDANCE",
     "ASSESSMENT_FIRST_GUIDANCE",
     "SIDE_EFFECT_CONFIRMATION_GUIDANCE",
-    "PROPORTIONALITY_GUIDANCE",
     "OBSERVED_CONTENT_BOUNDARY",
     "MEMORY_READBACK_NOTE",
     "CONTEXT_CONTINUITY_NOTE",

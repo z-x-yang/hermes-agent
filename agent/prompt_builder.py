@@ -289,9 +289,6 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "action (e.g. 'I will run the tests', 'Let me check the file', 'I will create "
     "the project'), you MUST immediately make the corresponding tool call in the same "
     "response. Never end your turn with a promise of future action — execute it now.\n"
-    "Keep working until the task is actually complete. Do not stop with a summary of "
-    "what you plan to do next time. If you have tools available that can accomplish "
-    "the task, use them instead of telling the user what you would do.\n"
     "Every response should either (a) contain tool calls that make progress, or "
     "(b) deliver a final result to the user. Responses that only describe intentions "
     "without acting are not acceptable."
@@ -301,35 +298,30 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek")
 
-# Universal "finish the job" guidance — applied to ALL models, not gated
-# by model family.  Addresses two cross-model failure modes:
-#   1. Stopping after a stub: writing a tiny file or running one command
-#      and then ending the turn with a description of the plan instead
-#      of the finished artifact.  (Observed on Opus during a real
-#      Sarasota real-estate build task: 3 API calls, 85-byte file,
-#      one terminal command, finish_reason=stop.)
-#   2. Fabricating output when a real path is blocked.  When `pip` or a
-#      tool fails, some models will synthesize plausible-looking results
-#      (fake addresses, fake JSON, fake numbers) instead of reporting
-#      the blocker.  (Observed on DeepSeek v4-flash on the same task:
-#      pushed through PEP-668 wall, then returned fabricated listings.)
+# Universal execution-and-stopping contract — applied to ALL models, not
+# gated by model family. It preserves working-artifact, no-fabrication,
+# evidence, and proportionality requirements while owning the only
+# continue/retry/stop semantics in the assembled prompt.
 #
-# Short on purpose.  This block is shipped to every user, every session,
+# Short on purpose. This block is shipped to every user, every session,
 # in the cached system prompt — token cost is paid once at install and
-# then amortised across all sessions via prefix caching.  Keep it tight.
+# then amortised across all sessions via prefix caching. Keep it tight.
 TASK_COMPLETION_GUIDANCE = (
-    "# Finishing the job\n"
+    "# Execution and stopping\n"
     "When the user asks you to build, run, or verify something, the deliverable is "
-    "a working artifact backed by real tool output — not a description of one. "
-    "Do not stop after writing a stub, a plan, or a single command. Keep working "
-    "until you have actually exercised the code or produced the requested result, "
-    "then report what real execution returned.\n"
-    "If a tool, install, or network call fails and blocks the real path, say so "
-    "directly and try an alternative (different package manager, different "
-    "approach, ask the user). NEVER substitute plausible-looking fabricated "
-    "output (made-up data, invented file contents, synthesised API responses) "
-    "for results you couldn't actually produce. Reporting a blocker honestly "
-    "is always better than inventing a result."
+    "a working artifact backed by fresh evidence from real tool output — not a "
+    "description of one.\n"
+    "Start with the lightest process that can satisfy the current user request and "
+    "its real done condition. Complexity is earned by an observed failure or "
+    "boundary, not by anticipation or by loading a skill. A request for a minimal "
+    "or quick path is a ceiling on ceremony, not on safety, authority, or required "
+    "evidence. Continue only while a concrete available action materially advances "
+    "that contract. Add each process step only for its own observable trigger, and "
+    "stop when the domain oracle passes.\n"
+    "Retry only when new evidence or a materially different strategy could change "
+    "the result. Otherwise report the blocker or partial coverage. A plan, review, "
+    "or assessment is complete when that is what the user requested. Never fabricate "
+    "results when the real path is blocked."
 )
 
 # Universal parallel-tool-call guidance — applied to ALL models.
@@ -373,9 +365,10 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
     "in doubt and the calls are independent, batch them."
 )
 
-# OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
-# where GPT models abandon work on partial results, skip prerequisite lookups,
-# hallucinate instead of using tools, and declare "done" without verification.
+# OpenAI GPT/Codex-specific evidence guidance. Addresses known failure modes
+# where GPT models skip prerequisite lookups, hallucinate instead of using
+# tools, and declare "done" without verification. Continue/retry/stop semantics
+# live only in TASK_COMPLETION_GUIDANCE above.
 # Inspired by patterns from OpenAI's GPT-5.4 prompting guide & OpenClaw PR #38953.
 # Also applied to xAI Grok — same failure modes in practice (claims completion
 # without tool calls, suggests workarounds instead of using existing tools,
@@ -383,15 +376,6 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
 # family-agnostic; the OPENAI_ prefix reflects origin, not exclusivity.
 OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "# Execution discipline\n"
-    "<tool_persistence>\n"
-    "- Use tools whenever they improve correctness, completeness, or grounding.\n"
-    "- Do not stop early when another tool call would materially improve the result.\n"
-    "- If a tool returns empty or partial results, retry with a different query or "
-    "strategy before giving up.\n"
-    "- Keep calling tools until: (1) the task is complete, AND (2) you have verified "
-    "the result.\n"
-    "</tool_persistence>\n"
-    "\n"
     "<mandatory_tool_use>\n"
     "NEVER answer these from memory or mental computation — ALWAYS use a tool:\n"
     "- Arithmetic, math, calculations → use terminal or execute_code\n"

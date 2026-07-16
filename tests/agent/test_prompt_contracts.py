@@ -15,11 +15,10 @@ from agent.prompt_contracts import (
     CONTEXT_CONTINUITY_NOTE,
     MEMORY_READBACK_NOTE,
     OBSERVED_CONTENT_BOUNDARY,
-    PROPORTIONALITY_GUIDANCE,
     SIDE_EFFECT_CONFIRMATION_GUIDANCE,
-    TURN_COMPLETION_CHECK,
     USER_PRECEDENCE_NOTE,
 )
+from agent.prompt_builder import TASK_COMPLETION_GUIDANCE
 from agent.system_prompt import build_system_prompt_parts
 
 
@@ -60,11 +59,9 @@ def _stable(agent):
 
 
 ALL_CONTRACT_BLOCKS = (
-    TURN_COMPLETION_CHECK,
     COMMUNICATION_GUIDANCE,
     ASSESSMENT_FIRST_GUIDANCE,
     SIDE_EFFECT_CONFIRMATION_GUIDANCE,
-    PROPORTIONALITY_GUIDANCE,
     OBSERVED_CONTENT_BOUNDARY,
     CONTEXT_CONTINUITY_NOTE,
     USER_PRECEDENCE_NOTE,
@@ -90,10 +87,8 @@ class TestContractPresence:
         stable = _stable(_make_agent(valid_tool_names=[]))
         assert ASSESSMENT_FIRST_GUIDANCE not in stable
         assert SIDE_EFFECT_CONFIRMATION_GUIDANCE not in stable
-        assert PROPORTIONALITY_GUIDANCE not in stable
         assert OBSERVED_CONTENT_BOUNDARY not in stable
-        # Rides the task-completion gate, which requires tools too.
-        assert TURN_COMPLETION_CHECK not in stable
+        assert TASK_COMPLETION_GUIDANCE not in stable
 
 
 class TestContractGating:
@@ -103,20 +98,17 @@ class TestContractGating:
             COMMUNICATION_GUIDANCE,
             ASSESSMENT_FIRST_GUIDANCE,
             SIDE_EFFECT_CONFIRMATION_GUIDANCE,
-            PROPORTIONALITY_GUIDANCE,
             OBSERVED_CONTENT_BOUNDARY,
             CONTEXT_CONTINUITY_NOTE,
             USER_PRECEDENCE_NOTE,
         ):
             assert block not in stable
 
-    def test_turn_check_rides_task_completion_gate_not_umbrella(self):
-        # Off with task_completion_guidance...
+    def test_execution_contract_rides_task_completion_gate_not_umbrella(self):
         stable = _stable(_make_agent(_task_completion_guidance=False))
-        assert TURN_COMPLETION_CHECK not in stable
-        # ...but unaffected by the umbrella flag.
+        assert TASK_COMPLETION_GUIDANCE not in stable
         stable = _stable(_make_agent(_behavior_contracts=False))
-        assert TURN_COMPLETION_CHECK in stable
+        assert TASK_COMPLETION_GUIDANCE in stable
 
     def test_memory_readback_rides_memory_tool_gate(self):
         with_memory = _stable(_make_agent(valid_tool_names=["memory"]))
@@ -136,29 +128,45 @@ class TestContractOrdering:
         # Precedence speaks about everything above it — must close the tier.
         assert stable.endswith(USER_PRECEDENCE_NOTE)
 
-    def test_turn_check_directly_follows_task_completion(self):
+    def test_execution_contract_precedes_communication_contract(self):
         stable = _stable(_make_agent())
-        task_at = stable.index("# Finishing the job")
-        check_at = stable.index(TURN_COMPLETION_CHECK)
+        task_at = stable.index(TASK_COMPLETION_GUIDANCE)
         comm_at = stable.index(COMMUNICATION_GUIDANCE)
-        assert task_at < check_at < comm_at
-
-    def test_proportionality_follows_permission_boundaries(self):
-        stable = _stable(_make_agent())
-        side_effect_at = stable.index(SIDE_EFFECT_CONFIRMATION_GUIDANCE)
-        proportionality_at = stable.index(PROPORTIONALITY_GUIDANCE)
-        parallel_at = stable.index("# Parallel tool calls")
-        assert side_effect_at < proportionality_at < parallel_at
+        assert task_at < comm_at
 
 
-class TestProportionalityContract:
-    def test_minimality_caps_ceremony_not_safety_or_evidence(self):
-        assert "observed failure or boundary" in PROPORTIONALITY_GUIDANCE
-        assert "not by anticipation or by loading a skill" in PROPORTIONALITY_GUIDANCE
-        assert "ceiling on ceremony" in PROPORTIONALITY_GUIDANCE
-        assert "not on safety, authority, or required evidence" in PROPORTIONALITY_GUIDANCE
-        assert "own observable trigger" in PROPORTIONALITY_GUIDANCE
-        assert "stop when the domain oracle passes" in PROPORTIONALITY_GUIDANCE
+class TestExecutionAndStoppingContract:
+    def test_preserves_artifact_evidence_and_no_fabrication(self):
+        assert "working artifact" in TASK_COMPLETION_GUIDANCE
+        assert "fresh evidence" in TASK_COMPLETION_GUIDANCE
+        assert "never fabricate" in TASK_COMPLETION_GUIDANCE.lower()
+
+    def test_consolidates_proportionality_and_stop_conditions(self):
+        text = TASK_COMPLETION_GUIDANCE.lower()
+        assert "lightest process" in text
+        assert "observed failure or boundary" in text
+        assert "materially advances" in text
+        assert "domain oracle passes" in text
+        assert "retry only when" in text
+        assert "new evidence" in text
+        assert "materially different strategy" in text
+        assert "plan, review, or assessment" in text
+
+    def test_gpt_assembled_prompt_has_one_persistence_decision_center(self):
+        stable = _stable(
+            _make_agent(model="gpt-5.6-sol", _tool_use_enforcement="auto")
+        )
+        assert stable.count("# Execution and stopping") == 1
+        assert "# Finishing the job" not in stable
+        assert "# Proportionality" not in stable
+        assert "<tool_persistence>" not in stable
+        for duplicated in (
+            "Keep working until",
+            "Do not stop early",
+            "Keep calling tools until",
+            "End your turn only",
+        ):
+            assert duplicated not in stable
 
 
 class TestCacheStability:
