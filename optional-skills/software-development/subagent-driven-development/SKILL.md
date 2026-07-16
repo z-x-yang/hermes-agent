@@ -8,7 +8,7 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [delegation, subagent, implementation, workflow, review-governance]
-    related_skills: [plan, requesting-code-review, test-driven-development]
+    related_skills: [plan, independent-review-governance, code-review-execution, test-driven-development]
 ---
 
 # Subagent-Driven Development
@@ -97,7 +97,7 @@ This is controller verification, not an independent reviewer call. Do not run se
 
 ### 4. Run one final independent review when required
 
-After all tasks are complete and controller-verified, use `requesting-code-review` for one fresh-context whole-change review. Supply the approved contract, scoped integrated diff, and fresh test/build evidence.
+After all tasks are complete and controller-verified, load `independent-review-governance` to decide whether one whole-change pass is authorized. If it authorizes a software pass, use `code-review-execution` with the approved contract, scoped integrated diff, and fresh test/build evidence.
 
 ```python
 delegate_task(
@@ -127,7 +127,7 @@ delegate_task(
 )
 ```
 
-For high-stakes/shared-core/auth/concurrency work, use the built-in `Reviewer` as the default final reviewer. Codex/Claude or another independence boundary is explicit opt-in under `requesting-code-review`. Reviewer findings are leads; the controller reproduces and classifies them before repair. A repair does not automatically authorize another review pass.
+For high-stakes/shared-core/auth/concurrency work, governance normally authorizes the built-in `Reviewer` as the fresh-context route; `code-review-execution` owns the software package and finding adjudication. Codex/Claude or another independence boundary is explicit opt-in under `independent-review-governance`. Reviewer findings are leads; the controller reproduces and classifies them before repair. A repair does not automatically authorize another review pass.
 
 ### 5. Close the branch
 
@@ -160,7 +160,8 @@ Never:
 
 - `plan` defines the approved software contract.
 - `test-driven-development` governs deterministic RED→GREEN behavior changes.
-- `requesting-code-review` owns the one final independent review.
+- `independent-review-governance` owns whether a pass is authorized, its global budget, route, and stop condition.
+- `code-review-execution` executes one governance-authorized software pass.
 - `verification-before-completion` owns fresh completion evidence.
 - `using-git-worktrees` owns isolation and safe integration.
 

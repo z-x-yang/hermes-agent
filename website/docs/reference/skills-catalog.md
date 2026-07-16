@@ -29,6 +29,7 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | [`claude-code`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-claude-code) | Delegate coding to Claude Code CLI (features, PRs). | `autonomous-ai-agents/claude-code` |
 | [`codex`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-codex) | Delegate coding to OpenAI Codex CLI (features, PRs). | `autonomous-ai-agents/codex` |
 | [`evelyn-agent`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-evelyn-agent) | Configure, extend, or contribute to Evelyn and its Hermes Agent upstream. | `autonomous-ai-agents/evelyn-agent` |
+| [`independent-review-governance`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-independent-review-governance) | Use before any independent Reviewer, Codex, Claude, human, or domain review is launched across code, research, documents, or artifacts, including first passes, prior-pass uncertainty, and distributed review ownership. | `autonomous-ai-agents/independent-review-governance` |
 | [`opencode`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-opencode) | Delegate coding to OpenCode CLI (features, PR review). | `autonomous-ai-agents/opencode` |
 
 ## creative
@@ -154,11 +155,11 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 
 | Skill | Description | Path |
 |-------|-------------|------|
+| [`code-review-execution`](/docs/user-guide/skills/bundled/software-development/software-development-code-review-execution) | Use only after independent-review-governance authorizes an independent pass for a completed software change with material shared-core, auth, concurrency, validation, irreversible-action, or public-contract risk. | `software-development/code-review-execution` |
 | [`evelyn-agent-skill-authoring`](/docs/user-guide/skills/bundled/software-development/software-development-evelyn-agent-skill-authoring) | Author in-repo SKILL.md: frontmatter, validator, structure. | `software-development/evelyn-agent-skill-authoring` |
 | [`node-inspect-debugger`](/docs/user-guide/skills/bundled/software-development/software-development-node-inspect-debugger) | Debug Node.js via --inspect + Chrome DevTools Protocol CLI. | `software-development/node-inspect-debugger` |
 | [`plan`](/docs/user-guide/skills/bundled/software-development/software-development-plan) | Plan mode: write an actionable markdown plan to .hermes/plans/, no execution. Bite-sized tasks, exact paths, complete code. | `software-development/plan` |
 | [`python-debugpy`](/docs/user-guide/skills/bundled/software-development/software-development-python-debugpy) | Debug Python: pdb REPL + debugpy remote (DAP). | `software-development/python-debugpy` |
-| [`requesting-code-review`](/docs/user-guide/skills/bundled/software-development/software-development-requesting-code-review) | Use when a completed software change has material shared/core, auth/security, concurrency, validation, irreversible-action, or public-contract risk and needs fresh independent review before landing. | `software-development/requesting-code-review` |
 | [`simplify-code`](/docs/user-guide/skills/bundled/software-development/software-development-simplify-code) | Parallel 3-agent cleanup of recent code changes. | `software-development/simplify-code` |
 | [`spike`](/docs/user-guide/skills/bundled/software-development/software-development-spike) | Throwaway experiments to validate an idea before build. | `software-development/spike` |
 | [`systematic-debugging`](/docs/user-guide/skills/bundled/software-development/software-development-systematic-debugging) | 4-phase root cause debugging: understand bugs before fixing. | `software-development/systematic-debugging` |

@@ -8,7 +8,7 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [code-review, cleanup, refactor, delegation, subagent, parallel, simplify]
-    related_skills: [requesting-code-review, test-driven-development, plan]
+    related_skills: [independent-review-governance, code-review-execution, test-driven-development, plan]
 ---
 
 # Simplify Code — Parallel Review & Cleanup
@@ -210,4 +210,4 @@ Wait for all three to return (batch mode returns them together).
 controller verification after each task, and one final whole-change independent
 review when the risk gate requires it. This skill is a separate user-invoked
 three-lens cleanup of recent changes; it does not replace or multiply that final
-review. Use `requesting-code-review` for the final high-risk independent review.
+review. If a final independent pass is being considered, route the decision through `independent-review-governance`; only an authorized software pass uses `code-review-execution`.

@@ -21,7 +21,7 @@ Author in-repo SKILL.md: frontmatter, validator, structure, and writing-quality 
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `skills`, `authoring`, `hermes-agent`, `conventions`, `skill-md` |
-| Related skills | [`plan`](/docs/user-guide/skills/bundled/software-development/software-development-plan), [`requesting-code-review`](/docs/user-guide/skills/bundled/software-development/software-development-requesting-code-review) |
+| Related skills | [`plan`](/docs/user-guide/skills/bundled/software-development/software-development-plan), [`code-review-execution`](/docs/user-guide/skills/bundled/software-development/software-development-code-review-execution) |
 
 ## Reference: full SKILL.md
 

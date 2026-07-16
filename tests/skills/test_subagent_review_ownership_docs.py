@@ -2,22 +2,32 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-REQUESTING_REVIEW = (
-    REPO_ROOT / "skills/software-development/requesting-code-review/SKILL.md"
+GOVERNANCE = (
+    REPO_ROOT
+    / "skills/autonomous-ai-agents/independent-review-governance/SKILL.md"
+)
+CODE_REVIEW = REPO_ROOT / "skills/software-development/code-review-execution/SKILL.md"
+CODE_REVIEW_TEMPLATE = (
+    REPO_ROOT / "skills/software-development/code-review-execution/code-reviewer.md"
 )
 SUBAGENT_DRIVEN = (
     REPO_ROOT
     / "optional-skills/software-development/subagent-driven-development/SKILL.md"
 )
-REQUESTING_REVIEW_DOC = (
+GOVERNANCE_DOC = (
+    REPO_ROOT
+    / "website/docs/user-guide/skills/bundled/autonomous-ai-agents/"
+    "autonomous-ai-agents-independent-review-governance.md"
+)
+CODE_REVIEW_DOC = (
     REPO_ROOT
     / "website/docs/user-guide/skills/bundled/software-development/"
-    "software-development-requesting-code-review.md"
+    "software-development-code-review-execution.md"
 )
-REQUESTING_REVIEW_ZH_DOC = (
+CODE_REVIEW_ZH_DOC = (
     REPO_ROOT
     / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/"
-    "skills/bundled/software-development/software-development-requesting-code-review.md"
+    "skills/bundled/software-development/software-development-code-review-execution.md"
 )
 SUBAGENT_DRIVEN_DOC = (
     REPO_ROOT
@@ -36,91 +46,141 @@ SIMPLIFY_CODE_DOC = (
     / "website/docs/user-guide/skills/bundled/software-development/"
     "software-development-simplify-code.md"
 )
+EN_SKILLS_CATALOG = REPO_ROOT / "website/docs/reference/skills-catalog.md"
 ZH_SKILLS_CATALOG = (
     REPO_ROOT
     / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/reference/"
     "skills-catalog.md"
 )
+KANBAN_SWARM = REPO_ROOT / "hermes_cli/kanban_swarm.py"
+
+
+OLD_OWNER_NAMES = ("requesting-code-review", "multi-agent-review-governance")
 
 
 def _text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def test_reviewer_examples_use_canonical_reviewer_profile():
-    for path in (
-        REQUESTING_REVIEW,
-        REQUESTING_REVIEW_DOC,
-        REQUESTING_REVIEW_ZH_DOC,
-        SUBAGENT_DRIVEN,
-        SUBAGENT_DRIVEN_DOC,
-    ):
-        text = _text(path)
-        assert 'subagent_type="Reviewer"' in text, path
-        assert 'subagent_type="Explore"' not in text, path
+def _normalized(path: Path) -> str:
+    return " ".join(_text(path).split()).lower()
 
 
-def test_subagent_driven_workflow_has_controller_owned_final_review_only():
+def test_review_owner_descriptions_are_disjoint_and_routeable():
+    governance = _text(GOVERNANCE)
+    code_review = _text(CODE_REVIEW)
+
+    assert (
+        "description: \"Use before any independent Reviewer, Codex, Claude, human, "
+        "or domain review is launched" in governance
+    )
+    assert (
+        "description: \"Use only after independent-review-governance authorizes "
+        "an independent pass" in code_review
+    )
+
+
+def test_governance_owns_authorization_budget_and_stop_not_code_mechanics():
+    text = _normalized(GOVERNANCE)
+    assert "canonical control plane for independent review across domains" in text
+    assert "global pass count" in text
+    assert "default budget" in text
+    assert "targeted pass 2" in text
+    assert "the budget does not reset" in text
+    assert "if the next-pass gate is not met, stop reviewing" in text
+    assert "git diff head" not in text
+    assert "untracked files" not in text
+
+
+def test_code_review_executes_one_authorized_pass_without_budget_policy():
+    text = _normalized(CODE_REVIEW)
+    assert "one software review pass already authorized" in text
+    assert "does not decide whether review is needed" in text
+    assert "count global passes" in text
+    assert "authorize follow-up review" in text
+    assert "git diff head --stat -- <task-files...>" in text
+    assert "git diff head --check -- <task-files...>" in text
+    assert "untracked files" in text
+    assert "default budget" not in text
+    assert "targeted pass 2" not in text
+    assert "the budget does not reset" not in text
+
+
+def test_reviewer_template_uses_canonical_one_shot_profile():
+    text = _text(CODE_REVIEW_TEMPLATE)
+    assert 'subagent_type="Reviewer"' in text
+    assert 'subagent_type="Explore"' not in text
+    assert "do not automatically launch another reviewer" in text.lower()
+
+
+def test_subagent_driven_routes_authorization_before_execution():
     for path in (SUBAGENT_DRIVEN, SUBAGENT_DRIVEN_DOC):
-        text = _text(path)
-        normalized = " ".join(text.split()).lower()
-        assert "two-stage review" not in normalized, path
-        assert "parent/controller owns all independent review" in normalized, path
-        assert "one final independent review" in normalized, path
-
-
-def test_requesting_review_does_not_reintroduce_per_task_review():
-    for path in (
-        REQUESTING_REVIEW,
-        REQUESTING_REVIEW_DOC,
-        REQUESTING_REVIEW_ZH_DOC,
-    ):
-        normalized = " ".join(_text(path).split()).lower()
-        assert "after each task in subagent-driven-development" not in normalized, path
-        assert (
-            "do not run reviewer subagents after every task" in normalized
-            or "默认不要在每个 task 后都启动 reviewer subagent" in normalized
-        ), path
-
-
-def test_plan_handoff_uses_controller_checks_and_one_final_review():
-    for path in (PLAN_SKILL, PLAN_DOC):
-        normalized = " ".join(_text(path).split()).lower()
-        assert "two-stage review" not in normalized, path
-        assert "controller-owned diff/test verification after each task" in normalized, path
-        assert "one final whole-change independent review" in normalized, path
-
-
-def test_requesting_review_includes_staged_unstaged_and_untracked_changes():
-    for path in (REQUESTING_REVIEW, REQUESTING_REVIEW_DOC, REQUESTING_REVIEW_ZH_DOC):
-        normalized = " ".join(_text(path).split()).lower()
-        assert "git diff head --stat -- <changed-files...>" in normalized, path
-        assert "git diff head --check -- <changed-files...>" in normalized, path
-        assert "untracked files" in normalized, path
-        assert "commit-only range" in normalized or "只比较 commits" in normalized, path
+        text = _normalized(path)
+        governance_at = text.index("load `independent-review-governance`")
+        execution_at = text.index("use `code-review-execution`", governance_at)
+        assert governance_at < execution_at
+        assert "parent/controller owns all independent review" in text
+        assert "per-task independent reviewers are exceptional" in text
 
 
 def test_final_reviewer_example_contains_the_review_inputs():
     for path in (SUBAGENT_DRIVEN, SUBAGENT_DRIVEN_DOC):
-        normalized = " ".join(_text(path).split()).lower()
-        assert "approved contract:" in normalized, path
-        assert "acceptance criteria / invariants:" in normalized, path
-        assert "scoped integrated diff or review package:" in normalized, path
-        assert "fresh test / build / runtime evidence:" in normalized, path
+        text = _normalized(path)
+        assert 'subagent_type="reviewer"' in text
+        assert "approved contract:" in text
+        assert "acceptance criteria / invariants:" in text
+        assert "scoped integrated diff or review package:" in text
+        assert "fresh test / build / runtime evidence:" in text
 
 
-def test_simplify_code_does_not_reintroduce_per_task_independent_review():
+def test_plan_handoff_preserves_controller_checks_and_one_final_review():
+    for path in (PLAN_SKILL, PLAN_DOC):
+        text = _normalized(path)
+        assert "two-stage review" not in text
+        assert "controller-owned diff/test verification after each task" in text
+        assert "one final whole-change independent review" in text
+
+
+def test_simplify_code_routes_final_review_through_governance():
     for path in (SIMPLIFY_CODE, SIMPLIFY_CODE_DOC):
-        normalized = " ".join(_text(path).split()).lower()
-        assert "parallel review during implementation, per task" not in normalized, path
-        assert "one final whole-change independent review" in normalized, path
-        assert "does not replace or multiply that final review" in normalized, path
+        text = _normalized(path)
+        assert "does not replace or multiply that final review" in text
+        assert "route the decision through `independent-review-governance`" in text
+        assert "authorized software pass uses `code-review-execution`" in text
 
 
-def test_chinese_catalog_does_not_advertise_removed_auto_fix_workflow():
-    text = _text(ZH_SKILLS_CATALOG)
-    line = next(
-        item for item in text.splitlines() if "software-development-requesting-code-review" in item
-    )
-    assert "自动修复" not in line
-    assert "全新独立审查" in line
+def test_runtime_verifier_preloads_governance_not_execution():
+    text = _text(KANBAN_SWARM)
+    assert 'skills=["independent-review-governance"]' in text
+    assert 'skills=["code-review-execution"]' not in text
+
+
+def test_generated_docs_and_catalogs_use_only_new_owner_names():
+    for path in (
+        GOVERNANCE_DOC,
+        CODE_REVIEW_DOC,
+        CODE_REVIEW_ZH_DOC,
+        EN_SKILLS_CATALOG,
+        ZH_SKILLS_CATALOG,
+    ):
+        text = _text(path)
+        for old_name in OLD_OWNER_NAMES:
+            assert old_name not in text, path
+
+    en = _text(EN_SKILLS_CATALOG)
+    zh = _text(ZH_SKILLS_CATALOG)
+    assert "independent-review-governance" in en
+    assert "code-review-execution" in en
+    assert "independent-review-governance" in zh
+    assert "code-review-execution" in zh
+
+
+def test_old_bundled_owner_paths_are_gone():
+    assert not (
+        REPO_ROOT / "skills/software-development/requesting-code-review"
+    ).exists()
+    assert not (
+        REPO_ROOT
+        / "website/docs/user-guide/skills/bundled/software-development/"
+        "software-development-requesting-code-review.md"
+    ).exists()

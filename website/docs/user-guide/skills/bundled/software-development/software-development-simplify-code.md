@@ -21,7 +21,7 @@ Parallel 3-agent cleanup of recent code changes.
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `code-review`, `cleanup`, `refactor`, `delegation`, `subagent`, `parallel`, `simplify` |
-| Related skills | [`requesting-code-review`](/docs/user-guide/skills/bundled/software-development/software-development-requesting-code-review), [`test-driven-development`](/docs/user-guide/skills/bundled/software-development/software-development-test-driven-development), [`plan`](/docs/user-guide/skills/bundled/software-development/software-development-plan) |
+| Related skills | [`independent-review-governance`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-independent-review-governance), [`code-review-execution`](/docs/user-guide/skills/bundled/software-development/software-development-code-review-execution), [`test-driven-development`](/docs/user-guide/skills/bundled/software-development/software-development-test-driven-development), [`plan`](/docs/user-guide/skills/bundled/software-development/software-development-plan) |
 
 ## Reference: full SKILL.md
 
@@ -228,4 +228,4 @@ Wait for all three to return (batch mode returns them together).
 controller verification after each task, and one final whole-change independent
 review when the risk gate requires it. This skill is a separate user-invoked
 three-lens cleanup of recent changes; it does not replace or multiply that final
-review. Use `requesting-code-review` for the final high-risk independent review.
+review. If a final independent pass is being considered, route the decision through `independent-review-governance`; only an authorized software pass uses `code-review-execution`.

@@ -21,7 +21,7 @@ description: "在仓库中编写 SKILL.md"
 | 许可证 | MIT |
 | 平台 | linux, macos, windows |
 | 标签 | `skills`, `authoring`, `hermes-agent`, `conventions`, `skill-md` |
-| 相关 skill | [`writing-plans`](/user-guide/skills/bundled/software-development/software-development-writing-plans), [`requesting-code-review`](/user-guide/skills/bundled/software-development/software-development-requesting-code-review) |
+| 相关 skill | [`writing-plans`](/user-guide/skills/bundled/software-development/software-development-writing-plans), [`code-review-execution`](/user-guide/skills/bundled/software-development/software-development-code-review-execution) |
 
 ## 参考：完整 SKILL.md
 
