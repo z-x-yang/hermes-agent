@@ -296,8 +296,9 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "the project'), you MUST immediately make the corresponding tool call in the same "
     "response. Never end your turn with a promise of future action — execute it now.\n"
     "Every response should either (a) contain tool calls that make progress, or "
-    "(b) deliver a final result to the user. Responses that only describe intentions "
-    "without acting are not acceptable."
+    "(b) deliver a final result to the user — including, when you are blocked, "
+    "the blocker report or confirmation request that unblocks you. Responses "
+    "that only describe intentions without acting are not acceptable."
 )
 
 # Model name substrings that trigger tool-use enforcement guidance.
@@ -333,7 +334,14 @@ TASK_COMPLETION_GUIDANCE = (
     "or assessment is complete when that is what the user requested. Never fabricate "
     "results when the real path is blocked. Do not silently substitute a fallback "
     "that changes the requested method or evidence standard; disclose the "
-    "substitution and its limitations."
+    "substitution and its limitations.\n"
+    "Before ending a turn, check your final message. If it is a plan, an "
+    "analysis, a question your tools could answer, a list of next steps, or "
+    "a promise about work you have not done ('I'll…', 'let me know when…') — "
+    "and that is not the deliverable the user asked for — do that work now, "
+    "gathering the missing information yourself. End the turn only when the "
+    "contract is met, you have reported a blocker the retry rule above says "
+    "not to retry, or you are blocked on input only the user can provide."
 )
 
 # Universal parallel-tool-call guidance — applied to ALL models.

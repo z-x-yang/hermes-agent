@@ -141,6 +141,14 @@ class TestContractOrdering:
         comm_at = stable.index(COMMUNICATION_GUIDANCE)
         assert task_at < comm_at
 
+    def test_acting_block_precedes_side_effect_protocol(self):
+        # "Acting and asking" defers the confirm protocol to the
+        # side-effect block "below" — the order is part of the meaning.
+        stable = _stable(_make_agent())
+        acting_at = stable.index(ASSESSMENT_FIRST_GUIDANCE)
+        side_effect_at = stable.index(SIDE_EFFECT_CONFIRMATION_GUIDANCE)
+        assert acting_at < side_effect_at
+
 
 class TestExecutionAndStoppingContract:
     def test_preserves_artifact_evidence_and_no_fabrication(self):
@@ -173,6 +181,27 @@ class TestExecutionAndStoppingContract:
         assert "do not silently substitute a fallback" in text
         assert "disclose the substitution and its limitations" in text
 
+    def test_turn_close_check_restored_with_single_legal_exit(self):
+        # The 7484f4d3c consolidation kept TURN_COMPLETION_CHECK's exception
+        # ("a plan ... is complete when that is what the user requested") but
+        # dropped the check itself; observed 2026-07-16: a diagnosis was
+        # delivered with the fix neither done nor offered.  The check lives
+        # here now, inside the single decision center.
+        text = TASK_COMPLETION_GUIDANCE.lower()
+        assert "check your final message" in text
+        assert "a plan, an analysis, a question your tools could answer" in text
+        assert "not the deliverable the user asked for" in text
+        assert "do that work now" in text
+        # Three legal exits: contract met, non-retryable blocker reported,
+        # or blocked on the user.  Omitting the blocker exit turns this
+        # check into a retry grinder on an over-persistent model.
+        assert "blocker the retry rule above says not to retry" in text
+        assert "blocked on input only the user can provide" in text
+        # Last-read position is load-bearing — the check must close the block.
+        assert TASK_COMPLETION_GUIDANCE.rstrip().endswith(
+            "only the user can provide."
+        )
+
     def test_gpt_assembled_prompt_has_one_persistence_decision_center(self):
         stable = _stable(
             _make_agent(model="gpt-5.6-sol", _tool_use_enforcement="auto")
@@ -181,6 +210,10 @@ class TestExecutionAndStoppingContract:
         assert "# Finishing the job" not in stable
         assert "# Proportionality" not in stable
         assert "<tool_persistence>" not in stable
+        # "End your turn only" is the retired standalone TURN_COMPLETION_CHECK
+        # signature; the live turn-close check inside the decision center
+        # deliberately reads "End the turn only" so this blacklist keeps
+        # guarding against the old block's return.
         for duplicated in (
             "Keep working until",
             "Do not stop early",
@@ -188,6 +221,52 @@ class TestExecutionAndStoppingContract:
             "End your turn only",
         ):
             assert duplicated not in stable
+
+
+class TestActingAndAskingContract:
+    def test_act_first_default_with_bounded_asking(self):
+        text = ASSESSMENT_FIRST_GUIDANCE.lower()
+        assert "not watching in real time" in text
+        assert "enough information to deliver what the current request needs" in text
+        assert "go ahead without checking in" in text
+        assert "asking permission before doing reversible, in-scope work is not" in text
+        # The ask-side bound must stay pinned too — a block that only keeps
+        # its act-side phrases is a different contract.
+        assert "confirm first for irreversible or outward-facing steps" in text
+        assert "the user's call, not yours" in text
+
+    def test_intent_classified_by_end_state_not_sentence_form(self):
+        text = ASSESSMENT_FIRST_GUIDANCE.lower()
+        assert "end state the user wants" in text
+        assert "not by its sentence form" in text
+        assert "thinking out loud" in text
+        assert "read-only tools" in text
+        assert "unreviewed intervention" in text
+        assert "however indirectly phrased" in text
+        assert "scoped to the change they actually want" in text
+
+    def test_diagnosis_and_ambiguity_both_land_on_offer_not_silent_stop(self):
+        text = ASSESSMENT_FIRST_GUIDANCE.lower()
+        assert "one-line offer to fix it" in text
+        assert "supports both readings" in text
+        assert "deliver the assessment" in text
+        assert "one-line offer to act" in text
+
+    def test_sentence_pattern_examples_stay_retired(self):
+        # 2026-07-16 regression: the example table ("can you fix this?",
+        # "why is X failing?") turned intent classification into literal
+        # pattern matching — "bug fixed yet?" matched no listed pattern and
+        # landed in the passive default.  Principles only; scenario example
+        # tables must not return.
+        text = ASSESSMENT_FIRST_GUIDANCE.lower()
+        assert "can you fix this" not in text
+        assert "why is x failing" not in text
+        # Structural guard: quoted sentence-pattern examples are
+        # interrogative, so the block must contain no question mark at all.
+        assert "?" not in ASSESSMENT_FIRST_GUIDANCE
+        stable = _stable(_make_agent())
+        assert "# Questions are not change requests" not in stable
+        assert stable.count("# Acting and asking") == 1
 
 
 class TestCacheStability:

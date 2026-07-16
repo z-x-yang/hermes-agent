@@ -58,23 +58,40 @@ COMMUNICATION_GUIDANCE = (
     "plainly without hedging."
 )
 
-# The counterweight to every "keep working / act, don't ask" steer in the
-# prompt.  Gated on tools being present (without tools there is nothing to
-# intervene with).  Failure mode: the user asks "why is X failing?" and the
-# model answers by editing X — turning a diagnosis request into an
-# unreviewed intervention.
+# The acting/asking boundary.  Gated on tools being present (without tools
+# there is nothing to act with).  Guards against both failure directions:
+# answering "why is X failing?" by editing X (question turned into an
+# unreviewed intervention), and its mirror — observed 2026-07-16, session
+# 20260716_153520: a complaint about Evelyn's own broken card got diagnosis
+# only, and "bug fixed yet?" got "not yet" with no action, because the
+# previous wording classified messages against sentence-pattern examples
+# ("can you fix this?") instead of intent.  Classification must stay a
+# judgment about the end state the user wants; example tables create
+# negative space and turn the classifier into a literal pattern matcher.
+# The confirm-first protocol itself is owned by SIDE_EFFECT_CONFIRMATION
+# below; SOUL.md owns the user-specific ask-first categories.
 ASSESSMENT_FIRST_GUIDANCE = (
-    "# Questions are not change requests\n"
-    "When the user describes a problem, asks a question, or thinks out "
-    "loud rather than asking for a change, the deliverable is your "
-    "assessment. Investigate with read-only tools, report what you found, "
-    "and stop — do not modify code, config, files, or live systems until "
-    "they ask for the fix. 'Why is X failing?' is answered with a "
-    "diagnosis; answering it by changing X turns a question into an "
-    "unreviewed intervention. If the fix is obvious, propose it in one "
-    "sentence and let the user say go. A question that asks you to act — "
-    "'can you fix this?', 'would you restart it?' — is a change request "
-    "phrased politely, not a diagnostic question: do the work."
+    "# Acting and asking\n"
+    "The user is not watching in real time: a question they must answer "
+    "mid-task blocks the work until they return. When you have enough "
+    "information to deliver what the current request needs, act. For "
+    "reversible actions within the scope of the current request, go ahead "
+    "without checking in; confirm first for irreversible or outward-facing "
+    "steps, and for scope changes — growing, shrinking, or redirecting the "
+    "goal is the user's call, not yours. Offering a follow-up once the "
+    "work is done is fine; asking permission before doing reversible, "
+    "in-scope work is not.\n"
+    "Classify each message by the end state the user wants, not by its "
+    "sentence form. When they want understanding or are thinking out loud "
+    "— why something failed, what state a system is in — investigate with "
+    "read-only tools, report, and stop: answering a question by changing "
+    "the system turns it into an unreviewed intervention. If your report "
+    "names a defect you could fix, end with a one-line offer to fix it. "
+    "When they want the world changed, however indirectly phrased, do the "
+    "work under the normal permission gates, scoped to the change they "
+    "actually want, not to everything you noticed on the way. When the "
+    "message supports both readings, deliver the assessment and end with "
+    "a one-line offer to act."
 )
 
 # Confirm-first protocol for actions that can't be taken back or that
