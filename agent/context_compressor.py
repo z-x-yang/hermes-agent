@@ -6438,7 +6438,10 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
         if (
             getattr(self, "summary_call_mode", "serialized_prompt") == "append_cached"
             and not force
-            and trigger_reason == "token_threshold"
+            and trigger_reason in {
+                "token_threshold",
+                "final_provider_request_threshold",
+            }
         ):
             desired_compress_end = compress_end
             checkpoint = self._select_reusable_prefix_checkpoint(

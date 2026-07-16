@@ -169,6 +169,10 @@ def test_append_cached_auto_compression_uses_transcript_fallback_without_anchor(
     assert receipt["reason"] == "transcript_reconstructed_fallback"
 
 
+@pytest.mark.parametrize("trigger_reason", [
+    "token_threshold",
+    "final_provider_request_threshold",
+])
 @pytest.mark.parametrize(
     ("provider", "api_mode"),
     [
@@ -180,6 +184,7 @@ def test_append_cached_uses_latest_replayable_endpoint(
     monkeypatch,
     provider: str,
     api_mode: str,
+    trigger_reason: str,
 ):
     compressor = _compressor(provider=provider, api_mode=api_mode)
     compressor.threshold_tokens = 100_000
@@ -211,7 +216,7 @@ def test_append_cached_uses_latest_replayable_endpoint(
         messages,
         current_tokens=80_000,
         force=False,
-        trigger_reason="token_threshold",
+        trigger_reason=trigger_reason,
     )
 
     assert compressor._last_compress_deferred is False
