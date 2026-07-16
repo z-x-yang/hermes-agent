@@ -112,7 +112,20 @@ def compute_session_context_breakdown(
     tools = list(getattr(agent, "tools", None) or [])
     builtin_tools, mcp_tools, subagent_tools = _split_tools(tools)
 
-    estimated_conversation_tokens = estimate_messages_tokens_rough(messages or [])
+    comp = getattr(agent, "context_compressor", None)
+    provider_estimator = getattr(comp, "estimate_provider_messages_tokens", None)
+    estimated_conversation_tokens: int
+    if callable(provider_estimator):
+        try:
+            provider_estimate = provider_estimator(messages or [])
+        except Exception:
+            provider_estimate = None
+        if isinstance(provider_estimate, (int, float)) and not isinstance(provider_estimate, bool):
+            estimated_conversation_tokens = max(0, int(provider_estimate))
+        else:
+            estimated_conversation_tokens = estimate_messages_tokens_rough(messages or [])
+    else:
+        estimated_conversation_tokens = estimate_messages_tokens_rough(messages or [])
 
     categories = [
         ("system_prompt", "System prompt", _chars_to_tokens(system_prompt_text)),
@@ -125,7 +138,6 @@ def compute_session_context_breakdown(
         ("conversation", "Conversation", estimated_conversation_tokens),
     ]
 
-    comp = getattr(agent, "context_compressor", None)
     context_max = int(
         getattr(
             comp,

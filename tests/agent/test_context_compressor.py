@@ -182,134 +182,11 @@ class TestUpdateFromResponse:
         assert compressor.last_prompt_tokens == 5000
         assert compressor.last_completion_tokens == 1000
         assert compressor.last_real_prompt_tokens == 5000
-        assert compressor.last_rough_tokens_when_real_prompt_fit == 90_000
         assert compressor.awaiting_real_usage_after_compression is False
 
     def test_missing_fields_default_zero(self, compressor):
         compressor.update_from_response({})
         assert compressor.last_prompt_tokens == 0
-
-
-class TestPreflightDeferral:
-    def test_clears_accepted_request_baseline_when_response_has_no_pending_rough(self, compressor):
-        compressor.threshold_tokens = 85_000
-        compressor.last_accepted_request_real_prompt_tokens = 50_000
-        compressor.last_accepted_request_rough_tokens = 90_000
-        compressor.last_accepted_request_fingerprint = "route-a"
-
-        compressor.update_from_response({"prompt_tokens": 51_000, "completion_tokens": 123})
-
-        assert compressor.last_accepted_request_real_prompt_tokens == 0
-        assert compressor.last_accepted_request_rough_tokens == 0
-        assert compressor.last_accepted_request_fingerprint == ""
-
-    def test_records_accepted_request_rough_baseline_from_successful_response(self, compressor):
-        compressor.threshold_tokens = 85_000
-        compressor.record_pending_request_estimate(90_000, fingerprint="route-a")
-
-        compressor.update_from_response({"prompt_tokens": 50_000, "completion_tokens": 123})
-
-        assert compressor.last_accepted_request_real_prompt_tokens == 50_000
-        assert compressor.last_accepted_request_rough_tokens == 90_000
-        assert compressor.last_accepted_request_fingerprint == "route-a"
-
-    def test_does_not_defer_when_accepted_request_fingerprint_is_missing(self, compressor):
-        compressor.threshold_tokens = 85_000
-        compressor.last_accepted_request_real_prompt_tokens = 50_000
-        compressor.last_accepted_request_rough_tokens = 90_000
-        compressor.last_accepted_request_fingerprint = "route-a"
-
-        assert compressor.should_defer_preflight_to_real_usage(93_000) is False
-
-    def test_does_not_defer_when_accepted_request_fingerprint_mismatches(self, compressor):
-        compressor.threshold_tokens = 85_000
-        compressor.last_accepted_request_real_prompt_tokens = 50_000
-        compressor.last_accepted_request_rough_tokens = 90_000
-        compressor.last_accepted_request_fingerprint = "route-a"
-
-        assert compressor.should_defer_preflight_to_real_usage(
-            93_000,
-            fingerprint="route-b",
-        ) is False
-
-    def test_does_not_defer_when_accepted_request_rough_growth_is_large(self, compressor):
-        compressor.threshold_tokens = 85_000
-        compressor.last_accepted_request_real_prompt_tokens = 50_000
-        compressor.last_accepted_request_rough_tokens = 90_000
-        compressor.last_accepted_request_fingerprint = "route-a"
-
-        assert compressor.should_defer_preflight_to_real_usage(
-            100_000,
-            fingerprint="route-a",
-        ) is False
-
-    def test_does_not_defer_when_calibrated_estimate_crosses_threshold(self, compressor):
-        compressor.threshold_tokens = 85_000
-        compressor.last_accepted_request_real_prompt_tokens = 83_000
-        compressor.last_accepted_request_rough_tokens = 90_000
-        compressor.last_accepted_request_fingerprint = "route-a"
-
-        assert compressor.should_defer_preflight_to_real_usage(
-            94_000,
-            fingerprint="route-a",
-        ) is False
-
-    def test_defers_when_accepted_request_rough_baseline_matches(self, compressor):
-        compressor.threshold_tokens = 85_000
-        compressor.last_accepted_request_real_prompt_tokens = 50_000
-        compressor.last_accepted_request_rough_tokens = 90_000
-        compressor.last_accepted_request_fingerprint = "route-a"
-
-        assert compressor.should_defer_preflight_to_real_usage(
-            93_000,
-            fingerprint="route-a",
-        ) is True
-        assert compressor.last_accepted_request_rough_tokens == 93_000
-
-    def test_defers_when_recent_real_usage_fit_and_rough_growth_is_small(self, compressor):
-        compressor.threshold_tokens = 85_000
-        compressor.last_real_prompt_tokens = 50_000
-        compressor.last_rough_tokens_when_real_prompt_fit = 90_000
-
-        assert compressor.should_defer_preflight_to_real_usage(93_000) is True
-        assert compressor.last_rough_tokens_when_real_prompt_fit == 93_000
-
-    def test_does_not_defer_when_rough_growth_is_large(self, compressor):
-        compressor.threshold_tokens = 85_000
-        compressor.last_real_prompt_tokens = 50_000
-        compressor.last_rough_tokens_when_real_prompt_fit = 90_000
-
-        assert compressor.should_defer_preflight_to_real_usage(100_000) is False
-
-    def test_does_not_defer_without_recent_real_usage(self, compressor):
-        compressor.threshold_tokens = 85_000
-        compressor.last_real_prompt_tokens = 0
-        compressor.last_rough_tokens_when_real_prompt_fit = 90_000
-
-        assert compressor.should_defer_preflight_to_real_usage(93_000) is False
-
-    def test_defers_immediately_after_compaction_with_stale_real_prompt(self, compressor):
-        """#36718: right after a compaction, last_real_prompt_tokens still holds
-        the stale pre-compression value (above threshold). The awaiting flag
-        must force deferral so preflight doesn't fire a SECOND compaction before
-        real post-compaction usage arrives."""
-        compressor.threshold_tokens = 85_000
-        # Stale pre-compression value — would hit the `>= threshold => False`
-        # short-circuit and defeat deferral without the flag guard.
-        compressor.last_real_prompt_tokens = 120_000
-        compressor.awaiting_real_usage_after_compression = True
-        assert compressor.should_defer_preflight_to_real_usage(95_000) is True
-
-    def test_resumes_normal_deferral_after_flag_cleared(self, compressor):
-        """Once update_from_response() clears the flag, the normal baseline/
-        growth deferral logic governs again (no permanent deferral)."""
-        compressor.threshold_tokens = 85_000
-        compressor.last_real_prompt_tokens = 120_000
-        compressor.awaiting_real_usage_after_compression = False
-        # Stale-high real prompt with the flag cleared => the >= threshold
-        # short-circuit applies => no deferral.
-        assert compressor.should_defer_preflight_to_real_usage(95_000) is False
-
 
 
 class TestCompress:
@@ -5141,11 +5018,7 @@ class TestUpdateModelBudgets:
 
 
 class TestUpdateModelResetsCalibration:
-    """#23767: update_model() must clear stale cross-call calibration state.
-
-    Old-model real-usage / defer baselines must not suppress a preflight
-    compression the new (smaller) model actually needs.
-    """
+    """#23767: update_model() must clear route-specific calibration state."""
 
     def _comp(self):
         from unittest.mock import patch
@@ -5157,8 +5030,10 @@ class TestUpdateModelResetsCalibration:
         # Simulate a large-model session that proved a prompt fit.
         comp.last_prompt_tokens = 120_000
         comp.last_real_prompt_tokens = 120_000
-        comp.last_rough_tokens_when_real_prompt_fit = 130_000
         comp.last_compression_rough_tokens = 130_000
+        comp._last_successful_request_actual_tokens = 120_000
+        comp._last_successful_request_semantic_tokens = 130_000
+        comp._last_successful_request_fingerprint = "old-route"
         comp.awaiting_real_usage_after_compression = True
         comp._ineffective_compression_count = 2
 
@@ -5166,25 +5041,12 @@ class TestUpdateModelResetsCalibration:
 
         assert comp.last_prompt_tokens == 0
         assert comp.last_real_prompt_tokens == 0
-        assert comp.last_rough_tokens_when_real_prompt_fit == 0
         assert comp.last_compression_rough_tokens == 0
+        assert comp._last_successful_request_actual_tokens == 0
+        assert comp._last_successful_request_semantic_tokens == 0
+        assert comp._last_successful_request_fingerprint == ""
         assert comp.awaiting_real_usage_after_compression is False
         assert comp._ineffective_compression_count == 0
-
-    def test_defer_no_longer_suppresses_after_switch(self):
-        """The exact #23767 failure: old model's 'it fit' must not defer
-        preflight on the new smaller model."""
-        comp = self._comp()
-        comp.last_real_prompt_tokens = 50_000
-        comp.last_rough_tokens_when_real_prompt_fit = 90_000
-        # Before switch, a modest rough growth would defer.
-        comp.threshold_tokens = 85_000
-        assert comp.should_defer_preflight_to_real_usage(93_000) is True
-
-        # After switching to a 65K model, the stale state is gone, so a rough
-        # estimate over the new threshold is NOT deferred — preflight will run.
-        comp.update_model("small-model", context_length=65_536)
-        assert comp.should_defer_preflight_to_real_usage(comp.threshold_tokens + 5_000) is False
 
 
 class TestTruncateToolCallArgsJson:

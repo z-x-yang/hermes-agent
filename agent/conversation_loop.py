@@ -16,6 +16,7 @@ resolved through :func:`_ra` so those patches keep working.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -29,7 +30,6 @@ from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.chat_completion_helpers import prepare_provider_visible_messages
-from agent.compression_summary_runtime import fingerprint_cache_visible_prefix
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
@@ -69,55 +69,20 @@ from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
 
+
+class _FinalRequestCompressionRequired(Exception):
+    """Signal that the final provider-shaped request must compress before send."""
+
+    def __init__(self, request_snapshot: Any, estimated_tokens: int):
+        super().__init__("final provider request exceeds compression threshold")
+        self.request_snapshot = request_snapshot
+        self.estimated_tokens = max(0, int(estimated_tokens or 0))
+
+
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
-
-
-def _record_pending_compression_request_estimate(
-    agent,
-    api_messages: List[Dict[str, Any]],
-    *,
-    active_system_prompt: str = "",
-) -> None:
-    """Pair the next provider call with its rough estimate for calibration.
-
-    This must be fail-open: calibration improves preflight decisions, but it
-    must never block a model request.
-    """
-    try:
-        compressor = getattr(agent, "context_compressor", None)
-        if compressor is None:
-            return
-        record_pending = getattr(compressor, "record_pending_request_estimate", None)
-        estimate_request = getattr(compressor, "estimate_provider_request_tokens", None)
-        if not callable(record_pending) or not callable(estimate_request):
-            return
-        tools = getattr(agent, "tools", None) or None
-        has_system_message = any(
-            isinstance(msg, dict) and msg.get("role") == "system"
-            for msg in api_messages
-        )
-        system_prompt_for_estimate = "" if has_system_message else (active_system_prompt or "")
-        rough_tokens = estimate_request(
-            api_messages,
-            system_prompt=system_prompt_for_estimate,
-            tools=tools,
-        )
-        fingerprint = ""
-        make_fingerprint = getattr(compressor, "preflight_request_fingerprint", None)
-        if callable(make_fingerprint):
-            fingerprint = str(
-                make_fingerprint(
-                    system_prompt=active_system_prompt or "",
-                    tools=tools,
-                )
-                or ""
-            )
-        record_pending(rough_tokens, fingerprint=fingerprint)
-    except Exception:
-        logger.debug("failed to record pending compression request estimate", exc_info=True)
 
 
 def _format_truncated_response_for_user(
@@ -756,6 +721,7 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
+    final_request_compression_bypass = ""
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
@@ -1194,12 +1160,6 @@ def run_conversation(
                     _prepared_provider_attempt.middleware_trace
                 )
 
-                _record_pending_compression_request_estimate(
-                    agent,
-                    api_messages,
-                    active_system_prompt=active_system_prompt or "",
-                )
-
                 def _emit_pre_api_observers(final_api_kwargs, middleware_trace):
                     """Run body-bearing observers only after governed fit approval."""
                     try:
@@ -1304,19 +1264,50 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
-                successful_request_kwargs = None
-                successful_request_source_message_count = 0
-                successful_request_provider_messages = None
+                successful_request_snapshot = None
 
                 def _perform_api_call(next_api_kwargs):
                     nonlocal provider_backend_invoked_this_iteration
-                    nonlocal successful_request_kwargs
-                    nonlocal successful_request_source_message_count
-                    nonlocal successful_request_provider_messages
+                    nonlocal successful_request_snapshot
+                    nonlocal final_request_compression_bypass
+                    from agent.chat_completion_helpers import (
+                        build_provider_request_snapshot,
+                    )
+
+                    successful_request_snapshot = build_provider_request_snapshot(
+                        next_api_kwargs,
+                        source_message_count=len(messages),
+                        lineage=(
+                            str(agent.provider or ""),
+                            str(agent.model or ""),
+                            str(agent.api_mode or ""),
+                            str(agent.base_url or ""),
+                            str(agent.api_key or ""),
+                        ),
+                    )
+                    if getattr(agent, "compression_enabled", True):
+                        estimated_tokens = (
+                            agent.context_compressor.estimate_provider_request_tokens(
+                                request_snapshot=successful_request_snapshot,
+                            )
+                        )
+                        threshold_tokens = int(
+                            getattr(agent.context_compressor, "threshold_tokens", 0) or 0
+                        )
+                        request_fingerprint = successful_request_snapshot.cache_fingerprint
+                        if (
+                            threshold_tokens > 0
+                            and estimated_tokens >= threshold_tokens
+                            and request_fingerprint != final_request_compression_bypass
+                            and agent.context_compressor.should_compress(estimated_tokens)
+                        ):
+                            raise _FinalRequestCompressionRequired(
+                                successful_request_snapshot,
+                                estimated_tokens,
+                            )
+                        if request_fingerprint == final_request_compression_bypass:
+                            final_request_compression_bypass = ""
                     provider_backend_invoked_this_iteration = True
-                    successful_request_kwargs = dict(next_api_kwargs)
-                    successful_request_source_message_count = len(messages)
-                    successful_request_provider_messages = api_messages
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -2054,6 +2045,7 @@ def run_conversation(
                         }
                 
                 # Track actual token usage from response for context management
+                aggregator_prompt_tokens = 0
                 if hasattr(response, 'usage') and response.usage:
                     canonical_usage = normalize_usage(
                         response.usage,
@@ -2065,6 +2057,7 @@ def run_conversation(
                     # rate, not the aggregator's, so they are added as dollars
                     # (below) rather than folded into the priced usage.
                     aggregator_usage = canonical_usage
+                    aggregator_prompt_tokens = aggregator_usage.prompt_tokens
                     # MoA: fold the reference (advisor) fan-out's token usage
                     # into this turn's REPORTED token counts. MoA runs advisors
                     # before the aggregator and returns only the aggregator's
@@ -2115,7 +2108,16 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
-                    agent.context_compressor.update_from_response(usage_dict)
+                    agent.context_compressor.update_from_response({
+                        "prompt_tokens": aggregator_prompt_tokens,
+                        "completion_tokens": aggregator_usage.output_tokens,
+                        "total_tokens": aggregator_usage.total_tokens,
+                        "input_tokens": aggregator_usage.input_tokens,
+                        "output_tokens": aggregator_usage.output_tokens,
+                        "cache_read_tokens": aggregator_usage.cache_read_tokens,
+                        "cache_write_tokens": aggregator_usage.cache_write_tokens,
+                        "reasoning_tokens": aggregator_usage.reasoning_tokens,
+                    })
 
                     # Cache discovered context length after successful call.
                     # Only persist limits confirmed by the provider (parsed
@@ -2265,21 +2267,14 @@ def run_conversation(
                         )
                 
                 try:
-                    checkpoint_fingerprint = fingerprint_cache_visible_prefix(
-                        successful_request_kwargs or {},
-                        lineage=(
-                            str(agent.provider or ""),
-                            str(agent.model or ""),
-                            str(agent.api_mode or ""),
-                            str(agent.base_url or ""),
-                            str(agent.api_key or ""),
-                        ),
-                    )
-                    agent.context_compressor.record_reusable_prefix_checkpoint(
-                        source_message_count=successful_request_source_message_count,
-                        prefix_fingerprint=checkpoint_fingerprint,
-                        provider_messages=successful_request_provider_messages,
-                    )
+                    if (
+                        successful_request_snapshot is not None
+                        and str(agent.provider or "").strip().lower() != "moa"
+                    ):
+                        agent.context_compressor.record_reusable_prefix_checkpoint(
+                            request_snapshot=successful_request_snapshot,
+                            provider_input_tokens=aggregator_prompt_tokens,
+                        )
                 except Exception:
                     logger.debug(
                         "Failed to record reusable prefix checkpoint",
@@ -2303,6 +2298,49 @@ def run_conversation(
                         pass
                 agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
+
+            except _FinalRequestCompressionRequired as compression_required:
+                if thinking_spinner:
+                    thinking_spinner.stop("")
+                    thinking_spinner = None
+                if agent.thinking_callback:
+                    agent.thinking_callback("")
+                before_messages = copy.deepcopy(messages)
+                before_system_prompt = active_system_prompt
+                messages, active_system_prompt = agent._compress_context(
+                    messages,
+                    system_message,
+                    approx_tokens=compression_required.estimated_tokens,
+                    task_id=effective_task_id,
+                    trigger_reason="final_provider_request_threshold",
+                    trigger_token_source="final_provider_request_snapshot",
+                    trigger_tokens=compression_required.estimated_tokens,
+                    trigger_threshold_tokens=getattr(
+                        agent.context_compressor, "threshold_tokens", None
+                    ),
+                    trigger_context_length=getattr(
+                        agent.context_compressor,
+                        "compression_context_length",
+                        getattr(agent.context_compressor, "context_length", None),
+                    ),
+                    trigger_message_count=len(messages),
+                )
+                conversation_history = conversation_history_after_compression(
+                    agent,
+                    messages,
+                )
+                if (
+                    messages == before_messages
+                    and active_system_prompt == before_system_prompt
+                ):
+                    # A failed/no-op compressor must not deadlock the turn. Allow
+                    # this exact request through once; provider overflow recovery
+                    # remains the final functional fallback.
+                    final_request_compression_bypass = (
+                        compression_required.request_snapshot.cache_fingerprint
+                    )
+                _retry.restart_with_compressed_messages = True
+                break
 
             except InterruptedError:
                 if thinking_spinner:
@@ -4817,67 +4855,11 @@ def run_conversation(
                 if _tc_names == {"execute_code"}:
                     agent.iteration_budget.refund()
                 
-                # Use real token counts from the API response to decide
-                # compression.  prompt_tokens + completion_tokens is the
-                # actual context size the provider reported plus the
-                # assistant turn — a tight lower bound for the next prompt.
-                # Tool results appended above aren't counted yet, but the
-                # threshold (default 50%) leaves ample headroom; if tool
-                # results push past it, the next API call will report the
-                # real total and trigger compression then.
-                #
-                # If last_prompt_tokens is 0 (stale after API disconnect
-                # or provider returned no usage data), fall back to rough
-                # estimate to avoid missing compression.  Without this,
-                # a session can grow unbounded after disconnects because
-                # should_compress(0) never fires.  (#2153)
-                _compressor = agent.context_compressor
-                if _compressor.last_prompt_tokens > 0:
-                    # Only use prompt_tokens — completion/reasoning
-                    # tokens don't consume context window space.
-                    # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
-                    # inflate completion_tokens with reasoning,
-                    # causing premature compression.  (#12026)
-                    _real_tokens = _compressor.last_prompt_tokens
-                    _trigger_token_source = "provider_actual"
-                elif _compressor.last_prompt_tokens == -1:
-                    # Compression just ran and no API-reported prompt count
-                    # has arrived yet. Avoid treating a schema-heavy rough
-                    # post-compression estimate as real context pressure.
-                    _real_tokens = 0
-                    _trigger_token_source = "post_compression_sentinel"
-                else:
-                    # Include tool schemas — with 50+ tools enabled
-                    # these add 20-30K tokens the messages-only
-                    # estimate misses, which can skip compression
-                    # past the configured threshold (#14695).
-                    _real_tokens = estimate_request_tokens_rough(
-                        messages, tools=agent.tools or None
-                    )
-                    _trigger_token_source = "rough_estimate_fallback"
+                # Tool results are part of the next provider request. The
+                # backend-adjacent final-request gate evaluates that exact shaped
+                # payload before send, so no stale post-tool usage/rough gate is
+                # needed here.
 
-                if agent.compression_enabled and _compressor.should_compress(_real_tokens):
-                    agent._safe_print("  ⟳ compacting context…")
-                    _compression_ctx = getattr(
-                        _compressor,
-                        "compression_context_length",
-                        _compressor.context_length,
-                    )
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message,
-                        approx_tokens=_real_tokens,
-                        task_id=effective_task_id,
-                        trigger_reason="token_threshold",
-                        trigger_token_source=_trigger_token_source,
-                        trigger_tokens=_real_tokens,
-                        trigger_threshold_tokens=_compressor.threshold_tokens,
-                        trigger_context_length=_compression_ctx,
-                        trigger_message_count=len(messages),
-                    )
-                    conversation_history = conversation_history_after_compression(
-                        agent, messages
-                    )
-                
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
                 

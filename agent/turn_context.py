@@ -394,57 +394,13 @@ def build_turn_context(
                 system_prompt=active_system_prompt or "",
                 tools=agent.tools or None,
             )
-        _preflight_fingerprint = ""
-        _make_preflight_fingerprint = getattr(
-            _compressor,
-            "preflight_request_fingerprint",
-            None,
-        )
-        if callable(_make_preflight_fingerprint):
-            try:
-                _preflight_fingerprint = str(
-                    _make_preflight_fingerprint(
-                        system_prompt=active_system_prompt or "",
-                        tools=agent.tools or None,
-                    )
-                    or ""
-                )
-            except Exception:
-                _preflight_fingerprint = ""
-        _defer_preflight = getattr(
-            _compressor,
-            "should_defer_preflight_to_real_usage",
-            lambda _tokens, **_kwargs: False,
-        )
-        try:
-            _preflight_deferred = _defer_preflight(
-                _preflight_tokens,
-                fingerprint=_preflight_fingerprint,
-            )
-        except TypeError:
-            _preflight_deferred = _defer_preflight(_preflight_tokens)
-
-        if not _preflight_deferred:
-            _last = _compressor.last_prompt_tokens
-            # Do NOT overwrite the -1 sentinel (#36718).
-            if _last >= 0 and _preflight_tokens > _last:
-                _compressor.last_prompt_tokens = _preflight_tokens
-
         _compression_cooldown = getattr(
             _compressor,
             "get_active_compression_failure_cooldown",
             lambda: None,
         )()
 
-        if _preflight_deferred:
-            logger.info(
-                "Skipping preflight compression: rough estimate ~%s >= %s, "
-                "but last real provider prompt was %s after compression",
-                f"{_preflight_tokens:,}",
-                f"{_compressor.threshold_tokens:,}",
-                f"{_compressor.last_real_prompt_tokens:,}",
-            )
-        elif _compression_cooldown:
+        if _compression_cooldown:
             logger.info(
                 "Skipping preflight compression: same-session cooldown active "
                 "(~%s seconds remaining, session %s)",

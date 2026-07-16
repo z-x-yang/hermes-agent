@@ -15,6 +15,7 @@ Key design decisions:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
@@ -23,6 +24,7 @@ import sqlite3
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -833,6 +835,18 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     holder TEXT NOT NULL,
     acquired_at REAL NOT NULL,
     expires_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS compression_replay_anchors (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    source_message_count INTEGER NOT NULL,
+    provider_input_tokens INTEGER NOT NULL,
+    target_tokens INTEGER NOT NULL,
+    prefix_fingerprint TEXT NOT NULL,
+    provider_request_zlib BLOB NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -2112,6 +2126,113 @@ class SessionDB:
                 "clear_compression_failure_cooldown(%s) failed: %s",
                 session_id, exc,
             )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Compression replay anchors
+    # ──────────────────────────────────────────────────────────────────────
+    def upsert_compression_replay_anchor(
+        self,
+        session_id: str,
+        *,
+        source_message_count: int,
+        provider_input_tokens: int,
+        target_tokens: int,
+        prefix_fingerprint: str,
+        provider_request: Dict[str, Any],
+    ) -> None:
+        """Persist one exact, short-lived replay anchor for a session."""
+        if not session_id or not prefix_fingerprint or not provider_request:
+            return
+        payload = json.dumps(
+            provider_request,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        digest = hashlib.sha256(payload).hexdigest()
+        compressed = zlib.compress(payload, level=6)
+        created_at = time.time()
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO compression_replay_anchors (
+                    session_id, source_message_count, provider_input_tokens,
+                    target_tokens, prefix_fingerprint, provider_request_zlib,
+                    payload_sha256, created_at, schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(session_id) DO NOTHING
+                """,
+                (
+                    session_id,
+                    max(0, int(source_message_count)),
+                    max(0, int(provider_input_tokens)),
+                    max(0, int(target_tokens)),
+                    str(prefix_fingerprint),
+                    compressed,
+                    digest,
+                    created_at,
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def get_compression_replay_anchor(
+        self,
+        session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Load and checksum-verify a persisted replay anchor."""
+        if not session_id:
+            return None
+        try:
+            row = self._conn.execute(
+                "SELECT * FROM compression_replay_anchors WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        if int(row["schema_version"] or 0) != 1:
+            logger.warning(
+                "compression replay anchor for %s has unsupported schema version %s",
+                session_id,
+                row["schema_version"],
+            )
+            return None
+        try:
+            payload = zlib.decompress(bytes(row["provider_request_zlib"]))
+            if hashlib.sha256(payload).hexdigest() != str(row["payload_sha256"]):
+                raise ValueError("payload checksum mismatch")
+            provider_request = json.loads(payload.decode("utf-8"))
+            if not isinstance(provider_request, dict) or not provider_request:
+                raise ValueError("provider request payload is not an object")
+        except Exception as exc:
+            logger.warning(
+                "compression replay anchor for %s is corrupt: %s",
+                session_id,
+                exc,
+            )
+            return None
+        result = dict(row)
+        result.pop("provider_request_zlib", None)
+        result["provider_request"] = provider_request
+        return result
+
+    def delete_compression_replay_anchor(self, session_id: str) -> None:
+        """Delete a session's replay anchor; idempotent."""
+        if not session_id:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM compression_replay_anchors WHERE session_id = ?",
+                (session_id,),
+            )
+
+        self._execute_write(_do)
+
     # ──────────────────────────────────────────────────────────────────────
     # Compression locks
     # ──────────────────────────────────────────────────────────────────────

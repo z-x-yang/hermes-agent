@@ -13,6 +13,7 @@ from agent.context_compressor import (
 )
 from agent.compression_summary_runtime import (
     apply_summary_tool_choice_none,
+    cache_visible_request_payload,
     extract_summary_cache_stats,
     extract_summary_response_content,
     fingerprint_cache_visible_prefix,
@@ -263,6 +264,89 @@ def test_summary_runtime_build_kwargs_applies_transport_preflight():
     assert kwargs["instructions"].endswith("\nPREFLIGHT")
 
 
+def test_summary_runtime_replays_exact_provider_request_and_appends_instruction():
+    runtime = make_summary_runtime(ScopedCodexAgentForSummaryRuntime())
+    provider_request = {
+        "model": "gpt-5.6-sol",
+        "instructions": "STORED_FINAL_INSTRUCTIONS",
+        "input": [
+            {
+                "id": "rs_1",
+                "type": "reasoning",
+                "encrypted_content": "opaque-replay-payload",
+            },
+            {"role": "user", "content": "cached prefix"},
+        ],
+        "tools": [{"type": "function", "name": "demo"}],
+        "prompt_cache_key": "stored-cache-scope",
+        "extra_headers": {"x-cache-namespace": "stable"},
+    }
+    original = json.loads(json.dumps(provider_request))
+
+    kwargs = runtime.build_kwargs_from_provider_request(
+        provider_request,
+        "SUMMARY_INSTRUCTION",
+        12_345,
+    )
+
+    assert provider_request == original
+    assert kwargs["instructions"] == "STORED_FINAL_INSTRUCTIONS"
+    assert kwargs["input"][:-1] == provider_request["input"]
+    assert kwargs["input"][-1] == {
+        "role": "user",
+        "content": "SUMMARY_INSTRUCTION",
+    }
+    assert kwargs["tools"] == provider_request["tools"]
+    assert kwargs["prompt_cache_key"] == "stored-cache-scope"
+    assert kwargs["extra_headers"] == {"x-cache-namespace": "stable"}
+    assert kwargs["max_output_tokens"] == 12_345
+
+
+def test_exact_replay_rebuilds_reasoning_controls_from_current_runtime():
+    from agent.transports import get_transport
+
+    agent = ScopedCodexAgentForSummaryRuntime()
+
+    def _high_reasoning_kwargs(messages):
+        transport = get_transport("codex_responses")
+        assert transport is not None
+        return transport.build_kwargs(
+            model=agent.model,
+            messages=messages,
+            tools=agent.tools,
+            reasoning_config={"enabled": True, "effort": "high"},
+            session_id=agent.session_id,
+        )
+
+    agent._build_api_kwargs = _high_reasoning_kwargs
+    runtime = make_summary_runtime(agent)
+    stored = cache_visible_request_payload(
+        {
+            "model": agent.model,
+            "instructions": "STORED_FINAL_INSTRUCTIONS",
+            "input": [{"role": "user", "content": "cached prefix"}],
+            "prompt_cache_key": "stored-cache-scope",
+            "reasoning": {"effort": "low", "summary": "auto"},
+            "include": ["reasoning.encrypted_content"],
+            "store": True,
+        }
+    )
+
+    assert "reasoning" not in stored
+    assert "include" not in stored
+    assert "store" not in stored
+
+    kwargs = runtime.build_kwargs_from_provider_request(
+        stored,
+        "SUMMARY_INSTRUCTION",
+        12_345,
+    )
+
+    assert kwargs["reasoning"] == {"effort": "high", "summary": "auto"}
+    assert kwargs["include"] == ["reasoning.encrypted_content"]
+    assert kwargs["store"] is False
+
+
 def test_cache_prefix_fingerprint_supports_unknown_request_shape():
     fingerprint = fingerprint_cache_visible_prefix({
         "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
@@ -482,6 +566,30 @@ def test_serialized_and_append_instruction_share_rules_hash():
     assert rules.rules_hash == compressor._build_summary_rules(turns, budget).rules_hash
 
 
+def test_summary_budget_depends_only_on_serialized_summary_source():
+    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        compressor = ContextCompressor(model="test/model", quiet_mode=True)
+    base = [{"role": "assistant", "content": "same visible summary source"}]
+    with_storage_only_payload = [{
+        **base[0],
+        "codex_message_items": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": "".join(f"{index:08x}" for index in range(20_000)),
+            }],
+        }],
+    }]
+
+    assert compressor._serialize_for_summary(base) == compressor._serialize_for_summary(
+        with_storage_only_payload
+    )
+    assert compressor._compute_summary_budget(base) == compressor._compute_summary_budget(
+        with_storage_only_payload
+    )
+
+
 def test_append_instruction_does_not_embed_serialized_turns():
     with patch("agent.context_compressor.get_model_context_length", return_value=100000):
         compressor = ContextCompressor(model="test/model", quiet_mode=True)
@@ -537,9 +645,9 @@ class CapturingRuntime:
     def fingerprint_prefix(self, _messages: list[dict[str, Any]]) -> str:
         return self.fingerprint_value
 
-    def fingerprint_provider_messages(
+    def fingerprint_provider_request(
         self,
-        _messages: list[dict[str, Any]],
+        _provider_request: dict[str, Any],
     ) -> str:
         return self.fingerprint_value
 
@@ -552,6 +660,20 @@ class CapturingRuntime:
             "max_tokens": max_tokens,
         }
         return dict(self.captured_kwargs)
+
+    def build_kwargs_from_provider_request(
+        self,
+        provider_request: dict[str, Any],
+        instruction: str,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        request = json.loads(json.dumps(provider_request))
+        carrier_key = "messages" if "messages" in request else "input"
+        request[carrier_key].append({"role": "user", "content": instruction})
+        request["max_tokens"] = max_tokens
+        self.captured_messages = request[carrier_key]
+        self.captured_kwargs = request
+        return dict(request)
 
     def invoke(self, api_kwargs: dict[str, Any]) -> Any:
         self.captured_kwargs = dict(api_kwargs)
@@ -576,6 +698,43 @@ class FlakyTransportRuntime(CapturingRuntime):
         if self.attempts <= self.fail_times:
             raise TimeoutError("simulated transient append-cached transport failure")
         return super().invoke(api_kwargs)
+
+
+def test_append_cached_transcript_fallback_is_explicit_in_audit():
+    runtime = CapturingRuntime()
+    with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+        compressor = ContextCompressor(
+            model="gpt-5.5",
+            quiet_mode=True,
+            summary_call_mode="append_cached",
+            append_cached_summary={"fallback_to_serialized_prompt": False},
+        )
+    compressor.bind_summary_runtime_factory(lambda: runtime)
+    source_messages = [
+        {"role": "user", "content": "old prefix"},
+        {"role": "assistant", "content": "old reply"},
+        {"role": "user", "content": "retained tail"},
+    ]
+    compressor._last_reusable_prefix_checkpoint_audit = {
+        "selected": False,
+        "reason": "transcript_reconstructed_fallback",
+        "desired_source_message_count": 2,
+    }
+
+    summary = compressor._generate_summary(
+        source_messages[:2],
+        source_messages=source_messages,
+        summarize_start=0,
+        compress_end=2,
+        focus_topic=None,
+    )
+
+    assert summary is not None
+    assert compressor._last_summary_call_audit["source_binding"] == (
+        "transcript_reconstructed_fallback"
+    )
+    assert runtime.captured_messages is not None
+    assert runtime.captured_messages[:-1] == source_messages[:2]
 
 
 def test_append_cached_retries_retryable_transport_error_before_serialized_fallback():
@@ -772,16 +931,39 @@ def test_append_cached_replays_latest_successful_endpoint_snapshot():
             append_cached_summary={"fallback_to_serialized_prompt": False},
         )
     compressor.bind_summary_runtime_factory(lambda: runtime)
+    compressor.threshold_tokens = 100_000
+    compressor.tail_token_budget = 20_000
     raw_messages = [
         {"role": "user", "content": "old prefix"},
         {"role": "assistant", "content": "old assistant"},
     ]
     successful_endpoint = [message.copy() for message in raw_messages]
     successful_endpoint[0]["content"] += "\n\nTURN_LOCAL_CONTEXT"
+    provider_request = {
+        "model": "gpt-5.5",
+        "messages": successful_endpoint,
+        "tools": [{"type": "function", "function": {"name": "noop"}}],
+        "extra_headers": {"x-cache-namespace": "stable"},
+    }
     compressor.record_reusable_prefix_checkpoint(
-        source_message_count=2,
-        prefix_fingerprint=runtime.fingerprint_value,
-        provider_messages=successful_endpoint,
+        request_snapshot=SimpleNamespace(
+            source_message_count=1,
+            cache_fingerprint=runtime.fingerprint_value,
+            semantic_tokens=70_000,
+            calibration_fingerprint="route",
+            provider_request={**provider_request, "messages": successful_endpoint[:1]},
+        ),
+        provider_input_tokens=70_000,
+    )
+    compressor.record_reusable_prefix_checkpoint(
+        request_snapshot=SimpleNamespace(
+            source_message_count=2,
+            cache_fingerprint=runtime.fingerprint_value,
+            semantic_tokens=82_000,
+            calibration_fingerprint="route",
+            provider_request=provider_request,
+        ),
+        provider_input_tokens=82_000,
     )
     compressor._last_reusable_prefix_checkpoint_audit = {
         "selected": True,
@@ -800,6 +982,9 @@ def test_append_cached_replays_latest_successful_endpoint_snapshot():
     assert runtime.captured_messages is not None
     assert runtime.captured_messages[:-1] == successful_endpoint
     assert "TURN_LOCAL_CONTEXT" in runtime.captured_messages[0]["content"]
+    assert runtime.captured_kwargs is not None
+    assert runtime.captured_kwargs["tools"] == provider_request["tools"]
+    assert runtime.captured_kwargs["extra_headers"] == provider_request["extra_headers"]
 
 
 def test_append_cached_uses_runtime_context_limit_not_threshold_tokens():
@@ -1034,7 +1219,7 @@ def test_append_cached_transport_error_tries_provider_fallback_before_serialized
     assert compressor._last_summary_call_audit["cache_key_runtime"]["provider"] == "openrouter"
 
 
-def test_auto_checkpoint_admission_does_not_leak_across_provider_fallback():
+def test_auto_checkpoint_mismatch_after_provider_fallback_uses_transcript_prefix():
     primary_runtime = FailingFallbackActivatingRuntime(
         fingerprint_value="primary-checkpoint"
     )
@@ -1052,12 +1237,25 @@ def test_auto_checkpoint_admission_does_not_leak_across_provider_fallback():
             summary_call_mode="append_cached",
             append_cached_summary={"fallback_to_serialized_prompt": True},
         )
+    compressor.threshold_tokens = 100_000
+    compressor.tail_token_budget = 20_000
     compressor.record_reusable_prefix_checkpoint(
-        source_message_count=1,
-        prefix_fingerprint="primary-checkpoint",
-        provider_messages=[{"role": "user", "content": "old prefix"}],
+        request_snapshot=SimpleNamespace(
+            source_message_count=1,
+            cache_fingerprint="primary-checkpoint",
+            semantic_tokens=1_000,
+            calibration_fingerprint="primary-route",
+            provider_request={
+                "model": "gpt-5.5",
+                "messages": [{"role": "user", "content": "old prefix"}],
+            },
+        ),
+        provider_input_tokens=80_000,
     )
-    compressor._last_reusable_prefix_checkpoint_audit = {"selected": True}
+    compressor._last_reusable_prefix_checkpoint_audit = {
+        "selected": True,
+        "desired_source_message_count": 1,
+    }
     compressor.bind_summary_runtime_factory(lambda: runtimes.pop(0))
 
     with patch(
@@ -1072,13 +1270,17 @@ def test_auto_checkpoint_admission_does_not_leak_across_provider_fallback():
             focus_topic=None,
         )
 
-    assert summary is None
+    assert summary is not None
+    assert "Fallback summary worked" in summary
     assert serialized_call.call_count == 0
-    assert compressor._last_compress_deferred is True
+    assert compressor._last_compress_deferred is False
     assert primary_runtime.activate_calls
-    assert fallback_runtime.captured_messages is None
-    assert compressor._last_summary_call_audit["fallback_reason"] == (
-        "reusable_prefix_checkpoint_unavailable"
+    assert fallback_runtime.captured_messages is not None
+    assert compressor._last_summary_call_audit["source_binding"] == (
+        "transcript_reconstructed_fallback"
+    )
+    assert compressor._last_summary_call_audit["anchor_fallback_reason"] == (
+        "runtime_fingerprint_mismatch"
     )
 
 

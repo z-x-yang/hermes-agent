@@ -193,6 +193,36 @@ def _estimate_hygiene_compressed_request_tokens(
         return int(estimate_messages_tokens_rough(list(messages or [])))
 
 
+def _estimate_hygiene_history_tokens(
+    messages: List[Dict[str, Any]],
+    *,
+    model: str = "",
+    provider: str = "",
+    api_mode: str = "",
+    base_url: str = "",
+) -> int:
+    """Shape no-usage hygiene history for the active provider route."""
+    try:
+        from agent.context_compressor import (
+            _estimate_provider_visible_messages_tokens_rough,
+        )
+
+        return int(
+            _estimate_provider_visible_messages_tokens_rough(
+                list(messages or []),
+                api_mode=api_mode,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+            )
+        )
+    except Exception:
+        logger.debug("Gateway hygiene history shaping failed", exc_info=True)
+        from agent.model_metadata import estimate_messages_tokens_rough
+
+        return int(estimate_messages_tokens_rough(list(messages or [])))
+
+
 def _streamed_final_matches_response(stream_consumer: Any, final_response: str) -> bool:
     """Return True when streamed visible text exactly equals final response.
 
@@ -11162,10 +11192,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #    whenever available.
         # -----------------------------------------------------------------
         if history and len(history) >= 4:
-            from agent.model_metadata import (
-                estimate_messages_tokens_rough,
-                get_model_context_length_async,
-            )
+            from agent.model_metadata import get_model_context_length_async
 
             # Read model + compression config from config.yaml.  Hygiene is a
             # safety net for sessions that grew too large between turns — it
@@ -11184,6 +11211,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_base_url = None
             _hyg_api_key = None
             _hyg_max_tokens = None
+            _hyg_api_mode = "chat_completions"
             _hyg_codex_gpt55_autoraise = True
             _hyg_data = {}
             try:
@@ -11256,6 +11284,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _hyg_base_url = _hyg_runtime.get("base_url") or _hyg_base_url
                     _hyg_api_key = _hyg_runtime.get("api_key") or _hyg_api_key
                     _hyg_max_tokens = _hyg_runtime.get("max_tokens") or _hyg_max_tokens
+                    _hyg_api_mode = _hyg_runtime.get("api_mode") or _hyg_api_mode
                 except Exception:
                     pass
 
@@ -11339,14 +11368,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _approx_tokens = _stored_tokens
                     _token_source = "actual"
                 else:
-                    _approx_tokens = estimate_messages_tokens_rough(history)
-                    _token_source = "estimated"
-                    # Note: rough estimates overestimate by 30-50% for code/JSON-heavy
-                    # sessions, but that just means hygiene fires a bit early — which
-                    # is safe and harmless.  A previous 1.4x multiplier tried to
-                    # compensate by inflating the threshold, but that can exceed the
-                    # model's limit and prevent hygiene from ever firing for ~200K
-                    # models (GLM-5). Use the compressor's threshold directly instead.
+                    _approx_tokens = _estimate_hygiene_history_tokens(
+                        history,
+                        model=_hyg_model,
+                        provider=_hyg_provider or "",
+                        api_mode=_hyg_api_mode,
+                        base_url=_hyg_base_url or "",
+                    )
+                    _token_source = "provider_shaped_estimate"
 
                 # Hard safety valve: force compression if message count is
                 # extreme, regardless of token estimates.  This breaks the

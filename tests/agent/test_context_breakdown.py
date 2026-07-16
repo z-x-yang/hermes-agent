@@ -97,6 +97,37 @@ def test_breakdown_uses_internal_context_window():
     assert data["context_percent"] == 25
 
 
+def test_breakdown_no_usage_uses_provider_visible_conversation_estimator():
+    agent, parts = _make_agent(last_prompt_tokens=0)
+    history = [{
+        "role": "assistant",
+        "content": "persisted shadow",
+        "codex_message_items": [{"type": "message", "role": "assistant"}],
+    }]
+
+    class _ProviderShapedCompressor:
+        context_length = 200_000
+        compression_context_length = 200_000
+        last_prompt_tokens = 0
+
+        def __init__(self):
+            self.seen = None
+
+        def estimate_provider_messages_tokens(self, messages):
+            self.seen = messages
+            return 1_729
+
+    compressor = _ProviderShapedCompressor()
+    agent.context_compressor = compressor
+
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        data = compute_session_context_breakdown(agent, history)
+
+    conversation = next(item for item in data["categories"] if item["id"] == "conversation")
+    assert conversation["tokens"] == 1_729
+    assert compressor.seen is history
+
+
 def test_breakdown_categories_do_not_exceed_measured_context():
     """Measured provider input tokens are the display total; categories must not contradict it."""
     agent, parts = _make_agent(

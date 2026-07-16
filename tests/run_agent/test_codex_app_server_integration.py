@@ -135,10 +135,11 @@ class TestRunConversationCodexPath:
         assert agent.context_compressor.last_total_tokens == 130
         assert agent.context_compressor.context_length == 200000
 
-    def test_codex_context_window_refresh_preserves_pending_calibration(self):
+    def test_codex_context_window_refresh_preserves_compression_estimate(self):
         agent = _make_codex_agent()
         compressor = agent.context_compressor
-        compressor.record_pending_request_estimate(12_345, fingerprint="fp-codex")
+        compressor.last_compression_rough_tokens = 12_345
+        compressor.awaiting_real_usage_after_compression = True
 
         turn = TurnResult(
             final_text="done",
@@ -159,9 +160,8 @@ class TestRunConversationCodexPath:
 
         assert compressor.context_length == 200000
         assert compressor.last_prompt_tokens == 100
-        assert compressor.last_accepted_request_real_prompt_tokens == 100
-        assert compressor.last_accepted_request_rough_tokens == 12_345
-        assert compressor.last_accepted_request_fingerprint == "fp-codex"
+        assert compressor.last_compression_rough_tokens == 12_345
+        assert compressor.awaiting_real_usage_after_compression is False
 
     def test_projected_messages_are_spliced(self, fake_session):
         agent = _make_codex_agent()

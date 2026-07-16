@@ -23,11 +23,11 @@ class SummaryRuntime:
     summary_runtime_shape: str | None
     summary_runtime_toolset_source: str | None
     build_kwargs: Callable[[list[dict[str, Any]], int], dict[str, Any]]
-    build_kwargs_from_provider_messages: Callable[
-        [list[dict[str, Any]], int], dict[str, Any]
+    build_kwargs_from_provider_request: Callable[
+        [dict[str, Any], str, int], dict[str, Any]
     ]
     fingerprint_prefix: Callable[[list[dict[str, Any]]], str]
-    fingerprint_provider_messages: Callable[[list[dict[str, Any]]], str]
+    fingerprint_provider_request: Callable[[dict[str, Any]], str]
     invoke: Callable[[dict[str, Any]], Any]
     estimate_request_tokens: Callable[[dict[str, Any]], int]
     activate_fallback: Callable[[BaseException], bool] | None = None
@@ -43,8 +43,11 @@ _NON_PREFIX_REQUEST_FIELDS = frozenset({
     "n",
     "parallel_tool_calls",
     "response_format",
+    "reasoning",
+    "reasoning_effort",
     "service_tier",
     "stop",
+    "store",
     "stream",
     "stream_options",
     "temperature",
@@ -53,7 +56,51 @@ _NON_PREFIX_REQUEST_FIELDS = frozenset({
     "top_k",
     "top_p",
     "user",
+    "verbosity",
 })
+_SENSITIVE_REQUEST_FIELDS = frozenset({
+    "access_token",
+    "api_key",
+    "authorization",
+    "password",
+    "secret",
+    "token",
+})
+_HEADER_CONTAINER_FIELDS = frozenset({"default_headers", "extra_headers", "headers"})
+_SENSITIVE_HEADER_NAMES = frozenset({
+    "anthropic-api-key",
+    "api-key",
+    "authorization",
+    "cookie",
+    "proxy-authorization",
+    "set-cookie",
+    "x-api-key",
+    "x-goog-api-key",
+})
+
+
+def cache_visible_request_payload(api_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return a deep-copied provider request prefix safe for durable replay."""
+    visible: dict[str, Any] = {}
+    for key, value in api_kwargs.items():
+        normalized_key = str(key).strip().lower() if isinstance(key, str) else ""
+        if key in _NON_PREFIX_REQUEST_FIELDS or normalized_key in _SENSITIVE_REQUEST_FIELDS:
+            continue
+        if (
+            isinstance(key, str)
+            and key.startswith("__")
+            and key.endswith("__")
+        ):
+            continue
+        if normalized_key in _HEADER_CONTAINER_FIELDS and isinstance(value, dict):
+            visible[key] = {
+                header: copy.deepcopy(header_value)
+                for header, header_value in value.items()
+                if str(header).strip().lower() not in _SENSITIVE_HEADER_NAMES
+            }
+            continue
+        visible[key] = copy.deepcopy(value)
+    return visible
 
 
 def fingerprint_cache_visible_prefix(
@@ -62,16 +109,7 @@ def fingerprint_cache_visible_prefix(
     lineage: tuple[str, ...] = (),
 ) -> str:
     """Hash one successful request's reusable prompt prefix and API lineage."""
-    prompt = {
-        key: value
-        for key, value in api_kwargs.items()
-        if key not in _NON_PREFIX_REQUEST_FIELDS
-        and not (
-            isinstance(key, str)
-            and key.startswith("__")
-            and key.endswith("__")
-        )
-    }
+    prompt = cache_visible_request_payload(api_kwargs)
     if not prompt:
         return ""
     projection = {
@@ -159,25 +197,43 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
         finally:
             agent._ephemeral_max_output_tokens = old_ephemeral
 
-    def _build_kwargs_from_provider_messages(
-        provider_messages: list[dict[str, Any]],
+    def _build_kwargs_from_provider_request(
+        provider_request: dict[str, Any],
+        instruction: str,
         max_tokens: int,
     ) -> dict[str, Any]:
-        old_ephemeral = getattr(agent, "_ephemeral_max_output_tokens", None)
-        try:
-            agent._ephemeral_max_output_tokens = max_tokens
-            api_kwargs = agent._build_api_kwargs(copy.deepcopy(provider_messages))
-            try:
-                transport = agent._get_transport()
-                api_kwargs = transport.preflight_kwargs(
-                    api_kwargs,
-                    allow_stream=False,
-                )
-            except (AttributeError, NotImplementedError):
-                pass
-            return api_kwargs
-        finally:
-            agent._ephemeral_max_output_tokens = old_ephemeral
+        """Replay one exact cache-visible request and append the summary ask."""
+        api_kwargs = copy.deepcopy(provider_request)
+        carrier_key = next(
+            (
+                key
+                for key in ("messages", "input")
+                if isinstance(api_kwargs.get(key), list)
+            ),
+            None,
+        )
+        if carrier_key is None:
+            raise ValueError("provider request has no replayable message carrier")
+        api_kwargs[carrier_key].append({"role": "user", "content": instruction})
+
+        # Durable anchors omit execution-only controls. Rebuild only those
+        # controls from the active runtime; never reshape the cached prefix.
+        controls = _build_kwargs(
+            [{"role": "user", "content": instruction}],
+            max_tokens,
+        )
+        for key in _NON_PREFIX_REQUEST_FIELDS:
+            if key in controls:
+                api_kwargs[key] = copy.deepcopy(controls[key])
+        if not any(
+            key in api_kwargs
+            for key in ("max_output_tokens", "max_completion_tokens", "max_tokens")
+        ):
+            if str(getattr(agent, "api_mode", "") or "") == "codex_responses":
+                api_kwargs["max_output_tokens"] = max_tokens
+            else:
+                api_kwargs["max_tokens"] = max_tokens
+        return api_kwargs
 
     @contextmanager
     def _suppress_main_stream_callbacks():
@@ -211,9 +267,9 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
             ),
         )
 
-    def _fingerprint_provider_messages(messages: list[dict[str, Any]]) -> str:
+    def _fingerprint_provider_request(provider_request: dict[str, Any]) -> str:
         return fingerprint_cache_visible_prefix(
-            _build_kwargs_from_provider_messages(messages, 1),
+            provider_request,
             lineage=(
                 str(getattr(agent, "provider", "") or ""),
                 str(getattr(agent, "model", "") or ""),
@@ -260,9 +316,9 @@ def make_summary_runtime(agent: Any) -> SummaryRuntime:
         summary_runtime_shape=getattr(agent, "_summary_runtime_shape", None),
         summary_runtime_toolset_source=getattr(agent, "_summary_runtime_toolset_source", None),
         build_kwargs=_build_kwargs,
-        build_kwargs_from_provider_messages=_build_kwargs_from_provider_messages,
+        build_kwargs_from_provider_request=_build_kwargs_from_provider_request,
         fingerprint_prefix=_fingerprint_prefix,
-        fingerprint_provider_messages=_fingerprint_provider_messages,
+        fingerprint_provider_request=_fingerprint_provider_request,
         invoke=_invoke,
         estimate_request_tokens=estimate_request_context_tokens,
         activate_fallback=_activate_fallback,

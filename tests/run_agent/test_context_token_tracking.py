@@ -128,8 +128,8 @@ def test_codex_no_cache_fields(monkeypatch):
     assert compressor.last_prompt_tokens == 3000
     checkpoint = compressor._latest_reusable_prefix_checkpoint
     assert checkpoint is not None
-    replay_fingerprint = make_summary_runtime(agent).fingerprint_provider_messages(
-        list(checkpoint.provider_messages)
+    replay_fingerprint = make_summary_runtime(agent).fingerprint_provider_request(
+        checkpoint.provider_request
     )
     assert replay_fingerprint == checkpoint.prefix_fingerprint
 
@@ -231,11 +231,11 @@ def test_turn_local_user_injection_does_not_invent_pre_user_checkpoint(monkeypat
         "context_compressor",
     )._latest_reusable_prefix_checkpoint
     assert latest is not None
-    replayed_payload = str(latest.provider_messages)
+    replayed_payload = str(latest.provider_request)
     assert "current question" in replayed_payload
     assert "temporary current-turn plugin context" in replayed_payload
-    replay_fingerprint = make_summary_runtime(agent).fingerprint_provider_messages(
-        list(latest.provider_messages)
+    replay_fingerprint = make_summary_runtime(agent).fingerprint_provider_request(
+        latest.provider_request
     )
     assert replay_fingerprint == latest.prefix_fingerprint
     assert history[-1] == {"role": "assistant", "content": "previous answer"}

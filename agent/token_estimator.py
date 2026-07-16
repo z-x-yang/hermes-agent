@@ -11,6 +11,7 @@ import tiktoken
 TOKEN_ESTIMATE_ENCODING = "o200k_base"
 IMAGE_TOKEN_ESTIMATE = 1_500
 _IMAGE_PART_TYPES = frozenset({"image", "image_url", "input_image"})
+_OPAQUE_TRANSPORT_CONTENT_KEYS = frozenset({"encrypted_content"})
 
 
 @lru_cache(maxsize=1)
@@ -84,14 +85,67 @@ def strip_image_payloads_for_token_estimate(value: Any) -> tuple[Any, int]:
     return value, 0
 
 
+def strip_opaque_transport_payloads_for_token_estimate(value: Any) -> Any:
+    """Return a semantic shadow with opaque transport blobs zeroed.
+
+    Encrypted reasoning is replayed verbatim for provider continuity, but its
+    ciphertext bytes are not model-visible text. Tokenizing random ciphertext
+    as prose makes context-pressure estimates grow with transport size instead
+    of semantic input size. Keep the key/item shape for small structural cost
+    while replacing the opaque value with an empty sentinel.
+    """
+    if isinstance(value, dict):
+        return {
+            key: (
+                ""
+                if str(key) in _OPAQUE_TRANSPORT_CONTENT_KEYS
+                else strip_opaque_transport_payloads_for_token_estimate(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [strip_opaque_transport_payloads_for_token_estimate(item) for item in value]
+    return value
+
+
 def count_json_tokens_with_images(
     value: Any,
     *,
     image_token_cost: int = IMAGE_TOKEN_ESTIMATE,
 ) -> int:
-    """Count arbitrary request JSON with a fixed charge per image part."""
+    """Count semantic request JSON with fixed image and opaque-blob handling."""
     cleaned, image_count = strip_image_payloads_for_token_estimate(value)
-    return count_json_tokens(cleaned) + image_count * image_token_cost
+    semantic = strip_opaque_transport_payloads_for_token_estimate(cleaned)
+    return count_json_tokens(semantic) + image_count * image_token_cost
+
+
+def _longest_prefix_within_token_budget(text: str, budget: int) -> str:
+    """Return the longest character-aligned prefix whose estimate fits."""
+    if budget <= 0 or not text:
+        return ""
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if count_text_tokens(text[:middle]) <= budget:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low]
+
+
+def _longest_suffix_within_token_budget(text: str, budget: int) -> str:
+    """Return the longest character-aligned suffix whose estimate fits."""
+    if budget <= 0 or not text:
+        return ""
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = text[len(text) - middle :]
+        if count_text_tokens(candidate) <= budget:
+            low = middle
+        else:
+            high = middle - 1
+    return text[len(text) - low :] if low else ""
 
 
 def split_text_for_token_budget(
@@ -101,16 +155,21 @@ def split_text_for_token_budget(
     head_ratio: float,
     tail_ratio: float,
 ) -> tuple[str, str, int, int, int] | None:
-    """Split oversized text into token-aligned head/tail fragments.
+    """Split oversized text into character-aligned head/tail fragments.
 
     Returns ``None`` when the text already fits. Otherwise returns
-    ``(head, tail, total_tokens, head_tokens, tail_tokens)``.
+    ``(head, tail, total_tokens, head_tokens, tail_tokens)``. Token budgets
+    are located on Python string boundaries rather than by decoding arbitrary
+    token slices, which can otherwise synthesize U+FFFD replacement text.
     """
-    tokens = _encoding().encode(text, disallowed_special=())
-    if len(tokens) <= max_tokens:
+    total_tokens = count_text_tokens(text)
+    if total_tokens <= max_tokens:
         return None
-    head_tokens = int(max_tokens * head_ratio)
-    tail_tokens = int(max_tokens * tail_ratio)
-    head = _encoding().decode(tokens[:head_tokens])
-    tail = _encoding().decode(tokens[-tail_tokens:]) if tail_tokens else ""
-    return head, tail, len(tokens), head_tokens, tail_tokens
+    head_budget = int(max_tokens * head_ratio)
+    tail_budget = int(max_tokens * tail_ratio)
+    head = _longest_prefix_within_token_budget(text, head_budget)
+    remaining = text[len(head) :]
+    tail = _longest_suffix_within_token_budget(remaining, tail_budget)
+    head_tokens = count_text_tokens(head)
+    tail_tokens = count_text_tokens(tail)
+    return head, tail, total_tokens, head_tokens, tail_tokens

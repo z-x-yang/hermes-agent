@@ -331,7 +331,10 @@ class ReusablePrefixCheckpoint:
     source_message_count: int
     prefix_fingerprint: str
     recorded_at: float
-    provider_messages: tuple[dict[str, Any], ...] = ()
+    provider_input_tokens: int = 0
+    semantic_tokens: int = 0
+    calibration_fingerprint: str = ""
+    provider_request: Optional[dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -598,6 +601,32 @@ def _api_mode_uses_codex_responses(api_mode: Any) -> bool:
     return str(api_mode or "").strip().lower() == "codex_responses"
 
 
+def _responses_issuer_for_estimate(*, provider: Any, base_url: Any) -> str:
+    """Resolve the same encrypted-reasoning issuer as CodexTransport."""
+    from agent.codex_responses_adapter import _classify_responses_issuer
+
+    provider_s = str(provider or "").strip().lower()
+    base_url_s = str(base_url or "")
+    return _classify_responses_issuer(
+        is_xai_responses=(
+            provider_s in {"xai", "xai-oauth"}
+            or base_url_host_matches(base_url_s, "api.x.ai")
+        ),
+        is_github_responses=(
+            base_url_host_matches(base_url_s, "models.github.ai")
+            or base_url_host_matches(base_url_s, "githubcopilot.com")
+        ),
+        is_codex_backend=(
+            provider_s == "openai-codex"
+            or (
+                base_url_host_matches(base_url_s, "chatgpt.com")
+                and "/backend-api/codex" in base_url_s.lower()
+            )
+        ),
+        base_url=base_url_s or None,
+    )
+
+
 def _provider_needs_reasoning_content_for_budget(
     *,
     provider: Any = "",
@@ -713,6 +742,25 @@ def _estimate_provider_visible_messages_tokens_rough(
     base_url: Any = "",
 ) -> int:
     """Roughly estimate only the message material that can reach provider input."""
+    if str(api_mode or "").strip().lower() == "anthropic_messages":
+        try:
+            from agent.anthropic_adapter import convert_messages_to_anthropic
+            from agent.token_estimator import count_json_tokens_with_images
+
+            system, converted = convert_messages_to_anthropic(
+                messages,
+                base_url=str(base_url or "") or None,
+                model=str(model or "") or None,
+            )
+            request_shape: dict[str, Any] = {"messages": converted}
+            if system is not None:
+                request_shape["system"] = system
+            return count_json_tokens_with_images(request_shape)
+        except Exception:
+            # Preserve the fail-open estimator contract for minimal/test
+            # runtimes that cannot import the native adapter.
+            pass
+
     if _api_mode_uses_codex_responses(api_mode):
         try:
             from agent.codex_responses_adapter import _chat_messages_to_responses_input
@@ -721,7 +769,10 @@ def _estimate_provider_visible_messages_tokens_rough(
             items = _chat_messages_to_responses_input(
                 messages,
                 replay_encrypted_reasoning=True,
-                current_issuer_kind=None,
+                current_issuer_kind=_responses_issuer_for_estimate(
+                    provider=provider,
+                    base_url=base_url,
+                ),
             )
             return count_json_tokens_with_images(items)
         except Exception:
@@ -1500,6 +1551,7 @@ class ContextCompressor(ContextEngine):
 
     def on_session_reset(self) -> None:
         """Reset all per-session state for /new or /reset."""
+        self._clear_replay_anchor(delete_persisted=True)
         super().on_session_reset()
         self._reset_cheap_tool_cleanup_audit()
         self._context_probed = False
@@ -1527,14 +1579,13 @@ class ContextCompressor(ContextEngine):
         self._last_compress_deferred = False
         self._reusable_prefix_checkpoints = []
         self._latest_reusable_prefix_checkpoint = None
+        self._replay_anchor_candidate = None
+        self._frozen_reusable_prefix_checkpoint = None
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
-        self.last_rough_tokens_when_real_prompt_fit = 0
-        self.last_accepted_request_real_prompt_tokens = 0
-        self.last_accepted_request_rough_tokens = 0
-        self.last_accepted_request_fingerprint = ""
-        self._pending_request_rough_tokens = 0
-        self._pending_request_fingerprint = ""
+        self._last_successful_request_actual_tokens = 0
+        self._last_successful_request_semantic_tokens = 0
+        self._last_successful_request_fingerprint = ""
         self.awaiting_real_usage_after_compression = False
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
@@ -1575,6 +1626,10 @@ class ContextCompressor(ContextEngine):
         one intentional divergence from ``on_session_reset()``'s surface; every
         contamination-relevant field below is cleared identically to it.
         """
+        self._clear_replay_anchor(
+            delete_persisted=True,
+            session_id=session_id,
+        )
         self._previous_summary = None
         self._last_summary_error = None
         self._last_summary_dropped_count = 0
@@ -1588,25 +1643,137 @@ class ContextCompressor(ContextEngine):
         self._last_compress_deferred = False
         self._reusable_prefix_checkpoints = []
         self._latest_reusable_prefix_checkpoint = None
+        self._replay_anchor_candidate = None
+        self._frozen_reusable_prefix_checkpoint = None
         self._context_probed = False
         self._context_probe_persistable = False
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
-        self.last_rough_tokens_when_real_prompt_fit = 0
-        self.last_accepted_request_real_prompt_tokens = 0
-        self.last_accepted_request_rough_tokens = 0
-        self.last_accepted_request_fingerprint = ""
-        self._pending_request_rough_tokens = 0
-        self._pending_request_fingerprint = ""
+        self._last_successful_request_actual_tokens = 0
+        self._last_successful_request_semantic_tokens = 0
+        self._last_successful_request_fingerprint = ""
         self.awaiting_real_usage_after_compression = False
 
+    def _clear_replay_anchor(
+        self,
+        *,
+        delete_persisted: bool = True,
+        session_id: str | None = None,
+    ) -> None:
+        target_session_id = str(
+            session_id if session_id is not None else getattr(self, "_session_id", "")
+        )
+        self._replay_anchor_candidate = None
+        self._frozen_reusable_prefix_checkpoint = None
+        self._latest_reusable_prefix_checkpoint = None
+        self._reusable_prefix_checkpoints = []
+        if not delete_persisted or not target_session_id:
+            return
+        session_db = getattr(self, "_session_db", None)
+        clearer = getattr(session_db, "delete_compression_replay_anchor", None)
+        if callable(clearer):
+            try:
+                clearer(target_session_id)
+            except Exception:
+                logger.warning(
+                    "Failed to delete compression replay anchor for %s",
+                    target_session_id,
+                    exc_info=True,
+                )
+
+    def _compression_anchor_target_tokens(self) -> int:
+        return max(
+            0,
+            int(getattr(self, "threshold_tokens", 0) or 0)
+            - int(getattr(self, "tail_token_budget", 0) or 0),
+        )
+
+    def _persist_frozen_replay_anchor(
+        self,
+        anchor: ReusablePrefixCheckpoint,
+    ) -> None:
+        session_db = getattr(self, "_session_db", None)
+        session_id = str(getattr(self, "_session_id", "") or "")
+        upsert = getattr(session_db, "upsert_compression_replay_anchor", None)
+        if not session_id or not callable(upsert):
+            return
+        try:
+            upsert(
+                session_id,
+                source_message_count=anchor.source_message_count,
+                provider_input_tokens=anchor.provider_input_tokens,
+                target_tokens=self._compression_anchor_target_tokens(),
+                prefix_fingerprint=anchor.prefix_fingerprint,
+                provider_request=copy.deepcopy(anchor.provider_request),
+            )
+        except Exception:
+            logger.warning(
+                "Failed to persist compression replay anchor for %s",
+                session_id,
+                exc_info=True,
+            )
+
+    def _load_persisted_replay_anchor(self) -> None:
+        session_db = getattr(self, "_session_db", None)
+        session_id = str(getattr(self, "_session_id", "") or "")
+        getter = getattr(session_db, "get_compression_replay_anchor", None)
+        if not session_id or not callable(getter):
+            return
+        try:
+            row = getter(session_id)
+        except Exception:
+            logger.warning(
+                "Failed to load compression replay anchor for %s",
+                session_id,
+                exc_info=True,
+            )
+            return
+        if not row or not isinstance(row, dict):
+            return
+        try:
+            target_tokens = int(row.get("target_tokens") or 0)
+            source_message_count = int(row.get("source_message_count") or 0)
+            provider_input_tokens = int(row.get("provider_input_tokens") or 0)
+            prefix_fingerprint = str(row.get("prefix_fingerprint") or "")
+            provider_request = row.get("provider_request") or {}
+            if (
+                target_tokens != self._compression_anchor_target_tokens()
+                or source_message_count <= 0
+                or provider_input_tokens <= 0
+                or not prefix_fingerprint
+                or not isinstance(provider_request, dict)
+                or not provider_request
+            ):
+                raise ValueError("persisted replay anchor is incompatible")
+            anchor = ReusablePrefixCheckpoint(
+                source_message_count=source_message_count,
+                prefix_fingerprint=prefix_fingerprint,
+                recorded_at=float(row.get("created_at") or time.time()),
+                provider_input_tokens=provider_input_tokens,
+                provider_request=copy.deepcopy(provider_request),
+            )
+        except Exception:
+            clearer = getattr(session_db, "delete_compression_replay_anchor", None)
+            if callable(clearer):
+                try:
+                    clearer(session_id)
+                except Exception:
+                    pass
+            return
+        self._replay_anchor_candidate = None
+        self._frozen_reusable_prefix_checkpoint = anchor
+        self._latest_reusable_prefix_checkpoint = anchor
+        self._reusable_prefix_checkpoints[:] = [anchor]
+
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
-        """Bind the current session row so durable cooldowns can round-trip."""
+        """Bind the current session row and reload durable compression state."""
         self._session_db = session_db
         self._session_id = session_id or ""
+        self._clear_replay_anchor(delete_persisted=False)
         self._summary_failure_cooldown_until = 0.0
         self._last_summary_error = None
         self.get_active_compression_failure_cooldown()
+        self._load_persisted_replay_anchor()
 
     def bind_summary_runtime_factory(self, factory: Any) -> None:
         """Bind a request-local main-runtime bridge used by append_cached summaries."""
@@ -1615,45 +1782,141 @@ class ContextCompressor(ContextEngine):
     def record_reusable_prefix_checkpoint(
         self,
         *,
-        source_message_count: int,
-        prefix_fingerprint: str,
-        provider_messages: Optional[List[Dict[str, Any]]] = None,
+        request_snapshot: Any,
+        provider_input_tokens: int = 0,
     ) -> None:
-        """Remember one successful API-request endpoint."""
-        source_end = int(source_message_count or 0)
-        fingerprint = str(prefix_fingerprint or "")
-        if source_end <= 0 or not fingerprint:
+        """Track actual usage and freeze the endpoint nearest the tail target."""
+        source_end = int(
+            getattr(request_snapshot, "source_message_count", 0) or 0
+        )
+        fingerprint = str(
+            getattr(request_snapshot, "cache_fingerprint", "") or ""
+        )
+        semantic_tokens = max(
+            0,
+            int(getattr(request_snapshot, "semantic_tokens", 0) or 0),
+        )
+        calibration_fingerprint = str(
+            getattr(request_snapshot, "calibration_fingerprint", "") or ""
+        )
+        raw_request = getattr(request_snapshot, "provider_request", None)
+        provider_request = (
+            copy.deepcopy(raw_request) if isinstance(raw_request, dict) else {}
+        )
+        if source_end <= 0 or not fingerprint or not provider_request:
             return
+        try:
+            actual_tokens = max(0, int(provider_input_tokens or 0))
+        except (TypeError, ValueError):
+            actual_tokens = 0
+        if actual_tokens <= 0:
+            # Without provider usage there is no trustworthy crossing point.
+            # Keep compression live via transcript reconstruction instead of
+            # promoting the latest request into a cache anchor.
+            return
+
         checkpoint = ReusablePrefixCheckpoint(
             source_message_count=source_end,
             prefix_fingerprint=fingerprint,
             recorded_at=time.monotonic(),
-            provider_messages=tuple(
-                copy.deepcopy(message)
-                for message in (provider_messages or [])
-                if isinstance(message, dict)
-            ),
+            provider_input_tokens=actual_tokens,
+            semantic_tokens=semantic_tokens,
+            calibration_fingerprint=calibration_fingerprint,
+            provider_request=provider_request,
         )
-        self._latest_reusable_prefix_checkpoint = checkpoint
-        # Compatibility/readback surface: keep a one-element list instead of a
-        # second historical checkpoint mechanism. The previous snapshot becomes
-        # unreachable immediately and can be reclaimed.
-        self._reusable_prefix_checkpoints[:] = [checkpoint]
+        if semantic_tokens > 0:
+            self._last_successful_request_actual_tokens = actual_tokens
+            self._last_successful_request_semantic_tokens = semantic_tokens
+            self._last_successful_request_fingerprint = calibration_fingerprint
+
+        frozen = getattr(self, "_frozen_reusable_prefix_checkpoint", None)
+        candidate = getattr(self, "_replay_anchor_candidate", None)
+        prior_lineage = str(
+            getattr(frozen or candidate, "calibration_fingerprint", "") or ""
+        )
+        if (
+            prior_lineage
+            and calibration_fingerprint
+            and prior_lineage != calibration_fingerprint
+        ):
+            self._clear_replay_anchor(delete_persisted=True)
+            frozen = None
+            candidate = None
+        if frozen is not None:
+            # The token baseline keeps moving, but the compression-cycle anchor
+            # is immutable until the cycle ends.
+            self._latest_reusable_prefix_checkpoint = frozen
+            self._reusable_prefix_checkpoints[:] = [frozen]
+            return
+
+        target_tokens = self._compression_anchor_target_tokens()
+        if actual_tokens < target_tokens:
+            self._replay_anchor_candidate = checkpoint
+            self._latest_reusable_prefix_checkpoint = checkpoint
+            self._reusable_prefix_checkpoints[:] = [checkpoint]
+            return
+
+        if actual_tokens == target_tokens:
+            selected = checkpoint
+        elif (
+            candidate is not None
+            and int(getattr(candidate, "provider_input_tokens", 0) or 0) < target_tokens
+        ):
+            selected = min(
+                (candidate, checkpoint),
+                key=lambda item: abs(
+                    int(getattr(item, "provider_input_tokens", 0) or 0)
+                    - target_tokens
+                ),
+            )
+        else:
+            # Restart/legacy recovery with no below-target predecessor: do not
+            # promote the latest request. Compression falls back to the stable
+            # transcript-derived path rather than sacrificing an arbitrary tail.
+            self._replay_anchor_candidate = None
+            self._latest_reusable_prefix_checkpoint = checkpoint
+            self._reusable_prefix_checkpoints[:] = [checkpoint]
+            return
+
+        self._replay_anchor_candidate = None
+        self._frozen_reusable_prefix_checkpoint = selected
+        self._latest_reusable_prefix_checkpoint = selected
+        self._reusable_prefix_checkpoints[:] = [selected]
+        self._persist_frozen_replay_anchor(selected)
 
     def _select_reusable_prefix_checkpoint(
         self,
         messages: List[Dict[str, Any]],
         desired_end: int,
     ) -> Any:
-        """Return the single latest replayable successful request endpoint."""
-        del desired_end  # The cut may move forward to preserve cache reuse.
-        latest = self._latest_reusable_prefix_checkpoint
+        """Return the one frozen endpoint for this compression cycle."""
+        del desired_end
+        anchor = getattr(self, "_frozen_reusable_prefix_checkpoint", None)
         if (
-            latest is not None
-            and latest.provider_messages
-            and 0 < latest.source_message_count <= len(messages)
+            anchor is not None
+            and anchor.provider_request
+            and 0 < anchor.source_message_count <= len(messages)
         ):
-            return latest
+            factory = getattr(self, "_summary_runtime_factory", None)
+            if callable(factory):
+                try:
+                    runtime = factory()
+                    fingerprint = getattr(
+                        runtime,
+                        "fingerprint_provider_request",
+                        None,
+                    )
+                    runtime_fingerprint = (
+                        str(fingerprint(anchor.provider_request) or "")
+                        if callable(fingerprint)
+                        else ""
+                    )
+                except Exception:
+                    runtime_fingerprint = ""
+                if runtime_fingerprint != anchor.prefix_fingerprint:
+                    self._clear_replay_anchor(delete_persisted=True)
+                    return None
+            return anchor
         return None
 
     def estimate_provider_messages_tokens(self, messages: List[Dict[str, Any]]) -> int:
@@ -1668,21 +1931,55 @@ class ContextCompressor(ContextEngine):
 
     def estimate_provider_request_tokens(
         self,
-        messages: List[Dict[str, Any]],
+        messages: Optional[List[Dict[str, Any]]] = None,
         *,
         system_prompt: str = "",
         tools: Optional[List[Dict[str, Any]]] = None,
+        request_snapshot: Any = None,
     ) -> int:
-        """Estimate provider-visible request payload (messages + system + tools)."""
-        return _estimate_provider_visible_request_tokens_rough(
-            messages,
-            system_prompt=system_prompt,
-            tools=tools,
-            api_mode=getattr(self, "api_mode", ""),
-            provider=getattr(self, "provider", ""),
-            model=getattr(self, "model", ""),
-            base_url=getattr(self, "base_url", ""),
+        """Estimate request pressure from provider actual usage plus semantic delta."""
+        if request_snapshot is not None:
+            semantic_tokens = max(
+                0,
+                int(getattr(request_snapshot, "semantic_tokens", 0) or 0),
+            )
+            current_fingerprint = str(
+                getattr(request_snapshot, "calibration_fingerprint", "") or ""
+            )
+        else:
+            semantic_tokens = _estimate_provider_visible_request_tokens_rough(
+                messages or [],
+                system_prompt=system_prompt,
+                tools=tools,
+                api_mode=getattr(self, "api_mode", ""),
+                provider=getattr(self, "provider", ""),
+                model=getattr(self, "model", ""),
+                base_url=getattr(self, "base_url", ""),
+            )
+            current_fingerprint = self.preflight_request_fingerprint(
+                system_prompt=system_prompt,
+                tools=tools,
+            )
+        actual_baseline = int(
+            getattr(self, "_last_successful_request_actual_tokens", 0) or 0
         )
+        semantic_baseline = int(
+            getattr(self, "_last_successful_request_semantic_tokens", 0) or 0
+        )
+        baseline_fingerprint = str(
+            getattr(self, "_last_successful_request_fingerprint", "") or ""
+        )
+        if (
+            actual_baseline > 0
+            and semantic_baseline > 0
+            and baseline_fingerprint
+            and current_fingerprint == baseline_fingerprint
+        ):
+            return max(
+                0,
+                actual_baseline + int(semantic_tokens) - semantic_baseline,
+            )
+        return int(semantic_tokens)
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
@@ -1786,6 +2083,7 @@ class ContextCompressor(ContextEngine):
         compression_context_length: int | None = None,
     ) -> None:
         """Update model info after a model switch or fallback activation."""
+        self._clear_replay_anchor(delete_persisted=True)
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
@@ -1831,30 +2129,17 @@ class ContextCompressor(ContextEngine):
             int(self.compression_context_length * 0.05), _SUMMARY_TOKENS_CEILING,
         )
 
-        # Reset cross-call calibration state captured under the PREVIOUS model.
-        # These fields encode "the provider proved this prompt fit" / "preflight
-        # can be deferred" decisions that are only valid for the model that
-        # produced them. Carrying them across a switch to a smaller-context
-        # model would let should_defer_preflight_to_real_usage() suppress a
-        # preflight compression the new model actually needs — the exact
-        # oversized-send-after-switch failure in #23767. The new model's first
-        # response repopulates them via update_from_response(). Setting
-        # last_prompt_tokens to 0 (NOT -1) is deliberate: 0 is the documented
-        # "no real usage yet -> use the rough estimate" state, so the post-
-        # response should_compress path falls back to estimate_request_tokens_rough
-        # rather than skipping compression. -1 is a different sentinel
-        # (#36718, "compression just ran, await real usage") and must not be set here.
+        # Final-request calibration is lineage-specific. A route/model switch
+        # invalidates the previous successful request's actual+semantic baseline.
+        # Keep last_prompt_tokens at 0 (not the post-compression -1 sentinel).
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
         self.last_real_prompt_tokens = 0
-        self.last_rough_tokens_when_real_prompt_fit = 0
         self.last_compression_rough_tokens = 0
-        self.last_accepted_request_real_prompt_tokens = 0
-        self.last_accepted_request_rough_tokens = 0
-        self.last_accepted_request_fingerprint = ""
-        self._pending_request_rough_tokens = 0
-        self._pending_request_fingerprint = ""
+        self._last_successful_request_actual_tokens = 0
+        self._last_successful_request_semantic_tokens = 0
+        self._last_successful_request_fingerprint = ""
         self.awaiting_real_usage_after_compression = False
         self._ineffective_compression_count = 0
 
@@ -1996,6 +2281,8 @@ class ContextCompressor(ContextEngine):
         self._last_summary_sample: dict[str, Any] | None = None
         self._reusable_prefix_checkpoints: list[Any] = []
         self._latest_reusable_prefix_checkpoint: Any = None
+        self._replay_anchor_candidate: Any = None
+        self._frozen_reusable_prefix_checkpoint: Any = None
         self._last_reusable_prefix_checkpoint_audit: dict[str, Any] = {}
         self._last_compress_deferred = False
         self._reset_cheap_tool_cleanup_audit()
@@ -2051,12 +2338,9 @@ class ContextCompressor(ContextEngine):
         self.last_completion_tokens = 0
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
-        self.last_rough_tokens_when_real_prompt_fit = 0
-        self.last_accepted_request_real_prompt_tokens = 0
-        self.last_accepted_request_rough_tokens = 0
-        self.last_accepted_request_fingerprint = ""
-        self._pending_request_rough_tokens = 0
-        self._pending_request_fingerprint = ""
+        self._last_successful_request_actual_tokens = 0
+        self._last_successful_request_semantic_tokens = 0
+        self._last_successful_request_fingerprint = ""
         self.awaiting_real_usage_after_compression = False
 
         self.summary_model = summary_model_override or ""
@@ -2176,19 +2460,6 @@ class ContextCompressor(ContextEngine):
         blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[:24]
 
-    def record_pending_request_estimate(self, rough_tokens: int, *, fingerprint: str = "") -> None:
-        """Record the local rough estimate for the request about to be sent.
-
-        ``update_from_response()`` pairs this pending rough estimate with the
-        provider-reported real prompt tokens after a successful call, giving
-        preflight a calibrated accepted-request baseline for later turns.
-        """
-        try:
-            self._pending_request_rough_tokens = max(0, int(rough_tokens or 0))
-        except (TypeError, ValueError):
-            self._pending_request_rough_tokens = 0
-        self._pending_request_fingerprint = str(fingerprint or "")
-
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
@@ -2196,88 +2467,7 @@ class ContextCompressor(ContextEngine):
         self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
         if self.last_prompt_tokens > 0:
             self.last_real_prompt_tokens = self.last_prompt_tokens
-            if self.last_prompt_tokens < self.threshold_tokens:
-                pending_rough = int(getattr(self, "_pending_request_rough_tokens", 0) or 0)
-                pending_fingerprint = str(getattr(self, "_pending_request_fingerprint", "") or "")
-                if pending_rough > 0:
-                    self.last_accepted_request_real_prompt_tokens = self.last_prompt_tokens
-                    self.last_accepted_request_rough_tokens = pending_rough
-                    self.last_accepted_request_fingerprint = pending_fingerprint
-                else:
-                    self.last_accepted_request_real_prompt_tokens = 0
-                    self.last_accepted_request_rough_tokens = 0
-                    self.last_accepted_request_fingerprint = ""
-                if self.awaiting_real_usage_after_compression and self.last_compression_rough_tokens > 0:
-                    self.last_rough_tokens_when_real_prompt_fit = self.last_compression_rough_tokens
-            else:
-                self.last_rough_tokens_when_real_prompt_fit = 0
-                self.last_accepted_request_real_prompt_tokens = 0
-                self.last_accepted_request_rough_tokens = 0
-                self.last_accepted_request_fingerprint = ""
-        self._pending_request_rough_tokens = 0
-        self._pending_request_fingerprint = ""
         self.awaiting_real_usage_after_compression = False
-
-    def should_defer_preflight_to_real_usage(self, rough_tokens: int, *, fingerprint: str = "") -> bool:
-        """Return True when a high rough preflight estimate is known-noisy.
-
-        ``estimate_request_tokens_rough(..., tools=...)`` intentionally
-        overestimates schema-heavy requests so Hermes compresses before a
-        provider rejects the payload. After a successful API call, though,
-        provider ``prompt_tokens`` are a better signal than repeating
-        compaction from the same rough schema overhead. Defer only while the
-        rough estimate has grown modestly since a request the provider proved
-        fit under the threshold.
-        """
-        if rough_tokens < self.threshold_tokens:
-            return False
-        # Immediately after a compaction the post-compression path sets
-        # ``awaiting_real_usage_after_compression`` and parks
-        # ``last_prompt_tokens = -1``, but ``last_real_prompt_tokens`` still
-        # holds the STALE pre-compression value (above threshold — that's why
-        # compaction fired).  Without this guard that stale value defeats the
-        # ``last_real_prompt_tokens >= threshold_tokens`` check below, so
-        # preflight fires a SECOND compaction before the provider has reported
-        # real token usage for the now-shorter conversation.  Defer for exactly
-        # one turn; update_from_response() clears the flag when real usage
-        # arrives.  (#36718)
-        if self.awaiting_real_usage_after_compression:
-            return True
-
-        accepted_real = int(getattr(self, "last_accepted_request_real_prompt_tokens", 0) or 0)
-        accepted_rough = int(getattr(self, "last_accepted_request_rough_tokens", 0) or 0)
-        accepted_fingerprint = str(getattr(self, "last_accepted_request_fingerprint", "") or "")
-        if accepted_real > 0 and accepted_rough > 0:
-            if accepted_real >= self.threshold_tokens:
-                return False
-            if accepted_fingerprint and fingerprint != accepted_fingerprint:
-                return False
-            growth = max(0, rough_tokens - accepted_rough)
-            tolerated_growth = max(4096, int(self.threshold_tokens * 0.05))
-            if growth > tolerated_growth:
-                return False
-            calibrated_tokens = accepted_real + growth
-            if calibrated_tokens >= self.threshold_tokens:
-                return False
-            self.last_accepted_request_rough_tokens = max(accepted_rough, rough_tokens)
-            return True
-
-        if self.last_real_prompt_tokens <= 0:
-            return False
-        if self.last_real_prompt_tokens >= self.threshold_tokens:
-            return False
-
-        baseline = self.last_rough_tokens_when_real_prompt_fit or self.last_compression_rough_tokens
-        if baseline <= 0:
-            return False
-
-        growth = max(0, rough_tokens - baseline)
-        tolerated_growth = max(4096, int(self.threshold_tokens * 0.05))
-        if growth > tolerated_growth:
-            return False
-
-        self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
-        return True
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """Check if context exceeds the compression threshold.
@@ -2710,6 +2900,8 @@ class ContextCompressor(ContextEngine):
         trigger_reason: str | None,
         focus_topic: str | None,
         cleanup_result: CheapToolResultCleanupResult,
+        original_messages: List[Dict[str, Any]],
+        current_tokens: int,
     ) -> bool:
         cfg = getattr(self, "cheap_tool_result_cleanup", CheapToolResultCleanupConfig())
         if not cfg.enabled or not cfg.skip_llm_summary_when_below_threshold:
@@ -2728,8 +2920,29 @@ class ContextCompressor(ContextEngine):
             "token_threshold_and_message_count_hard_limit",
         }:
             return False
-        post_tokens = self.estimate_provider_messages_tokens(cleanup_result.messages)
-        return int(post_tokens) < int(getattr(self, "threshold_tokens", 0) or 0)
+
+        semantic_before = self.estimate_provider_messages_tokens(original_messages)
+        semantic_after = self.estimate_provider_messages_tokens(cleanup_result.messages)
+        try:
+            pressure_before = max(0, int(current_tokens or 0))
+        except (TypeError, ValueError):
+            pressure_before = 0
+        if pressure_before <= 0:
+            pressure_before = semantic_before
+        calibrated_post_tokens = max(
+            0,
+            pressure_before + int(semantic_after) - int(semantic_before),
+        )
+        tail_target = max(
+            0,
+            int(getattr(self, "threshold_tokens", 0) or 0)
+            - int(getattr(self, "tail_token_budget", 0) or 0),
+        )
+        cleanup_result.audit["calibrated_post_cleanup_tokens_estimate"] = (
+            calibrated_post_tokens
+        )
+        cleanup_result.audit["cheap_cleanup_target_tokens"] = tail_target
+        return calibrated_post_tokens <= tail_target
 
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
@@ -3550,16 +3763,19 @@ class ContextCompressor(ContextEngine):
             },
         }
 
-    def _compute_summary_budget(self, turns_to_summarize: List[Dict[str, Any]]) -> int:
-        """Scale summary token budget with the amount of content being compressed.
+    def _compute_summary_budget_from_source(self, serialized_source: str) -> int:
+        """Scale output budget from the exact source presented to the summarizer."""
+        from agent.token_estimator import count_text_tokens
 
-        The maximum scales with the model's context window (5% of context,
-        capped at ``_SUMMARY_TOKENS_CEILING``) so large-context models get
-        richer summaries instead of being hard-capped at 8K tokens.
-        """
-        content_tokens = estimate_messages_tokens_rough(turns_to_summarize)
+        content_tokens = count_text_tokens(serialized_source)
         budget = int(content_tokens * _SUMMARY_RATIO)
         return max(_MIN_SUMMARY_TOKENS, min(budget, self.max_summary_tokens))
+
+    def _compute_summary_budget(self, turns_to_summarize: List[Dict[str, Any]]) -> int:
+        """Scale budget from the canonical serialized summary source."""
+        return self._compute_summary_budget_from_source(
+            self._serialize_for_summary(turns_to_summarize)
+        )
 
     # Summarizer-input limits.  Tool result bodies are rendered in full first;
     # these non-tool caps keep huge user/assistant prose from being duplicated
@@ -4741,18 +4957,22 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
             source_messages=source_messages,
             compress_end=compress_end,
         )
-        replay_checkpoint = self._latest_reusable_prefix_checkpoint
+        replay_checkpoint = getattr(
+            self,
+            "_frozen_reusable_prefix_checkpoint",
+            None,
+        )
         replaying_successful_endpoint = bool(
             replay_checkpoint is not None
-            and replay_checkpoint.provider_messages
+            and replay_checkpoint.provider_request
             and replay_checkpoint.source_message_count == compress_end
             and self._last_reusable_prefix_checkpoint_audit.get("selected")
         )
         if replaying_successful_endpoint and replay_checkpoint is not None:
-            prefix_messages = [
-                copy.deepcopy(message)
-                for message in replay_checkpoint.provider_messages
-            ]
+            carrier = replay_checkpoint.provider_request.get("messages")
+            if not isinstance(carrier, list):
+                carrier = replay_checkpoint.provider_request.get("input")
+            prefix_messages = copy.deepcopy(carrier) if isinstance(carrier, list) else []
         else:
             prefix_messages = list(source_messages[:compress_end])
         previous_summary_in_prefix = bool(previous_summary_for_prompt)
@@ -4765,8 +4985,11 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
         base_audit: dict[str, Any] = {
             "mode": "append_cached",
             "source_binding": (
-                "latest_successful_provider_request_endpoint"
+                "frozen_tail_boundary_endpoint"
                 if replaying_successful_endpoint
+                else "transcript_reconstructed_fallback"
+                if self._last_reusable_prefix_checkpoint_audit.get("reason")
+                == "transcript_reconstructed_fallback"
                 else "provider_payload_prefix_to_compress_end"
             ),
             "rules_hash": rules.rules_hash,
@@ -4783,6 +5006,7 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
                 "hit_rate_estimate": None,
             },
             "fallback_reason": None,
+            "anchor_fallback_reason": None,
             "tool_call_violation": False,
         }
         self._last_summary_call_audit = base_audit
@@ -4798,21 +5022,24 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
 
         checkpoint_audit = self._last_reusable_prefix_checkpoint_audit
         if bool(checkpoint_audit.get("selected")):
-            fingerprint_provider_messages = getattr(
+            fingerprint_provider_request = getattr(
                 runtime,
-                "fingerprint_provider_messages",
+                "fingerprint_provider_request",
                 None,
             )
             if (
                 not replaying_successful_endpoint
                 or replay_checkpoint is None
-                or not callable(fingerprint_provider_messages)
+                or not callable(fingerprint_provider_request)
             ):
                 checkpoint_matches_runtime = False
             else:
                 try:
                     runtime_fingerprint = str(
-                        fingerprint_provider_messages(prefix_messages) or ""
+                        fingerprint_provider_request(
+                            replay_checkpoint.provider_request
+                        )
+                        or ""
                     )
                 except Exception:
                     runtime_fingerprint = ""
@@ -4822,23 +5049,79 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
                 )
             checkpoint_audit["runtime_revalidated"] = checkpoint_matches_runtime
             if not checkpoint_matches_runtime:
-                self._last_compress_deferred = True
-                base_audit["fallback_reason"] = (
-                    "reusable_prefix_checkpoint_unavailable"
+                fallback_end = int(
+                    checkpoint_audit.get("desired_source_message_count")
+                    or compress_end
                 )
-                return None
+                fallback_end = max(
+                    summarize_start + 1,
+                    min(len(source_messages), fallback_end),
+                )
+                checkpoint_audit.update({
+                    "selected": False,
+                    "reason": "transcript_reconstructed_fallback",
+                    "anchor_unavailable_reason": "runtime_fingerprint_mismatch",
+                    "source_message_count": fallback_end,
+                })
+                self._clear_replay_anchor(delete_persisted=True)
+                self._last_compress_deferred = False
+                self._summary_effective_compress_end = fallback_end
+                compress_end = fallback_end
+                turns_to_summarize = list(
+                    source_messages[summarize_start:compress_end]
+                )
+                summary_budget = self._compute_summary_budget(turns_to_summarize)
+                rules = self._build_summary_rules(
+                    turns_to_summarize,
+                    summary_budget,
+                )
+                previous_summary_for_prompt = (
+                    self._previous_summary_for_summary_prompt(
+                        source_messages=source_messages,
+                        compress_end=compress_end,
+                    )
+                )
+                prefix_messages = list(source_messages[:compress_end])
+                previous_summary_in_prefix = bool(previous_summary_for_prompt)
+                instruction = self._build_append_cached_summary_instruction(
+                    rules,
+                    previous_summary=None,
+                    focus_topic=focus_topic,
+                    previous_summary_in_prefix=previous_summary_in_prefix,
+                )
+                replaying_successful_endpoint = False
+                base_audit["source_binding"] = (
+                    "transcript_reconstructed_fallback"
+                )
+                base_audit["anchor_fallback_reason"] = (
+                    "runtime_fingerprint_mismatch"
+                )
+                base_audit["rules_hash"] = rules.rules_hash
 
         request_messages = prefix_messages + [{"role": "user", "content": instruction}]
         requested_output_tokens = int(summary_budget * 1.3)
         if replaying_successful_endpoint:
             build_kwargs = getattr(
                 runtime,
-                "build_kwargs_from_provider_messages",
-                runtime.build_kwargs,
+                "build_kwargs_from_provider_request",
+                None,
+            )
+            if not callable(build_kwargs) or replay_checkpoint is None:
+                base_audit["fallback_reason"] = "summary_runtime_cannot_replay_anchor"
+                return None
+            api_kwargs = build_kwargs(
+                replay_checkpoint.provider_request,
+                instruction,
+                requested_output_tokens,
             )
         else:
-            build_kwargs = runtime.build_kwargs
-        api_kwargs = build_kwargs(request_messages, requested_output_tokens)
+            api_kwargs = runtime.build_kwargs(
+                request_messages,
+                requested_output_tokens,
+            )
+        if not isinstance(api_kwargs, dict):
+            base_audit["fallback_reason"] = "summary_runtime_invalid_request"
+            return None
         tool_choice_requested = False
         if append_cfg.allow_tool_choice_none:
             api_kwargs, tool_choice_requested = apply_summary_tool_choice_none(
@@ -5108,9 +5391,9 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
                 )
                 return None
 
-        summary_budget = self._compute_summary_budget(turns_to_summarize)
         append_failure = dict(getattr(self, "_last_summary_call_audit", {}) or {})
         content_to_summarize = self._serialize_for_summary(turns_to_summarize)
+        summary_budget = self._compute_summary_budget_from_source(content_to_summarize)
         rules = self._build_summary_rules(turns_to_summarize, summary_budget)
         prompt = self._build_serialized_summary_prompt(
             rules,
@@ -6057,6 +6340,7 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
         self._reset_cheap_tool_cleanup_audit()
         self._last_compress_aborted = False
         self._last_compress_deferred = False
+        self._summary_effective_compress_end = None
         # NOTE: do NOT reset _last_summary_auth_failure or
         # _last_summary_network_failure here.  These flags are set by
         # _generate_summary() on a terminal failure and are already cleared on
@@ -6147,9 +6431,10 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
         compress_start = self._align_boundary_forward(messages, compress_start)
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
 
-        # append_cached may only run when the selected source prefix is backed
-        # by a prior successful main-request checkpoint. Deferring keeps the
-        # transcript intact and lets a subsequent main request establish one.
+        # Prefer the frozen successful endpoint when available. If it is absent,
+        # keep the policy-selected boundary and use the stable transcript-derived
+        # summary path; cache reuse may be lower, but automatic compression must
+        # remain functional and must not defer.
         if (
             getattr(self, "summary_call_mode", "serialized_prompt") == "append_cached"
             and not force
@@ -6175,33 +6460,11 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
             else:
                 self._last_reusable_prefix_checkpoint_audit = {
                     "selected": False,
-                    "reason": "reusable_prefix_checkpoint_unavailable",
+                    "reason": "transcript_reconstructed_fallback",
                     "candidate_count": len(self._reusable_prefix_checkpoints),
                     "desired_source_message_count": compress_end,
                 }
-                self._last_compress_deferred = True
-                self._write_compression_audit_record(self._build_compression_audit_record(
-                    result="deferred",
-                    entrypoint=entrypoint,
-                    input_messages=n_messages,
-                    output_messages=n_messages,
-                    summary_start=compress_start,
-                    summary_end=compress_end,
-                    retained_tail_start=compress_end,
-                    abort_reason="reusable_prefix_checkpoint_unavailable",
-                    before_estimate=display_tokens,
-                    after_estimate=display_tokens,
-                    before_messages=original_messages,
-                    after_messages=original_messages,
-                    trigger_reason=trigger_reason,
-                    trigger_token_source=trigger_token_source,
-                    trigger_tokens=trigger_tokens,
-                    trigger_threshold_tokens=trigger_threshold_tokens,
-                    trigger_context_length=trigger_context_length,
-                    trigger_message_count=trigger_message_count,
-                    trigger_hard_message_limit=trigger_hard_message_limit,
-                ))
-                return messages
+                self._last_compress_deferred = False
 
         tail_tool_compacted = 0
         tail_boundary_promoted = False
@@ -6218,6 +6481,8 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
                 trigger_reason=trigger_reason,
                 focus_topic=focus_topic,
                 cleanup_result=empty_cleanup_result,
+                original_messages=messages,
+                current_tokens=display_tokens,
             ):
                 cheap_messages = [
                     m.copy() if isinstance(m, dict) else m
@@ -6257,6 +6522,7 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
                     retained_tail_raw_messages=original_messages[compress_end:n_messages],
                     **audit_trigger_kwargs,
                 ))
+                self._clear_replay_anchor(delete_persisted=True)
                 return cheap_messages
             if empty_cleanup_result.applied:
                 skipped_cleanup_audit = dict(empty_cleanup_result.audit)
@@ -6367,6 +6633,8 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
             trigger_reason=trigger_reason,
             focus_topic=focus_topic,
             cleanup_result=cleanup_result,
+            original_messages=messages,
+            current_tokens=display_tokens,
         ):
             cheap_messages = [
                 m.copy() if isinstance(m, dict) else m
@@ -6406,6 +6674,7 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
                 retained_tail_raw_messages=original_messages[compress_end:n_messages],
                 **audit_trigger_kwargs,
             ))
+            self._clear_replay_anchor(delete_persisted=True)
             return cheap_messages
 
         if cleanup_result.applied:
@@ -6460,35 +6729,15 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
                 compress_end=compress_end,
             )
 
-        if self._last_compress_deferred:
-            defer_reason = str(
-                (self._last_summary_call_audit or {}).get("fallback_reason")
-                or "reusable_prefix_checkpoint_unavailable"
-            )
-            self._last_summary_dropped_count = 0
-            self._last_summary_fallback_used = False
-            self._write_compression_audit_record(self._build_compression_audit_record(
-                result="deferred",
-                entrypoint=entrypoint,
-                input_messages=n_messages,
-                output_messages=n_messages,
-                summary_start=summarize_start,
-                summary_end=compress_end,
-                retained_tail_start=compress_end,
-                pruned_count=pruned_count,
-                tail_compacted_count=tail_tool_compacted,
-                tail_boundary_promoted=tail_boundary_promoted,
-                abort_reason=defer_reason,
-                before_estimate=display_tokens,
-                after_estimate=display_tokens,
-                previous_summary_text=previous_summary_for_audit,
-                before_messages=original_messages,
-                after_messages=original_messages,
-                retained_tail_messages=original_messages[compress_end:],
-                retained_tail_raw_messages=original_messages[compress_end:],
-                **audit_trigger_kwargs,
-            ))
-            return original_messages
+        effective_compress_end = getattr(
+            self,
+            "_summary_effective_compress_end",
+            None,
+        )
+        if effective_compress_end is not None:
+            compress_end = int(effective_compress_end)
+            turns_to_summarize = raw_messages[summarize_start:compress_end]
+            self._summary_effective_compress_end = None
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
@@ -6836,5 +7085,6 @@ Use this exact nine-section structure. Incorporate the conversation above, and r
         ))
         self._write_summary_sample_audit()
         self._write_user_message_ground_truth_audit()
+        self._clear_replay_anchor(delete_persisted=True)
 
         return compressed

@@ -89,3 +89,35 @@ def test_hygiene_compression_request_estimate_uses_full_provider_shape():
             "tools": agent.tools,
         }
     ]
+
+
+def test_hygiene_no_usage_estimate_shapes_storage_history_for_target_provider():
+    from agent.model_metadata import estimate_messages_tokens_rough
+    from gateway.run import _estimate_hygiene_history_tokens
+
+    history = [
+        {"role": "user", "content": "continue"},
+        {
+            "role": "assistant",
+            "content": "short answer",
+            "reasoning": "R" * 120_000,
+            "reasoning_content": "C" * 120_000,
+            "codex_reasoning_items": [
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "E" * 120_000,
+                }
+            ],
+        },
+    ]
+
+    shaped = _estimate_hygiene_history_tokens(
+        history,
+        model="gpt-5",
+        provider="openrouter",
+        api_mode="chat_completions",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert estimate_messages_tokens_rough(history) > shaped * 100
+    assert shaped < 100

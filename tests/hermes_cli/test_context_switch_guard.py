@@ -64,6 +64,40 @@ def test_no_warning_when_below_new_threshold(monkeypatch):
     assert not result.warning_message
 
 
+def test_switch_guard_no_usage_prefers_provider_visible_estimator():
+    from hermes_cli.context_switch_guard import _estimate_tokens
+
+    seen = {}
+
+    def estimate(messages, *, system_prompt="", tools=None):
+        seen.update(messages=messages, system_prompt=system_prompt, tools=tools)
+        return 1_729
+
+    cc = SimpleNamespace(
+        protect_first_n=0,
+        protect_last_n=0,
+        estimate_provider_request_tokens=estimate,
+        last_prompt_tokens=0,
+    )
+    agent = SimpleNamespace(
+        context_compressor=cc,
+        _cached_system_prompt="SYSTEM",
+        tools=[{"type": "function", "function": {"name": "terminal"}}],
+        session_prompt_tokens=0,
+    )
+    messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "answer", "reasoning": "R" * 10_000},
+    ]
+
+    assert _estimate_tokens(agent, messages) == 1_729
+    assert seen == {
+        "messages": messages,
+        "system_prompt": "SYSTEM",
+        "tools": agent.tools,
+    }
+
+
 def test_warns_when_estimate_exceeds_new_threshold(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.context_switch_guard.resolve_display_context_length",

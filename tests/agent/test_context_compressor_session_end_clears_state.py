@@ -67,7 +67,6 @@ def _make_compressor():
     c._last_aux_model_failure_model = None
     c.last_real_prompt_tokens = 0
     c.last_compression_rough_tokens = 0
-    c.last_rough_tokens_when_real_prompt_fit = 0
     c.awaiting_real_usage_after_compression = False
     c._previous_summary = None
     return c
@@ -89,7 +88,6 @@ def _simulate_cron_session_state(c):
     c._context_probe_persistable = True
     c.last_real_prompt_tokens = 50000
     c.last_compression_rough_tokens = 60000
-    c.last_rough_tokens_when_real_prompt_fit = 55000
     c.awaiting_real_usage_after_compression = True
 
 
@@ -144,9 +142,6 @@ def test_on_session_end_clears_all_per_session_state():
     assert c.last_compression_rough_tokens == 0, (
         f"last_compression_rough_tokens must be 0, got {c.last_compression_rough_tokens}"
     )
-    assert c.last_rough_tokens_when_real_prompt_fit == 0, (
-        f"last_rough_tokens_when_real_prompt_fit must be 0, got {c.last_rough_tokens_when_real_prompt_fit}"
-    )
     assert c.awaiting_real_usage_after_compression is False, (
         f"awaiting_real_usage_after_compression must be False, got {c.awaiting_real_usage_after_compression}"
     )
@@ -179,7 +174,6 @@ def test_on_session_end_matches_on_session_reset_surface():
         "_context_probe_persistable",
         "last_real_prompt_tokens",
         "last_compression_rough_tokens",
-        "last_rough_tokens_when_real_prompt_fit",
         "awaiting_real_usage_after_compression",
     ]
 

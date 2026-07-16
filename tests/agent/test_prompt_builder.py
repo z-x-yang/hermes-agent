@@ -257,6 +257,21 @@ class TestDynamicContextFileCap:
 
         assert "truncated" in result.lower()
 
+    def test_dynamic_truncation_counts_marker_inside_token_budget(self):
+        from agent.token_estimator import count_text_tokens
+
+        content = "👩🏽‍💻 mixed multilingual context 这是中文。" * 2_000
+        result = _truncate_content(
+            content,
+            "AGENTS.md",
+            context_length=8_000,
+            read_path="/proj/AGENTS.md",
+        )
+
+        assert "truncated" in result.lower()
+        assert "�" not in result
+        assert count_text_tokens(result) <= _dynamic_context_file_max_tokens(8_000)
+
     def test_dynamic_scales_above_floor_for_large_window(self):
         # 200K-token window → 12K tokens (200000 * 0.06).
         cap = _dynamic_context_file_max_tokens(200_000)

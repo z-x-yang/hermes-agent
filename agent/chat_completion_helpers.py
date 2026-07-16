@@ -15,6 +15,8 @@ sites unchanged.  Symbols that tests patch on ``run_agent`` (e.g.
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import logging
 import math
@@ -23,6 +25,7 @@ import re
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
@@ -58,6 +61,51 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # non-rate-limit case. See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 _RATE_LIMIT_FALLBACK_COOLDOWN_S = 600.0
+
+
+@dataclass(frozen=True)
+class ProviderRequestSnapshot:
+    """One final provider-shaped request observation at the wire boundary."""
+
+    source_message_count: int
+    semantic_tokens: int
+    cache_fingerprint: str
+    calibration_fingerprint: str
+    provider_request: dict[str, Any] = field(repr=False)
+
+
+def build_provider_request_snapshot(
+    api_payload: dict[str, Any],
+    *,
+    source_message_count: int,
+    lineage: tuple[str, ...],
+) -> ProviderRequestSnapshot:
+    """Capture semantic pressure and cache lineage from the final request."""
+    from agent.compression_summary_runtime import (
+        cache_visible_request_payload,
+        fingerprint_cache_visible_prefix,
+    )
+
+    normalized_lineage = tuple(
+        str(value or "").strip().rstrip("/") for value in lineage
+    )
+    calibration_payload = json.dumps(
+        normalized_lineage,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return ProviderRequestSnapshot(
+        source_message_count=max(0, int(source_message_count or 0)),
+        semantic_tokens=max(0, int(estimate_request_context_tokens(api_payload))),
+        cache_fingerprint=fingerprint_cache_visible_prefix(
+            api_payload,
+            lineage=normalized_lineage,
+        ),
+        calibration_fingerprint=hashlib.sha256(
+            calibration_payload.encode("utf-8")
+        ).hexdigest(),
+        provider_request=cache_visible_request_payload(copy.deepcopy(api_payload)),
+    )
 
 
 def _ra():

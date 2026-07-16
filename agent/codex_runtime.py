@@ -171,8 +171,6 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                 _preserve = {
                     name: getattr(compressor, name, None)
                     for name in (
-                        "_pending_request_rough_tokens",
-                        "_pending_request_fingerprint",
                         "awaiting_real_usage_after_compression",
                         "last_compression_rough_tokens",
                     )

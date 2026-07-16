@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -8,7 +9,9 @@ import pytest
 
 from agent.context_compressor import (
     CheapToolResultCleanupConfig,
+    CheapToolResultCleanupResult,
     ContextCompressor,
+    _estimate_provider_visible_messages_tokens_rough,
 )
 from agent.model_metadata import estimate_messages_tokens_rough
 
@@ -774,6 +777,88 @@ def test_codex_responses_image_estimate_uses_fixed_cost_not_base64_size():
     assert small >= 1_500
 
 
+def test_codex_responses_estimate_treats_encrypted_reasoning_as_opaque():
+    c = _compressor(api_mode="codex_responses")
+
+    def messages(ciphertext_size: int) -> list[dict]:
+        return [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "small visible reply",
+                "codex_reasoning_items": [{
+                    "id": "rs_1",
+                    "type": "reasoning",
+                    "encrypted_content": "E" * ciphertext_size,
+                }],
+            },
+        ]
+
+    small = c.estimate_provider_messages_tokens(messages(8))
+    large = c.estimate_provider_messages_tokens(messages(1_000_000))
+
+    assert large == small
+    assert large < 100
+
+
+def test_provider_request_estimate_uses_actual_baseline_plus_semantic_delta():
+    from agent.token_estimator import count_json_tokens
+
+    c = _compressor(api_mode="codex_responses")
+    system_prompt = "stable system prompt"
+    tools = [{"type": "function", "function": {"name": "terminal"}}]
+    baseline_messages = [
+        {"role": "user", "content": "hello"},
+        {
+            "role": "assistant",
+            "content": "reply",
+            "codex_reasoning_items": [{
+                "id": "rs_1",
+                "type": "reasoning",
+                "encrypted_content": "opaque-history" * 20_000,
+            }],
+        },
+    ]
+    provider_snapshot = [
+        {"role": "system", "content": system_prompt},
+        *baseline_messages,
+    ]
+    current_messages = [
+        *baseline_messages,
+        {"role": "user", "content": "new semantic turn " * 100},
+    ]
+    absolute_current = c.estimate_provider_request_tokens(
+        current_messages,
+        system_prompt=system_prompt,
+        tools=tools,
+    )
+    semantic_baseline = (
+        c.estimate_provider_messages_tokens(provider_snapshot)
+        + count_json_tokens(tools)
+    )
+    provider_actual = 40_000
+
+    c.record_reusable_prefix_checkpoint(
+        request_snapshot=SimpleNamespace(
+            source_message_count=len(baseline_messages),
+            cache_fingerprint="prefix-fingerprint",
+            semantic_tokens=semantic_baseline,
+            calibration_fingerprint=c.preflight_request_fingerprint(
+                system_prompt=system_prompt,
+                tools=tools,
+            ),
+            provider_request={"messages": provider_snapshot, "tools": tools},
+        ),
+        provider_input_tokens=provider_actual,
+    )
+
+    assert c.estimate_provider_request_tokens(
+        current_messages,
+        system_prompt=system_prompt,
+        tools=tools,
+    ) == provider_actual + absolute_current - semantic_baseline
+
+
 def test_chat_provider_visible_estimate_ignores_storage_only_reasoning_metadata():
     c = _compressor(api_mode="chat_completions")
     messages = [
@@ -849,7 +934,158 @@ def test_non_codex_non_gemini_estimate_strips_non_wire_tool_call_fields():
     assert provider_visible_estimate < 100
 
 
-def test_auto_cleanup_only_skips_summary_when_below_threshold(monkeypatch):
+def test_codex_estimate_filters_foreign_issuer_reasoning_like_wire_adapter():
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+    from agent.token_estimator import count_json_tokens_with_images
+
+    messages = [
+        {"role": "user", "content": "continue"},
+        {
+            "role": "assistant",
+            "content": "answer",
+            "codex_reasoning_items": [
+                {
+                    "id": "rs_codex",
+                    "type": "reasoning",
+                    "encrypted_content": "codex-sealed",
+                    "_issuer_kind": "codex_backend",
+                },
+                {
+                    "id": "rs_xai",
+                    "type": "reasoning",
+                    "encrypted_content": "xai-sealed",
+                    "_issuer_kind": "xai_responses",
+                },
+            ],
+        },
+    ]
+    wire_items = _chat_messages_to_responses_input(
+        messages,
+        replay_encrypted_reasoning=True,
+        current_issuer_kind="codex_backend",
+    )
+    unfiltered_items = _chat_messages_to_responses_input(
+        messages,
+        replay_encrypted_reasoning=True,
+        current_issuer_kind=None,
+    )
+
+    estimated = _estimate_provider_visible_messages_tokens_rough(
+        messages,
+        api_mode="codex_responses",
+        provider="openai-codex",
+        model="gpt-5.6-sol",
+        base_url="https://chatgpt.com/backend-api/codex",
+    )
+
+    assert estimated == count_json_tokens_with_images(wire_items)
+    assert estimated < count_json_tokens_with_images(unfiltered_items)
+
+
+def test_anthropic_estimate_counts_ordered_blocks_without_compatibility_mirrors():
+    from agent.anthropic_adapter import convert_messages_to_anthropic
+    from agent.token_estimator import count_json_tokens_with_images
+
+    messages = [
+        {"role": "user", "content": "start"},
+        {
+            "role": "assistant",
+            "content": "MIRROR_TEXT " * 4_000,
+            "reasoning_details": [
+                {"type": "thinking", "thinking": "MIRROR_THINKING " * 4_000}
+            ],
+            "tool_calls": [
+                {
+                    "id": "toolu_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"safe.txt"}',
+                    },
+                }
+            ],
+            "anthropic_content_blocks": [
+                {"type": "thinking", "thinking": "plan", "signature": "sig"},
+                {"type": "text", "text": "doing it"},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "read_file",
+                    "input": {"path": "raw-secret.txt"},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "toolu_1", "content": "done"},
+    ]
+    system, wire_messages = convert_messages_to_anthropic(
+        messages,
+        base_url="https://api.anthropic.com",
+        model="claude-sonnet-4-6",
+    )
+    expected_shape = {"messages": wire_messages}
+    if system is not None:
+        expected_shape["system"] = system
+
+    estimated = _estimate_provider_visible_messages_tokens_rough(
+        messages,
+        api_mode="anthropic_messages",
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        base_url="https://api.anthropic.com",
+    )
+
+    assert estimated == count_json_tokens_with_images(expected_shape)
+    assert estimate_messages_tokens_rough(messages) > estimated * 10
+
+
+@pytest.mark.parametrize(
+    ("post_cleanup_tokens", "expected"),
+    [
+        (81_000, False),
+        (80_000, True),
+    ],
+)
+def test_cheap_cleanup_only_requires_full_tail_runway(
+    monkeypatch,
+    post_cleanup_tokens,
+    expected,
+):
+    cfg = CheapToolResultCleanupConfig(
+        enabled=True,
+        keep_recent=0,
+        min_tokens_saved=1,
+        skip_llm_summary_when_below_threshold=True,
+    )
+    c = _compressor(cheap_tool_result_cleanup=cfg)
+    c.threshold_tokens = 100_000
+    c.tail_token_budget = 20_000
+    original = [{"role": "user", "content": "raw"}]
+    cleaned = [{"role": "user", "content": "cleaned"}]
+    cleanup_result = CheapToolResultCleanupResult(
+        messages=cleaned,
+        applied=True,
+        audit={"result": "applied"},
+        tokens_saved_estimate=20_000,
+    )
+
+    def semantic_tokens(messages):
+        return 100_000 if messages is original else post_cleanup_tokens
+
+    monkeypatch.setattr(c, "estimate_provider_messages_tokens", semantic_tokens)
+
+    assert c._cheap_cleanup_only_allowed(
+        entrypoint="auto",
+        trigger_reason="token_threshold",
+        focus_topic=None,
+        cleanup_result=cleanup_result,
+        original_messages=original,
+        current_tokens=100_000,
+    ) is expected
+
+
+def test_auto_cleanup_only_skips_summary_when_below_threshold(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
     cfg = CheapToolResultCleanupConfig(
         enabled=True,
         keep_recent=0,
@@ -858,7 +1094,9 @@ def test_auto_cleanup_only_skips_summary_when_below_threshold(monkeypatch):
     )
     c = _compressor(cheap_tool_result_cleanup=cfg)
     c.tail_token_budget = 1
-    c.bind_session_state(session_db=None, session_id="sess-1")
+    db = SessionDB(tmp_path / "state.db")
+    session_id = db.create_session("sess-1", "discord")
+    c.bind_session_state(session_db=db, session_id=session_id)
     called = {"summary": False}
 
     def fail_if_called(turns, focus_topic=None):
@@ -877,10 +1115,22 @@ def test_auto_cleanup_only_skips_summary_when_below_threshold(monkeypatch):
         {"role": "user", "content": "tail user"},
         {"role": "assistant", "content": "tail assistant"},
     ]
+    for source_end, provider_tokens in ((4, 40_000), (5, 55_000)):
+        c.record_reusable_prefix_checkpoint(
+            request_snapshot=SimpleNamespace(
+                source_message_count=source_end,
+                cache_fingerprint=f"prefix-{source_end}",
+                semantic_tokens=source_end * 1_000,
+                calibration_fingerprint="route",
+                provider_request={"messages": messages[:source_end]},
+            ),
+            provider_input_tokens=provider_tokens,
+        )
+    assert db.get_compression_replay_anchor(session_id) is not None
 
     out = c.compress(
         messages,
-        current_tokens=80_000,
+        current_tokens=60_000,
         force=False,
         trigger_reason="token_threshold",
     )
@@ -894,6 +1144,8 @@ def test_auto_cleanup_only_skips_summary_when_below_threshold(monkeypatch):
     assert audit["cheap_tool_result_cleanup"]["llm_summary_skipped_after_cleanup"] is True
     assert "post_cleanup_pipeline" not in audit["cheap_tool_result_cleanup"]
     assert audit["tokens"]["after_estimate"] == c.estimate_provider_messages_tokens(out)
+    assert db.get_compression_replay_anchor(session_id) is None
+    assert c._frozen_reusable_prefix_checkpoint is None
 
 
 def test_cleanup_only_preserves_reasoning_replay_and_tool_call_arguments(monkeypatch):

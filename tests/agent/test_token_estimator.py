@@ -45,6 +45,21 @@ def test_split_text_for_token_budget_special_token_literals():
     assert total > 100
 
 
+def test_split_text_for_token_budget_never_decodes_partial_unicode_tokens():
+    text = "👩🏽‍💻" * 1_000
+
+    result = split_text_for_token_budget(
+        text, 4, head_ratio=0.7, tail_ratio=0.3
+    )
+
+    assert result is not None
+    head, tail, *_ = result
+    assert "�" not in head
+    assert "�" not in tail
+    assert text.startswith(head)
+    assert text.endswith(tail)
+
+
 def test_estimate_messages_tokens_rough_special_token_literals():
     # The production crash path: a transcript discussing tokenizers.
     messages = [

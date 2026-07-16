@@ -4120,6 +4120,168 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
 
+    def test_provider_attempt_does_not_mutate_pending_calibration(self, agent):
+        self._setup_agent(agent)
+        assert not hasattr(
+            agent.context_compressor,
+            "record_pending_request_estimate",
+        )
+        response = _mock_response(
+            content="Final answer",
+            finish_reason="stop",
+            usage={"prompt_tokens": 84_000, "completion_tokens": 12},
+        )
+        agent.client.chat.completions.create.return_value = response
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+
+    def test_moa_reference_usage_is_billing_only_not_context_pressure(self, agent):
+        from agent.usage_pricing import CanonicalUsage
+
+        self._setup_agent(agent)
+        agent.provider = "moa"
+        agent.model = "review-preset"
+        response = _mock_response(
+            content="Aggregator answer",
+            finish_reason="stop",
+            usage={
+                "prompt_tokens": 80_000,
+                "completion_tokens": 100,
+                "total_tokens": 80_100,
+            },
+        )
+        agent.client.chat.completions.create.return_value = response
+        agent.client.consume_reference_usage = lambda: (
+            CanonicalUsage(input_tokens=240_000, output_tokens=300),
+            None,
+        )
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("review this")
+
+        assert result["final_response"] == "Aggregator answer"
+        assert agent.context_compressor.last_prompt_tokens == 80_000
+        assert agent.session_prompt_tokens == 320_000
+
+    def test_moa_virtual_request_is_not_recorded_as_replay_anchor(self, agent):
+        from agent.usage_pricing import CanonicalUsage
+
+        self._setup_agent(agent)
+        agent.provider = "moa"
+        agent.base_url = "moa://local"
+        agent.model = "review-preset"
+        response = _mock_response(
+            content="Aggregator answer",
+            finish_reason="stop",
+            usage={
+                "prompt_tokens": 80_000,
+                "completion_tokens": 100,
+                "total_tokens": 80_100,
+            },
+        )
+        agent.client.chat.completions.create.return_value = response
+        agent.client.consume_reference_usage = lambda: (
+            CanonicalUsage(input_tokens=240_000, output_tokens=300),
+            None,
+        )
+
+        with (
+            patch.object(
+                agent.context_compressor,
+                "record_reusable_prefix_checkpoint",
+            ) as record_checkpoint,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("review this")
+
+        assert result["final_response"] == "Aggregator answer"
+        record_checkpoint.assert_not_called()
+
+    def test_successful_request_records_actual_usage_and_provider_snapshot(self, agent):
+        self._setup_agent(agent)
+        resp = _mock_response(
+            content="Final answer",
+            finish_reason="stop",
+            usage={
+                "prompt_tokens": 84_000,
+                "completion_tokens": 12,
+                "total_tokens": 84_012,
+            },
+        )
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(
+                agent.context_compressor,
+                "record_reusable_prefix_checkpoint",
+            ) as record_checkpoint,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        final_request = agent.client.chat.completions.create.call_args.kwargs
+        record_checkpoint.assert_called_once()
+        recorded = record_checkpoint.call_args.kwargs
+        snapshot = recorded["request_snapshot"]
+        assert snapshot.source_message_count == 1
+        assert snapshot.provider_request["messages"] == final_request["messages"]
+        assert snapshot.provider_request["tools"] == final_request["tools"]
+        assert snapshot.semantic_tokens > 0
+        assert snapshot.cache_fingerprint
+        assert snapshot.calibration_fingerprint
+        assert recorded["provider_input_tokens"] == 84_000
+
+    def test_final_provider_request_compresses_before_backend_call(self, agent):
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+        agent.context_compressor.threshold_tokens = 50_000
+        response = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = response
+        final_estimates = iter([80_000, 100])
+
+        def estimate_request(*args, request_snapshot=None, **kwargs):
+            if request_snapshot is None:
+                return 100
+            return next(final_estimates)
+
+        def compress_once(messages, system_message, **kwargs):
+            return ([{"role": "user", "content": "compressed request"}], system_message)
+
+        with (
+            patch.object(
+                agent.context_compressor,
+                "estimate_provider_request_tokens",
+                side_effect=estimate_request,
+            ),
+            patch.object(agent, "_compress_context", side_effect=compress_once) as compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        compress.assert_called_once()
+        agent.client.chat.completions.create.assert_called_once()
+        sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert sent_messages[-1]["content"] == "compressed request"
+
     def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
         self._setup_agent(agent)
         agent.model = "qwen3.5:9b"
@@ -4163,7 +4325,7 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
-    def test_post_tool_provider_usage_compression_audits_internal_context_window(self, agent):
+    def test_post_tool_compression_uses_next_final_provider_request(self, agent):
         self._setup_agent(agent)
         agent.compression_enabled = True
         compressor = agent.context_compressor
@@ -4180,8 +4342,10 @@ class TestRunConversation:
         )
         resp2 = _mock_response(content="Done searching", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [resp1, resp2]
+        compressed_inputs = []
 
         def _compress_once(messages, system_message, **kwargs):
+            compressed_inputs.append(messages)
             agent.compression_enabled = False
             return messages, system_message
 
@@ -4195,10 +4359,14 @@ class TestRunConversation:
             result = agent.run_conversation("search something")
 
         assert result["final_response"] == "Done searching"
+        assert any(
+            message.get("role") == "tool" and message.get("content") == "search result"
+            for message in compressed_inputs[0]
+        )
         trigger = mock_compress.call_args.kwargs
-        assert trigger["trigger_reason"] == "token_threshold"
-        assert trigger["trigger_token_source"] == "provider_actual"
-        assert trigger["trigger_tokens"] == 280_000
+        assert trigger["trigger_reason"] == "final_provider_request_threshold"
+        assert trigger["trigger_token_source"] == "final_provider_request_snapshot"
+        assert trigger["trigger_tokens"] >= 280_000
         assert trigger["trigger_threshold_tokens"] == 258_400
         assert trigger["trigger_context_length"] == 272_000
 
@@ -4788,36 +4956,6 @@ class TestRunConversation:
         assert calls["refresh"] == 1
         assert result["completed"] is True
         assert result["final_response"] == "Recovered after remint"
-
-    def test_context_compression_triggered(self, agent):
-        """When compressor says should_compress, compression runs."""
-        self._setup_agent(agent)
-        agent.compression_enabled = True
-
-        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
-        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
-        resp2 = _mock_response(content="All done", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [resp1, resp2]
-
-        with (
-            patch("run_agent.handle_function_call", return_value="result"),
-            patch.object(
-                agent.context_compressor, "should_compress", return_value=True
-            ),
-            patch.object(agent, "_compress_context") as mock_compress,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            # _compress_context should return (messages, system_prompt)
-            mock_compress.return_value = (
-                [{"role": "user", "content": "search something"}],
-                "compressed system prompt",
-            )
-            result = agent.run_conversation("search something")
-        mock_compress.assert_called_once()
-        assert result["final_response"] == "All done"
-        assert result["completed"] is True
 
     def test_glm_prompt_exceeds_max_length_triggers_compression(self, agent):
         """GLM/Z.AI uses 'Prompt exceeds max length' for context overflow."""
@@ -5688,6 +5826,10 @@ class TestRetryExhaustion:
         agent.client.chat.completions.create.side_effect = RuntimeError("rate limited")
         from agent import conversation_loop as _conv_loop
         with (
+            patch.object(
+                agent.context_compressor,
+                "record_reusable_prefix_checkpoint",
+            ) as record_checkpoint,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -5700,6 +5842,7 @@ class TestRetryExhaustion:
         assert result.get("failed") is True
         assert "error" in result
         assert "rate limited" in result["error"]
+        record_checkpoint.assert_not_called()
 
     def test_api_error_retry_backoff_starts_at_five_seconds(self, agent):
         """Transient API errors should not retry after only ~2 seconds."""

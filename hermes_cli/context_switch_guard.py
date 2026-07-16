@@ -41,10 +41,20 @@ def _estimate_tokens(agent: Any, messages: Optional[List[dict]]) -> Optional[int
         if len(messages) <= protect:
             return None
         try:
-            from agent.model_metadata import estimate_request_tokens_rough
-
             system_prompt = getattr(agent, "_cached_system_prompt", None) or ""
             tools = getattr(agent, "tools", None)
+            estimator = getattr(cc, "estimate_provider_request_tokens", None)
+            if callable(estimator):
+                value = estimator(
+                    messages,
+                    system_prompt=system_prompt,
+                    tools=tools or None,
+                )
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return int(value)
+
+            from agent.model_metadata import estimate_request_tokens_rough
+
             return int(
                 estimate_request_tokens_rough(
                     messages,

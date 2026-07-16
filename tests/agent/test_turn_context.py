@@ -384,7 +384,6 @@ def test_near_compression_preflight_gate_uses_near_threshold_when_enabled():
         compression_count=0,
         last_prompt_tokens=0,
         last_real_prompt_tokens=0,
-        should_defer_preflight_to_real_usage=lambda _tokens: False,
         get_active_compression_failure_cooldown=lambda: None,
         should_compress=lambda tokens: tokens >= 1000,
     )
@@ -416,7 +415,6 @@ def test_near_compression_queues_runtime_context_status_once():
         compression_count=0,
         last_prompt_tokens=0,
         last_real_prompt_tokens=0,
-        should_defer_preflight_to_real_usage=lambda _tokens: False,
         get_active_compression_failure_cooldown=lambda: None,
         should_compress=lambda tokens: tokens >= 1000,
     )
@@ -451,7 +449,6 @@ def test_near_compression_notice_not_queued_when_compression_triggers():
         compression_count=0,
         last_prompt_tokens=0,
         last_real_prompt_tokens=0,
-        should_defer_preflight_to_real_usage=lambda _tokens: False,
         get_active_compression_failure_cooldown=lambda: None,
         should_compress=lambda tokens: tokens >= 1000,
     )
